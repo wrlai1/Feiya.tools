@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Feiya ERP</title>
+    <script>
+        const APP_URL = window.location.hostname === 'localhost'
+            ? 'http://localhost:8501'
+            : (window.FEYIA_APP_URL || 'http://localhost:8501');
+        window.location.replace(APP_URL);
+    </script>
+</head>
+
+<body>
+    <p>Redirecting to Feiya ERP...</p>
+</body>
+
+</html>
