@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Feiya ERP</title>
+    <script>
+        // Local: streamlit run main_app.py, then open index.html → goes to localhost:8501
+        // Production: feiya.tools (your Streamlit app with custom domain)
+        const STREAMLIT_URL = 'https://feiya.tools';
+        const APP_URL = window.location.hostname === 'localhost' ? 'http://localhost:8501' : STREAMLIT_URL;
+        window.location.replace(APP_URL);
+    </script>
+</head>
+
+<body>
+    <p>Redirecting to Feiya ERP...</p>
+</body>
+
+</html>
