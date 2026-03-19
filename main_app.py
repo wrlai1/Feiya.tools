@@ -337,8 +337,8 @@ def render_chat():
                             st.session_state.editing_id = None
                             st.rerun()
                 else:
-                    st.markdown(f"**{m['name']}:** {m['text']}")
-                    st.caption(time.strftime("%Y-%m-%d %H:%M", time.localtime(m.get("ts", 0))))
+                    ts_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(m.get("ts", 0)))
+                    st.markdown(f"**{m['name']}** ({ts_str}): {m['text']}")
                     if is_own:
                         be, bd = st.columns(2)
                         with be:
