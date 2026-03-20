@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useCallback } from 'react'
+import React, { useState, useMemo, useCallback, useEffect } from 'react'
 import {
   Search,
   Download,
@@ -9,13 +9,14 @@ import {
   AlertTriangle,
   CheckCircle,
   XCircle,
+  CloudOff,
 } from 'lucide-react'
 import FileUploadZone from '../components/FileUploadZone.jsx'
 import DataTable from '../components/DataTable.jsx'
-import { useLocalStorage } from '../hooks/useLocalStorage.js'
 import { useToast } from '../hooks/useToast.js'
 import { parseInventoryExcel, inventoryToCSV, downloadCSV } from '../utils/excelParser.js'
 import { formatLastUpdated } from '../utils/dateUtils.js'
+import { fetchInventory, saveInventory, clearInventory } from '../utils/api.js'
 
 const COLUMNS = [
   { key: 'style', label: 'Style #', sortable: true },
@@ -25,7 +26,7 @@ const COLUMNS = [
     key: 'quantity',
     label: 'Quantity',
     sortable: true,
-    render: (val, row) => (
+    render: (val) => (
       <span
         className={`inline-flex items-center gap-1.5 font-semibold ${
           val === 0
@@ -56,39 +57,68 @@ function RowColoring(row) {
 }
 
 export default function InventoryCheck() {
-  const [inventoryData, setInventoryData] = useLocalStorage('feiya_inventory', [])
-  const [lastUpdated, setLastUpdated] = useLocalStorage('feiya_inventory_updated', null)
+  const [inventoryData, setInventoryData] = useState([])
+  const [lastUpdated, setLastUpdated] = useState(null)
+  const [fileName, setFileName] = useState(null)
   const [searchQuery, setSearchQuery] = useState('')
-  const [isLoading, setIsLoading] = useState(false)
-  const [currentFile, setCurrentFile] = useState(null)
+  const [isFetching, setIsFetching] = useState(true)
+  const [isUploading, setIsUploading] = useState(false)
+  const [apiError, setApiError] = useState(null)
   const toast = useToast()
 
+  // Load shared inventory from DB on mount
+  useEffect(() => {
+    let cancelled = false
+    async function load() {
+      setIsFetching(true)
+      setApiError(null)
+      try {
+        const result = await fetchInventory()
+        if (!cancelled) {
+          setInventoryData(result.rows || [])
+          setLastUpdated(result.updatedAt || null)
+          setFileName(result.fileName || null)
+        }
+      } catch (err) {
+        if (!cancelled) setApiError(err.message)
+      } finally {
+        if (!cancelled) setIsFetching(false)
+      }
+    }
+    load()
+    return () => { cancelled = true }
+  }, [])
+
   const handleFile = useCallback(async (file) => {
-    setIsLoading(true)
-    setCurrentFile(file)
+    setIsUploading(true)
     try {
       const data = await parseInventoryExcel(file)
+      await saveInventory(data, file.name)
       setInventoryData(data)
       setLastUpdated(new Date().toISOString())
-      toast.success(`Loaded ${data.length} rows from ${file.name}`, 'File Parsed')
+      setFileName(file.name)
+      toast.success(`Uploaded ${data.length} rows — visible to everyone`, 'Inventory Updated')
     } catch (err) {
-      toast.error(err.message, 'Parse Error')
-      setCurrentFile(null)
+      toast.error(err.message, 'Upload Error')
     } finally {
-      setIsLoading(false)
+      setIsUploading(false)
     }
-  }, [setInventoryData, setLastUpdated, toast])
+  }, [toast])
 
-  const handleClear = useCallback(() => {
-    setInventoryData([])
-    setLastUpdated(null)
-    setCurrentFile(null)
-    setSearchQuery('')
-    toast.info('Inventory data cleared')
-  }, [setInventoryData, setLastUpdated, toast])
+  const handleClear = useCallback(async () => {
+    try {
+      await clearInventory()
+      setInventoryData([])
+      setLastUpdated(null)
+      setFileName(null)
+      setSearchQuery('')
+      toast.info('Inventory data cleared for everyone')
+    } catch (err) {
+      toast.error(err.message, 'Clear Error')
+    }
+  }, [toast])
 
   const filteredData = useMemo(() => {
-    if (!inventoryData) return []
     if (!searchQuery.trim()) return inventoryData
     const q = searchQuery.toLowerCase()
     return inventoryData.filter(
@@ -99,26 +129,24 @@ export default function InventoryCheck() {
     )
   }, [inventoryData, searchQuery])
 
-  const stats = useMemo(() => {
-    const data = inventoryData || []
-    return {
-      total: data.length,
-      outOfStock: data.filter((r) => r.quantity === 0).length,
-      lowStock: data.filter((r) => r.quantity > 0 && r.quantity < 10).length,
-      inStock: data.filter((r) => r.quantity >= 10).length,
-    }
-  }, [inventoryData])
+  const stats = useMemo(() => ({
+    total: inventoryData.length,
+    outOfStock: inventoryData.filter((r) => r.quantity === 0).length,
+    lowStock: inventoryData.filter((r) => r.quantity > 0 && r.quantity < 10).length,
+    inStock: inventoryData.filter((r) => r.quantity >= 10).length,
+  }), [inventoryData])
 
   const handleDownload = useCallback(() => {
     const csv = inventoryToCSV(filteredData)
-    const filename = searchQuery
+    const name = searchQuery
       ? `inventory_filtered_${Date.now()}.csv`
       : `inventory_${Date.now()}.csv`
-    downloadCSV(csv, filename)
+    downloadCSV(csv, name)
     toast.success(`Downloaded ${filteredData.length} rows`, 'CSV Exported')
   }, [filteredData, searchQuery, toast])
 
-  const hasData = inventoryData && inventoryData.length > 0
+  const hasData = inventoryData.length > 0
+  const isLoading = isFetching || isUploading
 
   return (
     <div className="space-y-6 max-w-7xl">
@@ -127,7 +155,7 @@ export default function InventoryCheck() {
         <div className="flex-1">
           <h2 className="text-xl font-bold text-slate-800">Inventory Check</h2>
           <p className="text-sm text-slate-500 mt-0.5">
-            Upload 主库存表.xlsx to search and analyze stock levels
+            Upload 主库存表.xlsx — data is shared with everyone on the team
           </p>
         </div>
         {hasData && (
@@ -144,6 +172,14 @@ export default function InventoryCheck() {
         )}
       </div>
 
+      {/* API Error banner */}
+      {apiError && (
+        <div className="flex items-center gap-3 px-4 py-3 bg-red-50 border border-red-200 rounded-xl text-sm text-red-700">
+          <CloudOff className="w-4 h-4 flex-shrink-0" />
+          <span>Could not reach the database: {apiError}. Check your Netlify environment variables.</span>
+        </div>
+      )}
+
       {/* Upload Zone */}
       <div className="card p-5">
         <h3 className="font-medium text-slate-700 mb-3 flex items-center gap-2">
@@ -153,7 +189,9 @@ export default function InventoryCheck() {
         {isLoading ? (
           <div className="flex items-center justify-center py-12">
             <RefreshCw className="w-6 h-6 text-blue-500 animate-spin" />
-            <span className="ml-3 text-slate-500">Parsing file...</span>
+            <span className="ml-3 text-slate-500">
+              {isFetching ? 'Loading shared inventory…' : 'Uploading & saving…'}
+            </span>
           </div>
         ) : (
           <FileUploadZone
@@ -161,7 +199,7 @@ export default function InventoryCheck() {
             accept=".xlsx,.xls"
             acceptedTypes="XLSX, XLS"
             label="Drag & drop 主库存表.xlsx here"
-            currentFile={hasData ? currentFile : null}
+            currentFile={hasData && fileName ? { name: fileName } : null}
             onClear={handleClear}
           />
         )}
@@ -169,6 +207,8 @@ export default function InventoryCheck() {
           <p className="text-xs text-slate-400 mt-3 flex items-center gap-1.5">
             <Clock className="w-3.5 h-3.5" />
             Last updated: {formatLastUpdated(lastUpdated)}
+            {fileName && <span className="text-slate-300 mx-1">·</span>}
+            {fileName && <span className="truncate max-w-xs">{fileName}</span>}
           </p>
         )}
       </div>
@@ -244,7 +284,6 @@ export default function InventoryCheck() {
             )}
           </div>
 
-          {/* Legend */}
           <div className="flex items-center gap-4 mb-3 text-xs text-slate-500">
             <span className="flex items-center gap-1.5">
               <span className="w-3 h-3 rounded bg-red-200 inline-block" />
@@ -265,11 +304,7 @@ export default function InventoryCheck() {
             columns={COLUMNS}
             pageSize={50}
             rowClassName={RowColoring}
-            emptyMessage={
-              searchQuery
-                ? `No results for "${searchQuery}"`
-                : 'No inventory data'
-            }
+            emptyMessage={searchQuery ? `No results for "${searchQuery}"` : 'No inventory data'}
           />
         </div>
       )}
@@ -282,7 +317,7 @@ export default function InventoryCheck() {
           </div>
           <h3 className="font-semibold text-slate-700 mb-1">No inventory loaded</h3>
           <p className="text-sm text-slate-400">
-            Upload your 主库存表.xlsx file above to get started.
+            Upload your 主库存表.xlsx file above — it will be visible to everyone on the team.
           </p>
         </div>
       )}

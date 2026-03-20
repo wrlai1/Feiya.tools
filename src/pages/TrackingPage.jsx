@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useCallback } from 'react'
+import React, { useState, useMemo, useCallback, useEffect } from 'react'
 import {
   Search,
   Truck,
@@ -9,12 +9,14 @@ import {
   RefreshCw,
   Trash2,
   Hash,
+  CloudOff,
+  Clock,
 } from 'lucide-react'
 import FileUploadZone from '../components/FileUploadZone.jsx'
-import { useLocalStorage } from '../hooks/useLocalStorage.js'
 import { useToast } from '../hooks/useToast.js'
 import { parseTrackingCSV } from '../utils/csvParser.js'
 import { formatLastUpdated } from '../utils/dateUtils.js'
+import { fetchTracking, saveTracking, clearTracking } from '../utils/api.js'
 
 function CopyButton({ text }) {
   const [copied, setCopied] = useState(false)
@@ -48,7 +50,6 @@ function CopyButton({ text }) {
 function SKUGroup({ sku, rows }) {
   const [expanded, setExpanded] = useState(false)
 
-  // Group by size
   const bySizeMap = useMemo(() => {
     const map = {}
     rows.forEach((r) => {
@@ -65,7 +66,6 @@ function SKUGroup({ sku, rows }) {
 
   return (
     <div className="border border-slate-200 rounded-xl overflow-hidden">
-      {/* SKU Header */}
       <div className="flex items-center gap-3 px-4 py-3 bg-slate-50">
         <div className="w-9 h-9 bg-blue-100 rounded-lg flex items-center justify-center flex-shrink-0">
           <Hash className="w-4 h-4 text-blue-600" />
@@ -79,14 +79,10 @@ function SKUGroup({ sku, rows }) {
         <CopyButton text={sku} />
       </div>
 
-      {/* Size breakdown */}
       <div className="px-4 py-3">
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2 mb-3">
           {bySizeMap.map(({ size, totalQty: qty, count }) => (
-            <div
-              key={size}
-              className="bg-white border border-slate-200 rounded-lg px-3 py-2"
-            >
+            <div key={size} className="bg-white border border-slate-200 rounded-lg px-3 py-2">
               <p className="text-xs text-slate-500 truncate">{size}</p>
               <p className="text-lg font-bold text-slate-800">{qty}</p>
               <p className="text-xs text-slate-400">{count} pkg</p>
@@ -94,16 +90,11 @@ function SKUGroup({ sku, rows }) {
           ))}
         </div>
 
-        {/* Expandable raw rows */}
         <button
           onClick={() => setExpanded((v) => !v)}
           className="flex items-center gap-1.5 text-xs text-slate-400 hover:text-slate-600 transition-colors"
         >
-          {expanded ? (
-            <ChevronDown className="w-3.5 h-3.5" />
-          ) : (
-            <ChevronRight className="w-3.5 h-3.5" />
-          )}
+          {expanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
           {expanded ? 'Hide' : 'Show'} {rows.length} raw rows
         </button>
 
@@ -112,15 +103,9 @@ function SKUGroup({ sku, rows }) {
             <table className="w-full text-xs">
               <thead>
                 <tr className="bg-slate-50 border-b border-slate-200">
-                  <th className="px-3 py-2 text-left font-semibold text-slate-500 uppercase tracking-wide">
-                    Tracking
-                  </th>
-                  <th className="px-3 py-2 text-left font-semibold text-slate-500 uppercase tracking-wide">
-                    Actual Size On TEMU
-                  </th>
-                  <th className="px-3 py-2 text-left font-semibold text-slate-500 uppercase tracking-wide">
-                    Qty
-                  </th>
+                  <th className="px-3 py-2 text-left font-semibold text-slate-500 uppercase tracking-wide">Tracking</th>
+                  <th className="px-3 py-2 text-left font-semibold text-slate-500 uppercase tracking-wide">Actual Size On TEMU</th>
+                  <th className="px-3 py-2 text-left font-semibold text-slate-500 uppercase tracking-wide">Qty</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
@@ -141,52 +126,78 @@ function SKUGroup({ sku, rows }) {
 }
 
 export default function TrackingPage() {
-  const [trackingData, setTrackingData] = useLocalStorage('feiya_tracking', [])
-  const [lastUpdated, setLastUpdated] = useLocalStorage('feiya_tracking_updated', null)
+  const [trackingData, setTrackingData] = useState([])
+  const [lastUpdated, setLastUpdated] = useState(null)
+  const [fileName, setFileName] = useState(null)
   const [searchQuery, setSearchQuery] = useState('')
-  const [isLoading, setIsLoading] = useState(false)
-  const [currentFile, setCurrentFile] = useState(null)
-  const [searchType, setSearchType] = useState('tracking') // 'tracking' | 'sku'
+  const [isFetching, setIsFetching] = useState(true)
+  const [isUploading, setIsUploading] = useState(false)
+  const [apiError, setApiError] = useState(null)
+  const [searchType, setSearchType] = useState('tracking')
   const toast = useToast()
 
+  // Load shared tracking data on mount
+  useEffect(() => {
+    let cancelled = false
+    async function load() {
+      setIsFetching(true)
+      setApiError(null)
+      try {
+        const result = await fetchTracking()
+        if (!cancelled) {
+          setTrackingData(result.rows || [])
+          setLastUpdated(result.updatedAt || null)
+          setFileName(result.fileName || null)
+        }
+      } catch (err) {
+        if (!cancelled) setApiError(err.message)
+      } finally {
+        if (!cancelled) setIsFetching(false)
+      }
+    }
+    load()
+    return () => { cancelled = true }
+  }, [])
+
   const handleFile = useCallback(async (file) => {
-    setIsLoading(true)
-    setCurrentFile(file)
+    setIsUploading(true)
     try {
       const data = await parseTrackingCSV(file)
+      await saveTracking(data, file.name)
       setTrackingData(data)
       setLastUpdated(new Date().toISOString())
-      toast.success(`Loaded ${data.length} rows from ${file.name}`, 'File Parsed')
+      setFileName(file.name)
+      toast.success(`Uploaded ${data.length} rows — visible to everyone`, 'Tracking Updated')
     } catch (err) {
-      toast.error(err.message, 'Parse Error')
-      setCurrentFile(null)
+      toast.error(err.message, 'Upload Error')
     } finally {
-      setIsLoading(false)
+      setIsUploading(false)
     }
-  }, [setTrackingData, setLastUpdated, toast])
+  }, [toast])
 
-  const handleClear = useCallback(() => {
-    setTrackingData([])
-    setLastUpdated(null)
-    setCurrentFile(null)
-    setSearchQuery('')
-    toast.info('Tracking data cleared')
-  }, [setTrackingData, setLastUpdated, toast])
+  const handleClear = useCallback(async () => {
+    try {
+      await clearTracking()
+      setTrackingData([])
+      setLastUpdated(null)
+      setFileName(null)
+      setSearchQuery('')
+      toast.info('Tracking data cleared for everyone')
+    } catch (err) {
+      toast.error(err.message, 'Clear Error')
+    }
+  }, [toast])
 
-  // Filter data based on search
   const filteredData = useMemo(() => {
-    if (!trackingData) return []
     if (!searchQuery.trim()) return trackingData
     const q = searchQuery.toLowerCase()
-    return trackingData.filter((r) => {
-      if (searchType === 'tracking') {
-        return (r.tracking || '').toLowerCase().includes(q)
-      }
-      return (r.sku || '').toLowerCase().includes(q)
-    })
+    return trackingData.filter((r) =>
+      searchType === 'tracking'
+        ? (r.tracking || '').toLowerCase().includes(q)
+        : (r.sku || '').toLowerCase().includes(q)
+    )
   }, [trackingData, searchQuery, searchType])
 
-  // Group by SKU
   const groupedBySKU = useMemo(() => {
     const map = {}
     filteredData.forEach((row) => {
@@ -197,9 +208,10 @@ export default function TrackingPage() {
     return Object.entries(map).sort(([a], [b]) => a.localeCompare(b))
   }, [filteredData])
 
-  const hasData = trackingData && trackingData.length > 0
+  const hasData = trackingData.length > 0
   const totalSKUs = groupedBySKU.length
   const totalUnits = filteredData.reduce((s, r) => s + (r.quantity || 0), 0)
+  const isLoading = isFetching || isUploading
 
   return (
     <div className="space-y-6 max-w-5xl">
@@ -208,7 +220,7 @@ export default function TrackingPage() {
         <div className="flex-1">
           <h2 className="text-xl font-bold text-slate-800">Tracking → SKU</h2>
           <p className="text-sm text-slate-500 mt-0.5">
-            Upload a tracking CSV to look up shipments by tracking number or SKU
+            Upload a tracking CSV — data stays shared until cleared or re-uploaded
           </p>
         </div>
         {hasData && (
@@ -219,6 +231,14 @@ export default function TrackingPage() {
         )}
       </div>
 
+      {/* API Error banner */}
+      {apiError && (
+        <div className="flex items-center gap-3 px-4 py-3 bg-red-50 border border-red-200 rounded-xl text-sm text-red-700">
+          <CloudOff className="w-4 h-4 flex-shrink-0" />
+          <span>Could not reach the database: {apiError}</span>
+        </div>
+      )}
+
       {/* Upload Zone */}
       <div className="card p-5">
         <h3 className="font-medium text-slate-700 mb-3 flex items-center gap-2">
@@ -228,7 +248,9 @@ export default function TrackingPage() {
         {isLoading ? (
           <div className="flex items-center justify-center py-12">
             <RefreshCw className="w-6 h-6 text-teal-500 animate-spin" />
-            <span className="ml-3 text-slate-500">Parsing file...</span>
+            <span className="ml-3 text-slate-500">
+              {isFetching ? 'Loading shared tracking data…' : 'Uploading & saving…'}
+            </span>
           </div>
         ) : (
           <FileUploadZone
@@ -237,14 +259,16 @@ export default function TrackingPage() {
             acceptedTypes="CSV"
             label="Drag & drop your tracking CSV here"
             sublabel="Columns: Tracking, SKU, Quantity, Actual Size On TEMU"
-            currentFile={hasData ? currentFile : null}
+            currentFile={hasData && fileName ? { name: fileName } : null}
             onClear={handleClear}
           />
         )}
         {lastUpdated && (
           <p className="text-xs text-slate-400 mt-3 flex items-center gap-1.5">
-            <Truck className="w-3.5 h-3.5" />
+            <Clock className="w-3.5 h-3.5" />
             Last updated: {formatLastUpdated(lastUpdated)}
+            {fileName && <span className="text-slate-300 mx-1">·</span>}
+            {fileName && <span className="truncate max-w-xs">{fileName}</span>}
           </p>
         )}
       </div>
@@ -252,10 +276,8 @@ export default function TrackingPage() {
       {/* Search + Results */}
       {hasData && (
         <>
-          {/* Search bar */}
           <div className="card p-4">
             <div className="flex flex-col sm:flex-row gap-2">
-              {/* Type toggle */}
               <div className="flex rounded-lg border border-slate-200 overflow-hidden">
                 <button
                   onClick={() => setSearchType('tracking')}
@@ -282,27 +304,19 @@ export default function TrackingPage() {
                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
                 <input
                   type="text"
-                  placeholder={
-                    searchType === 'tracking'
-                      ? 'Search by tracking number...'
-                      : 'Search by SKU...'
-                  }
+                  placeholder={searchType === 'tracking' ? 'Search by tracking number...' : 'Search by SKU...'}
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   className="input-base pl-9"
                 />
               </div>
               {searchQuery && (
-                <button
-                  onClick={() => setSearchQuery('')}
-                  className="btn-secondary text-sm flex-shrink-0"
-                >
+                <button onClick={() => setSearchQuery('')} className="btn-secondary text-sm flex-shrink-0">
                   Clear
                 </button>
               )}
             </div>
 
-            {/* Summary counts */}
             <div className="flex items-center gap-4 mt-3 text-xs text-slate-500">
               <span>{totalSKUs} SKUs</span>
               <span>·</span>
@@ -312,15 +326,12 @@ export default function TrackingPage() {
             </div>
           </div>
 
-          {/* SKU Groups */}
           <div className="space-y-3">
             {groupedBySKU.length === 0 ? (
               <div className="card p-10 text-center">
                 <Search className="w-8 h-8 text-slate-300 mx-auto mb-3" />
                 <p className="text-slate-500 font-medium">No results found</p>
-                <p className="text-slate-400 text-sm mt-1">
-                  Try searching with a different term
-                </p>
+                <p className="text-slate-400 text-sm mt-1">Try searching with a different term</p>
               </div>
             ) : (
               groupedBySKU.map(([sku, rows]) => (
@@ -339,7 +350,7 @@ export default function TrackingPage() {
           </div>
           <h3 className="font-semibold text-slate-700 mb-1">No tracking data loaded</h3>
           <p className="text-sm text-slate-400">
-            Upload a tracking CSV file to start searching shipments.
+            Upload a tracking CSV — it stays available for the whole team until cleared or replaced.
           </p>
         </div>
       )}

@@ -8,21 +8,24 @@ import {
   X,
   MessageSquare,
   User,
+  RefreshCw,
 } from 'lucide-react'
 import { useLocalStorage } from '../hooks/useLocalStorage.js'
 import { useToast } from '../hooks/useToast.js'
 import { relativeTime } from '../utils/dateUtils.js'
+import { fetchMessages, sendMessage, editMessage, deleteMessage } from '../utils/api.js'
 
-// Palette of user avatar colors
+const POLL_INTERVAL = 5000 // refresh every 5 seconds
+
 const USER_COLORS = [
-  { bg: 'bg-blue-500', text: 'text-white', bubble: 'bg-blue-500 text-white' },
+  { bg: 'bg-blue-500',    text: 'text-white', bubble: 'bg-blue-500 text-white'    },
   { bg: 'bg-emerald-500', text: 'text-white', bubble: 'bg-emerald-500 text-white' },
-  { bg: 'bg-violet-500', text: 'text-white', bubble: 'bg-violet-500 text-white' },
-  { bg: 'bg-rose-500', text: 'text-white', bubble: 'bg-rose-500 text-white' },
-  { bg: 'bg-amber-500', text: 'text-white', bubble: 'bg-amber-500 text-white' },
-  { bg: 'bg-cyan-500', text: 'text-white', bubble: 'bg-cyan-500 text-white' },
-  { bg: 'bg-pink-500', text: 'text-white', bubble: 'bg-pink-500 text-white' },
-  { bg: 'bg-indigo-500', text: 'text-white', bubble: 'bg-indigo-500 text-white' },
+  { bg: 'bg-violet-500',  text: 'text-white', bubble: 'bg-violet-500 text-white'  },
+  { bg: 'bg-rose-500',    text: 'text-white', bubble: 'bg-rose-500 text-white'    },
+  { bg: 'bg-amber-500',   text: 'text-white', bubble: 'bg-amber-500 text-white'   },
+  { bg: 'bg-cyan-500',    text: 'text-white', bubble: 'bg-cyan-500 text-white'    },
+  { bg: 'bg-pink-500',    text: 'text-white', bubble: 'bg-pink-500 text-white'    },
+  { bg: 'bg-indigo-500',  text: 'text-white', bubble: 'bg-indigo-500 text-white'  },
 ]
 
 function getColorForUser(name) {
@@ -34,21 +37,14 @@ function getColorForUser(name) {
 }
 
 function getInitials(name) {
-  return name
-    .split(/\s+/)
-    .map((w) => w[0])
-    .slice(0, 2)
-    .join('')
-    .toUpperCase()
+  return name.split(/\s+/).map((w) => w[0]).slice(0, 2).join('').toUpperCase()
 }
 
 function Avatar({ name, size = 'sm' }) {
   const color = getColorForUser(name)
   const sizeClass = size === 'sm' ? 'w-8 h-8 text-xs' : 'w-10 h-10 text-sm'
   return (
-    <div
-      className={`${sizeClass} rounded-full ${color.bg} ${color.text} flex items-center justify-center font-semibold flex-shrink-0`}
-    >
+    <div className={`${sizeClass} rounded-full ${color.bg} ${color.text} flex items-center justify-center font-semibold flex-shrink-0`}>
       {getInitials(name)}
     </div>
   )
@@ -57,6 +53,7 @@ function Avatar({ name, size = 'sm' }) {
 function MessageBubble({ note, isOwn, onEdit, onDelete }) {
   const [isEditing, setIsEditing] = useState(false)
   const [editText, setEditText] = useState(note.text)
+  const [isSaving, setIsSaving] = useState(false)
   const inputRef = useRef(null)
 
   useEffect(() => {
@@ -66,11 +63,16 @@ function MessageBubble({ note, isOwn, onEdit, onDelete }) {
     }
   }, [isEditing])
 
-  const handleSaveEdit = () => {
+  const handleSaveEdit = async () => {
     const trimmed = editText.trim()
-    if (!trimmed) return
-    onEdit(note.id, trimmed)
-    setIsEditing(false)
+    if (!trimmed || isSaving) return
+    setIsSaving(true)
+    try {
+      await onEdit(note.id, trimmed)
+      setIsEditing(false)
+    } finally {
+      setIsSaving(false)
+    }
   }
 
   const handleCancelEdit = () => {
@@ -78,23 +80,17 @@ function MessageBubble({ note, isOwn, onEdit, onDelete }) {
     setIsEditing(false)
   }
 
-  const color = getColorForUser(note.author)
-
   return (
     <div className={`flex items-end gap-2 ${isOwn ? 'flex-row-reverse' : 'flex-row'}`}>
-      {/* Avatar */}
       <Avatar name={note.author} />
 
-      {/* Message content */}
       <div className={`flex flex-col max-w-xs sm:max-w-md ${isOwn ? 'items-end' : 'items-start'}`}>
-        {/* Name + time */}
         <div className={`flex items-center gap-2 mb-1 text-xs text-slate-400 ${isOwn ? 'flex-row-reverse' : ''}`}>
           <span className="font-medium text-slate-600">{note.author}</span>
           <span>{relativeTime(note.timestamp)}</span>
           {note.edited && <span className="italic">(edited)</span>}
         </div>
 
-        {/* Bubble */}
         {isEditing ? (
           <div className="w-64">
             <textarea
@@ -102,27 +98,22 @@ function MessageBubble({ note, isOwn, onEdit, onDelete }) {
               value={editText}
               onChange={(e) => setEditText(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault()
-                  handleSaveEdit()
-                }
+                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSaveEdit() }
                 if (e.key === 'Escape') handleCancelEdit()
               }}
               className="w-full px-3 py-2 text-sm border border-blue-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
               rows={2}
             />
             <div className="flex gap-1 mt-1 justify-end">
-              <button
-                onClick={handleCancelEdit}
-                className="p-1.5 rounded-lg text-slate-400 hover:bg-slate-100 transition-colors"
-              >
+              <button onClick={handleCancelEdit} className="p-1.5 rounded-lg text-slate-400 hover:bg-slate-100 transition-colors">
                 <X className="w-3.5 h-3.5" />
               </button>
               <button
                 onClick={handleSaveEdit}
-                className="p-1.5 rounded-lg text-blue-600 hover:bg-blue-50 transition-colors"
+                disabled={isSaving}
+                className="p-1.5 rounded-lg text-blue-600 hover:bg-blue-50 transition-colors disabled:opacity-50"
               >
-                <Check className="w-3.5 h-3.5" />
+                {isSaving ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
               </button>
             </div>
           </div>
@@ -138,9 +129,8 @@ function MessageBubble({ note, isOwn, onEdit, onDelete }) {
               {note.text}
             </div>
 
-            {/* Own message actions */}
             {isOwn && (
-              <div className={`flex gap-1 mt-1 opacity-0 group-hover:opacity-100 transition-opacity ${isOwn ? 'justify-end' : ''}`}>
+              <div className={`flex gap-1 mt-1 opacity-0 group-hover:opacity-100 transition-opacity justify-end`}>
                 <button
                   onClick={() => setIsEditing(true)}
                   className="p-1 rounded text-slate-400 hover:text-blue-500 hover:bg-slate-100 transition-colors"
@@ -207,50 +197,90 @@ function JoinModal({ onJoin }) {
   )
 }
 
+// Normalize a DB row → internal note shape
+function toNote(row) {
+  return {
+    id: row.id,
+    author: row.name,
+    text: row.text,
+    timestamp: row.created_at,
+    edited: row.edited || false,
+  }
+}
+
 export default function NotesPage() {
-  const [notes, setNotes] = useLocalStorage('feiya_notes', [])
+  const [notes, setNotes] = useState([])
   const [currentUser, setCurrentUser] = useLocalStorage('feiya_notes_user', null)
   const [inputText, setInputText] = useState('')
+  const [isSending, setIsSending] = useState(false)
   const messagesEndRef = useRef(null)
   const textareaRef = useRef(null)
   const toast = useToast()
 
+  // Auto-scroll to latest message
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [notes.length])
 
-  const handleJoin = useCallback((name) => {
-    setCurrentUser(name)
-  }, [setCurrentUser])
+  // Load messages + poll for updates every 5 s
+  useEffect(() => {
+    let cancelled = false
 
-  const handleSend = useCallback(() => {
-    const text = inputText.trim()
-    if (!text || !currentUser) return
-
-    const note = {
-      id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
-      author: currentUser,
-      text,
-      timestamp: new Date().toISOString(),
-      edited: false,
+    async function load() {
+      try {
+        const rows = await fetchMessages()
+        if (!cancelled) setNotes(rows.map(toNote))
+      } catch {
+        // silently fail on poll — connection issues shouldn't spam toasts
+      }
     }
-    setNotes((prev) => [...prev, note])
+
+    load()
+    const interval = setInterval(load, POLL_INTERVAL)
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [])
+
+  const handleJoin = useCallback((name) => setCurrentUser(name), [setCurrentUser])
+
+  const handleSend = useCallback(async () => {
+    const text = inputText.trim()
+    if (!text || !currentUser || isSending) return
+
+    setIsSending(true)
     setInputText('')
-    textareaRef.current?.focus()
-  }, [inputText, currentUser, setNotes])
+    try {
+      const row = await sendMessage(currentUser, text)
+      setNotes((prev) => [...prev, toNote(row)])
+    } catch (err) {
+      toast.error(err.message, 'Send Failed')
+      setInputText(text) // restore
+    } finally {
+      setIsSending(false)
+      textareaRef.current?.focus()
+    }
+  }, [inputText, currentUser, isSending, toast])
 
-  const handleEdit = useCallback((id, newText) => {
-    setNotes((prev) =>
-      prev.map((n) =>
-        n.id === id ? { ...n, text: newText, edited: true } : n
-      )
-    )
-  }, [setNotes])
+  const handleEdit = useCallback(async (id, newText) => {
+    try {
+      const row = await editMessage(id, newText)
+      setNotes((prev) => prev.map((n) => (n.id === id ? toNote(row) : n)))
+    } catch (err) {
+      toast.error(err.message, 'Edit Failed')
+    }
+  }, [toast])
 
-  const handleDelete = useCallback((id) => {
-    setNotes((prev) => prev.filter((n) => n.id !== id))
-    toast.info('Message deleted')
-  }, [setNotes, toast])
+  const handleDelete = useCallback(async (id) => {
+    try {
+      await deleteMessage(id)
+      setNotes((prev) => prev.filter((n) => n.id !== id))
+      toast.info('Message deleted')
+    } catch (err) {
+      toast.error(err.message, 'Delete Failed')
+    }
+  }, [toast])
 
   const handleExport = useCallback(() => {
     const json = JSON.stringify(notes, null, 2)
@@ -273,9 +303,6 @@ export default function NotesPage() {
     }
   }
 
-  // Group consecutive messages from same user
-  const groupedNotes = notes
-
   if (!currentUser) {
     return <JoinModal onJoin={handleJoin} />
   }
@@ -290,22 +317,18 @@ export default function NotesPage() {
         <div className="flex-1 min-w-0">
           <h2 className="font-semibold text-slate-800">Low Inventory Notes</h2>
           <p className="text-xs text-slate-400">
-            {notes.length} message{notes.length !== 1 ? 's' : ''} · You are <span className="font-medium text-slate-600">{currentUser}</span>
+            {notes.length} message{notes.length !== 1 ? 's' : ''} · You are{' '}
+            <span className="font-medium text-slate-600">{currentUser}</span>
+            <span className="text-slate-300 mx-1">·</span>
+            <span className="text-green-500">Live</span>
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <button
-            onClick={handleExport}
-            className="btn-secondary text-xs"
-            disabled={notes.length === 0}
-          >
+          <button onClick={handleExport} className="btn-secondary text-xs" disabled={notes.length === 0}>
             <Download className="w-3.5 h-3.5" />
             Export
           </button>
-          <button
-            onClick={() => setCurrentUser(null)}
-            className="btn-ghost text-xs"
-          >
+          <button onClick={() => setCurrentUser(null)} className="btn-ghost text-xs">
             <User className="w-3.5 h-3.5" />
             Change name
           </button>
@@ -322,7 +345,7 @@ export default function NotesPage() {
           </div>
         ) : (
           <>
-            {groupedNotes.map((note) => (
+            {notes.map((note) => (
               <MessageBubble
                 key={note.id}
                 note={note}
@@ -346,7 +369,7 @@ export default function NotesPage() {
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="Type a note... (Enter to send, Shift+Enter for new line)"
+              placeholder="Type a note… (Enter to send, Shift+Enter for new line)"
               className="input-base resize-none min-h-[44px] max-h-32 pr-4"
               rows={1}
               style={{ height: 'auto' }}
@@ -358,10 +381,12 @@ export default function NotesPage() {
           </div>
           <button
             onClick={handleSend}
-            disabled={!inputText.trim()}
+            disabled={!inputText.trim() || isSending}
             className="w-10 h-10 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed text-white flex items-center justify-center transition-colors flex-shrink-0"
           >
-            <Send className="w-4 h-4" />
+            {isSending
+              ? <RefreshCw className="w-4 h-4 animate-spin" />
+              : <Send className="w-4 h-4" />}
           </button>
         </div>
         <p className="text-xs text-slate-400 mt-1.5 ml-10">
