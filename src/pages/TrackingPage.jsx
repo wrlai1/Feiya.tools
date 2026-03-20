@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useCallback, useEffect } from 'react'
+import React, { useState, useMemo, useCallback, useEffect, useTransition } from 'react'
 import {
   Search,
   Truck,
@@ -249,18 +249,13 @@ export default function TrackingPage() {
   const [lastUpdated, setLastUpdated] = useState(null)
   const [fileName, setFileName] = useState(null)
   const [inputValue, setInputValue] = useState('')   // instant — drives the input field
-  const [searchQuery, setSearchQuery] = useState('') // debounced — drives the filtering
+  const [searchQuery, setSearchQuery] = useState('') // deferred — drives the filtering
+  const [isPending, startTransition] = useTransition()
   const [isFetching, setIsFetching] = useState(true)
   const [isUploading, setIsUploading] = useState(false)
   const [apiError, setApiError] = useState(null)
   const [searchType, setSearchType] = useState('tracking')
   const toast = useToast()
-
-  // Debounce inputValue → searchQuery so typing is instant but filtering isn't blocking
-  useEffect(() => {
-    const t = setTimeout(() => setSearchQuery(inputValue), 150)
-    return () => clearTimeout(t)
-  }, [inputValue])
 
   useEffect(() => {
     let cancelled = false
@@ -431,7 +426,7 @@ export default function TrackingPage() {
             {/* Mode toggle */}
             <div className="flex rounded-lg border border-slate-200 overflow-hidden text-sm font-medium">
               <button
-                onClick={() => { setSearchType('tracking'); setInputValue(''); setSearchQuery('') }}
+                onClick={() => { setSearchType('tracking'); setInputValue(''); startTransition(() => setSearchQuery('')) }}
                 className={`px-4 py-2 transition-colors ${
                   searchType === 'tracking' ? 'bg-teal-600 text-white' : 'bg-white text-slate-600 hover:bg-slate-50'
                 }`}
@@ -439,7 +434,7 @@ export default function TrackingPage() {
                 Tracking #
               </button>
               <button
-                onClick={() => { setSearchType('sku'); setInputValue(''); setSearchQuery('') }}
+                onClick={() => { setSearchType('sku'); setInputValue(''); startTransition(() => setSearchQuery('')) }}
                 className={`px-4 py-2 transition-colors ${
                   searchType === 'sku' ? 'bg-blue-600 text-white' : 'bg-white text-slate-600 hover:bg-slate-50'
                 }`}
@@ -455,12 +450,16 @@ export default function TrackingPage() {
                 type="text"
                 placeholder={searchType === 'tracking' ? 'Enter tracking number…' : 'Enter SKU…'}
                 value={inputValue}
-                onChange={(e) => setInputValue(e.target.value)}
+                onChange={(e) => {
+                  const v = e.target.value
+                  setInputValue(v)
+                  startTransition(() => setSearchQuery(v))
+                }}
                 className="input-base pl-9"
               />
             </div>
             {hasQuery && (
-              <button onClick={() => { setInputValue(''); setSearchQuery('') }} className="btn-secondary text-sm flex-shrink-0">
+              <button onClick={() => { setInputValue(''); startTransition(() => setSearchQuery('')) }} className="btn-secondary text-sm flex-shrink-0">
                 Clear
               </button>
             )}

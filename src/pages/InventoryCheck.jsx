@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useCallback, useEffect } from 'react'
+import React, { useState, useMemo, useCallback, useEffect, useTransition } from 'react'
 import {
   Search,
   Download,
@@ -60,7 +60,9 @@ export default function InventoryCheck() {
   const [inventoryData, setInventoryData] = useState([])
   const [lastUpdated, setLastUpdated] = useState(null)
   const [fileName, setFileName] = useState(null)
+  const [inputValue, setInputValue] = useState('')
   const [searchQuery, setSearchQuery] = useState('')
+  const [isPending, startTransition] = useTransition()
   const [isFetching, setIsFetching] = useState(true)
   const [isUploading, setIsUploading] = useState(false)
   const [apiError, setApiError] = useState(null)
@@ -111,6 +113,7 @@ export default function InventoryCheck() {
       setInventoryData([])
       setLastUpdated(null)
       setFileName(null)
+      setInputValue('')
       setSearchQuery('')
       toast.info('Inventory data cleared for everyone')
     } catch (err) {
@@ -264,18 +267,22 @@ export default function InventoryCheck() {
               <input
                 type="text"
                 placeholder="Search by Style#, Color, or Location..."
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
+                value={inputValue}
+                onChange={(e) => {
+                  const v = e.target.value
+                  setInputValue(v)
+                  startTransition(() => setSearchQuery(v))
+                }}
                 className="input-base pl-9"
               />
             </div>
-            {searchQuery && (
+            {inputValue && (
               <div className="flex items-center gap-2 text-sm text-slate-500">
                 <span className="bg-blue-100 text-blue-700 px-2.5 py-1 rounded-full font-medium">
-                  {filteredData.length} results
+                  {isPending ? '…' : `${filteredData.length} results`}
                 </span>
                 <button
-                  onClick={() => setSearchQuery('')}
+                  onClick={() => { setInputValue(''); startTransition(() => setSearchQuery('')) }}
                   className="text-slate-400 hover:text-slate-600 transition-colors"
                 >
                   Clear
