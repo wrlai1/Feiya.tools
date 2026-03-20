@@ -248,12 +248,19 @@ export default function TrackingPage() {
   const [trackingData, setTrackingData] = useState([])
   const [lastUpdated, setLastUpdated] = useState(null)
   const [fileName, setFileName] = useState(null)
-  const [searchQuery, setSearchQuery] = useState('')
+  const [inputValue, setInputValue] = useState('')   // instant — drives the input field
+  const [searchQuery, setSearchQuery] = useState('') // debounced — drives the filtering
   const [isFetching, setIsFetching] = useState(true)
   const [isUploading, setIsUploading] = useState(false)
   const [apiError, setApiError] = useState(null)
   const [searchType, setSearchType] = useState('tracking')
   const toast = useToast()
+
+  // Debounce inputValue → searchQuery so typing is instant but filtering isn't blocking
+  useEffect(() => {
+    const t = setTimeout(() => setSearchQuery(inputValue), 150)
+    return () => clearTimeout(t)
+  }, [inputValue])
 
   useEffect(() => {
     let cancelled = false
@@ -299,6 +306,7 @@ export default function TrackingPage() {
       setTrackingData([])
       setLastUpdated(null)
       setFileName(null)
+      setInputValue('')
       setSearchQuery('')
       toast.info('Tracking data cleared for everyone')
     } catch (err) {
@@ -343,6 +351,7 @@ export default function TrackingPage() {
   const handleSelectTracking = useCallback((trackingNum) => {
     if (!trackingNum) return
     setSearchType('tracking')
+    setInputValue(trackingNum)
     setSearchQuery(trackingNum)
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }, [])
@@ -350,7 +359,7 @@ export default function TrackingPage() {
   const hasData    = trackingData.length > 0
   const isLoading  = isFetching || isUploading
   const totalUnits = filteredData.reduce((s, r) => s + (r.quantity || 0), 0)
-  const hasQuery   = searchQuery.trim().length > 0
+  const hasQuery   = inputValue.trim().length > 0
 
   const summaryLine = searchType === 'tracking'
     ? `${groupedByTracking.length} tracking number${groupedByTracking.length !== 1 ? 's' : ''} · ${filteredData.length} lines · ${totalUnits} units`
@@ -422,7 +431,7 @@ export default function TrackingPage() {
             {/* Mode toggle */}
             <div className="flex rounded-lg border border-slate-200 overflow-hidden text-sm font-medium">
               <button
-                onClick={() => { setSearchType('tracking'); setSearchQuery('') }}
+                onClick={() => { setSearchType('tracking'); setInputValue(''); setSearchQuery('') }}
                 className={`px-4 py-2 transition-colors ${
                   searchType === 'tracking' ? 'bg-teal-600 text-white' : 'bg-white text-slate-600 hover:bg-slate-50'
                 }`}
@@ -430,7 +439,7 @@ export default function TrackingPage() {
                 Tracking #
               </button>
               <button
-                onClick={() => { setSearchType('sku'); setSearchQuery('') }}
+                onClick={() => { setSearchType('sku'); setInputValue(''); setSearchQuery('') }}
                 className={`px-4 py-2 transition-colors ${
                   searchType === 'sku' ? 'bg-blue-600 text-white' : 'bg-white text-slate-600 hover:bg-slate-50'
                 }`}
@@ -445,13 +454,13 @@ export default function TrackingPage() {
               <input
                 type="text"
                 placeholder={searchType === 'tracking' ? 'Enter tracking number…' : 'Enter SKU…'}
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
+                value={inputValue}
+                onChange={(e) => setInputValue(e.target.value)}
                 className="input-base pl-9"
               />
             </div>
             {hasQuery && (
-              <button onClick={() => setSearchQuery('')} className="btn-secondary text-sm flex-shrink-0">
+              <button onClick={() => { setInputValue(''); setSearchQuery('') }} className="btn-secondary text-sm flex-shrink-0">
                 Clear
               </button>
             )}
