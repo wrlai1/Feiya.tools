@@ -1,4 +1,4 @@
-const BASE = '/.netlify/functions'
+const BASE = '/api'
 
 async function request(url, options = {}) {
   const res = await fetch(url, options)
