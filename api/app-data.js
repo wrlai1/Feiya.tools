@@ -1,4 +1,4 @@
-const { neon } = require('@neondatabase/serverless');
+import { neon } from '@neondatabase/serverless';
 
 async function ensureTable(sql) {
   await sql`
@@ -10,7 +10,7 @@ async function ensureTable(sql) {
   `;
 }
 
-module.exports = async function handler(req, res) {
+export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -18,9 +18,7 @@ module.exports = async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(204).end();
 
   const url = process.env.DATABASE_URL;
-  if (!url) {
-    return res.status(500).json({ error: 'DATABASE_URL not configured' });
-  }
+  if (!url) return res.status(500).json({ error: 'DATABASE_URL not configured' });
 
   const sql = neon(url);
   const type = req.query.type || req.body?.type;
@@ -32,12 +30,9 @@ module.exports = async function handler(req, res) {
   try {
     await ensureTable(sql);
 
-    // GET — return stored data + metadata
     if (req.method === 'GET') {
       const rows = await sql`SELECT value, updated_at FROM app_data WHERE key = ${type}`;
-      if (!rows[0]) {
-        return res.status(200).json({ rows: [], updatedAt: null, fileName: null });
-      }
+      if (!rows[0]) return res.status(200).json({ rows: [], updatedAt: null, fileName: null });
       const stored = rows[0].value;
       if (Array.isArray(stored)) {
         return res.status(200).json({ rows: stored, updatedAt: rows[0].updated_at, fileName: null });
@@ -45,28 +40,19 @@ module.exports = async function handler(req, res) {
       return res.status(200).json(stored);
     }
 
-    // POST — store data with metadata wrapper
     if (req.method === 'POST') {
       const { data, fileName, updatedAt } = req.body || {};
-      if (!Array.isArray(data)) {
-        return res.status(400).json({ error: 'data must be an array' });
-      }
-      const wrapper = {
-        rows: data,
-        fileName: fileName || null,
-        updatedAt: updatedAt || new Date().toISOString(),
-      };
+      if (!Array.isArray(data)) return res.status(400).json({ error: 'data must be an array' });
+      const wrapper = { rows: data, fileName: fileName || null, updatedAt: updatedAt || new Date().toISOString() };
       const jsonVal = JSON.stringify(wrapper);
       await sql`
         INSERT INTO app_data (key, value, updated_at)
         VALUES (${type}, ${jsonVal}::jsonb, NOW())
-        ON CONFLICT (key) DO UPDATE
-        SET value = EXCLUDED.value, updated_at = NOW()
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
       `;
       return res.status(200).json({ ok: true });
     }
 
-    // DELETE — clear data for a type
     if (req.method === 'DELETE') {
       await sql`DELETE FROM app_data WHERE key = ${type}`;
       return res.status(200).json({ ok: true });
@@ -76,4 +62,4 @@ module.exports = async function handler(req, res) {
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
-};
+}
