@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useCallback, useEffect, useTransition } from 'react'
+import React, { useState, useMemo, useCallback, useEffect, useDeferredValue } from 'react'
 import {
   Search,
   Truck,
@@ -248,9 +248,9 @@ export default function TrackingPage() {
   const [trackingData, setTrackingData] = useState([])
   const [lastUpdated, setLastUpdated] = useState(null)
   const [fileName, setFileName] = useState(null)
-  const [inputValue, setInputValue] = useState('')   // instant — drives the input field
-  const [searchQuery, setSearchQuery] = useState('') // deferred — drives the filtering
-  const [isPending, startTransition] = useTransition()
+  const [inputValue, setInputValue] = useState('')
+  const deferredQuery = useDeferredValue(inputValue) // lags behind — drives filtering
+  const isStale = deferredQuery !== inputValue       // true while results are catching up
   const [isFetching, setIsFetching] = useState(true)
   const [isUploading, setIsUploading] = useState(false)
   const [apiError, setApiError] = useState(null)
@@ -302,25 +302,25 @@ export default function TrackingPage() {
       setLastUpdated(null)
       setFileName(null)
       setInputValue('')
-      setSearchQuery('')
       toast.info('Tracking data cleared for everyone')
     } catch (err) {
       toast.error(err.message, 'Clear Error')
     }
   }, [toast])
 
-  // Filter rows matching the query
+  const MAX_GROUPS = 30
+
+  // All filtering/grouping runs off deferredQuery so the input is never blocked
   const filteredData = useMemo(() => {
-    if (!searchQuery.trim()) return trackingData
-    const q = searchQuery.toLowerCase()
+    if (!deferredQuery.trim()) return []
+    const q = deferredQuery.toLowerCase()
     return trackingData.filter((r) =>
       searchType === 'tracking'
         ? (r.tracking || '').toLowerCase().includes(q)
         : (r.sku || '').toLowerCase().includes(q)
     )
-  }, [trackingData, searchQuery, searchType])
+  }, [trackingData, deferredQuery, searchType])
 
-  // Group by tracking number (for tracking # search view)
   const groupedByTracking = useMemo(() => {
     const map = {}
     filteredData.forEach((row) => {
@@ -331,7 +331,6 @@ export default function TrackingPage() {
     return Object.entries(map).sort(([a], [b]) => a.localeCompare(b))
   }, [filteredData])
 
-  // Group by SKU (for SKU search view)
   const groupedBySKU = useMemo(() => {
     const map = {}
     filteredData.forEach((row) => {
@@ -342,21 +341,25 @@ export default function TrackingPage() {
     return Object.entries(map).sort(([a], [b]) => a.localeCompare(b))
   }, [filteredData])
 
-  // Jump from a SKU entry → tracking # view
   const handleSelectTracking = useCallback((trackingNum) => {
     if (!trackingNum) return
     setSearchType('tracking')
     setInputValue(trackingNum)
-    setSearchQuery(trackingNum)
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }, [])
 
   const hasData    = trackingData.length > 0
   const isLoading  = isFetching || isUploading
-  const totalUnits = filteredData.reduce((s, r) => s + (r.quantity || 0), 0)
   const hasQuery   = inputValue.trim().length > 0
+  const totalUnits = filteredData.reduce((s, r) => s + (r.quantity || 0), 0)
 
-  const summaryLine = searchType === 'tracking'
+  const visibleTracking = groupedByTracking.slice(0, MAX_GROUPS)
+  const visibleSKU      = groupedBySKU.slice(0, MAX_GROUPS)
+  const hiddenCount     = searchType === 'tracking'
+    ? groupedByTracking.length - visibleTracking.length
+    : groupedBySKU.length - visibleSKU.length
+
+  const summaryLine = isStale ? 'Searching…' : searchType === 'tracking'
     ? `${groupedByTracking.length} tracking number${groupedByTracking.length !== 1 ? 's' : ''} · ${filteredData.length} lines · ${totalUnits} units`
     : `${groupedBySKU.length} SKU${groupedBySKU.length !== 1 ? 's' : ''} · ${filteredData.length} rows · ${totalUnits} units`
 
@@ -426,7 +429,7 @@ export default function TrackingPage() {
             {/* Mode toggle */}
             <div className="flex rounded-lg border border-slate-200 overflow-hidden text-sm font-medium">
               <button
-                onClick={() => { setSearchType('tracking'); setInputValue(''); startTransition(() => setSearchQuery('')) }}
+                onClick={() => { setSearchType('tracking'); setInputValue('') }}
                 className={`px-4 py-2 transition-colors ${
                   searchType === 'tracking' ? 'bg-teal-600 text-white' : 'bg-white text-slate-600 hover:bg-slate-50'
                 }`}
@@ -434,7 +437,7 @@ export default function TrackingPage() {
                 Tracking #
               </button>
               <button
-                onClick={() => { setSearchType('sku'); setInputValue(''); startTransition(() => setSearchQuery('')) }}
+                onClick={() => { setSearchType('sku'); setInputValue('') }}
                 className={`px-4 py-2 transition-colors ${
                   searchType === 'sku' ? 'bg-blue-600 text-white' : 'bg-white text-slate-600 hover:bg-slate-50'
                 }`}
@@ -450,16 +453,12 @@ export default function TrackingPage() {
                 type="text"
                 placeholder={searchType === 'tracking' ? 'Enter tracking number…' : 'Enter SKU…'}
                 value={inputValue}
-                onChange={(e) => {
-                  const v = e.target.value
-                  setInputValue(v)
-                  startTransition(() => setSearchQuery(v))
-                }}
+                onChange={(e) => setInputValue(e.target.value)}
                 className="input-base pl-9"
               />
             </div>
             {hasQuery && (
-              <button onClick={() => { setInputValue(''); startTransition(() => setSearchQuery('')) }} className="btn-secondary text-sm flex-shrink-0">
+              <button onClick={() => setInputValue('')} className="btn-secondary text-sm flex-shrink-0">
                 Clear
               </button>
             )}
@@ -474,30 +473,44 @@ export default function TrackingPage() {
 
       {/* Results */}
       {hasData && hasQuery && (
-        <div className="space-y-3">
+        <div className={`space-y-3 transition-opacity duration-150 ${isStale ? 'opacity-50' : 'opacity-100'}`}>
           {searchType === 'tracking' ? (
-            groupedByTracking.length === 0 ? (
+            visibleTracking.length === 0 && !isStale ? (
               <div className="card p-10 text-center">
                 <Search className="w-8 h-8 text-slate-300 mx-auto mb-3" />
                 <p className="text-slate-500 font-medium">No tracking numbers found</p>
                 <p className="text-slate-400 text-sm mt-1">Try a different number</p>
               </div>
             ) : (
-              groupedByTracking.map(([tracking, rows]) => (
-                <TrackingGroup key={tracking} tracking={tracking} rows={rows} />
-              ))
+              <>
+                {visibleTracking.map(([tracking, rows]) => (
+                  <TrackingGroup key={tracking} tracking={tracking} rows={rows} />
+                ))}
+                {hiddenCount > 0 && (
+                  <p className="text-center text-xs text-slate-400 py-2">
+                    Showing {MAX_GROUPS} of {groupedByTracking.length} — type more to narrow results
+                  </p>
+                )}
+              </>
             )
           ) : (
-            groupedBySKU.length === 0 ? (
+            visibleSKU.length === 0 && !isStale ? (
               <div className="card p-10 text-center">
                 <Search className="w-8 h-8 text-slate-300 mx-auto mb-3" />
                 <p className="text-slate-500 font-medium">No SKUs found</p>
                 <p className="text-slate-400 text-sm mt-1">Try a different SKU</p>
               </div>
             ) : (
-              groupedBySKU.map(([sku, rows]) => (
-                <SKUGroup key={sku} sku={sku} rows={rows} onSelectTracking={handleSelectTracking} />
-              ))
+              <>
+                {visibleSKU.map(([sku, rows]) => (
+                  <SKUGroup key={sku} sku={sku} rows={rows} onSelectTracking={handleSelectTracking} />
+                ))}
+                {hiddenCount > 0 && (
+                  <p className="text-center text-xs text-slate-400 py-2">
+                    Showing {MAX_GROUPS} of {groupedBySKU.length} — type more to narrow results
+                  </p>
+                )}
+              </>
             )
           )}
         </div>
