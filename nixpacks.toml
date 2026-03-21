@@ -1,0 +1,3 @@
+# Tell Railway/nixpacks to use the Python provider only
+# (ignores package.json — the React app is built separately on Vercel)
+providers = ["python"]

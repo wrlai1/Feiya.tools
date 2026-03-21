@@ -12,15 +12,15 @@ import {
 } from 'lucide-react'
 
 const NAV_ITEMS = [
-  { label: 'Dashboard', to: '/', icon: LayoutDashboard, end: true },
-  { label: 'Inventory Check', to: '/inventory', icon: Package },
-  { label: 'Tracking', to: '/tracking', icon: Truck },
-  { label: 'Low Inventory Notes', to: '/notes', icon: MessageSquare },
+  { label: 'Dashboard',          to: '/',            icon: LayoutDashboard, end: true },
+  { label: 'Inventory Check',    to: '/inventory',   icon: Package },
+  { label: 'Tracking',           to: '/tracking',    icon: Truck },
+  { label: 'Low Inventory Notes',to: '/notes',       icon: MessageSquare },
+  { label: 'Stock Management',   to: '/stock',       icon: Boxes },
+  { label: 'Auto Deduct',        to: '/auto-deduct', icon: Minus },
 ]
 
 const COMING_SOON_ITEMS = [
-  { label: 'Stock Management', to: '/stock', icon: Boxes },
-  { label: 'Auto Deduct', to: '/auto-deduct', icon: Minus },
   { label: 'Auto Generate', to: '/auto-generate', icon: Sparkles },
 ]
 

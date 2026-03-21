@@ -82,7 +82,7 @@ export default function DataTable({
             {paginated.map((row, idx) => (
               <tr
                 key={idx}
-                className={`hover:bg-slate-50 transition-colors ${
+                className={`group hover:bg-slate-50 transition-colors ${
                   rowClassName ? rowClassName(row) : ''
                 }`}
               >

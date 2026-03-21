@@ -1,4 +1,6 @@
-streamlit
 pandas
 openpyxl
-streamlit-autorefresh
+flask
+flask-cors
+psycopg2-binary
+gunicorn
