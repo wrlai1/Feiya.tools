@@ -17,8 +17,7 @@ import tempfile
 import traceback
 
 import pandas as pd
-from flask import Flask, jsonify, request
-from flask_cors import CORS
+from flask import Flask, jsonify, make_response, request
 
 
 from inventory_autofill import fill_detail_inventory_inmemory, result_to_excel_bytes
@@ -45,25 +44,28 @@ from inventory_balance import (
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-CORS(app)  # allow all origins; fine-tune via ALLOWED_ORIGIN if needed
+
+
+@app.before_request
+def handle_preflight():
+    """Intercept ALL OPTIONS requests before route matching — avoids 405 on CORS preflight."""
+    if request.method == "OPTIONS":
+        res = make_response()
+        res.headers["Access-Control-Allow-Origin"]  = "*"
+        res.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        res.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        res.headers["Access-Control-Max-Age"]        = "3600"
+        res.status_code = 204
+        return res
 
 
 @app.after_request
 def add_cors_headers(response):
-    """Ensure CORS headers are present on every response, including errors."""
+    """Attach CORS headers to every real response."""
     response.headers["Access-Control-Allow-Origin"]  = "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    response.headers["Access-Control-Allow-Methods"] = (
-        "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-    )
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
     return response
-
-
-@app.route("/", defaults={"path": ""}, methods=["OPTIONS"])
-@app.route("/<path:path>",             methods=["OPTIONS"])
-def handle_options(path=""):
-    """Handle all CORS preflight requests."""
-    return "", 204
 
 
 # Initialise DB tables on startup
