@@ -150,6 +150,11 @@ def save_balance(df: pd.DataFrame) -> None:
                     INSERT INTO inventory_balance_rows
                         (style_n, size_n, color_n, style, color, size, quantity)
                     VALUES %s
+                    ON CONFLICT (style_n, size_n, color_n) DO UPDATE
+                        SET quantity = EXCLUDED.quantity,
+                            style    = EXCLUDED.style,
+                            color    = EXCLUDED.color,
+                            size     = EXCLUDED.size
                 """, records)
 
 
@@ -247,8 +252,15 @@ def initialize_balance(df: pd.DataFrame) -> pd.DataFrame:
         save_snapshot(label="pre_init", source_name="before re-initialize")
     bal = df[["Style", "Color", "Size", "Quantity"]].copy()
     bal["Quantity"] = pd.to_numeric(bal["Quantity"], errors="coerce").fillna(0)
-    bal = _add_keys(bal)[BALANCE_COLS]
-    bal = bal[bal["Style"].notna() & (bal["Style"].str.strip() != "")].reset_index(drop=True)
+    bal = _add_keys(bal)
+    bal = bal[bal["Style"].notna() & (bal["Style"].str.strip() != "")]
+    # Merge rows that normalise to the same key — sum their quantities
+    bal = (
+        bal.groupby(["style_n", "size_n", "color_n"], as_index=False)
+        .agg(Style=("Style", "first"), Color=("Color", "first"),
+             Size=("Size", "first"), Quantity=("Quantity", "sum"))
+    )
+    bal = bal[BALANCE_COLS].reset_index(drop=True)
     save_balance(bal)
     return bal
 
