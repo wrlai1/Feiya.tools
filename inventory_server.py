@@ -20,6 +20,7 @@ import pandas as pd
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
+
 from inventory_autofill import fill_detail_inventory_inmemory, result_to_excel_bytes
 from inventory_balance import (
     apply_transaction,
@@ -44,7 +45,26 @@ from inventory_balance import (
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-CORS(app, origins=os.environ.get("ALLOWED_ORIGIN", "*"))
+CORS(app)  # allow all origins; fine-tune via ALLOWED_ORIGIN if needed
+
+
+@app.after_request
+def add_cors_headers(response):
+    """Ensure CORS headers are present on every response, including errors."""
+    response.headers["Access-Control-Allow-Origin"]  = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Methods"] = (
+        "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+    )
+    return response
+
+
+@app.route("/", defaults={"path": ""}, methods=["OPTIONS"])
+@app.route("/<path:path>",             methods=["OPTIONS"])
+def handle_options(path=""):
+    """Handle all CORS preflight requests."""
+    return "", 204
+
 
 # Initialise DB tables on startup
 try:
