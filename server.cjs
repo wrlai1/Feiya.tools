@@ -303,6 +303,165 @@ app.delete('/api/chat-messages', async (req, res) => {
   } catch (err) { return res.status(500).json({ error: err.message }); }
 });
 
+// ─── /api/timeclock ───────────────────────────────────────────────────────────
+
+async function ensureTimeTables(sql) {
+  await sql`
+    CREATE TABLE IF NOT EXISTS time_punches (
+      id          SERIAL PRIMARY KEY,
+      user_id     INTEGER NOT NULL,
+      username    TEXT NOT NULL,
+      type        TEXT NOT NULL,
+      punched_at  TIMESTAMPTZ DEFAULT NOW(),
+      note        TEXT,
+      edited_by   TEXT,
+      original_at TIMESTAMPTZ,
+      created_at  TIMESTAMPTZ DEFAULT NOW()
+    )
+  `;
+  await sql`
+    CREATE TABLE IF NOT EXISTS time_periods (
+      id         SERIAL PRIMARY KEY,
+      started_at TIMESTAMPTZ DEFAULT NOW(),
+      reset_by   TEXT NOT NULL,
+      label      TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `;
+}
+
+async function getTimePeriodStart(sql) {
+  const rows = await sql`SELECT started_at FROM time_periods ORDER BY created_at DESC LIMIT 1`;
+  return rows[0]?.started_at || new Date(0).toISOString();
+}
+
+app.all('/api/timeclock', async (req, res) => {
+  try {
+    const sql     = getDB();
+    const secret  = getSecret();
+    const payload = verifyToken(req.headers.authorization, secret);
+    if (!payload) return res.status(401).json({ error: 'Not authenticated' });
+    const isAdmin = payload.role === 'admin';
+    const action  = req.query.action;
+
+    await ensureTimeTables(sql);
+    const periodStart = await getTimePeriodStart(sql);
+
+    // POST punch
+    if (req.method === 'POST' && action === 'punch') {
+      const { type, note } = req.body || {};
+      const valid = ['clock_in', 'clock_out', 'break_start', 'break_end'];
+      if (!valid.includes(type)) return res.status(400).json({ error: 'Invalid punch type' });
+      const last = await sql`
+        SELECT type FROM time_punches
+        WHERE user_id = ${payload.userId} AND punched_at >= ${periodStart}
+        ORDER BY punched_at DESC LIMIT 1
+      `;
+      const lastType = last[0]?.type || null;
+      if (type === 'clock_in' && (lastType === 'clock_in' || lastType === 'break_start' || lastType === 'break_end'))
+        return res.status(400).json({ error: 'Already clocked in' });
+      if ((type === 'clock_out' || type === 'break_start') && (!lastType || lastType === 'clock_out'))
+        return res.status(400).json({ error: 'You are not clocked in' });
+      if (type === 'break_start' && lastType === 'break_start')
+        return res.status(400).json({ error: 'Already on break' });
+      if (type === 'break_end' && lastType !== 'break_start')
+        return res.status(400).json({ error: 'Not on break' });
+      if (type === 'clock_out' && lastType === 'break_start')
+        return res.status(400).json({ error: 'End your break before clocking out' });
+      const rows = await sql`
+        INSERT INTO time_punches (user_id, username, type, note)
+        VALUES (${payload.userId}, ${payload.username}, ${type}, ${note || null})
+        RETURNING *
+      `;
+      return res.json(rows[0]);
+    }
+
+    // GET my
+    if (req.method === 'GET' && action === 'my') {
+      const rows = await sql`
+        SELECT * FROM time_punches
+        WHERE user_id = ${payload.userId} AND punched_at >= ${periodStart}
+        ORDER BY punched_at ASC
+      `;
+      return res.json({ punches: rows, periodStart });
+    }
+
+    // GET all (admin)
+    if (req.method === 'GET' && action === 'all') {
+      if (!isAdmin) return res.status(403).json({ error: 'Admin access required' });
+      const rows = await sql`
+        SELECT * FROM time_punches
+        WHERE punched_at >= ${periodStart}
+        ORDER BY username ASC, punched_at ASC
+      `;
+      return res.json({ punches: rows, periodStart });
+    }
+
+    // GET export (admin)
+    if (req.method === 'GET' && action === 'export') {
+      if (!isAdmin) return res.status(403).json({ error: 'Admin access required' });
+      const from = req.query.from || periodStart;
+      const to   = req.query.to   || new Date().toISOString();
+      const rows = await sql`
+        SELECT * FROM time_punches
+        WHERE punched_at >= ${from} AND punched_at <= ${to}
+        ORDER BY username ASC, punched_at ASC
+      `;
+      return res.json({ punches: rows, from, to });
+    }
+
+    // PATCH edit punch (admin)
+    if (req.method === 'PATCH') {
+      if (!isAdmin) return res.status(403).json({ error: 'Admin access required' });
+      const punchId = parseInt(req.query.id, 10);
+      if (!punchId) return res.status(400).json({ error: 'Punch id required' });
+      const { punched_at, note } = req.body || {};
+      const orig = await sql`SELECT * FROM time_punches WHERE id = ${punchId}`;
+      if (!orig[0]) return res.status(404).json({ error: 'Punch not found' });
+      const rows = await sql`
+        UPDATE time_punches SET
+          punched_at  = ${punched_at  || orig[0].punched_at},
+          note        = ${note !== undefined ? note : orig[0].note},
+          edited_by   = ${payload.username},
+          original_at = COALESCE(original_at, ${orig[0].punched_at})
+        WHERE id = ${punchId} RETURNING *
+      `;
+      return res.json(rows[0]);
+    }
+
+    // DELETE punch (admin)
+    if (req.method === 'DELETE' && req.query.id) {
+      if (!isAdmin) return res.status(403).json({ error: 'Admin access required' });
+      await sql`DELETE FROM time_punches WHERE id = ${parseInt(req.query.id, 10)}`;
+      return res.json({ ok: true });
+    }
+
+    // POST reset (admin)
+    if (req.method === 'POST' && action === 'reset') {
+      if (!isAdmin) return res.status(403).json({ error: 'Admin access required' });
+      const { label } = req.body || {};
+      const rows = await sql`
+        INSERT INTO time_periods (reset_by, label)
+        VALUES (${payload.username}, ${label || null})
+        RETURNING *
+      `;
+      return res.json(rows[0]);
+    }
+
+    // GET periods (admin)
+    if (req.method === 'GET' && action === 'periods') {
+      if (!isAdmin) return res.status(403).json({ error: 'Admin access required' });
+      const rows = await sql`SELECT * FROM time_periods ORDER BY created_at DESC LIMIT 24`;
+      return res.json(rows);
+    }
+
+    return res.status(400).json({ error: `Unknown action: ${action}` });
+  } catch (err) {
+    console.error('[/api/timeclock]', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {

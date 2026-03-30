@@ -2,7 +2,7 @@ import React, { useState } from 'react'
 import { NavLink } from 'react-router-dom'
 import {
   LayoutDashboard, Package, Truck, MessageSquare,
-  Boxes, Minus, Sparkles, X, Users, LogOut, KeyRound, ShieldCheck, User,
+  Boxes, Minus, Sparkles, X, Users, LogOut, KeyRound, ShieldCheck, User, Clock, ClipboardList,
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import ChangePasswordModal from './ChangePasswordModal.jsx'
@@ -14,15 +14,18 @@ const ADMIN_NAV = [
   { label: 'Low Inventory Notes', to: '/notes',       icon: MessageSquare },
   { label: 'Stock Management',    to: '/stock',       icon: Boxes },
   { label: 'Auto Deduct',         to: '/auto-deduct', icon: Minus },
+  { label: 'Time Clock',          to: '/timeclock',   icon: Clock },
 ]
 
 const USER_NAV = [
   { label: 'Tracking',            to: '/tracking',    icon: Truck },
   { label: 'Low Inventory Notes', to: '/notes',       icon: MessageSquare },
+  { label: 'Time Clock',          to: '/timeclock',   icon: Clock },
 ]
 
 const ADMIN_TOOLS = [
-  { label: 'User Management', to: '/users', icon: Users },
+  { label: 'User Management', to: '/users',       icon: Users },
+  { label: 'Time Report',     to: '/time-report', icon: ClipboardList },
 ]
 
 const COMING_SOON = [

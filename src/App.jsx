@@ -12,6 +12,8 @@ import StockManagement from './pages/StockManagement.jsx'
 import AutoDeduct from './pages/AutoDeduct.jsx'
 import AutoGenerate from './pages/AutoGenerate.jsx'
 import AdminUsers from './pages/AdminUsers.jsx'
+import TimeClockPage from './pages/TimeClockPage.jsx'
+import AdminTimeReport from './pages/AdminTimeReport.jsx'
 
 // Full-page spinner shown while verifying token on first load
 function SplashLoader() {
@@ -70,6 +72,8 @@ function AppRoutes() {
         <Route path="auto-deduct" element={<RequireAdmin><AutoDeduct /></RequireAdmin>} />
         <Route path="auto-generate" element={<RequireAdmin><AutoGenerate /></RequireAdmin>} />
         <Route path="users" element={<RequireAdmin><AdminUsers /></RequireAdmin>} />
+        <Route path="timeclock" element={<TimeClockPage />} />
+        <Route path="time-report" element={<RequireAdmin><AdminTimeReport /></RequireAdmin>} />
       </Route>
 
       {/* Fallback */}

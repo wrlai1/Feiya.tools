@@ -12,6 +12,8 @@ const PAGE_TITLES = {
   '/auto-deduct':  'Auto Deduct',
   '/auto-generate':'Auto Generate',
   '/users':        'User Management',
+  '/timeclock':    'Time Clock',
+  '/time-report':  'Time Report',
 }
 
 export default function Header({ onMenuClick }) {
