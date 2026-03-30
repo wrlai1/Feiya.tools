@@ -1,0 +1,9 @@
+[
+  {
+    "timestamp": "2026-03-21 14:07:49",
+    "source_file": "03.19_consolidated.csv",
+    "transaction_type": "sales",
+    "applied_units": 653,
+    "unmatched_rows": 0
+  }
+]

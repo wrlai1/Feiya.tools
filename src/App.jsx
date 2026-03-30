@@ -1,6 +1,9 @@
 import React from 'react'
-import { BrowserRouter, Routes, Route } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
+import { ToastProvider } from './components/Toast.jsx'
+import { AuthProvider, useAuth } from './context/AuthContext.jsx'
 import Layout from './components/Layout.jsx'
+import LoginPage from './pages/LoginPage.jsx'
 import Dashboard from './pages/Dashboard.jsx'
 import InventoryCheck from './pages/InventoryCheck.jsx'
 import TrackingPage from './pages/TrackingPage.jsx'
@@ -8,24 +11,81 @@ import NotesPage from './pages/NotesPage.jsx'
 import StockManagement from './pages/StockManagement.jsx'
 import AutoDeduct from './pages/AutoDeduct.jsx'
 import AutoGenerate from './pages/AutoGenerate.jsx'
-import { ToastProvider } from './components/Toast.jsx'
+import AdminUsers from './pages/AdminUsers.jsx'
+
+// Full-page spinner shown while verifying token on first load
+function SplashLoader() {
+  return (
+    <div className="min-h-screen bg-[#0f172a] flex items-center justify-center">
+      <div className="flex flex-col items-center gap-4">
+        <div className="w-14 h-14 rounded-2xl bg-blue-600 flex items-center justify-center shadow-2xl">
+          <span className="text-white font-bold text-2xl">F</span>
+        </div>
+        <svg className="animate-spin w-6 h-6 text-blue-400" viewBox="0 0 24 24" fill="none">
+          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+        </svg>
+      </div>
+    </div>
+  )
+}
+
+// Require login — redirect to /login if not authenticated
+function RequireAuth({ children }) {
+  const { user, loading } = useAuth()
+  const location = useLocation()
+  if (loading) return <SplashLoader />
+  if (!user) return <Navigate to="/login" state={{ from: location }} replace />
+  return children
+}
+
+// Admin-only gate — regular users are redirected to /tracking
+function RequireAdmin({ children }) {
+  const { user } = useAuth()
+  if (user?.role !== 'admin') return <Navigate to="/tracking" replace />
+  return children
+}
+
+// Redirect already-logged-in users away from /login
+function GuestOnly({ children }) {
+  const { user, loading } = useAuth()
+  if (loading) return <SplashLoader />
+  if (user) return <Navigate to={user.role === 'admin' ? '/' : '/tracking'} replace />
+  return children
+}
+
+function AppRoutes() {
+  return (
+    <Routes>
+      {/* Public */}
+      <Route path="/login" element={<GuestOnly><LoginPage /></GuestOnly>} />
+
+      {/* Protected */}
+      <Route path="/" element={<RequireAuth><Layout /></RequireAuth>}>
+        <Route index element={<RequireAdmin><Dashboard /></RequireAdmin>} />
+        <Route path="inventory" element={<RequireAdmin><InventoryCheck /></RequireAdmin>} />
+        <Route path="tracking" element={<TrackingPage />} />
+        <Route path="notes" element={<NotesPage />} />
+        <Route path="stock" element={<RequireAdmin><StockManagement /></RequireAdmin>} />
+        <Route path="auto-deduct" element={<RequireAdmin><AutoDeduct /></RequireAdmin>} />
+        <Route path="auto-generate" element={<RequireAdmin><AutoGenerate /></RequireAdmin>} />
+        <Route path="users" element={<RequireAdmin><AdminUsers /></RequireAdmin>} />
+      </Route>
+
+      {/* Fallback */}
+      <Route path="*" element={<Navigate to="/" replace />} />
+    </Routes>
+  )
+}
 
 export default function App() {
   return (
     <ToastProvider>
-      <BrowserRouter>
-        <Routes>
-          <Route path="/" element={<Layout />}>
-            <Route index element={<Dashboard />} />
-            <Route path="inventory" element={<InventoryCheck />} />
-            <Route path="tracking" element={<TrackingPage />} />
-            <Route path="notes" element={<NotesPage />} />
-            <Route path="stock" element={<StockManagement />} />
-            <Route path="auto-deduct" element={<AutoDeduct />} />
-            <Route path="auto-generate" element={<AutoGenerate />} />
-          </Route>
-        </Routes>
-      </BrowserRouter>
+      <AuthProvider>
+        <BrowserRouter>
+          <AppRoutes />
+        </BrowserRouter>
+      </AuthProvider>
     </ToastProvider>
   )
 }

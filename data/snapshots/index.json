@@ -1,0 +1,42 @@
+[
+  {
+    "id": "20260321_145636",
+    "timestamp": "2026-03-21 14:56:36",
+    "label": "pre_init",
+    "source_name": "before re-initialize",
+    "total_units": 0,
+    "total_rows": 3394
+  },
+  {
+    "id": "20260321_145705",
+    "timestamp": "2026-03-21 14:57:05",
+    "label": "pre_restore",
+    "source_name": "before restoring 20260321_145636",
+    "total_units": 328146,
+    "total_rows": 3394
+  },
+  {
+    "id": "20260321_150434",
+    "timestamp": "2026-03-21 15:04:34",
+    "label": "pre_init",
+    "source_name": "before re-initialize",
+    "total_units": 0,
+    "total_rows": 3394
+  },
+  {
+    "id": "20260321_151942",
+    "timestamp": "2026-03-21 15:19:42",
+    "label": "edit",
+    "source_name": "manual edit 50154/greenteal/L",
+    "total_units": 328146,
+    "total_rows": 3394
+  },
+  {
+    "id": "20260321_151955",
+    "timestamp": "2026-03-21 15:19:55",
+    "label": "edit",
+    "source_name": "manual edit 50154/greenteal/XL",
+    "total_units": 328087,
+    "total_rows": 3394
+  }
+]

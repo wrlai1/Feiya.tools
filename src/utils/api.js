@@ -1,12 +1,30 @@
 const BASE = '/api'
+const TOKEN_KEY = 'feiya_token'
+
+function authHeaders(extra = {}) {
+  const token = localStorage.getItem(TOKEN_KEY)
+  return { ...extra, ...(token ? { Authorization: `Bearer ${token}` } : {}) }
+}
 
 async function request(url, options = {}) {
-  const res = await fetch(url, options)
+  let res
+  try {
+    res = await fetch(url, { ...options, headers: authHeaders(options.headers) })
+  } catch {
+    throw new Error('Cannot reach the server. Make sure the API is running.')
+  }
   if (!res.ok) {
-    const msg = await res.text().catch(() => res.statusText)
+    const ct = res.headers.get('content-type') || ''
+    const msg = ct.includes('application/json')
+      ? (await res.json().catch(() => ({}))).error
+      : await res.text().catch(() => res.statusText)
     throw new Error(msg || `HTTP ${res.status}`)
   }
-  return res.json()
+  try {
+    return await res.json()
+  } catch {
+    throw new Error('Server returned an unexpected response. Please try again.')
+  }
 }
 
 // ─── Inventory ────────────────────────────────────────────────────────────────
@@ -19,12 +37,7 @@ export function saveInventory(data, fileName = null) {
   return request(`${BASE}/app-data`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      type: 'inventory',
-      data,
-      fileName,
-      updatedAt: new Date().toISOString(),
-    }),
+    body: JSON.stringify({ type: 'inventory', data, fileName, updatedAt: new Date().toISOString() }),
   })
 }
 
@@ -42,12 +55,7 @@ export function saveTracking(data, fileName = null) {
   return request(`${BASE}/app-data`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      type: 'tracking',
-      data,
-      fileName,
-      updatedAt: new Date().toISOString(),
-    }),
+    body: JSON.stringify({ type: 'tracking', data, fileName, updatedAt: new Date().toISOString() }),
   })
 }
 
