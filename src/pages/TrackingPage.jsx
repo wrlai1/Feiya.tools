@@ -20,6 +20,7 @@ import { useToast } from '../hooks/useToast.js'
 import { parseTrackingCSV } from '../utils/csvParser.js'
 import { formatLastUpdated } from '../utils/dateUtils.js'
 import { fetchTracking, saveTracking, clearTracking } from '../utils/api.js'
+import { useAuth } from '../context/AuthContext.jsx'
 
 // ─── Shared copy button ────────────────────────────────────────────────────────
 function CopyButton({ text }) {
@@ -245,6 +246,8 @@ function SKUGroup({ sku, rows, onSelectTracking }) {
 
 // ─── Page ─────────────────────────────────────────────────────────────────────
 export default function TrackingPage() {
+  const { user } = useAuth()
+  const isAdmin = user?.role === 'admin'
   const [trackingData, setTrackingData] = useState([])
   const [lastUpdated, setLastUpdated] = useState(null)
   const [fileName, setFileName] = useState(null)
@@ -373,7 +376,7 @@ export default function TrackingPage() {
             Upload a tracking CSV — data stays shared until cleared or re-uploaded
           </p>
         </div>
-        {hasData && (
+        {hasData && isAdmin && (
           <button onClick={handleClear} className="btn-secondary text-sm">
             <Trash2 className="w-4 h-4" />
             Clear Data

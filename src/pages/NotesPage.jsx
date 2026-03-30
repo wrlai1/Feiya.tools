@@ -14,6 +14,7 @@ import { useLocalStorage } from '../hooks/useLocalStorage.js'
 import { useToast } from '../hooks/useToast.js'
 import { relativeTime } from '../utils/dateUtils.js'
 import { fetchMessages, sendMessage, editMessage, deleteMessage } from '../utils/api.js'
+import { useAuth } from '../context/AuthContext.jsx'
 
 const POLL_INTERVAL = 5000 // refresh every 5 seconds
 
@@ -209,8 +210,14 @@ function toNote(row) {
 }
 
 export default function NotesPage() {
+  const { user } = useAuth()
   const [notes, setNotes] = useState([])
   const [currentUser, setCurrentUser] = useLocalStorage('feiya_notes_user', null)
+
+  // Auto-set username from logged-in account
+  useEffect(() => {
+    if (user?.username && !currentUser) setCurrentUser(user.username)
+  }, [user, currentUser, setCurrentUser])
   const [inputText, setInputText] = useState('')
   const [isSending, setIsSending] = useState(false)
   const messagesEndRef = useRef(null)
