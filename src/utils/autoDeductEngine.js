@@ -221,28 +221,29 @@ export function fillTemplate(templateRows, salesRows) {
     const key       = `${normStyle}||${normSize}`
     let candidates = buckets.get(key) || []
 
-    // ── Style-prefix / suffix / extension fallback ────────────────────────────
-    // Handles size-based style routing:
-    //   "M022" + L   → "M022 Missy"   (normalizes to m022missy, startsWith m022)
-    //   "M022" + 1X  → "M022 PLUS"    (normalizes to m022plus,  startsWith m022)
-    //   "M017" + L   → "M017-MISSY"   (normalizes to m017missy, startsWith m017)
-    //   "5010130" + L → "CK101/5010130" (normalizes to ck1015010130, endsWith 5010130)
-    //   "80423"  + 1X → "80423W"      (normalizes to 80423w,    startsWith 80423)
-    const prefixCandidates = []
-    for (const [bkey, bucket] of buckets.entries()) {
-      const sep    = bkey.lastIndexOf('||')
-      const bstyle = bkey.slice(0, sep)
-      const bsize  = bkey.slice(sep + 2)
-      if (bsize === normSize && bstyle !== normStyle &&
-          (bstyle.startsWith(normStyle) || normStyle.startsWith(bstyle) || bstyle.endsWith(normStyle))) {
-        prefixCandidates.push(...bucket)
+    // ── Style-prefix fallback — only when NO exact bucket match ─────────────
+    // Sales CSVs use a shorter style code that is a prefix of the full template
+    // style name. Size disambiguates which variant to route to:
+    //   "M022" + S/M/L/XL → "M022 Missy"   (bstyle m022missy startsWith m022)
+    //   "M022" + 1X/2X/3X → "M022 PLUS"    (bstyle m022plus  startsWith m022)
+    //   "M022" + PS/PM/PL  → "M022 Petite"  (bstyle m022petite startsWith m022)
+    //   "M017" + S/M/L/XL → "M017-MISSY"   (bstyle m017missy startsWith m017)
+    //   "80423" + any      → "80423W"       (bstyle 80423w    startsWith 80423)
+    //
+    // Guard: sales style must be ≥ 4 chars to avoid single/two-char false matches.
+    if (!candidates.length) {
+      const prefixCandidates = []
+      for (const [bkey, bucket] of buckets.entries()) {
+        const sep    = bkey.lastIndexOf('||')
+        const bstyle = bkey.slice(0, sep)
+        const bsize  = bkey.slice(sep + 2)
+        if (bsize !== normSize || bstyle === normStyle) continue
+        if (normStyle.length < 4) continue
+        if (bstyle.startsWith(normStyle)) {
+          prefixCandidates.push(...bucket)
+        }
       }
-    }
-    // Prefer prefix candidates if any have a color match (more specific style wins).
-    // Fall back to exact bucket if prefix candidates have no color match at all.
-    if (prefixCandidates.length > 0) {
-      const hasMatch = prefixCandidates.some(c => colorScore(c.color, color) > 0)
-      if (hasMatch || !candidates.length) candidates = prefixCandidates
+      if (prefixCandidates.length) candidates = prefixCandidates
     }
 
     if (!candidates?.length) {
