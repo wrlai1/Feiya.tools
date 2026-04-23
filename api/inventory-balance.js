@@ -147,7 +147,7 @@ export default async function handler(req, res) {
 
     // ── GET list ──────────────────────────────────────────────────────────────
     if (req.method === 'GET' && action === 'list') {
-      const rows = await sql`SELECT id, style, color, size, quantity FROM inventory_balance ORDER BY sort_order NULLS LAST, style, color, size`
+      const rows = await sql`SELECT id, style, color, size, quantity FROM inventory_balance ORDER BY sort_order NULLS LAST, id`
       return res.json({
         initialized: rows.length > 0,
         rows: formatRows(rows),
