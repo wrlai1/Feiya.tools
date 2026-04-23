@@ -58,6 +58,19 @@ async function ensureTables(sql) {
       applied_at       TIMESTAMPTZ DEFAULT NOW()
     )
   `
+  // For inventory_snapshots we check whether the live table matches our expected
+  // schema.  If stale NOT-NULL columns exist (snap_id, ts, …) from an older
+  // version, drop and recreate the whole table — snapshots are ephemeral rollback
+  // points (max 5 kept), so losing them during a schema migration is acceptable.
+  const staleCheck = await sql`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_name = 'inventory_snapshots'
+      AND column_name IN ('snap_id', 'ts')
+  `
+  if (staleCheck.length > 0) {
+    await sql`DROP TABLE IF EXISTS inventory_snapshots`
+  }
   await sql`
     CREATE TABLE IF NOT EXISTS inventory_snapshots (
       id          SERIAL PRIMARY KEY,
@@ -68,12 +81,6 @@ async function ensureTables(sql) {
       total_units INTEGER DEFAULT 0,
       created_at  TIMESTAMPTZ DEFAULT NOW()
     )
-  `
-  // One-time migration: drop stale snap_id column that was added in an earlier
-  // schema version and is no longer part of the model.  DROP COLUMN IF EXISTS
-  // is idempotent — safe to run on every cold start.
-  await sql`
-    ALTER TABLE inventory_snapshots DROP COLUMN IF EXISTS snap_id
   `
 }
 
