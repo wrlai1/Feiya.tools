@@ -45,12 +45,51 @@ export function normalizeSize(s) {
     .replace(/^([123])XL$/, '$1X')   // 1XL→1X, 2XL→2X, 3XL→3X
 }
 
+// ── Fuzzy helpers ─────────────────────────────────────────────────────────────
+
+/**
+ * Longest Common Subsequence length — O(m·n), fast enough for color tokens (~10 chars).
+ */
+function lcsLength(a, b) {
+  const m = a.length, n = b.length
+  if (!m || !n) return 0
+  const prev = new Array(m + 1).fill(0)
+  const curr = new Array(m + 1).fill(0)
+  for (let j = 1; j <= n; j++) {
+    curr[0] = 0
+    for (let i = 1; i <= m; i++) {
+      curr[i] = a[i - 1] === b[j - 1] ? prev[i - 1] + 1 : Math.max(curr[i - 1], prev[i])
+    }
+    for (let i = 0; i <= m; i++) { prev[i] = curr[i]; curr[i] = 0 }
+  }
+  return prev[m]
+}
+
+/**
+ * Split a raw color string into meaningful tokens (3+ chars) for fuzzy matching.
+ * Works on the original string BEFORE space-collapsing so "med denim" → ["med","denim"].
+ */
+function colorTokens(raw) {
+  return String(raw)
+    .toLowerCase()
+    .replace(/#\w+/g, '')        // remove codes (#1827 etc.)
+    .replace(/[^a-z\s]/g, ' ')  // non-alpha → space
+    .split(/\s+/)
+    .map(t => t.trim())
+    .filter(t => t.length >= 3) // drop 1–2 letter words
+}
+
 // ── Color scoring ─────────────────────────────────────────────────────────────
 
 /**
  * Score how well a sales color matches a template color (0–1).
- * 1.0 = exact, >0 = substring match, 0 = no match.
- * Prefers the match where more of the sales color is "explained."
+ *
+ * Priority order:
+ *   1. Exact normalized string match              → 1.0
+ *   2. One normalized string contains the other  → proportional score
+ *   3. Token-level LCS fuzzy fallback             → ≤ 0.45
+ *      (handles typos: fuchsia/fuschia, peapock/peacock, demim/denim,
+ *       and abbreviations: "med denim" → "medium denim")
  */
 function colorScore(templateColor, salesColor) {
   const tc = normalizeColor(templateColor)
@@ -58,9 +97,29 @@ function colorScore(templateColor, salesColor) {
   if (!tc || !sc) return 0
 
   if (tc === sc) return 1.0                           // exact
-  if (tc.includes(sc)) return sc.length / tc.length  // template contains sales (e.g. "blacktrmill" ⊃ "black")
-  if (sc.includes(tc)) return tc.length / sc.length  // sales contains template
-  return 0
+  if (tc.includes(sc)) return sc.length / tc.length  // template ⊃ sales
+  if (sc.includes(tc)) return tc.length / sc.length  // sales ⊃ template
+
+  // ── Token-level fuzzy fallback ────────────────────────────────────────────
+  // Split original strings into words, then compare word-pairs with LCS ratio.
+  // A sales token matches a template token if LCS / min(lengths) ≥ 0.80.
+  const ttks = colorTokens(templateColor)
+  const stks = colorTokens(salesColor)
+  if (!ttks.length || !stks.length) return 0
+
+  let matched = 0
+  for (const st of stks) {
+    for (const tt of ttks) {
+      const minLen = Math.min(st.length, tt.length)
+      if (minLen < 3) continue
+      if (lcsLength(st, tt) / minLen >= 0.80) { matched++; break }
+    }
+  }
+
+  // Require at least half the sales tokens to find a fuzzy match
+  return (matched > 0 && matched / stks.length >= 0.5)
+    ? (matched / stks.length) * 0.45
+    : 0
 }
 
 // ── CSV parser ────────────────────────────────────────────────────────────────
