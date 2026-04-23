@@ -10,15 +10,28 @@
 
 // ── Normalization ─────────────────────────────────────────────────────────────
 
+/**
+ * Semantic color aliases: maps informal/abbreviated sales color names to the
+ * canonical color names used in the template.  Keys are already normalized
+ * (lowercase, alphanumeric only) so the lookup happens after basic cleaning.
+ */
+const COLOR_ALIASES = {
+  melon:       'canyonrose',
+  rich:        'orchidhush',
+  pinkyarrow:  'fuschia',
+  pinkarrow:   'fuschia',
+}
+
 /** Normalize a color string for fuzzy comparison */
 export function normalizeColor(s) {
-  return String(s)
+  const base = String(s)
     .toLowerCase()
     .replace(/#\s*\d+/g, '')     // remove numeric codes: #2, #1827, #32, "# 51"
     .replace(/[^a-z\s]/g, ' ')  // non-alpha → space
     .replace(/\b[a-z]\b/g, '')  // remove single-letter words (l, m, w, g…)
     .replace(/\s+/g, '')         // collapse all spaces
     .trim()
+  return COLOR_ALIASES[base] ?? base
 }
 
 /**
@@ -100,6 +113,15 @@ function colorScore(templateColor, salesColor) {
   if (tc === sc) return 1.0                           // exact
   if (tc.includes(sc)) return sc.length / tc.length  // template ⊃ sales
   if (sc.includes(tc)) return tc.length / sc.length  // sales ⊃ template
+
+  // ── Normalized-string LCS (catches fuchsia/fuschia, alias near-misses) ────
+  // Compare the fully-normalized (and alias-resolved) strings directly.
+  // Threshold 0.85 avoids false positives between short color words (wine/vine, etc.)
+  const minNorm = Math.min(tc.length, sc.length)
+  if (minNorm >= 4) {
+    const normRatio = lcsLength(tc, sc) / minNorm
+    if (normRatio >= 0.85) return normRatio * 0.9   // near-match on normalized form
+  }
 
   // ── Token-level fuzzy fallback ────────────────────────────────────────────
   // Split original strings into words, then compare word-pairs with LCS ratio.
@@ -197,22 +219,30 @@ export function fillTemplate(templateRows, salesRows) {
     const normStyle = normalizeStyle(style)
     const normSize  = normalizeSize(rawSize)
     const key       = `${normStyle}||${normSize}`
-    let   candidates = buckets.get(key)
+    let candidates = buckets.get(key) || []
 
-    // ── Style-prefix fallback ─────────────────────────────────────────────────
-    // Handles cases where sales omits a suffix the template includes, e.g.:
-    //   sales "80423" → template "80423W"  (or vice-versa)
-    if (!candidates?.length) {
-      for (const [bkey, bucket] of buckets.entries()) {
-        const sep    = bkey.lastIndexOf('||')
-        const bstyle = bkey.slice(0, sep)
-        const bsize  = bkey.slice(sep + 2)
-        if (bsize === normSize && bstyle !== normStyle &&
-            (bstyle.startsWith(normStyle) || normStyle.startsWith(bstyle))) {
-          candidates = bucket
-          break
-        }
+    // ── Style-prefix / suffix / extension fallback ────────────────────────────
+    // Handles size-based style routing:
+    //   "M022" + L   → "M022 Missy"   (normalizes to m022missy, startsWith m022)
+    //   "M022" + 1X  → "M022 PLUS"    (normalizes to m022plus,  startsWith m022)
+    //   "M017" + L   → "M017-MISSY"   (normalizes to m017missy, startsWith m017)
+    //   "5010130" + L → "CK101/5010130" (normalizes to ck1015010130, endsWith 5010130)
+    //   "80423"  + 1X → "80423W"      (normalizes to 80423w,    startsWith 80423)
+    const prefixCandidates = []
+    for (const [bkey, bucket] of buckets.entries()) {
+      const sep    = bkey.lastIndexOf('||')
+      const bstyle = bkey.slice(0, sep)
+      const bsize  = bkey.slice(sep + 2)
+      if (bsize === normSize && bstyle !== normStyle &&
+          (bstyle.startsWith(normStyle) || normStyle.startsWith(bstyle) || bstyle.endsWith(normStyle))) {
+        prefixCandidates.push(...bucket)
       }
+    }
+    // Prefer prefix candidates if any have a color match (more specific style wins).
+    // Fall back to exact bucket if prefix candidates have no color match at all.
+    if (prefixCandidates.length > 0) {
+      const hasMatch = prefixCandidates.some(c => colorScore(c.color, color) > 0)
+      if (hasMatch || !candidates.length) candidates = prefixCandidates
     }
 
     if (!candidates?.length) {
