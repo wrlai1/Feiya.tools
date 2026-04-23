@@ -58,10 +58,11 @@ async function ensureTables(sql) {
       applied_at       TIMESTAMPTZ DEFAULT NOW()
     )
   `
-  // Migration: applied_by was added after the table was first created.
-  await sql`
-    ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS applied_by TEXT
-  `
+  // Migrations: drop stale columns and add ones introduced after initial creation.
+  await sql`ALTER TABLE inventory_transactions DROP COLUMN IF EXISTS ts`
+  await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS applied_by TEXT`
+  await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS source_file TEXT`
+  await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS applied_units INTEGER`
   // For inventory_snapshots we check whether the live table matches our expected
   // schema.  If stale NOT-NULL columns exist (snap_id, ts, …) from an older
   // version, drop and recreate the whole table — snapshots are ephemeral rollback
