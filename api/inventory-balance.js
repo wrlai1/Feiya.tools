@@ -54,9 +54,13 @@ async function ensureTables(sql) {
       transaction_type TEXT NOT NULL,
       source_file      TEXT,
       applied_units    INTEGER DEFAULT 0,
-      applied_by       TEXT NOT NULL,
+      applied_by       TEXT,
       applied_at       TIMESTAMPTZ DEFAULT NOW()
     )
+  `
+  // Migration: applied_by was added after the table was first created.
+  await sql`
+    ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS applied_by TEXT
   `
   // For inventory_snapshots we check whether the live table matches our expected
   // schema.  If stale NOT-NULL columns exist (snap_id, ts, …) from an older
