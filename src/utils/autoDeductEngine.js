@@ -14,7 +14,7 @@
 export function normalizeColor(s) {
   return String(s)
     .toLowerCase()
-    .replace(/#\w+/g, '')        // remove color codes: #2, #1827, #0298
+    .replace(/#\s*\d+/g, '')     // remove numeric codes: #2, #1827, #32, "# 51"
     .replace(/[^a-z\s]/g, ' ')  // non-alpha → space
     .replace(/\b[a-z]\b/g, '')  // remove single-letter words (l, m, w, g…)
     .replace(/\s+/g, '')         // collapse all spaces
@@ -66,17 +66,18 @@ function lcsLength(a, b) {
 }
 
 /**
- * Split a raw color string into meaningful tokens (3+ chars) for fuzzy matching.
- * Works on the original string BEFORE space-collapsing so "med denim" → ["med","denim"].
+ * Split a raw color string into meaningful tokens (2+ chars) for fuzzy matching.
+ * Works on the original string BEFORE space-collapsing so "med denim" → ["med","denim"],
+ * and handles short abbreviations like "bk" (black) or "nvy" (navy).
  */
 function colorTokens(raw) {
   return String(raw)
     .toLowerCase()
-    .replace(/#\w+/g, '')        // remove codes (#1827 etc.)
+    .replace(/#\s*\d+/g, '')     // remove numeric codes
     .replace(/[^a-z\s]/g, ' ')  // non-alpha → space
     .split(/\s+/)
     .map(t => t.trim())
-    .filter(t => t.length >= 3) // drop 1–2 letter words
+    .filter(t => t.length >= 2) // keep 2+ char tokens (catches "bk", "nv" etc.)
 }
 
 // ── Color scoring ─────────────────────────────────────────────────────────────
@@ -111,8 +112,10 @@ function colorScore(templateColor, salesColor) {
   for (const st of stks) {
     for (const tt of ttks) {
       const minLen = Math.min(st.length, tt.length)
-      if (minLen < 3) continue
-      if (lcsLength(st, tt) / minLen >= 0.80) { matched++; break }
+      if (minLen < 2) continue
+      // Short tokens (≤3 chars) are abbreviations — use a more lenient threshold
+      const threshold = minLen <= 3 ? 0.65 : 0.80
+      if (lcsLength(st, tt) / minLen >= threshold) { matched++; break }
     }
   }
 
