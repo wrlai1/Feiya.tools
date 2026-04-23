@@ -63,6 +63,9 @@ async function ensureTables(sql) {
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS applied_by TEXT`
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS source_file TEXT`
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS applied_units INTEGER`
+  // sort_order preserves the original SalesTEMPLATE.csv row sequence so the
+  // filled-template Excel download comes out in the same order as the template.
+  await sql`ALTER TABLE inventory_balance ADD COLUMN IF NOT EXISTS sort_order INTEGER`
   // For inventory_snapshots we check whether the live table matches our expected
   // schema.  If stale NOT-NULL columns exist (snap_id, ts, …) from an older
   // version, drop and recreate the whole table — snapshots are ephemeral rollback
@@ -144,7 +147,7 @@ export default async function handler(req, res) {
 
     // ── GET list ──────────────────────────────────────────────────────────────
     if (req.method === 'GET' && action === 'list') {
-      const rows = await sql`SELECT id, style, color, size, quantity FROM inventory_balance ORDER BY style, color, size`
+      const rows = await sql`SELECT id, style, color, size, quantity FROM inventory_balance ORDER BY sort_order NULLS LAST, style, color, size`
       return res.json({
         initialized: rows.length > 0,
         rows: formatRows(rows),
@@ -161,17 +164,18 @@ export default async function handler(req, res) {
       await saveSnapshot(sql, 'pre_init', sourceName)
       await sql`DELETE FROM inventory_balance`
 
-      for (const r of rows) {
-        const style = String(r.Style || r.style || '').trim()
-        const color = String(r.Color || r.color || '').trim()
-        const size  = String(r.Size  || r.size  || '').trim()
-        const qty   = parseInt(r.Quantity || r.quantity || 0, 10) || 0
+      for (const [i, r] of rows.entries()) {
+        const style      = String(r.Style || r.style || '').trim()
+        const color      = String(r.Color || r.color || '').trim()
+        const size       = String(r.Size  || r.size  || '').trim()
+        const qty        = parseInt(r.Quantity || r.quantity || 0, 10) || 0
+        const sort_order = r.SortOrder !== undefined ? parseInt(r.SortOrder, 10) : i
         if (!style || !color || !size) continue
         await sql`
-          INSERT INTO inventory_balance (style, color, size, quantity)
-          VALUES (${style}, ${color}, ${size}, ${qty})
+          INSERT INTO inventory_balance (style, color, size, quantity, sort_order)
+          VALUES (${style}, ${color}, ${size}, ${qty}, ${sort_order})
           ON CONFLICT (style, color, size)
-          DO UPDATE SET quantity = EXCLUDED.quantity, updated_at = NOW()
+          DO UPDATE SET quantity = EXCLUDED.quantity, sort_order = EXCLUDED.sort_order, updated_at = NOW()
         `
       }
 
@@ -202,15 +206,17 @@ export default async function handler(req, res) {
 
       let added = 0
       for (const r of rows) {
-        const style = String(r.Style || r.style || '').trim()
-        const color = String(r.Color || r.color || '').trim()
-        const size  = String(r.Size  || r.size  || '').trim()
-        const qty   = parseInt(r.Quantity || r.quantity || 0, 10) || 0
+        const style      = String(r.Style || r.style || '').trim()
+        const color      = String(r.Color || r.color || '').trim()
+        const size       = String(r.Size  || r.size  || '').trim()
+        const qty        = parseInt(r.Quantity || r.quantity || 0, 10) || 0
+        const sort_order = r.SortOrder !== undefined ? parseInt(r.SortOrder, 10) : null
         if (!style || !color || !size) continue
         const result = await sql`
-          INSERT INTO inventory_balance (style, color, size, quantity)
-          VALUES (${style}, ${color}, ${size}, ${qty})
-          ON CONFLICT (style, color, size) DO NOTHING
+          INSERT INTO inventory_balance (style, color, size, quantity, sort_order)
+          VALUES (${style}, ${color}, ${size}, ${qty}, ${sort_order})
+          ON CONFLICT (style, color, size)
+          DO UPDATE SET sort_order = COALESCE(EXCLUDED.sort_order, inventory_balance.sort_order)
           RETURNING id
         `
         if (result.length) added++

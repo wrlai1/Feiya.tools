@@ -43,13 +43,15 @@ function SettingsModal({ onClose, onUploaded, getToken }) {
       const raw  = parseCSV(text)
       if (!raw.length) throw new Error('CSV appears to be empty or unreadable')
 
-      // Normalise to Pascal case and set Quantity: 0 (add-rows preserves existing qty)
+      // Normalise to Pascal case, set Quantity: 0, and capture row index as SortOrder
+      // so the DB can return rows in the original SalesTEMPLATE.csv sequence.
       const rows = raw
-        .map(r => ({
-          Style:    String(r.STYLE || r.Style || r.style || '').trim(),
-          Color:    String(r.COLOR || r.Color || r.color || '').trim(),
-          Size:     String(r.SIZE  || r.Size  || r.size  || '').trim(),
-          Quantity: 0,
+        .map((r, i) => ({
+          Style:     String(r.STYLE || r.Style || r.style || '').trim(),
+          Color:     String(r.COLOR || r.Color || r.color || '').trim(),
+          Size:      String(r.SIZE  || r.Size  || r.size  || '').trim(),
+          Quantity:  0,
+          SortOrder: i,
         }))
         .filter(r => r.Style && r.Color && r.Size)
       if (!rows.length) throw new Error('No valid STYLE / COLOR / SIZE rows found')
