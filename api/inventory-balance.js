@@ -66,6 +66,10 @@ async function ensureTables(sql) {
   // sort_order preserves the original SalesTEMPLATE.csv row sequence so the
   // filled-template Excel download comes out in the same order as the template.
   await sql`ALTER TABLE inventory_balance ADD COLUMN IF NOT EXISTS sort_order INTEGER`
+  // Seed sort_order from id for any rows that are still NULL (e.g. imported
+  // before this column existed). Gives a stable insertion-order fallback until
+  // the user re-uploads the SalesTEMPLATE.csv to get the exact template order.
+  await sql`UPDATE inventory_balance SET sort_order = id WHERE sort_order IS NULL`
   // For inventory_snapshots we check whether the live table matches our expected
   // schema.  If stale NOT-NULL columns exist (snap_id, ts, …) from an older
   // version, drop and recreate the whole table — snapshots are ephemeral rollback
