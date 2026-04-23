@@ -296,11 +296,8 @@ export async function generateExcel(filledRows, unmatchedRows = [], baseName = '
 
   const wb = XLSX.utils.book_new()
 
-  // Sheet 1 — filled template (all rows, sorted by STYLE)
-  const sorted = [...filledRows].sort((a, b) =>
-    String(a.STYLE).localeCompare(String(b.STYLE), undefined, { numeric: true })
-  )
-  const ws1 = XLSX.utils.json_to_sheet(sorted, { header: ['STYLE', 'COLOR', 'SIZE', 'QTY'] })
+  // Sheet 1 — filled template in original template row order (preserves bucket insertion order)
+  const ws1 = XLSX.utils.json_to_sheet(filledRows, { header: ['STYLE', 'COLOR', 'SIZE', 'QTY'] })
   XLSX.utils.book_append_sheet(wb, ws1, 'Filled Template')
 
   // Sheet 2 — unmatched sales rows (for review)
