@@ -21,9 +21,28 @@ export function normalizeColor(s) {
     .trim()
 }
 
-/** Normalize a size string */
+/**
+ * Normalize a style string for bucket-key matching only (NOT for output).
+ * Lowercases and strips everything except alphanumeric so that:
+ *   LT366 === Lt366, M017-MISSY === M017Missy, 95401 CAPRI === 95401 Capri
+ */
+export function normalizeStyle(s) {
+  return String(s)
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '')  // keep only alphanumeric
+}
+
+/**
+ * Normalize a size string.
+ * Also maps plus-size variants: 1XL → 1X, 2XL → 2X, 3XL → 3X
+ * so sales and template entries match regardless of which convention is used.
+ */
 export function normalizeSize(s) {
-  return String(s).trim().toUpperCase().replace(/\s+/g, '')
+  return String(s)
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, '')
+    .replace(/^([123])XL$/, '$1X')   // 1XL→1X, 2XL→2X, 3XL→3X
 }
 
 // ── Color scoring ─────────────────────────────────────────────────────────────
@@ -84,18 +103,20 @@ export function parseCSV(text) {
  * @returns {{ filledRows, unmatchedRows, stats }}
  */
 export function fillTemplate(templateRows, salesRows) {
-  // Build per-(STYLE, SIZE) buckets so we only compare colors within the same style+size
-  // Each bucket entry tracks accumulated qty
+  // Build per-(normalizedStyle, normalizedSize) buckets.
+  // Keys are normalized so that LT366===Lt366, 1XL===1X, M017-MISSY===M017Missy, etc.
+  // Bucket entries keep the ORIGINAL template values for output.
   const buckets = new Map()
 
   templateRows.forEach(r => {
-    const style = String(r.STYLE || r.style || '').trim()
-    const size  = normalizeSize(String(r.SIZE || r.size || ''))
-    const color = String(r.COLOR || r.color || '').trim()
-    const key   = `${style}||${size}`
+    const style    = String(r.STYLE || r.style || '').trim()
+    const size     = String(r.SIZE  || r.size  || '').trim()
+    const color    = String(r.COLOR || r.color || '').trim()
+    const normKey  = `${normalizeStyle(style)}||${normalizeSize(size)}`
 
-    if (!buckets.has(key)) buckets.set(key, [])
-    buckets.get(key).push({ style, color, size, qty: 0 })
+    if (!buckets.has(normKey)) buckets.set(normKey, [])
+    // Keep ORIGINAL style/color/size for output — must match what's stored in the DB
+    buckets.get(normKey).push({ style, color, size, qty: 0 })
   })
 
   let srcTotal    = 0
@@ -103,19 +124,37 @@ export function fillTemplate(templateRows, salesRows) {
   const unmatchedRows = []
 
   salesRows.forEach(row => {
-    const style = String(row.style || row.STYLE || '').trim()
-    const color = String(row.color || row.COLOR || '').trim()
-    const size  = normalizeSize(String(row.size || row.SIZE || ''))
-    const qty   = parseInt(row.QTY || row.qty || 0, 10) || 0
+    const style    = String(row.style || row.STYLE || '').trim()
+    const color    = String(row.color || row.COLOR || '').trim()
+    const rawSize  = String(row.size  || row.SIZE  || '').trim()
+    const qty      = parseInt(row.QTY || row.qty || 0, 10) || 0
 
     if (!style || !qty) return
     srcTotal += qty
 
-    const key        = `${style}||${size}`
-    const candidates = buckets.get(key)
+    const normStyle = normalizeStyle(style)
+    const normSize  = normalizeSize(rawSize)
+    const key       = `${normStyle}||${normSize}`
+    let   candidates = buckets.get(key)
+
+    // ── Style-prefix fallback ─────────────────────────────────────────────────
+    // Handles cases where sales omits a suffix the template includes, e.g.:
+    //   sales "80423" → template "80423W"  (or vice-versa)
+    if (!candidates?.length) {
+      for (const [bkey, bucket] of buckets.entries()) {
+        const sep    = bkey.lastIndexOf('||')
+        const bstyle = bkey.slice(0, sep)
+        const bsize  = bkey.slice(sep + 2)
+        if (bsize === normSize && bstyle !== normStyle &&
+            (bstyle.startsWith(normStyle) || normStyle.startsWith(bstyle))) {
+          candidates = bucket
+          break
+        }
+      }
+    }
 
     if (!candidates?.length) {
-      unmatchedRows.push({ style, color, size, qty })
+      unmatchedRows.push({ style, color, size: normSize, qty })
       return
     }
 
@@ -131,7 +170,7 @@ export function fillTemplate(templateRows, salesRows) {
       candidates[bestIdx].qty += qty
       filledTotal += qty
     } else {
-      unmatchedRows.push({ style, color, size, qty })
+      unmatchedRows.push({ style, color, size: normSize, qty })
     }
   })
 
