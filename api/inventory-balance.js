@@ -69,6 +69,12 @@ async function ensureTables(sql) {
       created_at  TIMESTAMPTZ DEFAULT NOW()
     )
   `
+  // One-time migration: drop stale snap_id column that was added in an earlier
+  // schema version and is no longer part of the model.  DROP COLUMN IF EXISTS
+  // is idempotent — safe to run on every cold start.
+  await sql`
+    ALTER TABLE inventory_snapshots DROP COLUMN IF EXISTS snap_id
+  `
 }
 
 async function saveSnapshot(sql, label, sourceName = '') {
