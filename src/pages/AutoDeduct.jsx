@@ -25,8 +25,13 @@ function SettingsModal({ onClose, onUploaded, getToken }) {
   const toast = useToast()
 
   useEffect(() => {
-    fetch(`${BASE}/auto-deduct?action=config`, { headers: authHeaders(getToken()) })
-      .then(r => r.json()).then(setStatus).catch(() => {})
+    fetch(`${BASE}/inventory-balance?action=list`, { headers: authHeaders(getToken()) })
+      .then(r => r.json())
+      .then(data => setStatus({
+        template_exists: data.initialized,
+        template_name:   data.initialized ? `${data.rows?.length || 0} SKUs loaded` : null,
+      }))
+      .catch(() => {})
   }, [getToken])
 
   const handleSave = async () => {
@@ -35,18 +40,32 @@ function SettingsModal({ onClose, onUploaded, getToken }) {
     try {
       // Parse CSV client-side, send rows as JSON — no file upload needed
       const text = await file.text()
-      const rows = parseCSV(text)
-      if (!rows.length) throw new Error('CSV appears to be empty or unreadable')
+      const raw  = parseCSV(text)
+      if (!raw.length) throw new Error('CSV appears to be empty or unreadable')
 
-      const res = await fetch(`${BASE}/auto-deduct?action=upload-template`, {
+      // Normalise to Pascal case and set Quantity: 0 (add-rows preserves existing qty)
+      const rows = raw
+        .map(r => ({
+          Style:    String(r.STYLE || r.Style || r.style || '').trim(),
+          Color:    String(r.COLOR || r.Color || r.color || '').trim(),
+          Size:     String(r.SIZE  || r.Size  || r.size  || '').trim(),
+          Quantity: 0,
+        }))
+        .filter(r => r.Style && r.Color && r.Size)
+      if (!rows.length) throw new Error('No valid STYLE / COLOR / SIZE rows found')
+
+      const res = await fetch(`${BASE}/inventory-balance?action=add-rows`, {
         method:  'POST',
         headers: authHeaders(getToken(), true),
-        body:    JSON.stringify({ rows, fileName: file.name }),
+        body:    JSON.stringify({ rows }),
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error)
 
-      toast.success(`Template uploaded — ${data.count} combinations stored`, 'Template Updated')
+      toast.success(
+        `${data.added} new SKU${data.added !== 1 ? 's' : ''} added to inventory balance`,
+        'Template Synced'
+      )
       onUploaded?.()
       onClose()
     } catch (e) {
@@ -150,9 +169,9 @@ export default function AutoDeduct() {
   const toast = useToast()
 
   useEffect(() => {
-    fetch(`${BASE}/auto-deduct?action=config`, { headers: authHeaders(getToken()) })
+    fetch(`${BASE}/inventory-balance?action=list`, { headers: authHeaders(getToken()) })
       .then(r => r.json())
-      .then(cfg => { setConfigError(null); setTemplateMissing(!cfg.template_exists) })
+      .then(data => { setConfigError(null); setTemplateMissing(!data.initialized) })
       .catch(err => setConfigError(err.message))
   }, [getToken])
 
@@ -164,11 +183,11 @@ export default function AutoDeduct() {
     if (!srcFile || processing) return
     setProcessing(true); setResult(null); setApplied(false)
     try {
-      // 1. Fetch template from DB
-      const tRes  = await fetch(`${BASE}/auto-deduct?action=template`, { headers: authHeaders(getToken()) })
+      // 1. Fetch template from inventory balance (canonical SKU list)
+      const tRes  = await fetch(`${BASE}/inventory-balance?action=list`, { headers: authHeaders(getToken()) })
       const tData = await tRes.json()
-      if (!tRes.ok) throw new Error(tData.error || 'Could not load template')
-      const templateRows = tData.rows || []
+      if (!tRes.ok) throw new Error(tData.error || 'Could not load inventory balance')
+      const templateRows = (tData.rows || []).map(r => ({ STYLE: r.Style, COLOR: r.Color, SIZE: r.Size }))
 
       // 2. Parse sales CSV client-side
       const salesText = await srcFile.text()
@@ -206,7 +225,7 @@ export default function AutoDeduct() {
     if (!result?.filledRows || applying) return
     setApplying(true)
     try {
-      const res = await fetch(`${BASE}/auto-deduct?action=apply`, {
+      const res = await fetch(`${BASE}/inventory-balance?action=apply`, {
         method:  'POST',
         headers: authHeaders(getToken(), true),
         body:    JSON.stringify({
@@ -219,8 +238,8 @@ export default function AutoDeduct() {
       if (!res.ok) throw new Error(data.error)
       setApplied(true)
       toast.success(
-        `${data.totalQty.toLocaleString()} units ${txnType === 'sales' ? 'logged as deducted' : 'logged as returned'}`,
-        'Transaction Logged'
+        `${data.applied_units.toLocaleString()} units ${txnType === 'sales' ? 'deducted from inventory' : 'returned to inventory'}`,
+        'Inventory Updated'
       )
     } catch (err) {
       toast.error(err.message, 'Apply Failed')

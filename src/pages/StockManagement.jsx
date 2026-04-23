@@ -1,30 +1,58 @@
 import React, { useState, useMemo, useCallback, useEffect, useTransition } from 'react'
 import {
-  Boxes,
-  Search,
-  Download,
-  RefreshCw,
-  CheckCircle,
-  AlertTriangle,
-  XCircle,
-  TrendingUp,
-  ChevronDown,
-  ChevronUp,
-  ServerCrash,
-  Upload,
-  X,
-  FileUp,
-  Pencil,
-  Plus,
-  Minus,
+  Boxes, Search, Download, RefreshCw, CheckCircle, AlertTriangle, XCircle,
+  TrendingUp, ChevronDown, ChevronUp, ServerCrash, Upload, X, FileUp,
+  Pencil, Plus, Minus,
 } from 'lucide-react'
 import DataTable from '../components/DataTable.jsx'
 import FileUploadZone from '../components/FileUploadZone.jsx'
 import { useToast } from '../hooks/useToast.js'
-import {
-  getBalance, initBalance, resetBalance, getTransactions, getHistory, restoreSnapshot,
-  editQuantity, previewAddRows, confirmAddRows, previewRemoveRows, confirmRemoveRows,
-} from '../utils/inventoryFillApi.js'
+import { useAuth } from '../context/AuthContext.jsx'
+import { parseCSV } from '../utils/autoDeductEngine.js'
+
+const BASE = '/api'
+const MAX_SNAPSHOTS = 5
+
+function authHeaders(token, json = false) {
+  const h = { Authorization: `Bearer ${token}` }
+  if (json) h['Content-Type'] = 'application/json'
+  return h
+}
+
+async function apiFetch(url, options = {}) {
+  let res
+  try {
+    res = await fetch(url, options)
+  } catch {
+    throw new Error('Cannot reach the inventory server. Check your connection.')
+  }
+  const json = await res.json().catch(() => ({ error: res.statusText }))
+  if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`)
+  return json
+}
+
+/** Parse a CSV or XLSX file into an array of plain objects */
+async function parseFileRows(file) {
+  if (file.name.toLowerCase().endsWith('.csv')) {
+    const text = await file.text()
+    return parseCSV(text)
+  }
+  const XLSX = await import('xlsx')
+  const buf  = await file.arrayBuffer()
+  const wb   = XLSX.read(buf, { type: 'array' })
+  const ws   = wb.Sheets[wb.SheetNames[0]]
+  return XLSX.utils.sheet_to_json(ws, { defval: '' })
+}
+
+/** Normalise a row from any case convention into {Style, Color, Size, Quantity} */
+function normaliseRow(r) {
+  return {
+    Style:    String(r.Style    || r.style    || r.STYLE    || '').trim(),
+    Color:    String(r.Color    || r.color    || r.COLOR    || '').trim(),
+    Size:     String(r.Size     || r.size     || r.SIZE     || '').trim(),
+    Quantity: parseInt(r.Quantity ?? r.quantity ?? r.QUANTITY ?? 0, 10) || 0,
+  }
+}
 
 function rowColor(row) {
   const n = Number(row.Quantity)
@@ -34,7 +62,7 @@ function rowColor(row) {
 }
 
 // ── Edit Quantity Modal ────────────────────────────────────────────────────────
-function EditQtyModal({ row, onClose, onDone }) {
+function EditQtyModal({ row, onClose, onDone, getToken }) {
   const [qty,     setQty]     = useState(String(row.Quantity ?? 0))
   const [loading, setLoading] = useState(false)
   const toast = useToast()
@@ -44,9 +72,13 @@ function EditQtyModal({ row, onClose, onDone }) {
     if (isNaN(n)) { toast.error('Please enter a valid number'); return }
     setLoading(true)
     try {
-      const res = await editQuantity(row.style_n, row.size_n, row.color_n, n)
+      const data = await apiFetch(`${BASE}/inventory-balance?action=edit&id=${row.id}`, {
+        method:  'PATCH',
+        headers: authHeaders(getToken(), true),
+        body:    JSON.stringify({ quantity: n }),
+      })
       toast.success(
-        `${row.Style} / ${row.Color} / ${row.Size}: ${res.old_quantity} → ${res.new_quantity}`,
+        `${row.Style} / ${row.Color} / ${row.Size}: ${data.old_quantity} → ${data.new_quantity}`,
         'Quantity Updated'
       )
       onDone()
@@ -106,10 +138,10 @@ function EditQtyModal({ row, onClose, onDone }) {
 }
 
 // ── Add Rows Modal ─────────────────────────────────────────────────────────────
-function AddRowsModal({ onClose, onDone }) {
+function AddRowsModal({ onClose, onDone, currentRows, getToken }) {
   const [file,    setFile]    = useState(null)
   const [preview, setPreview] = useState(null)   // {to_add, already_exists}
-  const [step,    setStep]    = useState('upload') // upload | preview | done
+  const [step,    setStep]    = useState('upload')
   const [loading, setLoading] = useState(false)
   const toast = useToast()
 
@@ -117,8 +149,23 @@ function AddRowsModal({ onClose, onDone }) {
     if (!file) return
     setLoading(true)
     try {
-      const res = await previewAddRows(file)
-      setPreview(res)
+      const uploaded   = await parseFileRows(file)
+      const balanceSet = new Set(currentRows.map(r => `${r.Style}|||${r.Color}|||${r.Size}`))
+      const to_add        = []
+      const already_exists = []
+
+      for (const raw of uploaded) {
+        const r = normaliseRow(raw)
+        if (!r.Style || !r.Color || !r.Size) continue
+        const key = `${r.Style}|||${r.Color}|||${r.Size}`
+        if (balanceSet.has(key)) {
+          const existing = currentRows.find(x => x.Style === r.Style && x.Color === r.Color && x.Size === r.Size)
+          already_exists.push({ Style: r.Style, Color: r.Color, Size: r.Size, current_quantity: existing?.Quantity ?? 0 })
+        } else {
+          to_add.push({ Style: r.Style, Color: r.Color, Size: r.Size, Quantity: r.Quantity })
+        }
+      }
+      setPreview({ to_add, already_exists })
       setStep('preview')
     } catch (err) {
       toast.error(err.message, 'Preview Failed')
@@ -131,8 +178,12 @@ function AddRowsModal({ onClose, onDone }) {
     if (!preview?.to_add?.length) return
     setLoading(true)
     try {
-      const res = await confirmAddRows(preview.to_add)
-      toast.success(`Added ${res.added} new SKU${res.added !== 1 ? 's' : ''} to balance`, 'Rows Added')
+      const data = await apiFetch(`${BASE}/inventory-balance?action=add-rows`, {
+        method:  'POST',
+        headers: authHeaders(getToken(), true),
+        body:    JSON.stringify({ rows: preview.to_add }),
+      })
+      toast.success(`Added ${data.added} new SKU${data.added !== 1 ? 's' : ''} to balance`, 'Rows Added')
       onDone()
       onClose()
     } catch (err) {
@@ -187,7 +238,6 @@ function AddRowsModal({ onClose, onDone }) {
 
         {step === 'preview' && preview && (
           <>
-            {/* Will be added */}
             <div>
               <p className="text-sm font-medium text-slate-700 mb-2">
                 <span className="text-green-600 font-bold">{preview.to_add.length}</span> new SKU{preview.to_add.length !== 1 ? 's' : ''} to add
@@ -215,7 +265,6 @@ function AddRowsModal({ onClose, onDone }) {
               )}
             </div>
 
-            {/* Already exists */}
             {preview.already_exists.length > 0 && (
               <div>
                 <p className="text-sm font-medium text-slate-500 mb-2">
@@ -260,7 +309,7 @@ function AddRowsModal({ onClose, onDone }) {
 }
 
 // ── Remove Rows Modal ──────────────────────────────────────────────────────────
-function RemoveRowsModal({ onClose, onDone }) {
+function RemoveRowsModal({ onClose, onDone, currentRows, getToken }) {
   const [file,    setFile]    = useState(null)
   const [preview, setPreview] = useState(null)   // {to_remove, not_found}
   const [step,    setStep]    = useState('upload')
@@ -271,8 +320,23 @@ function RemoveRowsModal({ onClose, onDone }) {
     if (!file) return
     setLoading(true)
     try {
-      const res = await previewRemoveRows(file)
-      setPreview(res)
+      const uploaded   = await parseFileRows(file)
+      const balanceMap = new Map(currentRows.map(r => [`${r.Style}|||${r.Color}|||${r.Size}`, r]))
+      const to_remove = []
+      const not_found  = []
+
+      for (const raw of uploaded) {
+        const r = normaliseRow(raw)
+        if (!r.Style || !r.Color || !r.Size) continue
+        const key   = `${r.Style}|||${r.Color}|||${r.Size}`
+        const found = balanceMap.get(key)
+        if (found) {
+          to_remove.push(found) // already has id, Style, Color, Size, Quantity
+        } else {
+          not_found.push({ Style: r.Style, Color: r.Color, Size: r.Size })
+        }
+      }
+      setPreview({ to_remove, not_found })
       setStep('preview')
     } catch (err) {
       toast.error(err.message, 'Preview Failed')
@@ -288,8 +352,13 @@ function RemoveRowsModal({ onClose, onDone }) {
     )) return
     setLoading(true)
     try {
-      const res = await confirmRemoveRows(preview.to_remove)
-      toast.success(`Removed ${res.removed} SKU${res.removed !== 1 ? 's' : ''} from balance`, 'Rows Removed')
+      const ids  = preview.to_remove.map(r => r.id)
+      const data = await apiFetch(`${BASE}/inventory-balance?action=remove-rows`, {
+        method:  'DELETE',
+        headers: authHeaders(getToken(), true),
+        body:    JSON.stringify({ ids }),
+      })
+      toast.success(`Removed ${data.removed} SKU${data.removed !== 1 ? 's' : ''} from balance`, 'Rows Removed')
       onDone()
       onClose()
     } catch (err) {
@@ -347,7 +416,6 @@ function RemoveRowsModal({ onClose, onDone }) {
 
         {step === 'preview' && preview && (
           <>
-            {/* Will be removed */}
             <div>
               <p className="text-sm font-medium text-slate-700 mb-2">
                 <span className="text-red-600 font-bold">{preview.to_remove.length}</span> SKU{preview.to_remove.length !== 1 ? 's' : ''} will be removed
@@ -375,7 +443,6 @@ function RemoveRowsModal({ onClose, onDone }) {
               )}
             </div>
 
-            {/* Not found */}
             {preview.not_found.length > 0 && (
               <div>
                 <p className="text-sm font-medium text-slate-500 mb-2">
@@ -434,7 +501,7 @@ function StatCard({ label, value, icon: Icon, iconBg, iconColor }) {
 }
 
 // ── Version History (snapshots + transaction log) ─────────────────────────────
-function VersionHistory({ onRestore }) {
+function VersionHistory({ onRestore, getToken }) {
   const [snapOpen,  setSnapOpen]  = useState(false)
   const [logOpen,   setLogOpen]   = useState(false)
   const [snapshots, setSnapshots] = useState([])
@@ -444,25 +511,23 @@ function VersionHistory({ onRestore }) {
   const [restoring, setRestoring] = useState(null)
   const toast = useToast()
 
-  // Load snapshots when panel opens
   useEffect(() => {
     if (!snapOpen) return
     setLoadingS(true)
-    getHistory()
+    apiFetch(`${BASE}/inventory-balance?action=history`, { headers: authHeaders(getToken()) })
       .then((d) => setSnapshots(d.snapshots || []))
       .catch(() => {})
       .finally(() => setLoadingS(false))
-  }, [snapOpen])
+  }, [snapOpen, getToken])
 
-  // Load transaction log when panel opens
   useEffect(() => {
     if (!logOpen) return
     setLoadingL(true)
-    getTransactions()
+    apiFetch(`${BASE}/inventory-balance?action=transactions`, { headers: authHeaders(getToken()) })
       .then((d) => setLog(d.transactions || []))
       .catch(() => {})
       .finally(() => setLoadingL(false))
-  }, [logOpen])
+  }, [logOpen, getToken])
 
   const handleRestore = async (snap) => {
     if (!window.confirm(
@@ -473,14 +538,16 @@ function VersionHistory({ onRestore }) {
 
     setRestoring(snap.id)
     try {
-      const res = await restoreSnapshot(snap.id)
+      const res = await apiFetch(`${BASE}/inventory-balance?action=restore&id=${snap.id}`, {
+        method:  'POST',
+        headers: authHeaders(getToken()),
+      })
       toast.success(
         `Restored to ${snap.timestamp} — ${res.total_units.toLocaleString()} units`,
         'Balance Restored'
       )
       onRestore()
-      // Refresh snapshot list
-      const d = await getHistory()
+      const d = await apiFetch(`${BASE}/inventory-balance?action=history`, { headers: authHeaders(getToken()) })
       setSnapshots(d.snapshots || [])
     } catch (err) {
       toast.error(err.message, 'Restore Failed')
@@ -490,11 +557,12 @@ function VersionHistory({ onRestore }) {
   }
 
   const labelColors = {
-    sales:      'bg-orange-100 text-orange-700',
-    return:     'bg-green-100 text-green-700',
-    pre_init:   'bg-blue-100 text-blue-700',
-    pre_reset:  'bg-red-100 text-red-700',
-    pre_restore:'bg-purple-100 text-purple-700',
+    sales:       'bg-orange-100 text-orange-700',
+    return:      'bg-green-100 text-green-700',
+    pre_init:    'bg-blue-100 text-blue-700',
+    pre_reset:   'bg-red-100 text-red-700',
+    pre_restore: 'bg-purple-100 text-purple-700',
+    pre_remove:  'bg-rose-100 text-rose-700',
   }
 
   return (
@@ -511,9 +579,7 @@ function VersionHistory({ onRestore }) {
               last {snapshots.length || MAX_SNAPSHOTS} saves
             </span>
           </div>
-          {snapOpen
-            ? <ChevronUp   className="w-4 h-4 text-slate-400" />
-            : <ChevronDown className="w-4 h-4 text-slate-400" />}
+          {snapOpen ? <ChevronUp className="w-4 h-4 text-slate-400" /> : <ChevronDown className="w-4 h-4 text-slate-400" />}
         </button>
 
         {snapOpen && (
@@ -531,10 +597,7 @@ function VersionHistory({ onRestore }) {
             ) : (
               <div className="space-y-2">
                 {snapshots.map((snap, i) => (
-                  <div
-                    key={snap.id}
-                    className="flex items-center justify-between gap-3 py-2.5 border-b border-slate-50 last:border-0"
-                  >
+                  <div key={snap.id} className="flex items-center justify-between gap-3 py-2.5 border-b border-slate-50 last:border-0">
                     <div className="flex items-center gap-3 min-w-0">
                       <div className="w-7 h-7 rounded-full bg-slate-100 flex items-center justify-center flex-shrink-0 text-xs font-bold text-slate-500">
                         {i + 1}
@@ -556,9 +619,7 @@ function VersionHistory({ onRestore }) {
                       disabled={restoring === snap.id}
                       className="flex-shrink-0 flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                     >
-                      {restoring === snap.id
-                        ? <RefreshCw className="w-3 h-3 animate-spin" />
-                        : null}
+                      {restoring === snap.id ? <RefreshCw className="w-3 h-3 animate-spin" /> : null}
                       Restore
                     </button>
                   </div>
@@ -576,9 +637,7 @@ function VersionHistory({ onRestore }) {
           className="w-full flex items-center justify-between px-5 py-3.5 text-sm font-medium text-slate-700 hover:bg-slate-50 transition-colors"
         >
           <span>Transaction Log</span>
-          {logOpen
-            ? <ChevronUp   className="w-4 h-4 text-slate-400" />
-            : <ChevronDown className="w-4 h-4 text-slate-400" />}
+          {logOpen ? <ChevronUp className="w-4 h-4 text-slate-400" /> : <ChevronDown className="w-4 h-4 text-slate-400" />}
         </button>
 
         {logOpen && (
@@ -598,7 +657,7 @@ function VersionHistory({ onRestore }) {
                         t.transaction_type === 'sales' ? 'bg-orange-100 text-orange-600' : 'bg-green-100 text-green-600'
                       }`}>
                         {t.transaction_type === 'sales'
-                          ? <XCircle   className="w-3.5 h-3.5" />
+                          ? <XCircle    className="w-3.5 h-3.5" />
                           : <TrendingUp className="w-3.5 h-3.5" />}
                       </span>
                       <div>
@@ -623,11 +682,8 @@ function VersionHistory({ onRestore }) {
   )
 }
 
-// Expose MAX_SNAPSHOTS to the component label
-const MAX_SNAPSHOTS = 5
-
 // ── Import / Update modal ─────────────────────────────────────────────────────
-function ImportModal({ onClose, onDone }) {
+function ImportModal({ onClose, onDone, getToken }) {
   const [file,    setFile]    = useState(null)
   const [loading, setLoading] = useState(false)
   const toast = useToast()
@@ -636,9 +692,17 @@ function ImportModal({ onClose, onDone }) {
     if (!file) return
     setLoading(true)
     try {
-      const res = await initBalance(file)
+      const uploaded = await parseFileRows(file)
+      const rows     = uploaded.map(normaliseRow).filter(r => r.Style && r.Color && r.Size)
+      if (!rows.length) throw new Error('No valid rows found in file')
+
+      const data = await apiFetch(`${BASE}/inventory-balance?action=init`, {
+        method:  'POST',
+        headers: authHeaders(getToken(), true),
+        body:    JSON.stringify({ rows, sourceName: file.name }),
+      })
       toast.success(
-        `Balance updated: ${res.total_rows.toLocaleString()} rows · ${res.total_units.toLocaleString()} units`,
+        `Balance updated: ${data.total_rows.toLocaleString()} rows · ${data.total_units.toLocaleString()} units`,
         'Inventory Imported'
       )
       onDone()
@@ -653,8 +717,6 @@ function ImportModal({ onClose, onDone }) {
   return (
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
       <div className="bg-white rounded-2xl shadow-xl w-full max-w-lg p-6 space-y-5">
-
-        {/* Header */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-9 h-9 bg-blue-100 rounded-xl flex items-center justify-center">
@@ -670,7 +732,6 @@ function ImportModal({ onClose, onDone }) {
           </button>
         </div>
 
-        {/* Info banner */}
         <div className="flex items-start gap-2.5 bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 text-sm text-amber-800">
           <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
           <p>
@@ -679,7 +740,6 @@ function ImportModal({ onClose, onDone }) {
           </p>
         </div>
 
-        {/* File requirements */}
         <div className="bg-slate-50 rounded-xl px-4 py-3 text-xs text-slate-500 space-y-1">
           <p className="font-medium text-slate-600">Required columns:</p>
           <div className="flex flex-wrap gap-1.5 mt-1">
@@ -692,41 +752,22 @@ function ImportModal({ onClose, onDone }) {
           <p className="mt-1.5">Accepts CSV or Excel. Column names are detected automatically.</p>
         </div>
 
-        {/* Upload zone */}
         <FileUploadZone
-          onFile={setFile}
-          accept=".csv,.xlsx,.xls"
-          acceptedTypes="CSV, XLSX"
-          label="Drag & drop your updated inventory file"
-          sublabel="or click to browse"
-          currentFile={file}
-          onClear={() => setFile(null)}
+          onFile={setFile} accept=".csv,.xlsx,.xls" acceptedTypes="CSV, XLSX"
+          label="Drag & drop your updated inventory file" sublabel="or click to browse"
+          currentFile={file} onClear={() => setFile(null)}
         />
 
-        {/* Actions */}
         <div className="flex gap-2 pt-1">
-          <button
-            onClick={onClose}
-            className="btn-secondary flex-1 justify-center py-2.5"
-          >
-            Cancel
-          </button>
+          <button onClick={onClose} className="btn-secondary flex-1 justify-center py-2.5">Cancel</button>
           <button
             onClick={handleImport}
             disabled={!file || loading}
             className="btn-primary flex-1 justify-center py-2.5 disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {loading ? (
-              <>
-                <RefreshCw className="w-4 h-4 animate-spin" />
-                Importing…
-              </>
-            ) : (
-              <>
-                <Upload className="w-4 h-4" />
-                Replace Balance
-              </>
-            )}
+            {loading
+              ? <><RefreshCw className="w-4 h-4 animate-spin" /> Importing…</>
+              : <><Upload className="w-4 h-4" /> Replace Balance</>}
           </button>
         </div>
       </div>
@@ -735,7 +776,7 @@ function ImportModal({ onClose, onDone }) {
 }
 
 // ── Initialize panel ──────────────────────────────────────────────────────────
-function InitializePanel({ onDone }) {
+function InitializePanel({ onDone, getToken }) {
   const [file,    setFile]    = useState(null)
   const [loading, setLoading] = useState(false)
   const toast = useToast()
@@ -744,9 +785,17 @@ function InitializePanel({ onDone }) {
     if (!file) return
     setLoading(true)
     try {
-      const res = await initBalance(file)
+      const uploaded = await parseFileRows(file)
+      const rows     = uploaded.map(normaliseRow).filter(r => r.Style && r.Color && r.Size)
+      if (!rows.length) throw new Error('No valid rows found in file')
+
+      const data = await apiFetch(`${BASE}/inventory-balance?action=init`, {
+        method:  'POST',
+        headers: authHeaders(getToken(), true),
+        body:    JSON.stringify({ rows, sourceName: file.name }),
+      })
       toast.success(
-        `Balance initialized: ${res.total_rows.toLocaleString()} rows · ${res.total_units.toLocaleString()} units`,
+        `Balance initialized: ${data.total_rows.toLocaleString()} rows · ${data.total_units.toLocaleString()} units`,
         'Balance Ready'
       )
       onDone()
@@ -773,12 +822,9 @@ function InitializePanel({ onDone }) {
       </div>
 
       <FileUploadZone
-        onFile={setFile}
-        accept=".csv,.xlsx,.xls"
-        acceptedTypes="CSV, XLSX"
+        onFile={setFile} accept=".csv,.xlsx,.xls" acceptedTypes="CSV, XLSX"
         label="Drag & drop initial inventory file"
-        currentFile={file}
-        onClear={() => setFile(null)}
+        currentFile={file} onClear={() => setFile(null)}
       />
 
       <button
@@ -786,17 +832,9 @@ function InitializePanel({ onDone }) {
         disabled={!file || loading}
         className="btn-primary w-full justify-center py-2.5 disabled:opacity-50 disabled:cursor-not-allowed"
       >
-        {loading ? (
-          <>
-            <RefreshCw className="w-4 h-4 animate-spin" />
-            Initializing…
-          </>
-        ) : (
-          <>
-            <Upload className="w-4 h-4" />
-            Set as Starting Balance
-          </>
-        )}
+        {loading
+          ? <><RefreshCw className="w-4 h-4 animate-spin" /> Initializing…</>
+          : <><Upload className="w-4 h-4" /> Set as Starting Balance</>}
       </button>
     </div>
   )
@@ -804,7 +842,8 @@ function InitializePanel({ onDone }) {
 
 // ── Main page ─────────────────────────────────────────────────────────────────
 export default function StockManagement() {
-  const [balanceData,    setBalanceData]    = useState(null)   // full API response
+  const { getToken } = useAuth()
+  const [balanceData,    setBalanceData]    = useState(null)
   const [loading,        setLoading]        = useState(true)
   const [inputValue,     setInputValue]     = useState('')
   const [searchQuery,    setSearchQuery]    = useState('')
@@ -815,10 +854,9 @@ export default function StockManagement() {
   const [showImport,     setShowImport]     = useState(false)
   const [showAddRows,    setShowAddRows]    = useState(false)
   const [showRemoveRows, setShowRemoveRows] = useState(false)
-  const [editTarget,     setEditTarget]     = useState(null)   // row to edit qty
+  const [editTarget,     setEditTarget]     = useState(null)
   const toast = useToast()
 
-  // ── Columns (needs setEditTarget in scope) ──────────────────────────────────
   const COLUMNS = useMemo(() => [
     { key: 'Style',    label: 'Style',    sortable: true },
     { key: 'Color',    label: 'Color',    sortable: true },
@@ -828,8 +866,8 @@ export default function StockManagement() {
       label: 'Quantity',
       sortable: true,
       render: (val, row) => {
-        const n = Number(val)
-        const cls = n <= 0 ? 'text-red-600' : n < 5 ? 'text-yellow-600' : 'text-green-600'
+        const n    = Number(val)
+        const cls  = n <= 0 ? 'text-red-600' : n < 5 ? 'text-yellow-600' : 'text-green-600'
         const Icon = n <= 0 ? XCircle : n < 5 ? AlertTriangle : CheckCircle
         return (
           <span className="inline-flex items-center gap-2">
@@ -848,20 +886,22 @@ export default function StockManagement() {
         )
       },
     },
-  ], [setEditTarget])
+  ], [])
 
   const loadBalance = useCallback(async () => {
     setLoading(true)
     setServerError(null)
     try {
-      const data = await getBalance()
+      const data = await apiFetch(`${BASE}/inventory-balance?action=list`, {
+        headers: authHeaders(getToken()),
+      })
       setBalanceData(data)
     } catch (err) {
       setServerError(err.message)
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [getToken])
 
   useEffect(() => { loadBalance() }, [loadBalance])
 
@@ -869,7 +909,10 @@ export default function StockManagement() {
     if (!window.confirm('Reset all quantities to zero? This cannot be undone.')) return
     setResetting(true)
     try {
-      await resetBalance()
+      await apiFetch(`${BASE}/inventory-balance?action=reset`, {
+        method:  'POST',
+        headers: authHeaders(getToken()),
+      })
       toast.info('All quantities reset to zero')
       loadBalance()
     } catch (err) {
@@ -877,7 +920,7 @@ export default function StockManagement() {
     } finally {
       setResetting(false)
     }
-  }, [toast, loadBalance])
+  }, [getToken, toast, loadBalance])
 
   const allRows = balanceData?.rows || []
 
@@ -885,36 +928,32 @@ export default function StockManagement() {
     let rows = allRows
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase()
-      rows = rows.filter(
-        (r) =>
-          (r.Style  || '').toLowerCase().includes(q) ||
-          (r.Color  || '').toLowerCase().includes(q) ||
-          (r.Size   || '').toLowerCase().includes(q)
+      rows = rows.filter(r =>
+        (r.Style || '').toLowerCase().includes(q) ||
+        (r.Color || '').toLowerCase().includes(q) ||
+        (r.Size  || '').toLowerCase().includes(q)
       )
     }
-    if (filter === 'low')  rows = rows.filter((r) => Number(r.Quantity) > 0 && Number(r.Quantity) < 5)
-    if (filter === 'zero') rows = rows.filter((r) => Number(r.Quantity) <= 0)
+    if (filter === 'low')  rows = rows.filter(r => Number(r.Quantity) > 0 && Number(r.Quantity) < 5)
+    if (filter === 'zero') rows = rows.filter(r => Number(r.Quantity) <= 0)
     return rows
   }, [allRows, searchQuery, filter])
 
   const handleExport = useCallback(() => {
     if (!displayRows.length) return
     const header = 'Style,Color,Size,Quantity\n'
-    const body   = displayRows.map((r) =>
-      [r.Style, r.Color, r.Size, r.Quantity].map((v) => `"${v ?? ''}"`).join(',')
+    const body   = displayRows.map(r =>
+      [r.Style, r.Color, r.Size, r.Quantity].map(v => `"${v ?? ''}"`).join(',')
     ).join('\n')
     const blob = new Blob([header + body], { type: 'text/csv' })
     const url  = URL.createObjectURL(blob)
     const a    = document.createElement('a')
-    a.href     = url
-    a.download = `inventory_balance_${Date.now()}.csv`
-    a.click()
+    a.href = url; a.download = `inventory_balance_${Date.now()}.csv`; a.click()
     URL.revokeObjectURL(url)
     toast.success(`Exported ${displayRows.length.toLocaleString()} rows`)
   }, [displayRows, toast])
 
   // ── Render states ──────────────────────────────────────────────────────────
-
   if (serverError) {
     return (
       <div className="space-y-4 max-w-4xl">
@@ -922,11 +961,8 @@ export default function StockManagement() {
         <div className="card p-6 flex items-start gap-3 text-red-700 bg-red-50">
           <ServerCrash className="w-6 h-6 flex-shrink-0 mt-0.5" />
           <div>
-            <p className="font-semibold">Inventory server not reachable</p>
-            <p className="text-sm text-red-500 mt-1">Start it with:</p>
-            <code className="block text-xs bg-red-100 rounded px-3 py-2 mt-1 font-mono">
-              python3.9 inventory_server.py
-            </code>
+            <p className="font-semibold">Could not load inventory</p>
+            <p className="text-sm text-red-500 mt-1">{serverError}</p>
             <button onClick={loadBalance} className="btn-secondary text-sm mt-3">
               <RefreshCw className="w-4 h-4" />
               Retry
@@ -951,20 +987,16 @@ export default function StockManagement() {
   return (
     <div className="space-y-6 max-w-7xl">
       {showImport && (
-        <ImportModal onClose={() => setShowImport(false)} onDone={loadBalance} />
+        <ImportModal onClose={() => setShowImport(false)} onDone={loadBalance} getToken={getToken} />
       )}
       {showAddRows && (
-        <AddRowsModal onClose={() => setShowAddRows(false)} onDone={loadBalance} />
+        <AddRowsModal onClose={() => setShowAddRows(false)} onDone={loadBalance} currentRows={allRows} getToken={getToken} />
       )}
       {showRemoveRows && (
-        <RemoveRowsModal onClose={() => setShowRemoveRows(false)} onDone={loadBalance} />
+        <RemoveRowsModal onClose={() => setShowRemoveRows(false)} onDone={loadBalance} currentRows={allRows} getToken={getToken} />
       )}
       {editTarget && (
-        <EditQtyModal
-          row={editTarget}
-          onClose={() => setEditTarget(null)}
-          onDone={loadBalance}
-        />
+        <EditQtyModal row={editTarget} onClose={() => setEditTarget(null)} onDone={loadBalance} getToken={getToken} />
       )}
 
       {/* Header */}
@@ -990,11 +1022,7 @@ export default function StockManagement() {
                 <Minus className="w-4 h-4" />
                 Remove Styles
               </button>
-              <button
-                onClick={handleReset}
-                disabled={resetting}
-                className="btn-secondary text-sm disabled:opacity-50"
-              >
+              <button onClick={handleReset} disabled={resetting} className="btn-secondary text-sm disabled:opacity-50">
                 {resetting ? <RefreshCw className="w-4 h-4 animate-spin" /> : null}
                 Reset to Zero
               </button>
@@ -1013,7 +1041,7 @@ export default function StockManagement() {
 
       {/* Not initialized → show init panel */}
       {!initialized ? (
-        <InitializePanel onDone={loadBalance} />
+        <InitializePanel onDone={loadBalance} getToken={getToken} />
       ) : (
         <>
           {/* Stats */}
@@ -1027,7 +1055,8 @@ export default function StockManagement() {
               icon={CheckCircle}      iconBg="bg-green-100"  iconColor="text-green-600"
             />
             <StatCard
-              label="Low Stock (< 5)" value={allRows.filter((r) => Number(r.Quantity) > 0 && Number(r.Quantity) < 5).length}
+              label="Low Stock (< 5)"
+              value={allRows.filter(r => Number(r.Quantity) > 0 && Number(r.Quantity) < 5).length}
               icon={AlertTriangle}    iconBg="bg-yellow-100" iconColor="text-yellow-600"
             />
             <StatCard
@@ -1060,13 +1089,9 @@ export default function StockManagement() {
                   { id: 'low',  label: 'Low (< 5)' },
                   { id: 'zero', label: 'Out of Stock' },
                 ].map(({ id, label }) => (
-                  <button
-                    key={id}
-                    onClick={() => setFilter(id)}
+                  <button key={id} onClick={() => setFilter(id)}
                     className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
-                      filter === id
-                        ? 'bg-white text-slate-800 shadow-sm'
-                        : 'text-slate-500 hover:text-slate-700'
+                      filter === id ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'
                     }`}
                   >
                     {label}
@@ -1110,7 +1135,7 @@ export default function StockManagement() {
           </div>
 
           {/* Version history + transaction log */}
-          <VersionHistory onRestore={loadBalance} />
+          <VersionHistory onRestore={loadBalance} getToken={getToken} />
         </>
       )}
     </div>
