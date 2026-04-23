@@ -303,6 +303,72 @@ app.delete('/api/chat-messages', async (req, res) => {
   } catch (err) { return res.status(500).json({ error: err.message }); }
 });
 
+// ─── /api/auto-deduct ─────────────────────────────────────────────────────────
+
+async function ensureDeductLogTable(sql) {
+  await sql`
+    CREATE TABLE IF NOT EXISTS deduct_log (
+      id          SERIAL PRIMARY KEY,
+      txn_type    TEXT NOT NULL,
+      source_name TEXT,
+      applied_by  TEXT NOT NULL,
+      row_count   INTEGER NOT NULL DEFAULT 0,
+      total_qty   INTEGER NOT NULL DEFAULT 0,
+      applied_at  TIMESTAMPTZ DEFAULT NOW()
+    )
+  `;
+}
+
+app.all('/api/auto-deduct', async (req, res) => {
+  try {
+    const sql     = getDB();
+    const secret  = getSecret();
+    const payload = verifyToken(req.headers.authorization, secret);
+    if (!payload) return res.status(401).json({ error: 'Not authenticated' });
+    const isAdmin = payload.role === 'admin';
+    const action  = req.query.action;
+
+    // Ensure app_data table
+    await sql`CREATE TABLE IF NOT EXISTS app_data (
+      key TEXT PRIMARY KEY, value JSONB NOT NULL, updated_at TIMESTAMPTZ DEFAULT NOW()
+    )`;
+
+    if (req.method === 'GET' && action === 'config') {
+      const rows = await sql`SELECT value->>'fileName' AS file_name, updated_at FROM app_data WHERE key = 'autodeduct_template'`;
+      return res.json({ template_exists: rows.length > 0, template_name: rows[0]?.file_name || null, updated_at: rows[0]?.updated_at || null });
+    }
+
+    if (req.method === 'GET' && action === 'template') {
+      const rows = await sql`SELECT value FROM app_data WHERE key = 'autodeduct_template'`;
+      if (!rows[0]) return res.status(404).json({ error: 'No template uploaded yet' });
+      return res.json(rows[0].value);
+    }
+
+    if (req.method === 'POST' && action === 'upload-template') {
+      if (!isAdmin) return res.status(403).json({ error: 'Admin access required' });
+      const { rows, fileName } = req.body || {};
+      if (!Array.isArray(rows) || !rows.length) return res.status(400).json({ error: 'rows array required' });
+      const value = JSON.stringify({ rows, fileName: fileName || 'template.csv', uploadedAt: new Date().toISOString(), uploadedBy: payload.username });
+      await sql`INSERT INTO app_data (key, value, updated_at) VALUES ('autodeduct_template', ${value}::jsonb, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`;
+      return res.json({ ok: true, count: rows.length });
+    }
+
+    if (req.method === 'POST' && action === 'apply') {
+      await ensureDeductLogTable(sql);
+      const { filledRows = [], txnType = 'sales', sourceName = '' } = req.body || {};
+      const rowCount = filledRows.length;
+      const totalQty = filledRows.reduce((s, r) => s + (parseInt(r.QTY, 10) || 0), 0);
+      await sql`INSERT INTO deduct_log (txn_type, source_name, applied_by, row_count, total_qty) VALUES (${txnType}, ${sourceName}, ${payload.username}, ${rowCount}, ${totalQty})`;
+      return res.json({ ok: true, totalQty, rowCount });
+    }
+
+    return res.status(400).json({ error: `Unknown action: ${action}` });
+  } catch (err) {
+    console.error('[/api/auto-deduct]', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── /api/timeclock ───────────────────────────────────────────────────────────
 
 async function ensureTimeTables(sql) {
