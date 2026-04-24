@@ -78,30 +78,32 @@ function lcsLength(a, b) {
   return prev[m]
 }
 
+/**
+ * Split a raw color string into meaningful tokens (2+ chars) for fuzzy matching.
+ * Works on the original string BEFORE space-collapsing so "med denim" → ["med","denim"],
+ * and handles short abbreviations like "bk" (black) or "nvy" (navy).
+ */
+function colorTokens(raw) {
+  return String(raw)
+    .toLowerCase()
+    .replace(/#\s*\d+/g, '')     // remove numeric codes
+    .replace(/[^a-z\s]/g, ' ')  // non-alpha → space
+    .split(/\s+/)
+    .map(t => t.trim())
+    .filter(t => t.length >= 2) // keep 2+ char tokens (catches "bk", "nv" etc.)
+}
+
 // ── Color scoring ─────────────────────────────────────────────────────────────
 
-// MATCH_THRESHOLD: minimum colorScore to accept a match.
-// Anything below this goes to the Unmatched Sales sheet.
-// 0.9 means only exact normalized matches and very-near-miss spelling variants
-// (LCS ratio ≥ 0.85 on normalized strings) are accepted.
-// The old token-level fuzzy fallback (max 0.45) is intentionally removed —
-// it was causing false positives where wrong colors got sales quantities.
-const MATCH_THRESHOLD = 0.9
-
 /**
- * Score how well a sales color matches a template color (0 or 0.9–1.0).
+ * Score how well a sales color matches a template color (0–1).
  *
- * Tiers (in order):
+ * Priority order:
  *   1. Exact normalized string match              → 1.0
- *   2. One normalized string contains the other  → proportional (0–1)
- *      Only passes MATCH_THRESHOLD when coverage ≥ 90%.
- *   3. Normalized-string LCS near-miss            → 0.9
- *      Catches spelling variants: fuchsia/fuschia, med denim/medium denim.
- *      Requires LCS / min(len) ≥ 0.85 on the fully-normalized strings.
- *   4. Everything else                            → 0 (→ unmatched)
- *
- * If you need a new color alias (e.g. a sales abbreviation that never
- * matches), add it to COLOR_ALIASES at the top of this file.
+ *   2. One normalized string contains the other  → proportional score
+ *   3. Token-level LCS fuzzy fallback             → ≤ 0.45
+ *      (handles typos: fuchsia/fuschia, peapock/peacock, demim/denim,
+ *       and abbreviations: "med denim" → "medium denim")
  */
 function colorScore(templateColor, salesColor) {
   const tc = normalizeColor(templateColor)
@@ -112,15 +114,37 @@ function colorScore(templateColor, salesColor) {
   if (tc.includes(sc)) return sc.length / tc.length  // template ⊃ sales
   if (sc.includes(tc)) return tc.length / sc.length  // sales ⊃ template
 
-  // Normalized-string LCS — catches fuchsia/fuschia, med denim/medium denim, etc.
-  // Returns exactly 0.9 so it clears MATCH_THRESHOLD without over-confidence.
+  // ── Normalized-string LCS (catches fuchsia/fuschia, alias near-misses) ────
+  // Compare the fully-normalized (and alias-resolved) strings directly.
+  // Threshold 0.85 avoids false positives between short color words (wine/vine, etc.)
   const minNorm = Math.min(tc.length, sc.length)
   if (minNorm >= 4) {
     const normRatio = lcsLength(tc, sc) / minNorm
-    if (normRatio >= 0.85) return 0.9
+    if (normRatio >= 0.85) return normRatio * 0.9   // near-match on normalized form
   }
 
-  return 0  // no match confident enough → will go to Unmatched Sales
+  // ── Token-level fuzzy fallback ────────────────────────────────────────────
+  // Split original strings into words, then compare word-pairs with LCS ratio.
+  // A sales token matches a template token if LCS / min(lengths) ≥ 0.80.
+  const ttks = colorTokens(templateColor)
+  const stks = colorTokens(salesColor)
+  if (!ttks.length || !stks.length) return 0
+
+  let matched = 0
+  for (const st of stks) {
+    for (const tt of ttks) {
+      const minLen = Math.min(st.length, tt.length)
+      if (minLen < 2) continue
+      // Short tokens (≤3 chars) are abbreviations — use a more lenient threshold
+      const threshold = minLen <= 3 ? 0.65 : 0.80
+      if (lcsLength(st, tt) / minLen >= threshold) { matched++; break }
+    }
+  }
+
+  // Require at least half the sales tokens to find a fuzzy match
+  return (matched > 0 && matched / stks.length >= 0.5)
+    ? (matched / stks.length) * 0.45
+    : 0
 }
 
 // ── CSV parser ────────────────────────────────────────────────────────────────
@@ -168,20 +192,15 @@ export function fillTemplate(templateRows, salesRows) {
   // Bucket entries keep the ORIGINAL template values for output.
   const buckets = new Map()
 
-  // entries[] preserves the exact template row order — this drives the Excel output order.
-  // buckets[] holds references to the same objects so qty accumulates in-place.
-  const entries = []
-
   templateRows.forEach(r => {
     const style    = String(r.STYLE || r.style || '').trim()
     const size     = String(r.SIZE  || r.size  || '').trim()
     const color    = String(r.COLOR || r.color || '').trim()
-    if (!style || !color || !size) return
     const normKey  = `${normalizeStyle(style)}||${normalizeSize(size)}`
-    const entry    = { style, color, size, qty: 0 }
-    entries.push(entry)
+
     if (!buckets.has(normKey)) buckets.set(normKey, [])
-    buckets.get(normKey).push(entry)
+    // Keep ORIGINAL style/color/size for output — must match what's stored in the DB
+    buckets.get(normKey).push({ style, color, size, qty: 0 })
   })
 
   let srcTotal    = 0
@@ -240,7 +259,7 @@ export function fillTemplate(templateRows, salesRows) {
       if (s > bestScore) { bestScore = s; bestIdx = i }
     })
 
-    if (bestIdx >= 0 && bestScore >= MATCH_THRESHOLD) {
+    if (bestIdx >= 0 && bestScore > 0) {
       candidates[bestIdx].qty += qty
       filledTotal += qty
     } else {
@@ -248,9 +267,13 @@ export function fillTemplate(templateRows, salesRows) {
     }
   })
 
-  // Output in exact template order by iterating entries[], not buckets.
-  // Iterating buckets would group by (style+size), scrambling color-first templates.
-  const filledRows = entries.map(e => ({ STYLE: e.style, COLOR: e.color, SIZE: e.size, QTY: e.qty }))
+  // Flatten buckets back into output rows
+  const filledRows = []
+  for (const bucket of buckets.values()) {
+    for (const entry of bucket) {
+      filledRows.push({ STYLE: entry.style, COLOR: entry.color, SIZE: entry.size, QTY: entry.qty })
+    }
+  }
 
   const appendTotal = unmatchedRows.reduce((s, r) => s + r.qty, 0)
 

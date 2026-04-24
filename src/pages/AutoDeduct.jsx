@@ -56,7 +56,7 @@ function SettingsModal({ onClose, onUploaded, getToken }) {
         .filter(r => r.Style && r.Color && r.Size)
       if (!rows.length) throw new Error('No valid STYLE / COLOR / SIZE rows found')
 
-      const res = await fetch(`${BASE}/inventory-balance?action=sync-template`, {
+      const res = await fetch(`${BASE}/inventory-balance?action=add-rows`, {
         method:  'POST',
         headers: authHeaders(getToken(), true),
         body:    JSON.stringify({ rows }),
@@ -64,11 +64,8 @@ function SettingsModal({ onClose, onUploaded, getToken }) {
       const data = await res.json()
       if (!res.ok) throw new Error(data.error)
 
-      const parts = []
-      if (data.added)     parts.push(`${data.added} new SKU${data.added !== 1 ? 's' : ''} added`)
-      if (data.reordered) parts.push(`${data.reordered} reordered`)
       toast.success(
-        parts.length ? parts.join(' · ') : 'Template synced — no changes needed',
+        `${data.added} new SKU${data.added !== 1 ? 's' : ''} added to inventory balance`,
         'Template Synced'
       )
       onUploaded?.()
@@ -127,7 +124,7 @@ function SettingsModal({ onClose, onUploaded, getToken }) {
             onClear={() => setFile(null)}
           />
           <p className="text-xs text-slate-400 mt-1.5">
-            Safe to re-upload anytime — syncs row order and adds new SKUs. Existing quantities are never changed.
+            Template is stored and shared with all users. Uploading replaces the current one.
           </p>
           {err && <p className="text-xs text-red-600 mt-1">{err}</p>}
         </div>
@@ -140,7 +137,7 @@ function SettingsModal({ onClose, onUploaded, getToken }) {
             className="btn-primary text-sm px-4 py-2 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {saving ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Upload className="w-3.5 h-3.5" />}
-            {saving ? 'Syncing…' : 'Sync Template'}
+            Upload Template
           </button>
         </div>
       </div>
@@ -174,9 +171,9 @@ export default function AutoDeduct() {
   const toast = useToast()
 
   useEffect(() => {
-    fetch(`${BASE}/inventory-balance?action=template`, { headers: authHeaders(getToken()) })
+    fetch(`${BASE}/inventory-balance?action=list`, { headers: authHeaders(getToken()) })
       .then(r => r.json())
-      .then(data => { setConfigError(null); setTemplateMissing(!data.rows?.length) })
+      .then(data => { setConfigError(null); setTemplateMissing(!data.initialized) })
       .catch(err => setConfigError(err.message))
   }, [getToken])
 
@@ -188,13 +185,11 @@ export default function AutoDeduct() {
     if (!srcFile || processing) return
     setProcessing(true); setResult(null); setApplied(false)
     try {
-      // 1. Fetch template in its exact saved order (from app_settings, not inventory_balance)
-      //    This guarantees the Excel output always matches the SalesTEMPLATE.csv row sequence.
-      const tRes  = await fetch(`${BASE}/inventory-balance?action=template`, { headers: authHeaders(getToken()) })
+      // 1. Fetch template from inventory balance (canonical SKU list)
+      const tRes  = await fetch(`${BASE}/inventory-balance?action=list`, { headers: authHeaders(getToken()) })
       const tData = await tRes.json()
-      if (!tRes.ok) throw new Error(tData.error || 'Could not load template')
-      if (!tData.rows?.length) throw new Error('Template not uploaded yet — go to Settings and upload SalesTEMPLATE.csv')
-      const templateRows = tData.rows.map(r => ({ STYLE: r.style, COLOR: r.color, SIZE: r.size }))
+      if (!tRes.ok) throw new Error(tData.error || 'Could not load inventory balance')
+      const templateRows = (tData.rows || []).map(r => ({ STYLE: r.Style, COLOR: r.Color, SIZE: r.Size }))
 
       // 2. Parse sales CSV client-side
       const salesText = await srcFile.text()

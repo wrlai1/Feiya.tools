@@ -63,18 +63,13 @@ async function ensureTables(sql) {
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS applied_by TEXT`
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS source_file TEXT`
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS applied_units INTEGER`
+  // sort_order preserves the original SalesTEMPLATE.csv row sequence so the
+  // filled-template Excel download comes out in the same order as the template.
   await sql`ALTER TABLE inventory_balance ADD COLUMN IF NOT EXISTS sort_order INTEGER`
+  // Seed sort_order from id for any rows that are still NULL (e.g. imported
+  // before this column existed). Gives a stable insertion-order fallback until
+  // the user re-uploads the SalesTEMPLATE.csv to get the exact template order.
   await sql`UPDATE inventory_balance SET sort_order = id WHERE sort_order IS NULL`
-  // app_settings: generic key-value store.
-  // Used to persist the SalesTEMPLATE row order (key='template') as a JSON
-  // array so Auto Deduct always outputs rows in the exact template sequence —
-  // independent of sort_order or insertion order in inventory_balance.
-  await sql`
-    CREATE TABLE IF NOT EXISTS app_settings (
-      key   TEXT PRIMARY KEY,
-      value JSONB NOT NULL DEFAULT 'null'::jsonb
-    )
-  `
   // For inventory_snapshots we check whether the live table matches our expected
   // schema.  If stale NOT-NULL columns exist (snap_id, ts, …) from an older
   // version, drop and recreate the whole table — snapshots are ephemeral rollback
@@ -207,16 +202,13 @@ export default async function handler(req, res) {
       return res.json({ ok: true, old_quantity: old.quantity, new_quantity: quantity })
     }
 
-    // ── POST add-rows — sync template order + append new rows ────────────────
-    // On conflict: only updates sort_order, never touches quantity.
-    // (xmax = 0) is a PostgreSQL trick: true for a fresh INSERT, false for
-    // an ON CONFLICT DO UPDATE — lets us report new vs reordered counts.
+    // ── POST add-rows — append new rows, skip existing ────────────────────────
     if (req.method === 'POST' && action === 'add-rows') {
       if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
       const { rows } = req.body || {}
       if (!Array.isArray(rows)) return res.status(400).json({ error: 'rows required' })
 
-      let added = 0, reordered = 0
+      let added = 0
       for (const r of rows) {
         const style      = String(r.Style || r.style || '').trim()
         const color      = String(r.Color || r.color || '').trim()
@@ -229,14 +221,11 @@ export default async function handler(req, res) {
           VALUES (${style}, ${color}, ${size}, ${qty}, ${sort_order})
           ON CONFLICT (style, color, size)
           DO UPDATE SET sort_order = COALESCE(EXCLUDED.sort_order, inventory_balance.sort_order)
-          RETURNING id, (xmax::text::int8 = 0) AS is_new
+          RETURNING id
         `
-        if (result.length) {
-          if (result[0].is_new) added++
-          else reordered++
-        }
+        if (result.length) added++
       }
-      return res.json({ ok: true, added, reordered })
+      return res.json({ ok: true, added })
     }
 
     // ── DELETE remove-rows — delete by ids ────────────────────────────────────
@@ -351,57 +340,6 @@ export default async function handler(req, res) {
 
       const [stat] = await sql`SELECT COALESCE(SUM(quantity),0)::int AS u FROM inventory_balance`
       return res.json({ ok: true, total_units: stat.u })
-    }
-
-    // ── GET template — ordered template rows from app_settings ───────────────
-    // Returns the exact row sequence saved when the user last uploaded
-    // SalesTEMPLATE.csv — used by Auto Deduct to guarantee output order.
-    if (req.method === 'GET' && action === 'template') {
-      const [row] = await sql`SELECT value FROM app_settings WHERE key = 'template'`
-      return res.json({ rows: row?.value ?? [] })
-    }
-
-    // ── POST sync-template — save ordered template + upsert inventory rows ────
-    // Stores the full template as an ordered JSON array (so output order is
-    // always correct), and upserts every row into inventory_balance (adds new
-    // SKUs at qty 0, updates sort_order for existing ones — quantities untouched).
-    if (req.method === 'POST' && action === 'sync-template') {
-      if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
-      const { rows } = req.body || {}
-      if (!Array.isArray(rows)) return res.status(400).json({ error: 'rows required' })
-
-      // 1. Persist ordered template to app_settings
-      const templateData = rows
-        .map(r => ({
-          style: String(r.Style || r.style || '').trim(),
-          color: String(r.Color || r.color || '').trim(),
-          size:  String(r.Size  || r.size  || '').trim(),
-        }))
-        .filter(r => r.style && r.color && r.size)
-
-      await sql`
-        INSERT INTO app_settings (key, value)
-        VALUES ('template', ${JSON.stringify(templateData)}::jsonb)
-        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-      `
-
-      // 2. Upsert rows into inventory_balance
-      let added = 0, reordered = 0
-      for (const [i, r] of templateData.entries()) {
-        const result = await sql`
-          INSERT INTO inventory_balance (style, color, size, quantity, sort_order)
-          VALUES (${r.style}, ${r.color}, ${r.size}, 0, ${i})
-          ON CONFLICT (style, color, size)
-          DO UPDATE SET sort_order = ${i}
-          RETURNING id, (xmax::text::int8 = 0) AS is_new
-        `
-        if (result.length) {
-          if (result[0].is_new) added++
-          else reordered++
-        }
-      }
-
-      return res.json({ ok: true, added, reordered, total: templateData.length })
     }
 
     return res.status(400).json({ error: `Unknown action: ${action}` })
