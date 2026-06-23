@@ -79,72 +79,88 @@ function lcsLength(a, b) {
 }
 
 /**
- * Split a raw color string into meaningful tokens (2+ chars) for fuzzy matching.
- * Works on the original string BEFORE space-collapsing so "med denim" → ["med","denim"],
- * and handles short abbreviations like "bk" (black) or "nvy" (navy).
+ * Split a raw color string into meaningful word tokens (2+ chars).
+ * Strips numeric codes first so "dark denim#2" → ["dark","denim"],
+ * "med denim" → ["med","denim"], "BLACK TR & mill" → ["black","tr","mill"].
  */
 function colorTokens(raw) {
   return String(raw)
     .toLowerCase()
-    .replace(/#\s*\d+/g, '')     // remove numeric codes
+    .replace(/#\s*\d+/g, ' ')    // remove numeric codes
     .replace(/[^a-z\s]/g, ' ')  // non-alpha → space
     .split(/\s+/)
     .map(t => t.trim())
-    .filter(t => t.length >= 2) // keep 2+ char tokens (catches "bk", "nv" etc.)
+    .filter(t => t.length >= 2) // keep 2+ char tokens (catches "tr", "nv" etc.)
 }
 
 // ── Color scoring ─────────────────────────────────────────────────────────────
 
+/** A match is only accepted (auto-filled) when its color score reaches this. */
+export const MATCH_THRESHOLD = 0.9
+
+/**
+ * Pattern / print qualifier words. When a SINGLE-token sales color (e.g. "black")
+ * would subset-match a template color that ALSO carries one of these (e.g. "black
+ * floral"), the print is a distinct product — so we send it to the resolver for the
+ * user to confirm instead of silently merging it.
+ */
+const PATTERN_WORDS = new Set([
+  'floral', 'plaid', 'paisley', 'print', 'stripe', 'striped', 'check', 'checked',
+  'gingham', 'ginhgam', 'camo', 'snake', 'snakeskin', 'houndstooth', 'hounstooth',
+  'texture', 'textured', 'leopard', 'cheetah', 'zebra', 'python', 'tiger', 'tortoise',
+  'flower', 'flw', 'animal', 'geo', 'geometric', 'glen',
+])
+
 /**
  * Score how well a sales color matches a template color (0–1).
+ * Only scores ≥ MATCH_THRESHOLD are accepted; everything else goes to the resolver.
  *
- * Priority order:
- *   1. Exact normalized string match              → 1.0
- *   2. One normalized string contains the other  → proportional score
- *   3. Token-level LCS fuzzy fallback             → ≤ 0.45
- *      (handles typos: fuchsia/fuschia, peapock/peacock, demim/denim,
- *       and abbreviations: "med denim" → "medium denim")
+ * Tiers:
+ *   1. Exact normalized match                                   → 1.0
+ *   2. Token containment — every sales word is in the template  → 0.92
+ *      ("black" ⊆ "BLACK TR & mill", "light denim" ⊆ "knit denim light denim").
+ *      A lone sales word blocked by a print qualifier            → 0.60 (resolver)
+ *   3. Prefix abbreviation ("dazz" → "dazzling blue")           → 0.90
+ *   4. Whole-string typo near-miss (fuchsia/fuschia)            → 0.90
+ *   5. Proportional substring                                   → < threshold
  */
 function colorScore(templateColor, salesColor) {
   const tc = normalizeColor(templateColor)
   const sc = normalizeColor(salesColor)
   if (!tc || !sc) return 0
+  if (tc === sc) return 1.0                            // exact (handles spacing/concat/#)
 
-  if (tc === sc) return 1.0                           // exact
-  if (tc.includes(sc)) return sc.length / tc.length  // template ⊃ sales
-  if (sc.includes(tc)) return tc.length / sc.length  // sales ⊃ template
+  // "near" = same word or a spelling typo (similar length) — NOT subsequence
+  // containment, else short words like "blue" match anything holding b-l-u-e
+  // ("deepblue" → "blue"). Length must be within 2 and LCS ratio ≥ 0.85.
+  const near = (a, b) => a === b ||
+    (Math.min(a.length, b.length) >= 4 && Math.abs(a.length - b.length) <= 2 &&
+     lcsLength(a, b) / Math.min(a.length, b.length) >= 0.85)
 
-  // ── Normalized-string LCS (catches fuchsia/fuschia, alias near-misses) ────
-  // Compare the fully-normalized (and alias-resolved) strings directly.
-  // Threshold 0.85 avoids false positives between short color words (wine/vine, etc.)
-  const minNorm = Math.min(tc.length, sc.length)
-  if (minNorm >= 4) {
-    const normRatio = lcsLength(tc, sc) / minNorm
-    if (normRatio >= 0.85) return normRatio * 0.9   // near-match on normalized form
-  }
-
-  // ── Token-level fuzzy fallback ────────────────────────────────────────────
-  // Split original strings into words, then compare word-pairs with LCS ratio.
-  // A sales token matches a template token if LCS / min(lengths) ≥ 0.80.
-  const ttks = colorTokens(templateColor)
+  // Token containment — every sales word matches a template word (exact or near).
   const stks = colorTokens(salesColor)
-  if (!ttks.length || !stks.length) return 0
-
-  let matched = 0
-  for (const st of stks) {
-    for (const tt of ttks) {
-      const minLen = Math.min(st.length, tt.length)
-      if (minLen < 2) continue
-      // Short tokens (≤3 chars) are abbreviations — use a more lenient threshold
-      const threshold = minLen <= 3 ? 0.65 : 0.80
-      if (lcsLength(st, tt) / minLen >= threshold) { matched++; break }
+  const ttks = colorTokens(templateColor)
+  if (stks.length && ttks.length) {
+    const matched = stks.filter(s => ttks.some(t => near(s, t)))
+    if (matched.length === stks.length) {
+      if (stks.length >= 2) return 0.92                // multi-word subset: specific, safe
+      const extra = ttks.filter(t => !matched.some(m => near(m, t)))
+      if (extra.some(t => PATTERN_WORDS.has(t))) return 0.6  // lone word + print → resolver
+      return 0.92
     }
   }
 
-  // Require at least half the sales tokens to find a fuzzy match
-  return (matched > 0 && matched / stks.length >= 0.5)
-    ? (matched / stks.length) * 0.45
-    : 0
+  // Prefix abbreviation: "dazz" → "dazzlingblue", "bachelorbutt" → "bachelorbutton"
+  if (sc.length >= 4 && tc.startsWith(sc)) return 0.9
+
+  // Proportional substring (partials; usually below threshold)
+  if (tc.includes(sc)) return sc.length / tc.length
+  if (sc.includes(tc)) return tc.length / sc.length
+
+  // Whole-string typo near-miss (fuchsia/fuschia, peacock/peapock)
+  const minLen = Math.min(tc.length, sc.length)
+  if (minLen >= 4 && lcsLength(tc, sc) / minLen >= 0.85) return 0.9
+  return 0
 }
 
 // ── CSV parser ────────────────────────────────────────────────────────────────
@@ -179,17 +195,29 @@ export function parseCSV(text) {
 
 // ── Core fill algorithm ───────────────────────────────────────────────────────
 
+/** Build the lookup key for a learned alias: style + sales-color, both normalized. */
+export function aliasKey(style, salesColor) {
+  return `${normalizeStyle(style)}::${normalizeColor(salesColor)}`
+}
+
 /**
  * Match sales rows against the template and accumulate quantities.
  *
  * @param {Array}  templateRows  - parsed template CSV rows {STYLE, COLOR, SIZE}
  * @param {Array}  salesRows     - parsed sales CSV rows {style, color, size, QTY}
+ * @param {Object} aliases       - learned style-scoped overrides, keyed by aliasKey():
+ *                                 { "<normStyle>::<normSalesColor>": "<template COLOR>" }.
+ *                                 A hit forces the row to that template color, skipping
+ *                                 fuzzy scoring entirely. Style-scoped on purpose — "mid"
+ *                                 means MID DENIM for one style, MEDIUM for another.
  * @returns {{ filledRows, unmatchedRows, stats }}
  */
-export function fillTemplate(templateRows, salesRows) {
-  // Build per-(normalizedStyle, normalizedSize) buckets.
-  // Keys are normalized so that LT366===Lt366, 1XL===1X, M017-MISSY===M017Missy, etc.
-  // Bucket entries keep the ORIGINAL template values for output.
+export function fillTemplate(templateRows, salesRows, aliases = {}) {
+  // Build output entries in EXACT template row order. Buckets (keyed by normalized
+  // style||size) hold REFERENCES to the same entry objects, so quantities accumulate
+  // in place without disturbing order. Keys are normalized so LT366===Lt366, 1XL===1X,
+  // M017-MISSY===M017Missy, etc.
+  const entries = []
   const buckets = new Map()
 
   templateRows.forEach(r => {
@@ -198,14 +226,17 @@ export function fillTemplate(templateRows, salesRows) {
     const color    = String(r.COLOR || r.color || '').trim()
     const normKey  = `${normalizeStyle(style)}||${normalizeSize(size)}`
 
-    if (!buckets.has(normKey)) buckets.set(normKey, [])
     // Keep ORIGINAL style/color/size for output — must match what's stored in the DB
-    buckets.get(normKey).push({ style, color, size, qty: 0 })
+    const entry = { style, color, size, qty: 0 }
+    entries.push(entry)
+    if (!buckets.has(normKey)) buckets.set(normKey, [])
+    buckets.get(normKey).push(entry)
   })
 
   let srcTotal    = 0
   let filledTotal = 0
   const unmatchedRows = []
+  const matchLog      = []   // non-exact auto-matches, for human spot-checking
 
   salesRows.forEach(row => {
     const style    = String(row.style || row.STYLE || '').trim()
@@ -251,35 +282,72 @@ export function fillTemplate(templateRows, salesRows) {
       return
     }
 
-    // Find the template row whose color best matches the sales color
-    let bestScore = 0
-    let bestIdx   = -1
+    // ── Learned alias — a previous human "Link" wins outright ──────────────────
+    // If the user has taught us what this (style, color) means, fill that template
+    // color directly and skip fuzzy scoring. No-op if the aliased color isn't in
+    // this size's bucket (then fall through to normal matching).
+    const aliasTarget = aliases[`${normStyle}::${normalizeColor(color)}`]
+    if (aliasTarget) {
+      const want = normalizeColor(aliasTarget)
+      const ai   = candidates.findIndex(c => normalizeColor(c.color) === want)
+      if (ai >= 0) {
+        candidates[ai].qty += qty
+        filledTotal += qty
+        matchLog.push({ style, salesColor: color, size: normSize, qty, matchedTo: candidates[ai].color, via: 'alias' })
+        return
+      }
+    }
+
+    // Score every candidate, keeping the best score per DISTINCT color (a color's
+    // token-set signature, order-independent — so "faux suede black" and "black faux
+    // suede" count as the same color, but "grey white" and "winter white" do not).
+    const bySig = new Map()  // signature → { score, idx }
     candidates.forEach((c, i) => {
-      const s = colorScore(c.color, color)
-      if (s > bestScore) { bestScore = s; bestIdx = i }
+      const s   = colorScore(c.color, color)
+      const sig = colorTokens(c.color).slice().sort().join('|')
+      const cur = bySig.get(sig)
+      if (!cur || s > cur.score) bySig.set(sig, { score: s, idx: i })
     })
 
-    if (bestIdx >= 0 && bestScore > 0) {
-      candidates[bestIdx].qty += qty
+    const passing = [...bySig.values()]
+      .filter(x => x.score >= MATCH_THRESHOLD)
+      .sort((a, b) => b.score - a.score)
+
+    // Decide:
+    //   • nothing clears the bar                       → review (unmatched)
+    //   • exactly one distinct color qualifies         → fill it
+    //   • several qualify, but a UNIQUE exact (1.0)     → that exact match wins
+    //   • several distinct colors tie below exact      → AMBIGUOUS → review, never guess
+    let chosen = -1
+    if (passing.length === 1) {
+      chosen = passing[0].idx
+    } else if (passing.length > 1) {
+      const topExact = passing[0].score >= 0.999 && passing[1].score < 0.999
+      if (topExact) chosen = passing[0].idx
+    }
+
+    if (chosen >= 0) {
+      candidates[chosen].qty += qty
       filledTotal += qty
+      const chosenScore = passing.find(p => p.idx === chosen)?.score ?? 0
+      if (chosenScore < 0.999) {
+        matchLog.push({ style, salesColor: color, size: normSize, qty, matchedTo: candidates[chosen].color, via: `fuzzy ${chosenScore.toFixed(2)}` })
+      }
     } else {
       unmatchedRows.push({ style, color, size: normSize, qty })
     }
   })
 
-  // Flatten buckets back into output rows
-  const filledRows = []
-  for (const bucket of buckets.values()) {
-    for (const entry of bucket) {
-      filledRows.push({ STYLE: entry.style, COLOR: entry.color, SIZE: entry.size, QTY: entry.qty })
-    }
-  }
+  // Output in EXACT template row order. entries[] preserves it; iterating buckets
+  // would regroup by style+size and scramble the order.
+  const filledRows = entries.map(e => ({ STYLE: e.style, COLOR: e.color, SIZE: e.size, QTY: e.qty }))
 
   const appendTotal = unmatchedRows.reduce((s, r) => s + r.qty, 0)
 
   return {
     filledRows,
     unmatchedRows,
+    matchLog,
     stats: {
       src_total:        srcTotal,
       filled_total:     filledTotal,

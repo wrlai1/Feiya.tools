@@ -32,10 +32,13 @@ function SplashLoader() {
   )
 }
 
-// Require login — redirect to /login if not authenticated
+// Require login — redirect to /login if not authenticated.
+// DEV-ONLY: ?mock=1 skips auth for local UI preview. import.meta.env.DEV is false in
+// production builds, so this branch is stripped out — it can never bypass auth in prod.
 function RequireAuth({ children }) {
   const { user, loading } = useAuth()
   const location = useLocation()
+  if (import.meta.env.DEV && new URLSearchParams(location.search).get('mock') === '1') return children
   if (loading) return <SplashLoader />
   if (!user) return <Navigate to="/login" state={{ from: location }} replace />
   return children
@@ -44,6 +47,8 @@ function RequireAuth({ children }) {
 // Admin-only gate — regular users are redirected to /tracking
 function RequireAdmin({ children }) {
   const { user } = useAuth()
+  const location = useLocation()
+  if (import.meta.env.DEV && new URLSearchParams(location.search).get('mock') === '1') return children
   if (user?.role !== 'admin') return <Navigate to="/tracking" replace />
   return children
 }

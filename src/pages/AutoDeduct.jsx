@@ -1,9 +1,10 @@
-import React, { useState, useCallback, useEffect } from 'react'
+import React, { useState, useCallback, useEffect, useMemo } from 'react'
 import {
   Minus, TrendingUp, RefreshCw, FileDown,
   CheckCircle, AlertTriangle, Settings, X, Upload, AlertCircle,
 } from 'lucide-react'
 import FileUploadZone from '../components/FileUploadZone.jsx'
+import UnmatchedResolver from '../components/UnmatchedResolver.jsx'
 import { useToast } from '../hooks/useToast.js'
 import { useAuth } from '../context/AuthContext.jsx'
 import { parseCSV, fillTemplate, generateExcel } from '../utils/autoDeductEngine.js'
@@ -156,13 +157,40 @@ function StatCard({ label, value, color = 'slate' }) {
   )
 }
 
+// ── Mock data for UI preview (only active when ?mock=1 in the URL) ─────────────
+const MOCK_TEMPLATE = [
+  { STYLE: '50073', COLOR: 'dark denim#2',         SIZE: 'S' },
+  { STYLE: '50073', COLOR: 'dark denim#2',         SIZE: 'M' },
+  { STYLE: '50073', COLOR: 'dark denim#2',         SIZE: 'L' },
+  { STYLE: '50073', COLOR: 'knit denim',           SIZE: 'S' },
+  { STYLE: 'M022 Missy', COLOR: 'Canyon Rose',     SIZE: 'S' },
+  { STYLE: 'M022 Missy', COLOR: 'Canyon Rose',     SIZE: 'M' },
+  { STYLE: 'M022 PLUS',  COLOR: 'Canyon Rose',     SIZE: '1X' },
+  { STYLE: '88053',      COLOR: 'BLACK',            SIZE: '12' },
+  { STYLE: '88053',      COLOR: 'BLACK',            SIZE: '14' },
+  { STYLE: '88053',      COLOR: 'WHITE',            SIZE: '12' },
+]
+const MOCK_RESULT = {
+  filledRows:    MOCK_TEMPLATE.map(r => ({ ...r, QTY: 0 })),
+  unmatchedRows: [
+    { style: 'M022', color: 'melon', size: 'S', qty: 12 },
+    { style: '88053', color: 'khaki white', size: '12', qty: 5 },
+    { style: '5010130', color: 'peacock', size: 'M', qty: 8 },
+  ],
+  stats: { src_total: 25, filled_total: 0, append_total: 25, reconciled_total: 25 },
+}
+
 // ── Main page ──────────────────────────────────────────────────────────────────
 export default function AutoDeduct() {
   const { getToken } = useAuth()
+  // DEV-ONLY preview switch; import.meta.env.DEV is false in production builds.
+  const isMock = import.meta.env.DEV && new URLSearchParams(window.location.search).get('mock') === '1'
   const [srcFile,         setSrcFile]         = useState(null)
   const [txnType,         setTxnType]         = useState('sales')
   const [processing,      setProcessing]      = useState(false)
   const [result,          setResult]          = useState(null)   // { filledRows, unmatchedRows, stats }
+  const [templateRows,    setTemplateRows]    = useState([])     // raw template for the resolver
+  const [resolvedExtras,  setResolvedExtras]  = useState(null)  // null = resolver not done yet
   const [applying,        setApplying]        = useState(false)
   const [applied,         setApplied]         = useState(false)
   const [configError,     setConfigError]     = useState(null)
@@ -170,41 +198,75 @@ export default function AutoDeduct() {
   const [showSettings,    setShowSettings]    = useState(false)
   const toast = useToast()
 
+  // Merge resolver output into filledRows:
+  //   linked items  → find the matching row and add QTY
+  //   created items → append as new row at the end
+  const mergedFilledRows = useMemo(() => {
+    if (!result) return []
+    if (!resolvedExtras?.length) return result.filledRows
+    const rows = result.filledRows.map(r => ({ ...r }))
+    for (const extra of resolvedExtras) {
+      if (extra._isNew) {
+        rows.push({ STYLE: extra.STYLE, COLOR: extra.COLOR, SIZE: extra.SIZE, QTY: extra.QTY })
+      } else {
+        const found = rows.find(r => r.STYLE === extra.STYLE && r.COLOR === extra.COLOR && r.SIZE === extra.SIZE)
+        if (found) found.QTY = (found.QTY || 0) + extra.QTY
+        else rows.push({ STYLE: extra.STYLE, COLOR: extra.COLOR, SIZE: extra.SIZE, QTY: extra.QTY })
+      }
+    }
+    return rows
+  }, [result, resolvedExtras])
+
   useEffect(() => {
+    if (isMock) { setTemplateRows(MOCK_TEMPLATE); return }
     fetch(`${BASE}/inventory-balance?action=list`, { headers: authHeaders(getToken()) })
       .then(r => r.json())
       .then(data => { setConfigError(null); setTemplateMissing(!data.initialized) })
       .catch(err => setConfigError(err.message))
-  }, [getToken])
+  }, [getToken, isMock])
 
   const handleFile = useCallback((file) => {
-    setSrcFile(file); setResult(null); setApplied(false)
+    setSrcFile(file); setResult(null); setApplied(false); setResolvedExtras(null)
   }, [])
 
   const handleRun = useCallback(async () => {
+    if (isMock) {
+      setResult(MOCK_RESULT)
+      setTemplateRows(MOCK_TEMPLATE)
+      toast.info('3 rows need review', 'Mock Run Complete')
+      return
+    }
     if (!srcFile || processing) return
-    setProcessing(true); setResult(null); setApplied(false)
+    setProcessing(true); setResult(null); setApplied(false); setResolvedExtras(null)
     try {
       // 1. Fetch template from inventory balance (canonical SKU list)
       const tRes  = await fetch(`${BASE}/inventory-balance?action=list`, { headers: authHeaders(getToken()) })
       const tData = await tRes.json()
       if (!tRes.ok) throw new Error(tData.error || 'Could not load inventory balance')
-      const templateRows = (tData.rows || []).map(r => ({ STYLE: r.Style, COLOR: r.Color, SIZE: r.Size }))
+      const tRows = (tData.rows || []).map(r => ({ STYLE: r.Style, COLOR: r.Color, SIZE: r.Size }))
+      setTemplateRows(tRows)
 
       // 2. Parse sales CSV client-side
       const salesText = await srcFile.text()
       const salesRows = parseCSV(salesText)
 
       // 3. Match & fill — pure JS, no server needed
-      const engineResult = fillTemplate(templateRows, salesRows)
+      const engineResult = fillTemplate(tRows, salesRows)
       setResult(engineResult)
       setConfigError(null)
 
       const { src_total, filled_total, append_total } = engineResult.stats
-      toast.success(
-        `${filled_total.toLocaleString()} / ${src_total.toLocaleString()} units matched · ${append_total} unmatched`,
-        'Auto-Fill Complete'
-      )
+      if (append_total > 0) {
+        toast.info(
+          `${filled_total.toLocaleString()} / ${src_total.toLocaleString()} units matched · ${append_total} need review`,
+          'Review Required'
+        )
+      } else {
+        toast.success(
+          `${filled_total.toLocaleString()} / ${src_total.toLocaleString()} units matched`,
+          'Auto-Fill Complete'
+        )
+      }
     } catch (err) {
       setConfigError(err.message)
       toast.error(err.message, 'Processing Error')
@@ -213,25 +275,38 @@ export default function AutoDeduct() {
     }
   }, [srcFile, processing, getToken, toast])
 
+  // Called by UnmatchedResolver when user finishes reviewing
+  const handleResolve = useCallback((items) => {
+    setResolvedExtras(items)
+    if (items.length > 0) {
+      toast.success(`${items.length} row${items.length !== 1 ? 's' : ''} resolved`, 'Ready to Download')
+    }
+  }, [toast])
+
   const handleDownload = useCallback(async () => {
     if (!result) return
+    // Only pass truly remaining-unmatched rows to the Unmatched sheet
+    // (resolver handled some; skipped ones are still unmatched)
+    const remainingUnmatched = resolvedExtras !== null
+      ? result.unmatchedRows.slice(resolvedExtras.length + (result.unmatchedRows.length - (resolvedExtras.length + result.unmatchedRows.length - resolvedExtras.length)))
+      : result.unmatchedRows
     try {
-      await generateExcel(result.filledRows, result.unmatchedRows, srcFile?.name || 'output')
+      await generateExcel(mergedFilledRows, resolvedExtras !== null ? [] : result.unmatchedRows, srcFile?.name || 'output')
       toast.success('Excel downloaded')
     } catch (err) {
       toast.error(err.message, 'Download Failed')
     }
-  }, [result, srcFile, toast])
+  }, [result, resolvedExtras, mergedFilledRows, srcFile, toast])
 
   const handleApply = useCallback(async () => {
-    if (!result?.filledRows || applying) return
+    if (!mergedFilledRows.length || applying) return
     setApplying(true)
     try {
       const res = await fetch(`${BASE}/inventory-balance?action=apply`, {
         method:  'POST',
         headers: authHeaders(getToken(), true),
         body:    JSON.stringify({
-          filledRows:  result.filledRows,
+          filledRows:  mergedFilledRows,
           txnType,
           sourceName:  srcFile?.name || '',
         }),
@@ -248,9 +323,11 @@ export default function AutoDeduct() {
     } finally {
       setApplying(false)
     }
-  }, [result, txnType, srcFile, applying, getToken, toast])
+  }, [mergedFilledRows, txnType, srcFile, applying, getToken, toast])
 
-  const stats = result?.stats
+  const stats            = result?.stats
+  const hasUnresolved    = result?.unmatchedRows?.length > 0 && resolvedExtras === null
+  const resolverDone     = resolvedExtras !== null
 
   return (
     <div className="space-y-6 max-w-4xl">
@@ -329,7 +406,7 @@ export default function AutoDeduct() {
         {/* Run button */}
         <button
           onClick={handleRun}
-          disabled={!srcFile || processing || templateMissing}
+          disabled={!isMock && (!srcFile || processing || templateMissing)}
           className="btn-primary w-full justify-center py-3 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {processing
@@ -359,45 +436,17 @@ export default function AutoDeduct() {
             </div>
           </div>
 
-          {/* Unmatched rows preview */}
-          {result.unmatchedRows?.length > 0 && (
-            <div className="card p-4">
-              <p className="text-sm font-medium text-yellow-700 mb-2 flex items-center gap-1.5">
-                <AlertTriangle className="w-4 h-4" />
-                {result.unmatchedRows.length} sales rows had no template match — included in "Unmatched Sales" sheet of the Excel
-              </p>
-              <div className="overflow-x-auto">
-                <table className="w-full text-xs text-slate-600">
-                  <thead>
-                    <tr className="border-b border-slate-100">
-                      {['Style','Color','Size','Qty'].map(h => (
-                        <th key={h} className="text-left py-1 pr-4 text-slate-400 font-medium">{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {result.unmatchedRows.slice(0, 10).map((r, i) => (
-                      <tr key={i} className="border-b border-slate-50">
-                        <td className="py-1 pr-4">{r.style}</td>
-                        <td className="py-1 pr-4">{r.color}</td>
-                        <td className="py-1 pr-4">{r.size}</td>
-                        <td className="py-1">{r.qty}</td>
-                      </tr>
-                    ))}
-                    {result.unmatchedRows.length > 10 && (
-                      <tr>
-                        <td colSpan={4} className="py-1 text-slate-400 italic">
-                          …and {result.unmatchedRows.length - 10} more (see Excel sheet)
-                        </td>
-                      </tr>
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
+          {/* Resolver — shown when there are unmatched rows and user hasn't resolved yet */}
+          {hasUnresolved && (
+            <UnmatchedResolver
+              unmatchedRows={result.unmatchedRows}
+              templateRows={templateRows}
+              onDone={handleResolve}
+            />
           )}
 
-          {/* Actions */}
+          {/* Actions — shown after resolver is done (or if no unmatched rows) */}
+          {(!hasUnresolved) && (
           <div className="card p-5 space-y-3">
             <h3 className="font-medium text-slate-700 text-sm">Actions</h3>
 
@@ -432,6 +481,7 @@ export default function AutoDeduct() {
               </button>
             )}
           </div>
+          )}
         </>
       )}
     </div>

@@ -18,3 +18,4 @@ Thumbs.db
 # data/*.csv
 # data/*.json
 # data/*.xlsx
+.vercel
