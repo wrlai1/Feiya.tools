@@ -191,6 +191,7 @@ export default function AutoDeduct() {
   const [result,          setResult]          = useState(null)   // { filledRows, unmatchedRows, stats }
   const [templateRows,    setTemplateRows]    = useState([])     // raw template for the resolver
   const [resolvedExtras,  setResolvedExtras]  = useState(null)  // null = resolver not done yet
+  const [skippedRows,     setSkippedRows]     = useState([])    // rows user chose to skip — stay on the Unmatched sheet
   const [applying,        setApplying]        = useState(false)
   const [applied,         setApplied]         = useState(false)
   const [configError,     setConfigError]     = useState(null)
@@ -226,18 +227,19 @@ export default function AutoDeduct() {
   }, [getToken, isMock])
 
   const handleFile = useCallback((file) => {
-    setSrcFile(file); setResult(null); setApplied(false); setResolvedExtras(null)
+    setSrcFile(file); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([])
   }, [])
 
   const handleRun = useCallback(async () => {
     if (isMock) {
       setResult(MOCK_RESULT)
       setTemplateRows(MOCK_TEMPLATE)
+      setApplied(false); setResolvedExtras(null); setSkippedRows([])
       toast.info('3 rows need review', 'Mock Run Complete')
       return
     }
     if (!srcFile || processing) return
-    setProcessing(true); setResult(null); setApplied(false); setResolvedExtras(null)
+    setProcessing(true); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([])
     try {
       // 1. Fetch template from inventory balance (canonical SKU list)
       const tRes  = await fetch(`${BASE}/inventory-balance?action=list`, { headers: authHeaders(getToken()) })
@@ -275,28 +277,32 @@ export default function AutoDeduct() {
     }
   }, [srcFile, processing, getToken, toast])
 
-  // Called by UnmatchedResolver when user finishes reviewing
-  const handleResolve = useCallback((items) => {
+  // Called by UnmatchedResolver when user finishes reviewing.
+  // Skipped rows are NOT deducted, but they must stay visible on the Unmatched
+  // sheet — a skip is "leave for later", never "silently discard".
+  const handleResolve = useCallback((items, skipped = []) => {
     setResolvedExtras(items)
-    if (items.length > 0) {
-      toast.success(`${items.length} row${items.length !== 1 ? 's' : ''} resolved`, 'Ready to Download')
+    setSkippedRows(skipped)
+    if (items.length > 0 || skipped.length > 0) {
+      const parts = []
+      if (items.length)   parts.push(`${items.length} resolved`)
+      if (skipped.length) parts.push(`${skipped.length} skipped (kept on Unmatched sheet)`)
+      toast.success(parts.join(' · '), 'Ready to Download')
     }
   }, [toast])
 
   const handleDownload = useCallback(async () => {
     if (!result) return
-    // Only pass truly remaining-unmatched rows to the Unmatched sheet
-    // (resolver handled some; skipped ones are still unmatched)
-    const remainingUnmatched = resolvedExtras !== null
-      ? result.unmatchedRows.slice(resolvedExtras.length + (result.unmatchedRows.length - (resolvedExtras.length + result.unmatchedRows.length - resolvedExtras.length)))
-      : result.unmatchedRows
+    // Before the resolver runs: all unmatched rows. After: only the skipped ones
+    // (linked/created rows are already merged into mergedFilledRows).
+    const unmatchedSheet = resolvedExtras !== null ? skippedRows : result.unmatchedRows
     try {
-      await generateExcel(mergedFilledRows, resolvedExtras !== null ? [] : result.unmatchedRows, srcFile?.name || 'output')
+      await generateExcel(mergedFilledRows, unmatchedSheet, srcFile?.name || 'output')
       toast.success('Excel downloaded')
     } catch (err) {
       toast.error(err.message, 'Download Failed')
     }
-  }, [result, resolvedExtras, mergedFilledRows, srcFile, toast])
+  }, [result, resolvedExtras, skippedRows, mergedFilledRows, srcFile, toast])
 
   const handleApply = useCallback(async () => {
     if (!mergedFilledRows.length || applying) return
@@ -327,7 +333,6 @@ export default function AutoDeduct() {
 
   const stats            = result?.stats
   const hasUnresolved    = result?.unmatchedRows?.length > 0 && resolvedExtras === null
-  const resolverDone     = resolvedExtras !== null
 
   return (
     <div className="space-y-6 max-w-4xl">

@@ -119,7 +119,8 @@ const PATTERN_WORDS = new Set([
  *   1. Exact normalized match                                   → 1.0
  *   2. Token containment — every sales word is in the template  → 0.92
  *      ("black" ⊆ "BLACK TR & mill", "light denim" ⊆ "knit denim light denim").
- *      A lone sales word blocked by a print qualifier            → 0.60 (resolver)
+ *      Blocked when the template has a print/pattern word the
+ *      sales color doesn't claim ("black" vs "black floral")     → 0.60 (resolver)
  *   3. Prefix abbreviation ("dazz" → "dazzling blue")           → 0.90
  *   4. Whole-string typo near-miss (fuchsia/fuschia)            → 0.90
  *   5. Proportional substring                                   → < threshold
@@ -138,14 +139,20 @@ function colorScore(templateColor, salesColor) {
      lcsLength(a, b) / Math.min(a.length, b.length) >= 0.85)
 
   // Token containment — every sales word matches a template word (exact or near).
+  // Pattern guard, all token counts: when the sales color claims NO pattern word but
+  // the template carries one ("black mill" vs "black floral mill"), the print is a
+  // different product → defer to the resolver. When the sales color itself names a
+  // pattern ("grey plaid", "leopard"), template-side pattern words are not
+  // disqualifying — generic qualifiers like "Ponte Print" would wrongly demote the
+  // correct candidate and hand the win to a worse one.
   const stks = colorTokens(salesColor)
   const ttks = colorTokens(templateColor)
   if (stks.length && ttks.length) {
     const matched = stks.filter(s => ttks.some(t => near(s, t)))
     if (matched.length === stks.length) {
-      if (stks.length >= 2) return 0.92                // multi-word subset: specific, safe
-      const extra = ttks.filter(t => !matched.some(m => near(m, t)))
-      if (extra.some(t => PATTERN_WORDS.has(t))) return 0.6  // lone word + print → resolver
+      const salesHasPattern = stks.some(t => PATTERN_WORDS.has(t))
+      const extra = ttks.filter(t => !stks.some(s => near(s, t)))
+      if (!salesHasPattern && extra.some(t => PATTERN_WORDS.has(t))) return 0.6  // → resolver
       return 0.92
     }
   }

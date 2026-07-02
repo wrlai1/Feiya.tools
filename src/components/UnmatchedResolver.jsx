@@ -70,10 +70,15 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
   }
 
   function handleApply() {
-    const items = []
+    const items   = []
+    const skipped = []   // original sales rows the user chose NOT to resolve —
+                         // callers must keep these visible (Unmatched sheet), never drop them
     for (const [i, row] of unmatchedRows.entries()) {
       const r = resolved[i]
-      if (!r || r.type === 'skip') continue
+      if (!r || r.type === 'skip') {
+        skipped.push({ style: row.style, color: row.color, size: row.size, qty: row.qty })
+        continue
+      }
       items.push({
         STYLE:  r.entry.STYLE,
         COLOR:  r.entry.COLOR,
@@ -82,7 +87,7 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
         _isNew: r.type === 'create',
       })
     }
-    onDone(items)
+    onDone(items, skipped)
   }
 
   // Filter template entries for the search box
