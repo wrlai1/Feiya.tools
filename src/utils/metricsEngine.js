@@ -97,6 +97,45 @@ export function formatMetric(value, type) {
   return Math.round(value).toLocaleString('en-US')
 }
 
+// ── Per-row + correlation (for the "which variable affects sales" comparison) ──
+// The functions above aggregate a GROUP of rows. These evaluate ONE row (one
+// product) so we can correlate variables against a sales target across products.
+
+// One metric's value for a single row — a column, or a custom ratio (num/den on
+// that row). Returns null when a field is missing or the denominator is 0.
+export function rowMetricValue(row, key, customMetrics = []) {
+  const cm = customMetrics.find((c) => c.id === key)
+  if (cm) {
+    const n = rawFieldValue(row, cm.numerator)
+    const d = rawFieldValue(row, cm.denominator)
+    return n == null || !d ? null : n / d
+  }
+  return rawFieldValue(row, key)
+}
+
+// Pearson correlation between two metrics across rows. Pairs where either side
+// is missing are dropped; returns null if fewer than 3 usable pairs or no
+// variance. Range -1..1: sign = direction, magnitude = strength.
+export function pearson(rows, xKey, yKey, customMetrics = []) {
+  const pairs = []
+  for (const r of rows) {
+    const x = rowMetricValue(r, xKey, customMetrics)
+    const y = rowMetricValue(r, yKey, customMetrics)
+    if (x != null && y != null && !Number.isNaN(x) && !Number.isNaN(y)) pairs.push([x, y])
+  }
+  const n = pairs.length
+  if (n < 3) return null
+  const mx = pairs.reduce((s, p) => s + p[0], 0) / n
+  const my = pairs.reduce((s, p) => s + p[1], 0) / n
+  let sxy = 0, sxx = 0, syy = 0
+  for (const [x, y] of pairs) {
+    const dx = x - mx, dy = y - my
+    sxy += dx * dy; sxx += dx * dx; syy += dy * dy
+  }
+  if (!sxx || !syy) return null
+  return sxy / Math.sqrt(sxx * syy)
+}
+
 // Slug helper for generating a custom metric's id from its label.
 export function slugify(str) {
   return (
