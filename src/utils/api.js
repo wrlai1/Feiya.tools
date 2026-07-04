@@ -142,3 +142,15 @@ export function fetchStoreRange(store, from, to) {
 export function deleteStoreDay(store, day) {
   return request(`${BASE}/analytics-store?action=delete-day&store=${encodeURIComponent(store)}&day=${day}`, { method: 'DELETE' })
 }
+
+export function fetchStoreProducts(store) {
+  return request(`${BASE}/analytics-store?action=products&store=${encodeURIComponent(store)}`)
+}
+
+export function saveStoreProducts(store, products, fileName = null) {
+  return request(`${BASE}/analytics-store?action=save-products`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ store, products, fileName }),
+  })
+}

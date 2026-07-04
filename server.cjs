@@ -327,6 +327,17 @@ async function ensureAnalyticsStoreTables(sql) {
       PRIMARY KEY (username, store, day)
     )
   `;
+  await sql`
+    CREATE TABLE IF NOT EXISTS analytics_store_products (
+      username   TEXT NOT NULL,
+      store      TEXT NOT NULL,
+      spu        TEXT NOT NULL,
+      data       JSONB NOT NULL,
+      file_name  TEXT,
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (username, store, spu)
+    )
+  `;
 }
 
 app.all('/api/analytics-store', async (req, res) => {
@@ -360,8 +371,40 @@ app.all('/api/analytics-store', async (req, res) => {
       const name = String(req.query.name || '').trim();
       if (!name) return res.status(400).json({ error: 'name is required' });
       await sql`DELETE FROM analytics_store_days WHERE username = ${username} AND store = ${name}`;
+      await sql`DELETE FROM analytics_store_products WHERE username = ${username} AND store = ${name}`;
       await sql`DELETE FROM analytics_stores WHERE username = ${username} AND name = ${name}`;
       return res.json({ ok: true });
+    }
+
+    if (req.method === 'GET' && action === 'products') {
+      const store = String(req.query.store || '').trim();
+      if (!store) return res.status(400).json({ error: 'store is required' });
+      const rows = await sql`
+        SELECT data FROM analytics_store_products
+        WHERE username = ${username} AND store = ${store}
+        ORDER BY data->>'sku', spu
+      `;
+      return res.json({ products: rows.map((r) => r.data) });
+    }
+
+    if (req.method === 'POST' && action === 'save-products') {
+      const { store, products, fileName } = req.body || {};
+      const name = String(store || '').trim();
+      if (!name || !Array.isArray(products)) return res.status(400).json({ error: 'store and products are required' });
+      await sql`INSERT INTO analytics_stores (username, name) VALUES (${username}, ${name}) ON CONFLICT DO NOTHING`;
+      await sql`DELETE FROM analytics_store_products WHERE username = ${username} AND store = ${name}`;
+      for (const product of products) {
+        const spu = String(product?.spu || '').trim();
+        if (!spu) continue;
+        const json = JSON.stringify({ ...product, store: product.store || name, spu });
+        await sql`
+          INSERT INTO analytics_store_products (username, store, spu, data, file_name, updated_at)
+          VALUES (${username}, ${name}, ${spu}, ${json}::jsonb, ${fileName || null}, NOW())
+          ON CONFLICT (username, store, spu)
+          DO UPDATE SET data = EXCLUDED.data, file_name = EXCLUDED.file_name, updated_at = NOW()
+        `;
+      }
+      return res.json({ ok: true, count: products.length });
     }
 
     if (req.method === 'POST' && action === 'save-day') {
