@@ -92,3 +92,21 @@ export function deleteMessage(id) {
 export function clearMessages() {
   return request(`${BASE}/chat-messages`, { method: 'DELETE' })
 }
+
+// ─── Custom Metrics (Analytics) ─────────────────────────────────────────────────
+
+export function fetchCustomMetrics() {
+  return request(`${BASE}/custom-metrics`)
+}
+
+export function saveCustomMetric(metric) {
+  return request(`${BASE}/custom-metrics`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(metric),
+  })
+}
+
+export function deleteCustomMetric(id) {
+  return request(`${BASE}/custom-metrics?id=${encodeURIComponent(id)}`, { method: 'DELETE' })
+}

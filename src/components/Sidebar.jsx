@@ -2,7 +2,7 @@ import React, { useState } from 'react'
 import { NavLink } from 'react-router-dom'
 import {
   LayoutDashboard, Package, Truck, MessageSquare,
-  Boxes, Minus, Sparkles, X, Users, LogOut, KeyRound, ShieldCheck, User, Clock, ClipboardList,
+  Boxes, Minus, Sparkles, X, Users, LogOut, KeyRound, ShieldCheck, User, Clock, ClipboardList, BarChart3,
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import ChangePasswordModal from './ChangePasswordModal.jsx'
@@ -14,6 +14,7 @@ const ADMIN_NAV = [
   { label: 'Low Inventory Notes', to: '/notes',       icon: MessageSquare },
   { label: 'Stock Management',    to: '/stock',       icon: Boxes },
   { label: 'Auto Deduct',         to: '/auto-deduct', icon: Minus },
+  { label: 'Analytics',           to: '/analytics',   icon: BarChart3 },
   { label: 'Time Clock',          to: '/timeclock',   icon: Clock },
 ]
 

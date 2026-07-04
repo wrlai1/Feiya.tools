@@ -243,6 +243,67 @@ app.delete('/api/app-data', async (req, res) => {
   } catch (err) { return res.status(500).json({ error: err.message }); }
 });
 
+// ─── /api/custom-metrics ──────────────────────────────────────────────────────
+// Per-account user-defined ratio metrics (Analytics page).
+
+async function ensureCustomMetricsTable(sql) {
+  await sql`
+    CREATE TABLE IF NOT EXISTS custom_metrics (
+      id          TEXT NOT NULL,
+      username    TEXT NOT NULL,
+      label       TEXT NOT NULL,
+      numerator   TEXT NOT NULL,
+      denominator TEXT NOT NULL,
+      type        TEXT NOT NULL DEFAULT 'number',
+      created_at  TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (username, id)
+    )
+  `;
+}
+
+app.all('/api/custom-metrics', async (req, res) => {
+  try {
+    const sql     = getDB();
+    const payload = verifyToken(req.headers.authorization, getSecret());
+    if (!payload) return res.status(401).json({ error: 'Not authenticated' });
+    const username = payload.username;
+    await ensureCustomMetricsTable(sql);
+
+    if (req.method === 'GET') {
+      const rows = await sql`
+        SELECT id, label, numerator, denominator, type
+        FROM custom_metrics WHERE username = ${username} ORDER BY created_at
+      `;
+      return res.json({ metrics: rows });
+    }
+
+    if (req.method === 'POST') {
+      const { id, label, numerator, denominator, type } = req.body || {};
+      if (!id || !label || !numerator || !denominator) {
+        return res.status(400).json({ error: 'id, label, numerator and denominator are required' });
+      }
+      const safeType = ['percent', 'number', 'ratio', 'currency'].includes(type) ? type : 'number';
+      await sql`
+        INSERT INTO custom_metrics (id, username, label, numerator, denominator, type)
+        VALUES (${id}, ${username}, ${label}, ${numerator}, ${denominator}, ${safeType})
+        ON CONFLICT (username, id) DO UPDATE SET
+          label = EXCLUDED.label, numerator = EXCLUDED.numerator,
+          denominator = EXCLUDED.denominator, type = EXCLUDED.type
+      `;
+      return res.json({ ok: true, metric: { id, label, numerator, denominator, type: safeType } });
+    }
+
+    if (req.method === 'DELETE') {
+      const id = req.query.id;
+      if (!id) return res.status(400).json({ error: 'id is required' });
+      await sql`DELETE FROM custom_metrics WHERE username = ${username} AND id = ${id}`;
+      return res.json({ ok: true });
+    }
+
+    return res.status(405).json({ error: 'Method not allowed' });
+  } catch (err) { return res.status(500).json({ error: err.message }); }
+});
+
 // ─── /api/chat-messages ───────────────────────────────────────────────────────
 
 async function ensureChatTable(sql) {
