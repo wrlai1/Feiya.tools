@@ -3,14 +3,19 @@ import {
   BarChart, Bar, LineChart, Line, ScatterChart, Scatter,
   XAxis, YAxis, ZAxis, CartesianGrid, Tooltip, ResponsiveContainer,
 } from 'recharts'
-import { BarChart3, LineChart as LineIcon, GitCompare, Plus, Trash2, X, Sigma } from 'lucide-react'
+import { BarChart3, LineChart as LineIcon, GitCompare, Plus, Trash2, X, Sigma, Upload, Store, Save, Calendar } from 'lucide-react'
 import * as XLSX from 'xlsx'
 import FileUploadZone from '../components/FileUploadZone.jsx'
 import KPICard from '../components/KPICard.jsx'
 import { useToast } from '../hooks/useToast.js'
 import { parseCSV } from '../utils/autoDeductEngine.js'
 import { metricValue, rowMetricValue, pearson, metricOptions, formatMetric, slugify } from '../utils/metricsEngine.js'
-import { fetchCustomMetrics, saveCustomMetric, deleteCustomMetric } from '../utils/api.js'
+import {
+  fetchCustomMetrics, saveCustomMetric, deleteCustomMetric,
+  fetchStores, createStore, deleteStore, saveStoreDay, fetchStoreRange, deleteStoreDay,
+} from '../utils/api.js'
+
+const todayISO = () => new Date().toISOString().slice(0, 10)
 
 const MAX_BARS = 30
 const MAX_SCATTERS = 9
@@ -118,6 +123,33 @@ function joinDatasets(datasets) {
   return { rows, columns: [...new Set(datasets.flatMap((d) => d.columns))], numericCols, dimensionCols }
 }
 
+// Re-derive column metadata from already-parsed rows (store-loaded data, whose
+// numeric values are already numbers). Mirrors parseDataFile's numeric detection.
+function deriveColumns(rows) {
+  const columns = [...new Set(rows.flatMap((r) => Object.keys(r)))]
+  const numericCols = []
+  for (const c of columns) {
+    let n = 0, t = 0
+    for (const r of rows) { const v = r[c]; if (v == null || v === '') continue; t++; if (typeof v === 'number') n++ }
+    if (t > 0 && n / t >= 0.6 && !isKeyCol(c)) numericCols.push(c)
+  }
+  const numSet = new Set(numericCols)
+  return { rows, columns, numericCols, dimensionCols: columns.filter((c) => !numSet.has(c)) }
+}
+
+// A preset/custom timeframe → { from, to } ISO dates. 7d/14d include today.
+function timeframeRange(tf, customFrom, customTo) {
+  const iso = (d) => d.toISOString().slice(0, 10)
+  const today = new Date()
+  const to = iso(today)
+  if (tf === '7d' || tf === '14d') {
+    const d = new Date(today); d.setDate(d.getDate() - (tf === '7d' ? 6 : 13))
+    return { from: iso(d), to }
+  }
+  if (tf === 'custom') return { from: customFrom, to: customTo }
+  return { from: to, to } // today
+}
+
 export default function MetricsAnalytics() {
   const toast = useToast()
   const [datasets, setDatasets]         = useState([])
@@ -128,12 +160,72 @@ export default function MetricsAnalytics() {
   const [salesTarget, setSalesTarget]   = useState('')
   const [customMetrics, setCustomMetrics] = useState([])
   const [showBuilder, setShowBuilder]   = useState(false)
+  // Data source: one-off uploads, or a saved store's daily data over a window.
+  const [source, setSource]             = useState('upload')  // 'upload' | 'store'
+  const [stores, setStores]             = useState([])
+  const [activeStore, setActiveStore]   = useState('')
+  const [timeframe, setTimeframe]       = useState('7d')
+  const [customFrom, setCustomFrom]     = useState('')
+  const [customTo, setCustomTo]         = useState('')
+  const [storeRows, setStoreRows]       = useState(null)      // fetched window rows
+  const [storeDays, setStoreDays]       = useState([])        // per-day summary for the window
+  const [loadingWindow, setLoadingWindow] = useState(false)
+  const [saveOpen, setSaveOpen]         = useState(false)
 
-  const data = useMemo(() => (datasets.length ? joinDatasets(datasets) : null), [datasets])
+  const uploadData = useMemo(() => (datasets.length ? joinDatasets(datasets) : null), [datasets])
+  const storeData  = useMemo(() => (storeRows && storeRows.length ? deriveColumns(storeRows) : null), [storeRows])
+  const data = source === 'store' ? storeData : uploadData
 
   useEffect(() => {
     fetchCustomMetricsSafe().then(setCustomMetrics)
   }, [])
+
+  const reloadStores = useCallback(() => { fetchStoresSafe().then(setStores) }, [])
+  useEffect(() => { reloadStores() }, [reloadStores])
+
+  // Load the selected store's rows for the chosen window.
+  const loadWindow = useCallback(async () => {
+    if (!activeStore) { setStoreRows(null); setStoreDays([]); return }
+    const { from, to } = timeframeRange(timeframe, customFrom, customTo)
+    if (!from || !to) return
+    setLoadingWindow(true)
+    try {
+      const res = await fetchStoreRange(activeStore, from, to)
+      setStoreRows(res.rows || [])
+      setStoreDays(res.days || [])
+    } catch (err) {
+      toast.error(err.message, 'Could not load store data'); setStoreRows([]); setStoreDays([])
+    } finally { setLoadingWindow(false) }
+  }, [activeStore, timeframe, customFrom, customTo, toast])
+
+  useEffect(() => { if (source === 'store') loadWindow() }, [source, loadWindow])
+
+  const currentFileLabel = useMemo(() => datasets.map((d) => d.name).join(' + '), [datasets])
+
+  const saveToStore = useCallback(async (store, day) => {
+    if (!uploadData || !store || !day) return
+    try {
+      await saveStoreDay(store, day, currentFileLabel, uploadData.rows)
+      toast.success(`${uploadData.rows.length} rows → ${store} (${day})`, 'Saved to store')
+      setSaveOpen(false)
+      reloadStores()
+    } catch (err) { toast.error(err.message, 'Could not save') }
+  }, [uploadData, currentFileLabel, toast, reloadStores])
+
+  const handleCreateStore = useCallback(async (name) => {
+    try { await createStore(name); await reloadStores(); setActiveStore(name) }
+    catch (err) { toast.error(err.message, 'Could not create store') }
+  }, [reloadStores, toast])
+
+  const handleDeleteStore = useCallback(async (name) => {
+    try { await deleteStore(name); if (activeStore === name) { setActiveStore(''); setStoreRows(null) } reloadStores() }
+    catch (err) { toast.error(err.message, 'Could not delete store') }
+  }, [activeStore, reloadStores, toast])
+
+  const handleDeleteDay = useCallback(async (day) => {
+    try { await deleteStoreDay(activeStore, day); loadWindow(); reloadStores() }
+    catch (err) { toast.error(err.message, 'Could not delete day') }
+  }, [activeStore, loadWindow, reloadStores, toast])
 
   // Pick sensible defaults whenever the combined dataset changes.
   useEffect(() => {
@@ -222,49 +314,73 @@ export default function MetricsAnalytics() {
 
   return (
     <div className="space-y-6 max-w-6xl">
-      <div className="flex items-start justify-between gap-4 flex-wrap">
-        <div>
-          <h1 className="text-2xl font-bold text-slate-800">Analytics</h1>
-          <p className="text-slate-500 mt-1">
-            Upload one or more exports — files sharing an SPU/SKU column are joined — then build ratios and compare what drives sales.
-          </p>
-        </div>
+      <div>
+        <h1 className="text-2xl font-bold text-slate-800">Analytics</h1>
+        <p className="text-slate-500 mt-1">
+          Analyze a one-off upload, or save each day into a store and view any window — today, 7d, 14d, or custom.
+        </p>
       </div>
 
+      {/* Source */}
+      <div className="flex gap-2">
+        <ModeBtn active={source === 'upload'} onClick={() => setSource('upload')} icon={Upload} label="Upload files" />
+        <ModeBtn active={source === 'store'} onClick={() => setSource('store')} icon={Store} label="Stores" />
+      </div>
+
+      {source === 'store' && (
+        <StorePanel
+          stores={stores} activeStore={activeStore} setActiveStore={setActiveStore}
+          onCreate={handleCreateStore} onDelete={handleDeleteStore}
+          timeframe={timeframe} setTimeframe={setTimeframe}
+          customFrom={customFrom} setCustomFrom={setCustomFrom} customTo={customTo} setCustomTo={setCustomTo}
+          days={storeDays} loading={loadingWindow} onDeleteDay={handleDeleteDay}
+        />
+      )}
+
       {!data ? (
-        <div className="card p-6">
-          <FileUploadZone
-            onFile={addFile}
-            accept=".xlsx,.xls,.csv"
-            label="Drag & drop a performance or product export"
-            sublabel="or click to browse"
-            acceptedTypes="XLSX, XLS, CSV"
-          />
-          <p className="text-xs text-slate-400 mt-3 text-center">
-            Upload multiple files (e.g. ad performance + pricing plan) and they'll be joined on their shared SPU/SKU.
-          </p>
-        </div>
+        source === 'upload' ? (
+          <div className="card p-6">
+            <FileUploadZone
+              onFile={addFile} accept=".xlsx,.xls,.csv"
+              label="Drag & drop a performance or product export" sublabel="or click to browse" acceptedTypes="XLSX, XLS, CSV"
+            />
+            <p className="text-xs text-slate-400 mt-3 text-center">
+              Upload multiple files (e.g. ad performance + pricing plan) and they'll be joined on their shared SPU/SKU.
+            </p>
+          </div>
+        ) : (
+          <div className="card p-6 text-center text-slate-400 text-sm">
+            {loadingWindow ? 'Loading…'
+              : activeStore ? 'No saved data in this window. Save a day from the Upload tab, or widen the timeframe.'
+              : 'Create or pick a store above, then choose a timeframe.'}
+          </div>
+        )
       ) : (
         <>
-          {/* Loaded files + add another */}
-          <div className="flex flex-wrap items-center gap-2">
-            {datasets.map((d) => (
-              <span key={d.name} className="inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full bg-slate-100 text-slate-600">
-                {d.name} · {d.rows.length} rows
-                <button onClick={() => setDatasets((p) => p.filter((x) => x.name !== d.name))} className="text-slate-400 hover:text-red-500">
-                  <X className="w-3 h-3" />
-                </button>
-              </span>
-            ))}
-            <label className="text-xs px-2.5 py-1 rounded-full border border-dashed border-slate-300 text-slate-500 cursor-pointer hover:bg-slate-50">
-              + add file
-              <input type="file" accept=".xlsx,.xls,.csv" className="hidden"
-                onChange={(e) => { const f = e.target.files?.[0]; if (f) addFile(f); e.target.value = '' }} />
-            </label>
-            {datasets.length > 1 && (
-              <span className="text-xs text-slate-400">joined → {data.rows.length} rows · {data.numericCols.length} numeric fields</span>
-            )}
-          </div>
+          {source === 'upload' ? (
+            <div className="flex flex-wrap items-center gap-2">
+              {datasets.map((d) => (
+                <span key={d.name} className="inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full bg-slate-100 text-slate-600">
+                  {d.name} · {d.rows.length} rows
+                  <button onClick={() => setDatasets((p) => p.filter((x) => x.name !== d.name))} className="text-slate-400 hover:text-red-500"><X className="w-3 h-3" /></button>
+                </span>
+              ))}
+              <label className="text-xs px-2.5 py-1 rounded-full border border-dashed border-slate-300 text-slate-500 cursor-pointer hover:bg-slate-50">
+                + add file
+                <input type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) addFile(f); e.target.value = '' }} />
+              </label>
+              {datasets.length > 1 && <span className="text-xs text-slate-400">joined → {data.rows.length} rows</span>}
+              <button onClick={() => setSaveOpen((s) => !s)} className="btn-secondary text-xs px-3 py-1.5 ml-auto"><Save className="w-3.5 h-3.5" /> Save to store</button>
+            </div>
+          ) : (
+            <div className="text-xs text-slate-500">
+              <b>{activeStore}</b> · {storeDays.length} day{storeDays.length !== 1 ? 's' : ''} in window · {data.rows.length} rows combined
+            </div>
+          )}
+
+          {saveOpen && source === 'upload' && (
+            <SaveToStoreBar stores={stores} onSave={saveToStore} onCancel={() => setSaveOpen(false)} />
+          )}
 
           {/* Mode toggle */}
           <div className="flex gap-2">
@@ -287,7 +403,9 @@ export default function MetricsAnalytics() {
             />
           )}
 
-          <button onClick={() => setDatasets([])} className="text-sm text-slate-400 hover:text-slate-600">← Start over with new files</button>
+          {source === 'upload' && (
+            <button onClick={() => setDatasets([])} className="text-sm text-slate-400 hover:text-slate-600">← Start over with new files</button>
+          )}
         </>
       )}
     </div>
@@ -460,6 +578,100 @@ function ModeBtn({ active, onClick, icon: Icon, label }) {
   )
 }
 
+// Store selector + create/delete, timeframe picker, and the loaded-days list.
+function StorePanel({
+  stores, activeStore, setActiveStore, onCreate, onDelete,
+  timeframe, setTimeframe, customFrom, setCustomFrom, customTo, setCustomTo, days, loading, onDeleteDay,
+}) {
+  const [newName, setNewName] = useState('')
+  const TF = [['today', 'Today'], ['7d', '7 days'], ['14d', '14 days'], ['custom', 'Custom']]
+  return (
+    <div className="card p-4 space-y-4">
+      {/* Stores */}
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-xs text-slate-500 font-medium mr-1">Store</span>
+        {stores.map((s) => (
+          <span key={s.name} className={`inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full border cursor-pointer ${activeStore === s.name ? 'bg-blue-50 border-blue-300 text-blue-700' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'}`}>
+            <button onClick={() => setActiveStore(s.name)} className="font-medium">{s.name}</button>
+            <span className="text-slate-400">{s.days}d</span>
+            <button onClick={() => onDelete(s.name)} title="Delete store" className="text-slate-300 hover:text-red-500"><Trash2 className="w-3 h-3" /></button>
+          </span>
+        ))}
+        <span className="inline-flex items-center gap-1">
+          <input className="metric-input !py-1 w-32" placeholder="New store…" value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter' && newName.trim()) { onCreate(newName.trim()); setNewName('') } }} />
+          <button onClick={() => { if (newName.trim()) { onCreate(newName.trim()); setNewName('') } }} className="btn-secondary text-xs px-2 py-1"><Plus className="w-3 h-3" /></button>
+        </span>
+      </div>
+
+      {/* Timeframe */}
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-xs text-slate-500 font-medium mr-1">Timeframe</span>
+        {TF.map(([key, label]) => (
+          <button key={key} onClick={() => setTimeframe(key)}
+            className={`text-xs px-3 py-1.5 rounded-lg border ${timeframe === key ? 'bg-blue-50 border-blue-300 text-blue-700' : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'}`}>
+            {label}
+          </button>
+        ))}
+        {timeframe === 'custom' && (
+          <span className="inline-flex items-center gap-2 text-xs text-slate-500">
+            <Calendar className="w-3.5 h-3.5" />
+            <input type="date" className="metric-input !py-1" value={customFrom} onChange={(e) => setCustomFrom(e.target.value)} />
+            <span>→</span>
+            <input type="date" className="metric-input !py-1" value={customTo} onChange={(e) => setCustomTo(e.target.value)} />
+          </span>
+        )}
+      </div>
+
+      {/* Loaded days */}
+      {activeStore && (
+        <div className="text-xs text-slate-500">
+          {loading ? 'Loading…' : days.length === 0 ? 'No days saved in this window.' : (
+            <div className="flex flex-wrap gap-1.5">
+              {days.map((d) => (
+                <span key={d.day} className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-slate-100 text-slate-600">
+                  {d.day} · {d.rowCount} rows
+                  <button onClick={() => onDeleteDay(d.day)} title="Remove this day" className="text-slate-300 hover:text-red-500"><X className="w-3 h-3" /></button>
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Save the current upload as one day of a store.
+function SaveToStoreBar({ stores, onSave, onCancel }) {
+  const [store, setStore] = useState(stores[0]?.name || '')
+  const [newStore, setNewStore] = useState('')
+  const [day, setDay] = useState(todayISO())
+  const chosen = newStore.trim() || store
+  return (
+    <div className="card p-4 border-blue-200 bg-blue-50/40 flex flex-wrap items-end gap-3">
+      <Field label="Store">
+        <select className="metric-input" value={store} onChange={(e) => setStore(e.target.value)} disabled={!!newStore.trim()}>
+          {stores.length === 0 && <option value="">— none yet —</option>}
+          {stores.map((s) => <option key={s.name} value={s.name}>{s.name}</option>)}
+        </select>
+      </Field>
+      <span className="pb-2 text-slate-400 text-xs">or</span>
+      <Field label="New store">
+        <input className="metric-input" placeholder="e.g. JR" value={newStore} onChange={(e) => setNewStore(e.target.value)} />
+      </Field>
+      <Field label="Date (one day)">
+        <input type="date" className="metric-input" value={day} onChange={(e) => setDay(e.target.value)} />
+      </Field>
+      <button onClick={() => chosen && day && onSave(chosen, day)} disabled={!chosen || !day} className="btn-primary text-sm px-4 py-2 disabled:opacity-40">
+        <Save className="w-4 h-4" /> Save
+      </button>
+      <button onClick={onCancel} className="btn-secondary text-sm px-4 py-2">Cancel</button>
+    </div>
+  )
+}
+
 function Field({ label, children }) {
   return (
     <label className="flex flex-col gap-1">
@@ -522,6 +734,9 @@ function CustomMetricBuilder({ options, onAdd, onCancel }) {
 // Persistence — degrade quietly if the metrics API/DB isn't reachable.
 async function fetchCustomMetricsSafe() {
   try { return (await fetchCustomMetrics()).metrics || [] } catch { return [] }
+}
+async function fetchStoresSafe() {
+  try { return (await fetchStores()).stores || [] } catch { return [] }
 }
 const saveCustomMetricSafe = (metric) => saveCustomMetric(metric)
 const deleteCustomMetricSafe = (id) => deleteCustomMetric(id)

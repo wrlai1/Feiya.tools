@@ -110,3 +110,35 @@ export function saveCustomMetric(metric) {
 export function deleteCustomMetric(id) {
   return request(`${BASE}/custom-metrics?id=${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
+
+// ─── Analytics Stores (per-store daily data) ────────────────────────────────────
+
+export function fetchStores() {
+  return request(`${BASE}/analytics-store?action=stores`)
+}
+
+export function createStore(name) {
+  return request(`${BASE}/analytics-store?action=create-store`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  })
+}
+
+export function deleteStore(name) {
+  return request(`${BASE}/analytics-store?action=delete-store&name=${encodeURIComponent(name)}`, { method: 'DELETE' })
+}
+
+export function saveStoreDay(store, day, fileName, rows) {
+  return request(`${BASE}/analytics-store?action=save-day`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ store, day, fileName, rows }),
+  })
+}
+
+export function fetchStoreRange(store, from, to) {
+  return request(`${BASE}/analytics-store?action=range&store=${encodeURIComponent(store)}&from=${from}&to=${to}`)
+}
+
+export function deleteStoreDay(store, day) {
+  return request(`${BASE}/analytics-store?action=delete-day&store=${encodeURIComponent(store)}&day=${day}`, { method: 'DELETE' })
+}
