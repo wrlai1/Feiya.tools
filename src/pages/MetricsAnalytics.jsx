@@ -5,7 +5,7 @@ import {
 } from 'recharts'
 import {
   AlertTriangle, BarChart3, Calendar, CheckCircle, Package, Plus,
-  Save, Store, Trash2, TrendingUp, Upload, X,
+  Save, Trash2, TrendingUp, Upload, X,
 } from 'lucide-react'
 import FileUploadZone from '../components/FileUploadZone.jsx'
 import KPICard from '../components/KPICard.jsx'
@@ -259,6 +259,19 @@ function aggregateTotals(rows) {
   }
 }
 
+function matchesProductKey(item, query) {
+  const q = normalizeId(query).toLowerCase()
+  if (!q) return false
+  return [item?.spu, item?.sku].some((v) => normalizeId(v).toLowerCase() === q)
+}
+
+function productKeyLabel(item) {
+  if (!item) return ''
+  const left = item.sku ? `SKU ${item.sku}` : `SPU ${item.spu}`
+  const right = item.sku ? `SPU ${item.spu}` : ''
+  return [left, right, item.productName].filter(Boolean).join(' · ')
+}
+
 function daySeries(rows) {
   const days = new Map()
   for (const r of rows) {
@@ -300,6 +313,9 @@ export default function MetricsAnalytics() {
   const [loading, setLoading] = useState(false)
   const [metricX, setMetricX] = useState('ctr')
   const [tableFilter, setTableFilter] = useState('all')
+  const [selectedProduct, setSelectedProduct] = useState('')
+  const [storeComparison, setStoreComparison] = useState([])
+  const [comparisonLoading, setComparisonLoading] = useState(false)
 
   const reloadStores = useCallback(async () => {
     try {
@@ -350,6 +366,33 @@ export default function MetricsAnalytics() {
   const visibleRows = draftReport?.rows?.length ? draftReport.rows : storeRows
   const totals = useMemo(() => aggregateTotals(visibleRows), [visibleRows])
   const productRows = useMemo(() => aggregateBySpu(visibleRows, products), [visibleRows, products])
+  const productChoices = useMemo(() => {
+    const map = new Map()
+    for (const p of [...products, ...productRows]) {
+      if (!p?.spu) continue
+      map.set(p.spu, { ...map.get(p.spu), ...p })
+    }
+    return [...map.values()].sort((a, b) => String(a.sku || a.spu).localeCompare(String(b.sku || b.spu)))
+  }, [products, productRows])
+  const selectedProductMatches = useMemo(
+    () => productChoices.filter((p) => matchesProductKey(p, selectedProduct)),
+    [productChoices, selectedProduct],
+  )
+  const selectedSpus = useMemo(
+    () => new Set(selectedProductMatches.map((p) => p.spu).filter(Boolean)),
+    [selectedProductMatches],
+  )
+  const selectedRows = useMemo(() => {
+    const q = normalizeId(selectedProduct)
+    if (!q) return []
+    return visibleRows.filter((r) => selectedSpus.has(r.spu) || normalizeId(r.spu) === q)
+  }, [visibleRows, selectedProduct, selectedSpus])
+  const selectedTotals = useMemo(() => aggregateTotals(selectedRows), [selectedRows])
+  const selectedTrends = useMemo(() => daySeries(selectedRows), [selectedRows])
+  const selectedProductSummary = useMemo(
+    () => aggregateBySpu(selectedRows, products)[0] || selectedProductMatches[0] || null,
+    [selectedRows, products, selectedProductMatches],
+  )
   const trends = useMemo(() => daySeries(visibleRows), [visibleRows])
   const relationPoints = useMemo(() => productRows
     .map((p) => ({ ...p, x: p[metricX], y: p.units }))
@@ -358,6 +401,42 @@ export default function MetricsAnalytics() {
     if (tableFilter === 'all') return productRows
     return productRows.filter((p) => p.status === tableFilter)
   }, [productRows, tableFilter])
+
+  useEffect(() => {
+    let cancelled = false
+    async function loadStoreComparison() {
+      const query = normalizeId(selectedProduct)
+      if (!query || !stores.length) { setStoreComparison([]); return }
+      const { from, to } = timeframeRange(timeframe, customFrom, customTo)
+      if (!from || !to) return
+      setComparisonLoading(true)
+      try {
+        const rows = []
+        for (const store of stores) {
+          const storeName = store.name
+          const [productRes, rangeRes] = await Promise.all([
+            fetchStoreProducts(storeName).catch(() => ({ products: [] })),
+            fetchStoreRange(storeName, from, to).catch(() => ({ rows: [] })),
+          ])
+          const storeProducts = productRes.products || []
+          const matchingProducts = storeProducts.filter((p) => matchesProductKey(p, query))
+          const matchingSpus = new Set(matchingProducts.map((p) => p.spu))
+          const matchingRows = (rangeRes.rows || []).filter((r) => matchingSpus.has(r.spu) || normalizeId(r.spu) === query)
+          if (!matchingRows.length && !matchingProducts.length) continue
+          const summary = aggregateBySpu(matchingRows, matchingProducts)[0] || {
+            ...(matchingProducts[0] || { spu: query, sku: query }),
+            ...aggregateTotals(matchingRows),
+          }
+          rows.push({ store: storeName, ...summary, rows: matchingRows.length })
+        }
+        if (!cancelled) setStoreComparison(rows.sort((a, b) => (b.units || 0) - (a.units || 0)))
+      } finally {
+        if (!cancelled) setComparisonLoading(false)
+      }
+    }
+    loadStoreComparison()
+    return () => { cancelled = true }
+  }, [selectedProduct, stores, timeframe, customFrom, customTo])
 
   const handleCreateStore = async () => {
     const name = newStore.trim()
@@ -540,6 +619,48 @@ export default function MetricsAnalytics() {
         </div>
       </section>
 
+      <section className="card p-5 space-y-4">
+        <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-3">
+          <div>
+            <h2 className="font-semibold text-slate-800">SPU / SKU Focus</h2>
+            <p className="text-xs text-slate-400 mt-0.5">选择一个 SPU 或 SKU，看当前店铺单品表现，并对比所有店铺同款表现。</p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              className="metric-input min-w-64"
+              list="analytics-product-options"
+              placeholder="输入或选择 SPU / SKU"
+              value={selectedProduct}
+              onChange={(e) => setSelectedProduct(e.target.value)}
+            />
+            <datalist id="analytics-product-options">
+              {productChoices.map((p) => (
+                <option key={p.spu} value={p.sku || p.spu}>{productKeyLabel(p)}</option>
+              ))}
+              {productChoices.map((p) => p.sku ? <option key={`${p.spu}-spu`} value={p.spu}>{productKeyLabel(p)}</option> : null)}
+            </datalist>
+            {selectedProduct && <button className="btn-secondary text-xs px-3 py-1.5" onClick={() => setSelectedProduct('')}>Clear</button>}
+          </div>
+        </div>
+
+        {selectedProduct ? (
+          <div className="space-y-4">
+            <SelectedProductPanel
+              product={selectedProductSummary}
+              rows={selectedRows}
+              totals={selectedTotals}
+              trends={selectedTrends}
+              activeStore={activeStore}
+            />
+            <CrossStoreComparison rows={storeComparison} loading={comparisonLoading} />
+          </div>
+        ) : (
+          <div className="rounded-lg border border-dashed border-slate-200 p-5 text-center text-sm text-slate-400">
+            选择一个 SPU 或 SKU 后，这里会显示单品趋势和跨店对比。
+          </div>
+        )}
+      </section>
+
       {!visibleRows.length ? (
         <div className="card p-8 text-center text-slate-400">
           {activeStore ? '上传一份表现数据，或选择有数据的时间范围。' : '先创建或选择店铺。'}
@@ -607,6 +728,138 @@ export default function MetricsAnalytics() {
 
           <ProductMatrix products={filteredProducts} filter={tableFilter} setFilter={setTableFilter} />
         </>
+      )}
+    </div>
+  )
+}
+
+function SelectedProductPanel({ product, rows, totals, trends, activeStore }) {
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      <div className="rounded-lg border border-slate-200 p-4">
+        <p className="text-xs text-slate-400 mb-1">当前店铺单品</p>
+        <h3 className="font-semibold text-slate-800">{product?.sku || product?.spu || 'No match'}</h3>
+        <p className="text-xs text-slate-400 mt-1 line-clamp-3">{product?.productName || '当前时间范围里没有匹配数据。'}</p>
+        <div className="grid grid-cols-2 gap-2 mt-4 text-sm">
+          <MetricCell label="Store" value={activeStore || '-'} />
+          <MetricCell label="Rows" value={count(rows.length)} />
+          <MetricCell label="Units" value={count(totals.units)} />
+          <MetricCell label="Orders" value={count(totals.orders)} />
+          <MetricCell label="Revenue" value={money(totals.revenue)} />
+          <MetricCell label="Spend" value={money(totals.spend)} />
+          <MetricCell label="ROAS" value={ratio(totals.roas)} />
+          <MetricCell label="CVR" value={pct(totals.conversionRate)} />
+        </div>
+        {product?.decision && (
+          <div className="mt-4">
+            <span className={`inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-xs font-medium ${statusClass(product.status)}`}>
+              {product.status === 'good' ? <CheckCircle className="w-3 h-3" /> : <AlertTriangle className="w-3 h-3" />}
+              {product.decision}
+            </span>
+            <p className="text-xs text-slate-400 mt-1">{product.reason}</p>
+          </div>
+        )}
+      </div>
+
+      <div className="rounded-lg border border-slate-200 p-4 lg:col-span-2">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="font-semibold text-slate-800">Single Product Trend</h3>
+          <span className="text-xs text-slate-400">{trends.length} day{trends.length !== 1 ? 's' : ''}</span>
+        </div>
+        {trends.length ? (
+          <ResponsiveContainer width="100%" height={240}>
+            <LineChart data={trends} margin={{ top: 8, right: 8, left: -8, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#eef2f7" />
+              <XAxis dataKey="day" tick={{ fontSize: 11 }} />
+              <YAxis yAxisId="left" tick={{ fontSize: 11 }} />
+              <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 11 }} tickFormatter={ratio} />
+              <Tooltip formatter={(v, k) => k === 'roas' ? ratio(v) : count(v)} />
+              <Line yAxisId="left" type="monotone" dataKey="units" stroke="#2563eb" strokeWidth={2} name="Units" />
+              <Line yAxisId="left" type="monotone" dataKey="orders" stroke="#14b8a6" strokeWidth={2} name="Orders" />
+              <Line yAxisId="right" type="monotone" dataKey="roas" stroke="#f97316" strokeWidth={2} name="ROAS" />
+            </LineChart>
+          </ResponsiveContainer>
+        ) : (
+          <div className="h-60 flex items-center justify-center text-sm text-slate-400">当前店铺和时间范围没有这个产品的数据。</div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function MetricCell({ label, value }) {
+  return (
+    <div className="rounded-md bg-slate-50 px-3 py-2">
+      <div className="text-[11px] text-slate-400">{label}</div>
+      <div className="font-semibold text-slate-700 truncate">{value}</div>
+    </div>
+  )
+}
+
+function CrossStoreComparison({ rows, loading }) {
+  const chartRows = rows.map((r) => ({ store: r.store, units: r.units || 0, roas: r.roas || 0, revenue: r.revenue || 0 }))
+  return (
+    <div className="rounded-lg border border-slate-200 p-4">
+      <div className="flex items-center justify-between mb-3">
+        <div>
+          <h3 className="font-semibold text-slate-800">Same Product Across Stores</h3>
+          <p className="text-xs text-slate-400 mt-0.5">比较同一个 SPU/SKU 在不同店铺的销量、ROAS、转化率和判断。</p>
+        </div>
+        {loading && <span className="text-xs text-slate-400">Loading...</span>}
+      </div>
+      {rows.length ? (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <ResponsiveContainer width="100%" height={260}>
+            <BarChart data={chartRows} margin={{ top: 8, right: 8, left: -8, bottom: 8 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#eef2f7" />
+              <XAxis dataKey="store" tick={{ fontSize: 11 }} />
+              <YAxis yAxisId="left" tick={{ fontSize: 11 }} />
+              <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 11 }} tickFormatter={ratio} />
+              <Tooltip formatter={(v, k) => k === 'roas' ? ratio(v) : count(v)} />
+              <Bar yAxisId="left" dataKey="units" fill="#2563eb" name="Units" radius={[4, 4, 0, 0]} />
+              <Bar yAxisId="right" dataKey="roas" fill="#f97316" name="ROAS" radius={[4, 4, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+          <div className="overflow-x-auto">
+            <table className="min-w-full text-sm">
+              <thead>
+                <tr className="text-left text-xs text-slate-400 border-b border-slate-100">
+                  <th className="py-2 pr-4">Store</th>
+                  <th className="py-2 pr-4 text-right">Units</th>
+                  <th className="py-2 pr-4 text-right">Revenue</th>
+                  <th className="py-2 pr-4 text-right">ROAS</th>
+                  <th className="py-2 pr-4 text-right">CTR</th>
+                  <th className="py-2 pr-4 text-right">CVR</th>
+                  <th className="py-2 pr-4">Decision</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {rows.map((r) => (
+                  <tr key={r.store}>
+                    <td className="py-3 pr-4 font-medium text-slate-700">{r.store}</td>
+                    <td className="py-3 pr-4 text-right">{count(r.units)}</td>
+                    <td className="py-3 pr-4 text-right">{money(r.revenue)}</td>
+                    <td className="py-3 pr-4 text-right">{ratio(r.roas)}</td>
+                    <td className="py-3 pr-4 text-right">{pct(r.ctr)}</td>
+                    <td className="py-3 pr-4 text-right">{pct(r.conversionRate)}</td>
+                    <td className="py-3 pr-4 min-w-44">
+                      {r.decision ? (
+                        <>
+                          <span className={`inline-flex rounded-full px-2 py-1 text-xs font-medium ${statusClass(r.status)}`}>{r.decision}</span>
+                          <p className="text-xs text-slate-400 mt-1">{r.reason}</p>
+                        </>
+                      ) : <span className="text-slate-400">No data</span>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ) : (
+        <div className="h-28 flex items-center justify-center text-sm text-slate-400">
+          {loading ? '正在读取所有店铺...' : '其他店铺没有匹配的 SPU/SKU 数据。'}
+        </div>
       )}
     </div>
   )
