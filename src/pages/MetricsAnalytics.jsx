@@ -293,6 +293,7 @@ export default function MetricsAnalytics() {
   const [storeRows, setStoreRows] = useState([])
   const [storeDays, setStoreDays] = useState([])
   const [draftReport, setDraftReport] = useState(null)
+  const [uploadDate, setUploadDate] = useState(todayISO())
   const [timeframe, setTimeframe] = useState('7d')
   const [customFrom, setCustomFrom] = useState('')
   const [customTo, setCustomTo] = useState('')
@@ -399,6 +400,7 @@ export default function MetricsAnalytics() {
     try {
       const report = await parsePerformanceFile(file)
       setDraftReport(report)
+      setUploadDate(todayISO())
       toast.success(`${report.rows.length} 个商品 · ${report.start} 到 ${report.end}`, '表现数据已读取')
     } catch (err) {
       toast.error(err.message, '表现数据读取失败')
@@ -407,10 +409,20 @@ export default function MetricsAnalytics() {
 
   const saveDraft = async () => {
     if (!activeStore || !draftReport) return
+    const saveDate = uploadDate || todayISO()
     try {
-      const rows = draftReport.rows.map((r) => ({ ...r, reportDate: draftReport.end }))
-      await saveStoreDay(activeStore, draftReport.end, draftReport.fileName, rows)
-      toast.success(`${rows.length} 行保存到 ${activeStore} (${draftReport.end})`, '每日数据已保存')
+      const existing = await fetchStoreRange(activeStore, saveDate, saveDate).catch(() => ({ rows: [] }))
+      const existingRows = Array.isArray(existing.rows) ? existing.rows : []
+      const hasExisting = existingRows.length > 0
+      let mode = 'overwrite'
+      if (hasExisting) {
+        const overwrite = window.confirm(`${activeStore} 在 ${saveDate} 已经有 ${existingRows.length} 行数据。\n\n点击 OK = 覆盖这一天\n点击 Cancel = 加到原有数据后面`)
+        mode = overwrite ? 'overwrite' : 'append'
+      }
+      const nextRows = draftReport.rows.map((r) => ({ ...r, date: saveDate, reportDate: saveDate }))
+      const rows = mode === 'append' ? [...existingRows, ...nextRows] : nextRows
+      await saveStoreDay(activeStore, saveDate, draftReport.fileName, rows)
+      toast.success(`${rows.length} 行保存到 ${activeStore} (${saveDate})`, mode === 'append' ? '已加到原有数据' : '每日数据已保存')
       setDraftReport(null)
       await reloadStores()
       await loadWindow()
@@ -514,10 +526,14 @@ export default function MetricsAnalytics() {
           {draftReport && (
             <div className="mt-3 flex flex-wrap items-center gap-2">
               <span className="text-xs text-slate-500">{draftReport.rows.length} rows from {draftReport.fileName}</span>
+              <label className="inline-flex items-center gap-1.5 text-xs text-slate-500">
+                保存日期
+                <input type="date" className="metric-input !py-1" value={uploadDate} onChange={(e) => setUploadDate(e.target.value)} />
+              </label>
               <button onClick={saveDraft} disabled={!activeStore} className="btn-primary text-xs px-3 py-1.5 disabled:opacity-40"><Save className="w-3.5 h-3.5" /> Save to {activeStore || 'store'}</button>
               <button onClick={() => setDraftReport(null)} className="btn-secondary text-xs px-3 py-1.5">Clear preview</button>
               {draftReport.start !== draftReport.end && (
-                <span className="inline-flex items-center gap-1 text-xs text-amber-600"><AlertTriangle className="w-3.5 h-3.5" /> 这是区间报表，会按结束日期保存。</span>
+                <span className="inline-flex items-center gap-1 text-xs text-amber-600"><AlertTriangle className="w-3.5 h-3.5" /> 这是区间报表，请确认保存日期。</span>
               )}
             </div>
           )}
