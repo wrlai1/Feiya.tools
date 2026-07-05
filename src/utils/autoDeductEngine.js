@@ -202,9 +202,11 @@ export function parseCSV(text) {
 
 // ── Core fill algorithm ───────────────────────────────────────────────────────
 
-/** Build the lookup key for a learned alias: style + sales-color, both normalized. */
-export function aliasKey(style, salesColor) {
-  return `${normalizeStyle(style)}::${normalizeColor(salesColor)}`
+/** Build the lookup key for a learned alias: style + sales-color + optional size. */
+export function aliasKey(style, salesColor, size = '') {
+  const base = `${normalizeStyle(style)}::${normalizeColor(salesColor)}`
+  const normSize = normalizeSize(size)
+  return normSize ? `${base}::${normSize}` : base
 }
 
 /**
@@ -284,19 +286,45 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
       if (prefixCandidates.length) candidates = prefixCandidates
     }
 
+    // ── Learned alias — a previous human "Link" wins outright ──────────────────
+    // If the user has taught us what this (style, color) means, fill that template
+    // color directly and skip fuzzy scoring. No-op if the aliased color isn't in
+    // this size's bucket (then fall through to normal matching).
+    const aliasTarget = aliases[aliasKey(style, color, normSize)] || aliases[aliasKey(style, color)]
+    const target = typeof aliasTarget === 'string' ? { COLOR: aliasTarget } : aliasTarget
+    if (!candidates?.length && target) {
+      const wantStyle = normalizeStyle(target.STYLE || '')
+      const wantColor = normalizeColor(target.COLOR || '')
+      const wantSize = normalizeSize(target.SIZE || normSize)
+      const ai = entries.findIndex(c => {
+        const styleOk = !wantStyle || normalizeStyle(c.style) === wantStyle
+        const colorOk = !wantColor || normalizeColor(c.color) === wantColor
+        const sizeOk = !wantSize || normalizeSize(c.size) === wantSize
+        return styleOk && colorOk && sizeOk
+      })
+      if (ai >= 0) {
+        entries[ai].qty += qty
+        filledTotal += qty
+        matchLog.push({ style, salesColor: color, size: normSize, qty, matchedTo: entries[ai].color, via: 'alias' })
+        return
+      }
+    }
+
     if (!candidates?.length) {
       unmatchedRows.push({ style, color, size: normSize, qty })
       return
     }
 
-    // ── Learned alias — a previous human "Link" wins outright ──────────────────
-    // If the user has taught us what this (style, color) means, fill that template
-    // color directly and skip fuzzy scoring. No-op if the aliased color isn't in
-    // this size's bucket (then fall through to normal matching).
-    const aliasTarget = aliases[`${normStyle}::${normalizeColor(color)}`]
     if (aliasTarget) {
-      const want = normalizeColor(aliasTarget)
-      const ai   = candidates.findIndex(c => normalizeColor(c.color) === want)
+      const wantStyle = normalizeStyle(target.STYLE || '')
+      const wantColor = normalizeColor(target.COLOR || '')
+      const wantSize = normalizeSize(target.SIZE || normSize)
+      const ai = candidates.findIndex(c => {
+        const styleOk = !wantStyle || normalizeStyle(c.style) === wantStyle
+        const colorOk = !wantColor || normalizeColor(c.color) === wantColor
+        const sizeOk = !wantSize || normalizeSize(c.size) === wantSize
+        return styleOk && colorOk && sizeOk
+      })
       if (ai >= 0) {
         candidates[ai].qty += qty
         filledTotal += qty

@@ -588,6 +588,11 @@ app.all('/api/auto-deduct', async (req, res) => {
       return res.json(rows[0].value);
     }
 
+    if (req.method === 'GET' && action === 'aliases') {
+      const rows = await sql`SELECT value FROM app_data WHERE key = 'autodeduct_aliases'`;
+      return res.json({ aliases: rows[0]?.value?.aliases || {} });
+    }
+
     if (req.method === 'POST' && action === 'upload-template') {
       if (!isAdmin) return res.status(403).json({ error: 'Admin access required' });
       const { rows, fileName } = req.body || {};
@@ -595,6 +600,14 @@ app.all('/api/auto-deduct', async (req, res) => {
       const value = JSON.stringify({ rows, fileName: fileName || 'template.csv', uploadedAt: new Date().toISOString(), uploadedBy: payload.username });
       await sql`INSERT INTO app_data (key, value, updated_at) VALUES ('autodeduct_template', ${value}::jsonb, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`;
       return res.json({ ok: true, count: rows.length });
+    }
+
+    if (req.method === 'POST' && action === 'save-aliases') {
+      const { aliases } = req.body || {};
+      if (!aliases || typeof aliases !== 'object' || Array.isArray(aliases)) return res.status(400).json({ error: 'aliases object required' });
+      const value = JSON.stringify({ aliases, updatedAt: new Date().toISOString(), updatedBy: payload.username });
+      await sql`INSERT INTO app_data (key, value, updated_at) VALUES ('autodeduct_aliases', ${value}::jsonb, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`;
+      return res.json({ ok: true, count: Object.keys(aliases).length });
     }
 
     if (req.method === 'POST' && action === 'apply') {

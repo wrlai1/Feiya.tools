@@ -5,7 +5,9 @@
 // Endpoints:
 //   GET  ?action=config          — check if template exists
 //   GET  ?action=template        — return stored template rows
+//   GET  ?action=aliases         — return learned unmatched-row aliases
 //   POST ?action=upload-template — save template rows (JSON body from client)
+//   POST ?action=save-aliases    — save learned unmatched-row aliases
 //   POST ?action=apply           — log a deduction/return transaction
 
 import { neon } from '@neondatabase/serverless'
@@ -89,6 +91,11 @@ export default async function handler(req, res) {
       return res.json(rows[0].value)
     }
 
+    if (req.method === 'GET' && action === 'aliases') {
+      const rows = await sql`SELECT value FROM app_data WHERE key = 'autodeduct_aliases'`
+      return res.json({ aliases: rows[0]?.value?.aliases || {} })
+    }
+
     // ── POST upload-template (admin only) ───────────────────────────────────
     if (req.method === 'POST' && action === 'upload-template') {
       if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
@@ -109,6 +116,24 @@ export default async function handler(req, res) {
         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
       `
       return res.json({ ok: true, count: rows.length })
+    }
+
+    if (req.method === 'POST' && action === 'save-aliases') {
+      const { aliases } = req.body || {}
+      if (!aliases || typeof aliases !== 'object' || Array.isArray(aliases)) {
+        return res.status(400).json({ error: 'aliases object required' })
+      }
+      const value = JSON.stringify({
+        aliases,
+        updatedAt: new Date().toISOString(),
+        updatedBy: payload.username,
+      })
+      await sql`
+        INSERT INTO app_data (key, value, updated_at)
+        VALUES ('autodeduct_aliases', ${value}::jsonb, NOW())
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+      `
+      return res.json({ ok: true, count: Object.keys(aliases).length })
     }
 
     // ── POST apply ──────────────────────────────────────────────────────────

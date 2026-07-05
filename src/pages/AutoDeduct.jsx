@@ -7,7 +7,7 @@ import FileUploadZone from '../components/FileUploadZone.jsx'
 import UnmatchedResolver from '../components/UnmatchedResolver.jsx'
 import { useToast } from '../hooks/useToast.js'
 import { useAuth } from '../context/AuthContext.jsx'
-import { parseCSV, fillTemplate, generateExcel } from '../utils/autoDeductEngine.js'
+import { parseCSV, fillTemplate, generateExcel, aliasKey } from '../utils/autoDeductEngine.js'
 
 const BASE = '/api'
 
@@ -197,6 +197,7 @@ export default function AutoDeduct() {
   const [configError,     setConfigError]     = useState(null)
   const [templateMissing, setTemplateMissing] = useState(false)
   const [showSettings,    setShowSettings]    = useState(false)
+  const [aliases,         setAliases]         = useState({})
   const toast = useToast()
 
   // Merge resolver output into filledRows:
@@ -226,6 +227,14 @@ export default function AutoDeduct() {
       .catch(err => setConfigError(err.message))
   }, [getToken, isMock])
 
+  useEffect(() => {
+    if (isMock) return
+    fetch(`${BASE}/auto-deduct?action=aliases`, { headers: authHeaders(getToken()) })
+      .then(r => r.json())
+      .then(data => setAliases(data.aliases || {}))
+      .catch(() => setAliases({}))
+  }, [getToken, isMock])
+
   const handleFile = useCallback((file) => {
     setSrcFile(file); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([])
   }, [])
@@ -253,7 +262,7 @@ export default function AutoDeduct() {
       const salesRows = parseCSV(salesText)
 
       // 3. Match & fill — pure JS, no server needed
-      const engineResult = fillTemplate(tRows, salesRows)
+      const engineResult = fillTemplate(tRows, salesRows, aliases)
       setResult(engineResult)
       setConfigError(null)
 
@@ -275,21 +284,49 @@ export default function AutoDeduct() {
     } finally {
       setProcessing(false)
     }
-  }, [srcFile, processing, getToken, toast])
+  }, [srcFile, processing, getToken, toast, aliases])
 
   // Called by UnmatchedResolver when user finishes reviewing.
   // Skipped rows are NOT deducted, but they must stay visible on the Unmatched
   // sheet — a skip is "leave for later", never "silently discard".
+  const saveAliases = useCallback(async (nextAliases) => {
+    if (isMock) return
+    const res = await fetch(`${BASE}/auto-deduct?action=save-aliases`, {
+      method: 'POST',
+      headers: authHeaders(getToken(), true),
+      body: JSON.stringify({ aliases: nextAliases }),
+    })
+    const data = await res.json()
+    if (!res.ok) throw new Error(data.error || 'Could not save learned matches')
+  }, [getToken, isMock])
+
   const handleResolve = useCallback((items, skipped = []) => {
     setResolvedExtras(items)
     setSkippedRows(skipped)
+    const learned = {}
+    for (const item of items) {
+      if (!item._learnAlias || !item._source) continue
+      learned[aliasKey(item._source.style, item._source.color, item._source.size)] = {
+        STYLE: item.STYLE,
+        COLOR: item.COLOR,
+        SIZE: item.SIZE,
+      }
+    }
+    const learnedCount = Object.keys(learned).length
+    if (learnedCount) {
+      const nextAliases = { ...aliases, ...learned }
+      setAliases(nextAliases)
+      saveAliases(nextAliases)
+        .then(() => toast.success(`${learnedCount} match${learnedCount !== 1 ? 'es' : ''} remembered for next time`, 'Matches Saved'))
+        .catch((err) => toast.error(err.message, 'Could Not Save Matches'))
+    }
     if (items.length > 0 || skipped.length > 0) {
       const parts = []
       if (items.length)   parts.push(`${items.length} resolved`)
       if (skipped.length) parts.push(`${skipped.length} skipped (kept on Unmatched sheet)`)
       toast.success(parts.join(' · '), 'Ready to Download')
     }
-  }, [toast])
+  }, [aliases, saveAliases, toast])
 
   const handleDownload = useCallback(async () => {
     if (!result) return
