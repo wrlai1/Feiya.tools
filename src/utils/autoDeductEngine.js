@@ -292,22 +292,34 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
     // this size's bucket (then fall through to normal matching).
     const aliasTarget = aliases[aliasKey(style, color, normSize)] || aliases[aliasKey(style, color)]
     const target = typeof aliasTarget === 'string' ? { COLOR: aliasTarget } : aliasTarget
-    if (!candidates?.length && target) {
+    const applyAliasTarget = (pool = []) => {
       const wantStyle = normalizeStyle(target.STYLE || '')
       const wantColor = normalizeColor(target.COLOR || '')
       const wantSize = normalizeSize(target.SIZE || normSize)
-      const ai = entries.findIndex(c => {
+      const matchIn = (items) => items.find(c => {
         const styleOk = !wantStyle || normalizeStyle(c.style) === wantStyle
         const colorOk = !wantColor || normalizeColor(c.color) === wantColor
         const sizeOk = !wantSize || normalizeSize(c.size) === wantSize
         return styleOk && colorOk && sizeOk
       })
-      if (ai >= 0) {
-        entries[ai].qty += qty
+      const matched = matchIn(pool) || (wantStyle ? matchIn(entries) : null)
+      if (matched) {
+        matched.qty += qty
         filledTotal += qty
-        matchLog.push({ style, salesColor: color, size: normSize, qty, matchedTo: entries[ai].color, via: 'alias' })
-        return
+        matchLog.push({ style, salesColor: color, size: normSize, qty, matchedTo: matched.color, via: 'alias' })
+        return true
       }
+      if (target._isNew && target.STYLE && target.COLOR) {
+        entries.push({ style: target.STYLE, color: target.COLOR, size: target.SIZE || normSize, qty })
+        filledTotal += qty
+        matchLog.push({ style, salesColor: color, size: normSize, qty, matchedTo: target.COLOR, via: 'alias new' })
+        return true
+      }
+      return false
+    }
+
+    if (!candidates?.length && target) {
+      if (applyAliasTarget([])) return
     }
 
     if (!candidates?.length) {
@@ -316,21 +328,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
     }
 
     if (aliasTarget) {
-      const wantStyle = normalizeStyle(target.STYLE || '')
-      const wantColor = normalizeColor(target.COLOR || '')
-      const wantSize = normalizeSize(target.SIZE || normSize)
-      const ai = candidates.findIndex(c => {
-        const styleOk = !wantStyle || normalizeStyle(c.style) === wantStyle
-        const colorOk = !wantColor || normalizeColor(c.color) === wantColor
-        const sizeOk = !wantSize || normalizeSize(c.size) === wantSize
-        return styleOk && colorOk && sizeOk
-      })
-      if (ai >= 0) {
-        candidates[ai].qty += qty
-        filledTotal += qty
-        matchLog.push({ style, salesColor: color, size: normSize, qty, matchedTo: candidates[ai].color, via: 'alias' })
-        return
-      }
+      if (applyAliasTarget(candidates)) return
     }
 
     // Score every candidate, keeping the best score per DISTINCT color (a color's

@@ -306,13 +306,19 @@ export default function AutoDeduct() {
     const learned = {}
     for (const item of items) {
       if (!item._learnAlias || !item._source) continue
+      learned[aliasKey(item._source.style, item._source.color)] = {
+        STYLE: item.STYLE,
+        COLOR: item.COLOR,
+        _isNew: !!item._isNew,
+      }
       learned[aliasKey(item._source.style, item._source.color, item._source.size)] = {
         STYLE: item.STYLE,
         COLOR: item.COLOR,
         SIZE: item.SIZE,
+        _isNew: !!item._isNew,
       }
     }
-    const learnedCount = Object.keys(learned).length
+    const learnedCount = items.filter((item) => item._learnAlias && item._source).length
     if (learnedCount) {
       const nextAliases = { ...aliases, ...learned }
       setAliases(nextAliases)

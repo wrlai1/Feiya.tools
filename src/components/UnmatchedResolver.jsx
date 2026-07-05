@@ -86,7 +86,7 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
         QTY:    row.qty,
         _isNew: r.type === 'create',
         _source: { style: row.style, color: row.color, size: row.size },
-        _learnAlias: r.type === 'link',
+        _learnAlias: r.type === 'link' || r.type === 'create',
       })
     }
     onDone(items, skipped)
