@@ -317,6 +317,63 @@ function productKeyLabel(item) {
   return [left, right, item.productName].filter(Boolean).join(' · ')
 }
 
+function productIdentity(product) {
+  return {
+    spu: normalizeId(product?.spu),
+    sku: normalizeId(product?.sku),
+  }
+}
+
+function uniqueProductPlanRows(rows) {
+  const map = new Map()
+  const duplicateSpus = new Set()
+  for (const row of rows) {
+    const { spu } = productIdentity(row)
+    if (!spu) continue
+    if (map.has(spu)) duplicateSpus.add(spu)
+    map.set(spu, row)
+  }
+  return { rows: [...map.values()], duplicateSpus: [...duplicateSpus] }
+}
+
+function findProductPlanDuplicates(incoming, existing) {
+  const existingSpus = new Set()
+  const existingSkus = new Set()
+  for (const product of existing) {
+    const { spu, sku } = productIdentity(product)
+    if (spu) existingSpus.add(spu)
+    if (sku) existingSkus.add(sku)
+  }
+  return incoming.filter((product) => {
+    const { spu, sku } = productIdentity(product)
+    return (spu && existingSpus.has(spu)) || (sku && existingSkus.has(sku))
+  })
+}
+
+function mergeProductPlans(existing, incoming, overwriteDuplicates) {
+  const incomingSpus = new Set(incoming.map((p) => productIdentity(p).spu).filter(Boolean))
+  const incomingSkus = new Set(incoming.map((p) => productIdentity(p).sku).filter(Boolean))
+  const base = existing.filter((product) => {
+    const { spu, sku } = productIdentity(product)
+    const duplicated = (spu && incomingSpus.has(spu)) || (sku && incomingSkus.has(sku))
+    return overwriteDuplicates ? !duplicated : true
+  })
+  const additions = overwriteDuplicates
+    ? incoming
+    : incoming.filter((product) => {
+      const { spu, sku } = productIdentity(product)
+      return !existing.some((item) => {
+        const current = productIdentity(item)
+        return (spu && current.spu === spu) || (sku && current.sku === sku)
+      })
+    })
+  return [...base, ...additions]
+}
+
+function duplicatePreview(rows) {
+  return rows.slice(0, 6).map((r) => r.sku || r.spu).filter(Boolean).join(', ')
+}
+
 function daySeries(rows) {
   const days = new Map()
   for (const r of rows) {
@@ -538,10 +595,27 @@ export default function MetricsAnalytics() {
     if (!activeStore) { toast.error('请先选择或创建店铺', '不能保存上新计划'); return }
     try {
       const rows = await parseProductPlan(file)
-      const scoped = rows.map((r) => ({ ...r, store: r.store || activeStore }))
-      await saveStoreProducts(activeStore, scoped, file.name)
-      setProducts(scoped)
-      toast.success(`${scoped.length} 个 SPU 已保存到 ${activeStore}`, '上新计划已导入')
+      const scoped = rows.map((r) => ({ ...r, store: activeStore }))
+      const { rows: uniqueRows, duplicateSpus } = uniqueProductPlanRows(scoped)
+      if (duplicateSpus.length) {
+        toast.info(`文件里有 ${duplicateSpus.length} 个重复 SPU，已保留最后一条`, '上新计划去重')
+      }
+      const current = await fetchStoreProducts(activeStore).catch(() => ({ products: products || [] }))
+      const existingProducts = current.products || []
+      const duplicates = findProductPlanDuplicates(uniqueRows, existingProducts)
+      let overwriteDuplicates = false
+      if (duplicates.length) {
+        overwriteDuplicates = window.confirm(`${activeStore} 已经有 ${duplicates.length} 个相同 SPU/SKU。\n\n重复项：${duplicatePreview(duplicates) || '见上传文件'}${duplicates.length > 6 ? ' ...' : ''}\n\n点击 OK = 覆盖这些重复产品\n点击 Cancel = 跳过这些重复产品，只导入新产品`)
+      }
+      const merged = mergeProductPlans(existingProducts, uniqueRows, overwriteDuplicates).map((r) => ({ ...r, store: activeStore }))
+      const addedCount = Math.max(0, merged.length - existingProducts.length)
+      const skippedCount = overwriteDuplicates ? 0 : duplicates.length
+      await saveStoreProducts(activeStore, merged, file.name)
+      setProducts(merged)
+      toast.success(
+        `${uniqueRows.length - skippedCount} 个 SPU 已保存到 ${activeStore}${skippedCount ? `，跳过 ${skippedCount} 个重复` : ''}${addedCount ? `，新增 ${addedCount} 个` : ''}`,
+        overwriteDuplicates ? '重复产品已覆盖' : '上新计划已导入',
+      )
     } catch (err) {
       toast.error(err.message, '上新计划读取失败')
     }
@@ -687,6 +761,9 @@ export default function MetricsAnalytics() {
               <p className="text-xs text-slate-400 mt-0.5">保存 SKU、SPU、品类、生命周期、成本、售价、毛利。</p>
             </div>
             <span className="text-xs text-slate-500">{products.length} SPU</span>
+          </div>
+          <div className={`mb-3 rounded-lg px-3 py-2 text-xs ${activeStore ? 'bg-blue-50 text-blue-700' : 'bg-amber-50 text-amber-700'}`}>
+            {activeStore ? `上新计划会保存到：${activeStore}` : '请先选择或创建店铺，再上传上新计划。'}
           </div>
           <FileUploadZone onFile={handlePlanUpload} accept=".csv,.xlsx,.xls" label="Upload 上新计划.csv" acceptedTypes="CSV, XLSX" />
         </div>
