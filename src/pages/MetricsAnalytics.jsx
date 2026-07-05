@@ -405,6 +405,32 @@ function duplicatePreview(rows) {
   return rows.slice(0, 6).map((r) => r.sku || r.spu).filter(Boolean).join(', ')
 }
 
+function unmatchedPerformanceGroups(rows, products) {
+  const knownSpus = new Set(products.map((p) => normalizeId(p.spu)).filter(Boolean))
+  const groups = new Map()
+  for (const row of rows || []) {
+    const spu = normalizeId(row.spu)
+    if (!spu || knownSpus.has(spu)) continue
+    if (!groups.has(spu)) {
+      groups.set(spu, {
+        spu,
+        rows: 0,
+        productName: row.productName || '',
+        spend: 0,
+        units: 0,
+        revenue: 0,
+      })
+    }
+    const group = groups.get(spu)
+    group.rows += 1
+    group.spend += Number(row.spend) || 0
+    group.units += Number(row.units) || 0
+    group.revenue += Number(row.revenue) || 0
+    if (!group.productName && row.productName) group.productName = row.productName
+  }
+  return [...groups.values()].sort((a, b) => (b.units || 0) - (a.units || 0))
+}
+
 function blankProduct(store) {
   return {
     store,
@@ -516,7 +542,12 @@ export default function MetricsAnalytics() {
   const reloadStores = useCallback(async () => {
     try {
       const res = await fetchStores()
-      setStores(res.stores || [])
+      const baseStores = res.stores || []
+      const withCounts = await Promise.all(baseStores.map(async (store) => {
+        const productRes = await fetchStoreProducts(store.name).catch(() => ({ products: [] }))
+        return { ...store, spuCount: productRes.products?.length || 0 }
+      }))
+      setStores(withCounts)
     } catch (err) {
       setStores([])
     }
@@ -574,6 +605,10 @@ export default function MetricsAnalytics() {
   }, [activeStore])
 
   const visibleRows = draftReport?.rows?.length ? draftReport.rows : storeRows
+  const unmatchedDraftSpus = useMemo(
+    () => unmatchedPerformanceGroups(draftReport?.rows || [], products),
+    [draftReport, products],
+  )
   const totals = useMemo(() => aggregateTotals(visibleRows), [visibleRows])
   const productRows = useMemo(() => aggregateBySpu(visibleRows, products, targets), [visibleRows, products, targets])
   const productChoices = useMemo(() => {
@@ -584,6 +619,10 @@ export default function MetricsAnalytics() {
     }
     return [...map.values()].sort((a, b) => String(a.sku || a.spu).localeCompare(String(b.sku || b.spu)))
   }, [products, productRows])
+  const catalogChoices = useMemo(
+    () => products.filter((p) => p?.spu).sort((a, b) => String(a.sku || a.spu).localeCompare(String(b.sku || b.spu))),
+    [products],
+  )
   const selectedProductMatches = useMemo(
     () => productChoices.filter((p) => matchesProductKey(p, selectedProduct)),
     [productChoices, selectedProduct],
@@ -713,6 +752,7 @@ export default function MetricsAnalytics() {
     try {
       await saveStoreProducts(activeStore, next, 'manual-product-edit')
       setProducts(next)
+      await reloadStores()
       toast.success(`${product.sku || product.spu} 已保存到 ${activeStore}`, index >= 0 ? 'SPU 已更新' : 'SPU 已新增')
       return true
     } catch (err) {
@@ -729,6 +769,7 @@ export default function MetricsAnalytics() {
     try {
       await saveStoreProducts(activeStore, next, 'manual-product-delete')
       setProducts(next)
+      await reloadStores()
       toast.success(`${label} 已从产品档案移除`, 'SPU 已删除')
       return true
     } catch (err) {
@@ -758,6 +799,7 @@ export default function MetricsAnalytics() {
       const skippedCount = overwriteDuplicates ? 0 : duplicates.length
       await saveStoreProducts(activeStore, merged, file.name)
       setProducts(merged)
+      await reloadStores()
       toast.success(
         `${uniqueRows.length - skippedCount} 个 SPU 已保存到 ${activeStore}${skippedCount ? `，跳过 ${skippedCount} 个重复` : ''}${addedCount ? `，新增 ${addedCount} 个` : ''}`,
         overwriteDuplicates ? '重复产品已覆盖' : '上新计划已导入',
@@ -778,8 +820,52 @@ export default function MetricsAnalytics() {
     }
   }
 
+  const addDraftSpuToCatalog = async (group) => {
+    const product = {
+      ...blankProduct(activeStore),
+      spu: group.spu,
+      productName: group.productName || group.spu,
+      notes: `Added from performance upload ${draftReport?.fileName || ''}`.trim(),
+    }
+    await handleSaveProduct(product)
+  }
+
+  const removeDraftSpu = (spu) => {
+    setDraftReport((prev) => {
+      if (!prev) return prev
+      const rows = prev.rows.filter((row) => normalizeId(row.spu) !== normalizeId(spu))
+      return { ...prev, rows }
+    })
+    toast.info(`${spu} 已从本次上传删除`, '上传数据已更新')
+  }
+
+  const renameDraftSpu = (fromSpu, target) => {
+    const matches = catalogChoices.filter((p) => matchesProductKey(p, target))
+    const product = matches[0]
+    if (!product?.spu) {
+      toast.error('没有找到这个 SPU/SKU，请先加入产品档案或重新输入。', '无法修改 SPU')
+      return
+    }
+    setDraftReport((prev) => {
+      if (!prev) return prev
+      const rows = prev.rows.map((row) => normalizeId(row.spu) === normalizeId(fromSpu)
+        ? { ...row, spu: product.spu, productName: row.productName || product.productName }
+        : row)
+      return { ...prev, rows }
+    })
+    toast.success(`${fromSpu} 已改成 ${product.spu}`, '上传 SPU 已修改')
+  }
+
   const saveDraft = async () => {
     if (!activeStore || !draftReport) return
+    if (!draftReport.rows.length) {
+      toast.error('本次上传已经没有可保存的数据行。', '不能保存每日数据')
+      return
+    }
+    if (unmatchedDraftSpus.length) {
+      toast.error(`还有 ${unmatchedDraftSpus.length} 个 SPU 没有匹配产品档案，请先添加、修改或删除。`, '不能保存每日数据')
+      return
+    }
     const saveDate = uploadDate || todayISO()
     try {
       const existing = await fetchStoreRange(activeStore, saveDate, saveDate).catch(() => ({ rows: [] }))
@@ -814,14 +900,12 @@ export default function MetricsAnalytics() {
 
   return (
     <div className="space-y-6 max-w-7xl">
+      <FloatingStoreSwitcher stores={stores} activeStore={activeStore} setActiveStore={setActiveStore} />
+
       <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-slate-800">Product Analytics</h1>
           <p className="text-slate-500 mt-1">按店铺和 SPU 追踪每天表现，看销量和点击率、转化率、加购、花费、ROAS 的关系。</p>
-        </div>
-        <div className="rounded-lg border border-slate-200 bg-white px-4 py-3 min-w-56">
-          <div className="text-xs text-slate-400">Current store</div>
-          <div className="text-lg font-semibold text-slate-800">{activeStore || '未选择店铺'}</div>
         </div>
       </div>
 
@@ -844,7 +928,7 @@ export default function MetricsAnalytics() {
               className={`text-left rounded-lg border px-4 py-3 transition ${activeStore === s.name ? 'bg-blue-50 border-blue-300 text-blue-800 shadow-sm' : 'bg-white border-slate-200 text-slate-600 hover:border-slate-300'}`}
             >
               <div className="font-semibold truncate">{s.name}</div>
-              <div className="text-xs mt-1 text-slate-400">{s.days || 0} saved days</div>
+              <div className="text-xs mt-1 text-slate-400">{s.days || 0} saved days · {s.spuCount || 0} SPU</div>
             </button>
           ))}
           {!stores.length && <div className="rounded-lg border border-dashed border-slate-200 p-4 text-sm text-slate-400">先到 Store Settings 里创建一个店铺。</div>}
@@ -908,29 +992,29 @@ export default function MetricsAnalytics() {
       </section>
 
       <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <div className="card p-5">
+        <div className="card p-4">
           <div className="flex items-center justify-between mb-3">
             <div>
-              <h2 className="font-semibold text-slate-800">1. 上新计划 / 产品档案</h2>
-              <p className="text-xs text-slate-400 mt-0.5">保存 SKU、SPU、品类、生命周期、成本、售价、毛利。</p>
+              <h2 className="font-semibold text-slate-800">1. 上新计划</h2>
+              <p className="text-xs text-slate-400 mt-0.5">上传或更新当前店铺 SPU 档案。</p>
             </div>
             <span className="text-xs text-slate-500">{products.length} SPU</span>
           </div>
-          <div className={`mb-3 rounded-lg px-3 py-2 text-xs ${activeStore ? 'bg-blue-50 text-blue-700' : 'bg-amber-50 text-amber-700'}`}>
+          <div className={`mb-2 rounded-lg px-3 py-1.5 text-xs ${activeStore ? 'bg-blue-50 text-blue-700' : 'bg-amber-50 text-amber-700'}`}>
             {activeStore ? `上新计划会保存到：${activeStore}` : '请先选择或创建店铺，再上传上新计划。'}
           </div>
-          <FileUploadZone onFile={handlePlanUpload} accept=".csv,.xlsx,.xls" label="Upload 上新计划.csv" acceptedTypes="CSV, XLSX" />
+          <FileUploadZone compact onFile={handlePlanUpload} accept=".csv,.xlsx,.xls" label="Upload 上新计划.csv" acceptedTypes="CSV, XLSX" />
         </div>
 
-        <div className="card p-5">
+        <div className="card p-4">
           <div className="flex items-center justify-between mb-3">
             <div>
               <h2 className="font-semibold text-slate-800">2. 每日表现数据</h2>
-              <p className="text-xs text-slate-400 mt-0.5">上传商品推广数据，系统按 SPU 和产品档案合并。</p>
+              <p className="text-xs text-slate-400 mt-0.5">上传后先检查 SPU 是否能匹配产品档案。</p>
             </div>
             {draftReport && <span className="text-xs text-blue-600">{draftReport.start} to {draftReport.end}</span>}
           </div>
-          <FileUploadZone onFile={handlePerformanceUpload} accept=".csv,.xlsx,.xls" label="Upload 商品推广数据" acceptedTypes="CSV, XLSX" />
+          <FileUploadZone compact onFile={handlePerformanceUpload} accept=".csv,.xlsx,.xls" label="Upload 商品推广数据" acceptedTypes="CSV, XLSX" />
           {draftReport && (
             <div className="mt-3 flex flex-wrap items-center gap-2">
               <span className="text-xs text-slate-500">{draftReport.rows.length} rows from {draftReport.fileName}</span>
@@ -938,12 +1022,21 @@ export default function MetricsAnalytics() {
                 保存日期
                 <input type="date" className="metric-input !py-1" value={uploadDate} onChange={(e) => setUploadDate(e.target.value)} />
               </label>
-              <button onClick={saveDraft} disabled={!activeStore} className="btn-primary text-xs px-3 py-1.5 disabled:opacity-40"><Save className="w-3.5 h-3.5" /> Save to {activeStore || 'store'}</button>
+              <button onClick={saveDraft} disabled={!activeStore || unmatchedDraftSpus.length > 0} className="btn-primary text-xs px-3 py-1.5 disabled:opacity-40"><Save className="w-3.5 h-3.5" /> Save to {activeStore || 'store'}</button>
               <button onClick={() => setDraftReport(null)} className="btn-secondary text-xs px-3 py-1.5">Clear preview</button>
               {draftReport.start !== draftReport.end && (
                 <span className="inline-flex items-center gap-1 text-xs text-amber-600"><AlertTriangle className="w-3.5 h-3.5" /> 这是区间报表，请确认保存日期。</span>
               )}
             </div>
+          )}
+          {draftReport && unmatchedDraftSpus.length > 0 && (
+            <PerformanceSpuReconcile
+              groups={unmatchedDraftSpus}
+              catalogChoices={catalogChoices}
+              onAdd={addDraftSpuToCatalog}
+              onRemove={removeDraftSpu}
+              onRename={renameDraftSpu}
+            />
           )}
         </div>
       </section>
@@ -1094,7 +1187,115 @@ export default function MetricsAnalytics() {
   )
 }
 
+function FloatingStoreSwitcher({ stores, activeStore, setActiveStore }) {
+  const [open, setOpen] = useState(false)
+  const active = stores.find((s) => s.name === activeStore)
+  return (
+    <div className="fixed right-5 bottom-5 z-40">
+      {open && (
+        <div className="mb-2 w-72 rounded-lg border border-slate-200 bg-white shadow-xl overflow-hidden">
+          <div className="px-3 py-2 border-b border-slate-100">
+            <div className="text-xs font-semibold text-slate-500 uppercase">Switch Store</div>
+          </div>
+          <div className="max-h-80 overflow-y-auto p-2 space-y-1">
+            {stores.map((store) => (
+              <button
+                key={store.name}
+                onClick={() => { setActiveStore(store.name); setOpen(false) }}
+                className={`w-full text-left rounded-md px-3 py-2 ${activeStore === store.name ? 'bg-blue-50 text-blue-800' : 'hover:bg-slate-50 text-slate-600'}`}
+              >
+                <div className="font-semibold truncate">{store.name}</div>
+                <div className="text-xs text-slate-400">{store.days || 0} days · {store.spuCount || 0} SPU</div>
+              </button>
+            ))}
+            {!stores.length && <div className="px-3 py-6 text-sm text-slate-400 text-center">No stores yet.</div>}
+          </div>
+        </div>
+      )}
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="rounded-lg border border-blue-200 bg-white px-4 py-3 text-left shadow-xl hover:border-blue-300 min-w-56"
+      >
+        <div className="text-[11px] uppercase font-semibold text-blue-500">Current Store</div>
+        <div className="font-semibold text-slate-800 truncate">{activeStore || '未选择店铺'}</div>
+        <div className="text-xs text-slate-400 mt-0.5">{active ? `${active.days || 0} days · ${active.spuCount || 0} SPU` : 'Click to switch'}</div>
+      </button>
+    </div>
+  )
+}
+
+function PerformanceSpuReconcile({ groups, catalogChoices, onAdd, onRemove, onRename }) {
+  const [targets, setTargets] = useState({})
+  const setTarget = (spu, value) => setTargets((prev) => ({ ...prev, [spu]: value }))
+  return (
+    <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50/70 p-4">
+      <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-3">
+        <div>
+          <h3 className="font-semibold text-amber-800">SPU 对账需要处理</h3>
+          <p className="text-xs text-amber-700/80 mt-0.5">
+            上传文件里有 {groups.length} 个 SPU 没有匹配当前店铺的产品档案。请先改成已有 SPU、加入档案，或从本次上传删除。
+          </p>
+        </div>
+        <span className="text-xs text-amber-700 bg-white/70 rounded-lg px-2.5 py-1">保存前必须处理完成</span>
+      </div>
+
+      <datalist id="performance-catalog-spu-options">
+        {catalogChoices.map((p) => (
+          <option key={p.spu} value={p.sku || p.spu}>{productKeyLabel(p)}</option>
+        ))}
+        {catalogChoices.map((p) => p.sku ? <option key={`${p.spu}-spu-reconcile`} value={p.spu}>{productKeyLabel(p)}</option> : null)}
+      </datalist>
+
+      <div className="mt-3 overflow-x-auto">
+        <table className="min-w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs text-amber-700/70 border-b border-amber-200">
+              <th className="py-2 pr-4">上传 SPU</th>
+              <th className="py-2 pr-4">商品名</th>
+              <th className="py-2 pr-4 text-right">Rows</th>
+              <th className="py-2 pr-4 text-right">Units</th>
+              <th className="py-2 pr-4 text-right">Spend</th>
+              <th className="py-2 pr-4">改成已有 SPU/SKU</th>
+              <th className="py-2 pr-4">Action</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-amber-100">
+            {groups.map((group) => (
+              <tr key={group.spu} className="align-top">
+                <td className="py-3 pr-4 font-semibold text-amber-900">{group.spu}</td>
+                <td className="py-3 pr-4 min-w-48 text-amber-900/80">{group.productName || '-'}</td>
+                <td className="py-3 pr-4 text-right text-amber-900/80">{count(group.rows)}</td>
+                <td className="py-3 pr-4 text-right text-amber-900/80">{count(group.units)}</td>
+                <td className="py-3 pr-4 text-right text-amber-900/80">{money(group.spend)}</td>
+                <td className="py-3 pr-4 min-w-56">
+                  <div className="flex gap-2">
+                    <input
+                      className="metric-input !py-1.5 bg-white"
+                      list="performance-catalog-spu-options"
+                      placeholder="选择已有 SPU / SKU"
+                      value={targets[group.spu] || ''}
+                      onChange={(e) => setTarget(group.spu, e.target.value)}
+                    />
+                    <button onClick={() => onRename(group.spu, targets[group.spu])} className="btn-secondary text-xs px-3 py-1.5">Apply</button>
+                  </div>
+                </td>
+                <td className="py-3 pr-4">
+                  <div className="flex flex-wrap gap-2">
+                    <button onClick={() => onAdd(group)} className="btn-secondary text-xs px-3 py-1.5">加入档案</button>
+                    <button onClick={() => onRemove(group.spu)} className="btn-secondary text-xs px-3 py-1.5 text-red-600">从上传删除</button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
 function ProductCatalogEditor({ activeStore, products, onSave, onDelete }) {
+  const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
   const [draft, setDraft] = useState(null)
   const [isNew, setIsNew] = useState(false)
@@ -1114,6 +1315,22 @@ function ProductCatalogEditor({ activeStore, products, onSave, onDelete }) {
     setIsNew(false)
     setQuery('')
   }, [activeStore])
+
+  if (!open) {
+    return (
+      <section className="card p-4">
+        <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+          <div>
+            <h2 className="font-semibold text-slate-800">SPU Product Catalog</h2>
+            <p className="text-xs text-slate-400 mt-0.5">{activeStore ? `${activeStore} · ${products.length} SPU` : '选择店铺后可以维护 SPU 档案。'} 这个工具不常用，默认收起。</p>
+          </div>
+          <button onClick={() => setOpen(true)} disabled={!activeStore} className="btn-secondary text-xs px-3 py-1.5 disabled:opacity-40">
+            Manage SPU Catalog
+          </button>
+        </div>
+      </section>
+    )
+  }
 
   const startNew = () => {
     setDraft(blankProduct(activeStore))
@@ -1157,9 +1374,12 @@ function ProductCatalogEditor({ activeStore, products, onSave, onDelete }) {
           <h2 className="font-semibold text-slate-800">SPU Product Catalog</h2>
           <p className="text-xs text-slate-400 mt-0.5">修改上新计划里的 SPU 档案。这里的 SKU、商品名、备注、价格和毛利会用于后续分析。</p>
         </div>
-        <button onClick={startNew} disabled={!activeStore} className="btn-primary text-xs px-3 py-1.5 disabled:opacity-40">
-          <Plus className="w-3.5 h-3.5" /> Add SPU
-        </button>
+        <div className="flex gap-2">
+          <button onClick={startNew} disabled={!activeStore} className="btn-primary text-xs px-3 py-1.5 disabled:opacity-40">
+            <Plus className="w-3.5 h-3.5" /> Add SPU
+          </button>
+          <button onClick={() => setOpen(false)} className="btn-secondary text-xs px-3 py-1.5">Collapse</button>
+        </div>
       </div>
 
       {!activeStore ? (

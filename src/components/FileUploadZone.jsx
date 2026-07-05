@@ -9,6 +9,7 @@ export default function FileUploadZone({
   acceptedTypes = 'XLSX, XLS, CSV',
   currentFile = null,
   onClear,
+  compact = false,
 }) {
   const inputRef = useRef(null)
   const [isDragOver, setIsDragOver] = useState(false)
@@ -84,7 +85,7 @@ export default function FileUploadZone({
 
   return (
     <div
-      className={`upload-zone rounded-xl p-8 text-center cursor-pointer select-none ${
+      className={`upload-zone rounded-xl ${compact ? 'p-4' : 'p-8'} text-center cursor-pointer select-none ${
         isDragOver ? 'drag-over' : ''
       }`}
       onDragOver={handleDragOver}
@@ -99,27 +100,27 @@ export default function FileUploadZone({
         className="hidden"
         onChange={handleInputChange}
       />
-      <div className="flex flex-col items-center gap-3">
+      <div className={`flex flex-col items-center ${compact ? 'gap-2' : 'gap-3'}`}>
         <div
-          className={`w-14 h-14 rounded-2xl flex items-center justify-center transition-colors ${
+          className={`${compact ? 'w-10 h-10 rounded-xl' : 'w-14 h-14 rounded-2xl'} flex items-center justify-center transition-colors ${
             isDragOver ? 'bg-blue-100' : 'bg-slate-100'
           }`}
         >
           <Upload
-            className={`w-7 h-7 transition-colors ${
+            className={`${compact ? 'w-5 h-5' : 'w-7 h-7'} transition-colors ${
               isDragOver ? 'text-blue-500' : 'text-slate-400'
             }`}
           />
         </div>
         <div>
           <p
-            className={`text-base font-medium transition-colors ${
+            className={`${compact ? 'text-sm' : 'text-base'} font-medium transition-colors ${
               isDragOver ? 'text-blue-700' : 'text-slate-600'
             }`}
           >
             {label}
           </p>
-          <p className="text-sm text-slate-400 mt-1">
+          <p className={`${compact ? 'text-xs' : 'text-sm'} text-slate-400 mt-1`}>
             {sublabel}
           </p>
         </div>
