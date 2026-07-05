@@ -338,6 +338,15 @@ async function ensureAnalyticsStoreTables(sql) {
       PRIMARY KEY (username, store, spu)
     )
   `;
+  await sql`
+    CREATE TABLE IF NOT EXISTS analytics_store_settings (
+      username   TEXT NOT NULL,
+      store      TEXT NOT NULL,
+      data       JSONB NOT NULL,
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (username, store)
+    )
+  `;
 }
 
 app.all('/api/analytics-store', async (req, res) => {
@@ -372,6 +381,7 @@ app.all('/api/analytics-store', async (req, res) => {
       if (!name) return res.status(400).json({ error: 'name is required' });
       await sql`DELETE FROM analytics_store_days WHERE username = ${username} AND store = ${name}`;
       await sql`DELETE FROM analytics_store_products WHERE username = ${username} AND store = ${name}`;
+      await sql`DELETE FROM analytics_store_settings WHERE username = ${username} AND store = ${name}`;
       await sql`DELETE FROM analytics_stores WHERE username = ${username} AND name = ${name}`;
       return res.json({ ok: true });
     }
@@ -405,6 +415,31 @@ app.all('/api/analytics-store', async (req, res) => {
         `;
       }
       return res.json({ ok: true, count: products.length });
+    }
+
+    if (req.method === 'GET' && action === 'settings') {
+      const store = String(req.query.store || '__global__').trim() || '__global__';
+      const rows = await sql`
+        SELECT data FROM analytics_store_settings
+        WHERE username = ${username} AND (store = ${store} OR store = '__global__')
+        ORDER BY CASE WHEN store = ${store} THEN 0 ELSE 1 END
+        LIMIT 1
+      `;
+      return res.json({ settings: rows[0]?.data || null });
+    }
+
+    if (req.method === 'POST' && action === 'save-settings') {
+      const { store, settings } = req.body || {};
+      const name = String(store || '__global__').trim() || '__global__';
+      if (!settings || typeof settings !== 'object') return res.status(400).json({ error: 'settings are required' });
+      const json = JSON.stringify(settings);
+      await sql`
+        INSERT INTO analytics_store_settings (username, store, data, updated_at)
+        VALUES (${username}, ${name}, ${json}::jsonb, NOW())
+        ON CONFLICT (username, store)
+        DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()
+      `;
+      return res.json({ ok: true, settings });
     }
 
     if (req.method === 'POST' && action === 'save-day') {

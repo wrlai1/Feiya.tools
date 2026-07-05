@@ -154,3 +154,15 @@ export function saveStoreProducts(store, products, fileName = null) {
     body: JSON.stringify({ store, products, fileName }),
   })
 }
+
+export function fetchAnalyticsSettings(store = '') {
+  return request(`${BASE}/analytics-store?action=settings&store=${encodeURIComponent(store || '')}`)
+}
+
+export function saveAnalyticsSettings(store, settings) {
+  return request(`${BASE}/analytics-store?action=save-settings`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ store, settings }),
+  })
+}

@@ -13,7 +13,7 @@ import { useToast } from '../hooks/useToast.js'
 import { parseCSV } from '../utils/autoDeductEngine.js'
 import {
   fetchStores, createStore, deleteStore, saveStoreDay, fetchStoreRange, deleteStoreDay,
-  fetchStoreProducts, saveStoreProducts,
+  fetchStoreProducts, saveStoreProducts, fetchAnalyticsSettings, saveAnalyticsSettings,
 } from '../utils/api.js'
 
 const todayISO = () => {
@@ -24,6 +24,30 @@ const todayISO = () => {
 
 const MONEY_COLS = ['花费', '销售额', '申报价', '成本', '价格', '毛利', '售价', 'Coupon']
 const RATE_COLS = ['率', '费比', '折扣']
+const DEFAULT_TARGETS = {
+  ctrTarget: 0.03,
+  conversionTarget: 0.02,
+  cartRateTarget: 0.08,
+  roasTarget: 2.5,
+  costRatioMax: 0.4,
+  minImpressions: 500,
+  minClicks: 50,
+  stopLossSpend: 10,
+  targetUnits: 3,
+  newProductDays: 7,
+}
+const TARGET_FIELDS = [
+  ['ctrTarget', 'CTR 目标', 'percent'],
+  ['conversionTarget', '转化率目标', 'percent'],
+  ['cartRateTarget', '加购率目标', 'percent'],
+  ['roasTarget', 'ROAS 目标', 'number'],
+  ['costRatioMax', '费比上限', 'percent'],
+  ['minImpressions', '最低曝光判断量', 'integer'],
+  ['minClicks', '最低点击判断量', 'integer'],
+  ['stopLossSpend', '花费止损线 $', 'money'],
+  ['targetUnits', '销量目标', 'integer'],
+  ['newProductDays', '新品观察天数', 'integer'],
+]
 
 function normalizeId(v) {
   const s = String(v ?? '').trim()
@@ -167,7 +191,7 @@ function sum(rows, key) {
   return rows.reduce((s, r) => s + (Number(r[key]) || 0), 0)
 }
 
-function aggregateBySpu(rows, products) {
+function aggregateBySpu(rows, products, settings = DEFAULT_TARGETS) {
   const productMap = new Map(products.map((p) => [p.spu, p]))
   const groups = new Map()
   for (const row of rows) {
@@ -212,33 +236,54 @@ function aggregateBySpu(rows, products) {
       grossProfitEstimate,
       daysSeen: new Set(group.map((r) => r.date || r.periodEnd).filter(Boolean)).size,
     }
-    return { ...out, ...diagnoseProduct(out) }
+    return { ...out, ...diagnoseProduct(out, settings) }
   }).sort((a, b) => (b.units || 0) - (a.units || 0))
 }
 
-function diagnoseProduct(p) {
-  if (p.roas >= 2.5 && p.units >= 3) {
-    return { status: 'good', decision: '表现好，可加流量', reason: 'ROAS 和销量都不错，优先观察库存和预算。' }
+function scoreProduct(p, settings = DEFAULT_TARGETS) {
+  let score = 0
+  if ((p.ctr ?? 0) >= settings.ctrTarget) score += 15
+  if ((p.conversionRate ?? 0) >= settings.conversionTarget) score += 20
+  if ((p.cartRate ?? 0) >= settings.cartRateTarget) score += 10
+  if ((p.roas ?? 0) >= settings.roasTarget) score += 25
+  if (p.costRatio != null && p.costRatio <= settings.costRatioMax) score += 10
+  if ((p.units || 0) >= settings.targetUnits) score += 15
+  if ((p.grossMargin ?? 0) >= 0.4) score += 5
+  return Math.min(100, score)
+}
+
+function scoreBand(score) {
+  if (score >= 80) return { status: 'good', label: 'Winner' }
+  if (score >= 60) return { status: 'good', label: 'Potential' }
+  if (score >= 40) return { status: 'warn', label: 'Fix' }
+  return { status: 'bad', label: 'Kill / Pause' }
+}
+
+function diagnoseProduct(p, settings = DEFAULT_TARGETS) {
+  const score = scoreProduct(p, settings)
+  const band = scoreBand(score)
+  if ((p.roas ?? 0) >= settings.roasTarget && (p.units || 0) >= settings.targetUnits) {
+    return { score, grade: band.label, status: 'good', decision: '表现好，可加流量', reason: 'ROAS 和销量都达到你的目标，优先观察库存和预算。' }
   }
-  if (p.conversionRate >= 0.03 && p.impressions < 800) {
-    return { status: 'good', decision: '转化好，缺流量', reason: '进来的人愿意买，可以测试加曝光。' }
+  if ((p.conversionRate ?? 0) >= settings.conversionTarget && (p.impressions || 0) < settings.minImpressions) {
+    return { score, grade: band.label, status: 'good', decision: '转化好，缺流量', reason: '转化率达标但曝光不足，可以测试加流量。' }
   }
-  if (p.impressions >= 1000 && (p.ctr ?? 0) < 0.03) {
-    return { status: 'bad', decision: '先改主图/标题', reason: '曝光够，但点击率低，前端吸引力不够。' }
+  if ((p.impressions || 0) >= settings.minImpressions && (p.ctr ?? 0) < settings.ctrTarget) {
+    return { score, grade: band.label, status: 'bad', decision: '先改主图/标题', reason: '曝光达到判断量，但 CTR 低于你的目标。' }
   }
-  if (p.clicks >= 80 && (p.conversionRate ?? 0) < 0.015) {
-    return { status: 'bad', decision: '点击有，转化弱', reason: '用户点进来了但不买，优先看价格、页面、评价。' }
+  if ((p.clicks || 0) >= settings.minClicks && (p.conversionRate ?? 0) < settings.conversionTarget) {
+    return { score, grade: band.label, status: 'bad', decision: '点击有，转化弱', reason: '点击达到判断量，但转化率低于你的目标，优先看价格、页面、评价。' }
   }
-  if (p.carts >= 10 && p.orders <= 1) {
-    return { status: 'warn', decision: '加购不成单', reason: '有兴趣但没成交，检查优惠、价格或结账阻力。' }
+  if ((p.cartRate ?? 0) >= settings.cartRateTarget && (p.conversionRate ?? 0) < settings.conversionTarget) {
+    return { score, grade: band.label, status: 'warn', decision: '加购不成单', reason: '加购率达标但订单转化弱，检查优惠、价格或结账阻力。' }
   }
-  if (p.spend >= 10 && p.orders === 0) {
-    return { status: 'bad', decision: '花费无单，控预算', reason: '已经花钱但没有订单，先暂停或降低测试。' }
+  if ((p.spend || 0) >= settings.stopLossSpend && (p.orders || 0) === 0) {
+    return { score, grade: band.label, status: 'bad', decision: '花费无单，控预算', reason: '花费超过止损线但没有订单，先暂停或降低测试。' }
   }
-  if (p.clicks < 20 && p.impressions < 500) {
-    return { status: 'watch', decision: '数据太少，继续观察', reason: '样本量不够，暂时不要过早判断。' }
+  if ((p.clicks || 0) < settings.minClicks && (p.impressions || 0) < settings.minImpressions) {
+    return { score, grade: band.label, status: 'watch', decision: '数据太少，继续观察', reason: '样本量不够，暂时不要过早判断。' }
   }
-  return { status: 'watch', decision: '稳定观察', reason: '没有明显异常，继续积累数据。' }
+  return { score, grade: band.label, status: band.status, decision: band.label === 'Potential' ? '有潜力，继续测试' : '稳定观察', reason: '没有明显异常，继续按当前目标积累数据。' }
 }
 
 function aggregateTotals(rows) {
@@ -316,6 +361,8 @@ export default function MetricsAnalytics() {
   const [selectedProduct, setSelectedProduct] = useState('')
   const [storeComparison, setStoreComparison] = useState([])
   const [comparisonLoading, setComparisonLoading] = useState(false)
+  const [targets, setTargets] = useState(DEFAULT_TARGETS)
+  const [settingsOpen, setSettingsOpen] = useState(false)
 
   const reloadStores = useCallback(async () => {
     try {
@@ -363,9 +410,23 @@ export default function MetricsAnalytics() {
     loadWindow()
   }, [loadWindow])
 
+  useEffect(() => {
+    let cancelled = false
+    async function loadSettings() {
+      try {
+        const res = await fetchAnalyticsSettings(activeStore || '')
+        if (!cancelled) setTargets({ ...DEFAULT_TARGETS, ...(res.settings || {}) })
+      } catch {
+        if (!cancelled) setTargets(DEFAULT_TARGETS)
+      }
+    }
+    loadSettings()
+    return () => { cancelled = true }
+  }, [activeStore])
+
   const visibleRows = draftReport?.rows?.length ? draftReport.rows : storeRows
   const totals = useMemo(() => aggregateTotals(visibleRows), [visibleRows])
-  const productRows = useMemo(() => aggregateBySpu(visibleRows, products), [visibleRows, products])
+  const productRows = useMemo(() => aggregateBySpu(visibleRows, products, targets), [visibleRows, products, targets])
   const productChoices = useMemo(() => {
     const map = new Map()
     for (const p of [...products, ...productRows]) {
@@ -390,8 +451,8 @@ export default function MetricsAnalytics() {
   const selectedTotals = useMemo(() => aggregateTotals(selectedRows), [selectedRows])
   const selectedTrends = useMemo(() => daySeries(selectedRows), [selectedRows])
   const selectedProductSummary = useMemo(
-    () => aggregateBySpu(selectedRows, products)[0] || selectedProductMatches[0] || null,
-    [selectedRows, products, selectedProductMatches],
+    () => aggregateBySpu(selectedRows, products, targets)[0] || selectedProductMatches[0] || null,
+    [selectedRows, products, selectedProductMatches, targets],
   )
   const trends = useMemo(() => daySeries(visibleRows), [visibleRows])
   const relationPoints = useMemo(() => productRows
@@ -423,7 +484,7 @@ export default function MetricsAnalytics() {
           const matchingSpus = new Set(matchingProducts.map((p) => p.spu))
           const matchingRows = (rangeRes.rows || []).filter((r) => matchingSpus.has(r.spu) || normalizeId(r.spu) === query)
           if (!matchingRows.length && !matchingProducts.length) continue
-          const summary = aggregateBySpu(matchingRows, matchingProducts)[0] || {
+          const summary = aggregateBySpu(matchingRows, matchingProducts, targets)[0] || {
             ...(matchingProducts[0] || { spu: query, sku: query }),
             ...aggregateTotals(matchingRows),
           }
@@ -436,7 +497,18 @@ export default function MetricsAnalytics() {
     }
     loadStoreComparison()
     return () => { cancelled = true }
-  }, [selectedProduct, stores, timeframe, customFrom, customTo])
+  }, [selectedProduct, stores, timeframe, customFrom, customTo, targets])
+
+  const saveTargets = async (nextTargets) => {
+    const normalized = { ...DEFAULT_TARGETS, ...nextTargets }
+    setTargets(normalized)
+    try {
+      await saveAnalyticsSettings(activeStore || '', normalized)
+      toast.success(activeStore ? `${activeStore} 的目标已保存` : '默认目标已保存', 'Analytics Settings')
+    } catch (err) {
+      toast.error(err.message, '目标保存失败')
+    }
+  }
 
   const handleCreateStore = async () => {
     const name = newStore.trim()
@@ -581,6 +653,32 @@ export default function MetricsAnalytics() {
         )}
       </section>
 
+      <section className="card p-5">
+        <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+          <div>
+            <h2 className="font-semibold text-slate-800">Analytics Settings</h2>
+            <p className="text-xs text-slate-400 mt-0.5">设置你自己的目标。诊断、评分和行动清单都会按这些目标计算。</p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <TargetPill label="CTR" value={pct(targets.ctrTarget)} />
+            <TargetPill label="CVR" value={pct(targets.conversionTarget)} />
+            <TargetPill label="ROAS" value={ratio(targets.roasTarget)} />
+            <TargetPill label="Stop" value={money(targets.stopLossSpend)} />
+            <button onClick={() => setSettingsOpen((v) => !v)} className="btn-secondary text-xs px-3 py-1.5">
+              {settingsOpen ? 'Hide settings' : 'Edit targets'}
+            </button>
+          </div>
+        </div>
+        {settingsOpen && (
+          <SettingsPanel
+            targets={targets}
+            activeStore={activeStore}
+            onSave={saveTargets}
+            onReset={() => saveTargets(DEFAULT_TARGETS)}
+          />
+        )}
+      </section>
+
       <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <div className="card p-5">
           <div className="flex items-center justify-between mb-3">
@@ -667,6 +765,8 @@ export default function MetricsAnalytics() {
         </div>
       ) : (
         <>
+          <ActionList products={productRows} />
+
           <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
             <KPICard title="Units" value={count(totals.units)} subtitle={`${count(totals.orders)} orders`} icon={Package} color="blue" />
             <KPICard title="Revenue" value={money(totals.revenue)} subtitle={`${ratio(totals.roas)} ROAS`} icon={TrendingUp} color="teal" />
@@ -749,6 +849,7 @@ function SelectedProductPanel({ product, rows, totals, trends, activeStore }) {
           <MetricCell label="Spend" value={money(totals.spend)} />
           <MetricCell label="ROAS" value={ratio(totals.roas)} />
           <MetricCell label="CVR" value={pct(totals.conversionRate)} />
+          <MetricCell label="Score" value={product?.score != null ? `${product.score} · ${product.grade || ''}` : '-'} />
         </div>
         {product?.decision && (
           <div className="mt-4">
@@ -830,6 +931,7 @@ function CrossStoreComparison({ rows, loading }) {
                   <th className="py-2 pr-4 text-right">ROAS</th>
                   <th className="py-2 pr-4 text-right">CTR</th>
                   <th className="py-2 pr-4 text-right">CVR</th>
+                  <th className="py-2 pr-4 text-right">Score</th>
                   <th className="py-2 pr-4">Decision</th>
                 </tr>
               </thead>
@@ -842,6 +944,7 @@ function CrossStoreComparison({ rows, loading }) {
                     <td className="py-3 pr-4 text-right">{ratio(r.roas)}</td>
                     <td className="py-3 pr-4 text-right">{pct(r.ctr)}</td>
                     <td className="py-3 pr-4 text-right">{pct(r.conversionRate)}</td>
+                    <td className="py-3 pr-4 text-right font-semibold text-slate-700">{r.score ?? '-'}</td>
                     <td className="py-3 pr-4 min-w-44">
                       {r.decision ? (
                         <>
@@ -862,6 +965,112 @@ function CrossStoreComparison({ rows, loading }) {
         </div>
       )}
     </div>
+  )
+}
+
+function TargetPill({ label, value }) {
+  return (
+    <span className="inline-flex items-center gap-1 rounded-lg bg-slate-100 px-2.5 py-1 text-xs text-slate-600">
+      <span className="text-slate-400">{label}</span>
+      <span className="font-semibold">{value}</span>
+    </span>
+  )
+}
+
+function SettingsPanel({ targets, activeStore, onSave, onReset }) {
+  const [draft, setDraft] = useState(targets)
+
+  useEffect(() => { setDraft(targets) }, [targets])
+
+  const setField = (key, value, type) => {
+    const n = Number(value)
+    setDraft((prev) => ({
+      ...prev,
+      [key]: type === 'percent' ? n / 100 : n,
+    }))
+  }
+
+  return (
+    <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50/60 p-4">
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+        <div>
+          <h3 className="font-semibold text-slate-700">Scoring Rules</h3>
+          <p className="text-xs text-slate-400 mt-0.5">
+            {activeStore ? `这些目标会保存到 ${activeStore}。` : '未选择店铺时保存为默认目标。'}
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <button onClick={() => onSave(draft)} className="btn-primary text-xs px-3 py-1.5"><Save className="w-3.5 h-3.5" /> Save targets</button>
+          <button onClick={onReset} className="btn-secondary text-xs px-3 py-1.5">Reset default</button>
+        </div>
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+        {TARGET_FIELDS.map(([key, label, type]) => {
+          const value = type === 'percent' ? (draft[key] || 0) * 100 : draft[key]
+          return (
+            <label key={key} className="flex flex-col gap-1">
+              <span className="text-xs text-slate-500 font-medium">{label}</span>
+              <input
+                type="number"
+                className="metric-input"
+                min="0"
+                step={type === 'integer' ? '1' : '0.1'}
+                value={Number.isFinite(value) ? value : ''}
+                onChange={(e) => setField(key, e.target.value, type)}
+              />
+            </label>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+function ActionList({ products }) {
+  const used = new Set()
+  const take = (predicate) => products.filter((p) => {
+    if (used.has(p.spu) || !predicate(p)) return false
+    used.add(p.spu)
+    return true
+  })
+  const groups = [
+    ['加流量', take((p) => p.decision === '表现好，可加流量' || p.decision === '转化好，缺流量')],
+    ['需要修改', take((p) => p.status === 'bad')],
+    ['继续测试', take((p) => p.grade === 'Potential' || p.decision === '有潜力，继续测试')],
+    ['观察', take((p) => p.status === 'watch' || p.decision === '稳定观察')],
+  ]
+  return (
+    <section className="card p-5">
+      <div className="flex items-center justify-between mb-4">
+        <div>
+          <h2 className="font-semibold text-slate-800">Daily Action List</h2>
+          <p className="text-xs text-slate-400 mt-0.5">按当前目标自动整理这个时间范围里最该看的产品。</p>
+        </div>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
+        {groups.map(([title, rows]) => (
+          <div key={title} className="rounded-lg border border-slate-200 p-3">
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="text-sm font-semibold text-slate-700">{title}</h3>
+              <span className="text-xs text-slate-400">{rows.length}</span>
+            </div>
+            <div className="space-y-2">
+              {rows.slice(0, 5).map((p) => (
+                <div key={`${title}-${p.spu}`} className="rounded-md bg-slate-50 px-3 py-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-medium text-sm text-slate-700 truncate">{p.sku || p.spu}</span>
+                    <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-semibold ${statusClass(p.status)}`}>{p.score ?? 0}</span>
+                  </div>
+                  <div className="text-xs text-slate-400 mt-0.5 truncate">{p.decision}</div>
+                  <div className="text-[11px] text-slate-400 mt-1">{count(p.units)} units · {ratio(p.roas)} ROAS · {pct(p.ctr)} CTR</div>
+                </div>
+              ))}
+              {!rows.length && <div className="text-xs text-slate-400 py-3">暂无产品。</div>}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
   )
 }
 
@@ -962,6 +1171,7 @@ function ProductMatrix({ products, filter, setFilter }) {
               <th className="py-2 pr-4 text-right">ROAS</th>
               <th className="py-2 pr-4 text-right">CTR</th>
               <th className="py-2 pr-4 text-right">CVR</th>
+              <th className="py-2 pr-4 text-right">Score</th>
               <th className="py-2 pr-4">Decision</th>
             </tr>
           </thead>
@@ -984,6 +1194,10 @@ function ProductMatrix({ products, filter, setFilter }) {
                 <td className="py-3 pr-4 text-right">{ratio(p.roas)}</td>
                 <td className="py-3 pr-4 text-right">{pct(p.ctr)}</td>
                 <td className="py-3 pr-4 text-right">{pct(p.conversionRate)}</td>
+                <td className="py-3 pr-4 text-right">
+                  <div className="font-semibold text-slate-700">{p.score ?? 0}</div>
+                  <div className="text-[11px] text-slate-400">{p.grade || '-'}</div>
+                </td>
                 <td className="py-3 pr-4 min-w-52">
                   <span className={`inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-xs font-medium ${statusClass(p.status)}`}>
                     {p.status === 'good' ? <CheckCircle className="w-3 h-3" /> : <AlertTriangle className="w-3 h-3" />}
@@ -994,7 +1208,7 @@ function ProductMatrix({ products, filter, setFilter }) {
               </tr>
             ))}
             {!products.length && (
-              <tr><td colSpan="9" className="py-8 text-center text-slate-400">这个筛选下没有产品。</td></tr>
+              <tr><td colSpan="10" className="py-8 text-center text-slate-400">这个筛选下没有产品。</td></tr>
             )}
           </tbody>
         </table>
