@@ -61,6 +61,23 @@ const TREND_METRICS = [
   { key: 'carts', label: 'Carts', type: 'count', axis: 'left', color: '#f59e0b' },
 ]
 const DEFAULT_TREND_METRICS = ['units', 'revenue', 'spend', 'ctr', 'conversionRate']
+const PRODUCT_TEXT_FIELDS = ['sku', 'productName', 'notes', 'category', 'sizeLine', 'lifecycle', 'skuType']
+const PRODUCT_NUMBER_FIELDS = ['cost', 'declaredPrice', 'frontPrice', 'couponPrice', 'grossProfit']
+const PRODUCT_PERCENT_FIELDS = ['grossMargin', 'discountRate']
+const PRODUCT_EDIT_FIELDS = [
+  ['sku', 'SKU', 'text'],
+  ['productName', '商品名', 'text'],
+  ['notes', '备注', 'textarea'],
+  ['category', '品类', 'text'],
+  ['lifecycle', '生命周期', 'text'],
+  ['skuType', 'SKU 类型', 'text'],
+  ['cost', '成本 $', 'number'],
+  ['declaredPrice', '申报价 $', 'number'],
+  ['frontPrice', '前端售价 $', 'number'],
+  ['couponPrice', 'Coupon 后价 $', 'number'],
+  ['grossProfit', '毛利 $', 'number'],
+  ['grossMargin', '毛利率 %', 'percent'],
+]
 
 function normalizeId(v) {
   const s = String(v ?? '').trim()
@@ -136,6 +153,7 @@ async function parseProductPlan(file) {
         store: String(r['店铺'] ?? '').trim(),
         sku: normalizeId(r['SKU']),
         productName: String(r['商品名'] ?? r['商品名称'] ?? '').trim(),
+        notes: String(r['备注'] ?? r['Notes'] ?? '').trim(),
         category: String(r['品类'] ?? '').trim(),
         sizeLine: String(r['尺码线'] ?? '').trim(),
         lifecycle: String(r['生命周期'] ?? '').trim(),
@@ -387,6 +405,43 @@ function duplicatePreview(rows) {
   return rows.slice(0, 6).map((r) => r.sku || r.spu).filter(Boolean).join(', ')
 }
 
+function blankProduct(store) {
+  return {
+    store,
+    spu: '',
+    sku: '',
+    productName: '',
+    notes: '',
+    category: '',
+    sizeLine: '',
+    lifecycle: '',
+    skuType: '',
+    cost: null,
+    declaredPrice: null,
+    frontPrice: null,
+    couponPrice: null,
+    grossProfit: null,
+    grossMargin: null,
+    discountRate: null,
+  }
+}
+
+function normalizeProductDraft(draft, store) {
+  const product = { ...draft, store, spu: normalizeId(draft?.spu) }
+  PRODUCT_TEXT_FIELDS.forEach((key) => {
+    product[key] = String(draft?.[key] ?? '').trim()
+  })
+  product.sku = normalizeId(product.sku)
+  PRODUCT_NUMBER_FIELDS.forEach((key) => {
+    product[key] = toNumber(draft?.[key], '价格')
+  })
+  PRODUCT_PERCENT_FIELDS.forEach((key) => {
+    const n = Number(draft?.[key])
+    product[key] = Number.isFinite(n) ? n : null
+  })
+  return product
+}
+
 function daySeries(rows) {
   const days = new Map()
   for (const r of rows) {
@@ -456,6 +511,7 @@ export default function MetricsAnalytics() {
   const [comparisonLoading, setComparisonLoading] = useState(false)
   const [targets, setTargets] = useState(DEFAULT_TARGETS)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [storeSettingsOpen, setStoreSettingsOpen] = useState(false)
 
   const reloadStores = useCallback(async () => {
     try {
@@ -629,13 +685,55 @@ export default function MetricsAnalytics() {
   }
 
   const handleDeleteStore = async (name) => {
-    if (!window.confirm(`Delete store ${name}? This removes its saved daily data.`)) return
+    const typed = window.prompt(`删除店铺会移除 ${name} 的每日数据、产品档案和目标设置。\n\n请输入店铺名 "${name}" 来确认删除：`)
+    if (typed !== name) {
+      if (typed != null) toast.info('店铺名不匹配，已取消删除', '删除已取消')
+      return
+    }
     try {
       await deleteStore(name)
       if (activeStore === name) setActiveStore('')
+      setStoreSettingsOpen(false)
       await reloadStores()
     } catch (err) {
       toast.error(err.message, '店铺删除失败')
+    }
+  }
+
+  const handleSaveProduct = async (draft) => {
+    if (!activeStore) { toast.error('请先选择店铺', '不能保存 SPU'); return false }
+    const product = normalizeProductDraft(draft, activeStore)
+    if (!product.spu) { toast.error('SPU 不能为空', '不能保存 SPU'); return false }
+    const duplicateSku = product.sku && products.some((p) => normalizeId(p.sku) === product.sku && normalizeId(p.spu) !== product.spu)
+    if (duplicateSku && !window.confirm(`SKU ${product.sku} 已经存在于其他 SPU。\n\n点击 OK 继续保存，点击 Cancel 返回修改。`)) return false
+    const index = products.findIndex((p) => normalizeId(p.spu) === product.spu)
+    const next = index >= 0
+      ? products.map((p, i) => i === index ? { ...p, ...product, store: activeStore } : p)
+      : [...products, product]
+    try {
+      await saveStoreProducts(activeStore, next, 'manual-product-edit')
+      setProducts(next)
+      toast.success(`${product.sku || product.spu} 已保存到 ${activeStore}`, index >= 0 ? 'SPU 已更新' : 'SPU 已新增')
+      return true
+    } catch (err) {
+      toast.error(err.message, 'SPU 保存失败')
+      return false
+    }
+  }
+
+  const handleDeleteProduct = async (product) => {
+    if (!activeStore || !product?.spu) return false
+    const label = product.sku || product.spu
+    if (!window.confirm(`确认从 ${activeStore} 的产品档案里删除 ${label}？\n\n历史每日表现数据不会删除，但这个 SPU 的档案信息会移除。`)) return false
+    const next = products.filter((p) => normalizeId(p.spu) !== normalizeId(product.spu))
+    try {
+      await saveStoreProducts(activeStore, next, 'manual-product-delete')
+      setProducts(next)
+      toast.success(`${label} 已从产品档案移除`, 'SPU 已删除')
+      return true
+    } catch (err) {
+      toast.error(err.message, 'SPU 删除失败')
+      return false
     }
   }
 
@@ -721,24 +819,55 @@ export default function MetricsAnalytics() {
           <h1 className="text-2xl font-bold text-slate-800">Product Analytics</h1>
           <p className="text-slate-500 mt-1">按店铺和 SPU 追踪每天表现，看销量和点击率、转化率、加购、花费、ROAS 的关系。</p>
         </div>
-        <div className="flex flex-wrap gap-2">
-          <input className="metric-input" placeholder="New store" value={newStore} onChange={(e) => setNewStore(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') handleCreateStore() }} />
-          <button className="btn-primary text-sm px-3 py-2" onClick={handleCreateStore}><Plus className="w-4 h-4" /> Create</button>
+        <div className="rounded-lg border border-slate-200 bg-white px-4 py-3 min-w-56">
+          <div className="text-xs text-slate-400">Current store</div>
+          <div className="text-lg font-semibold text-slate-800">{activeStore || '未选择店铺'}</div>
         </div>
       </div>
 
-      <section className="card p-4 space-y-4">
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-xs font-semibold text-slate-500 uppercase">Stores</span>
-          {stores.map((s) => (
-            <span key={s.name} className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs ${activeStore === s.name ? 'bg-blue-50 border-blue-300 text-blue-700' : 'bg-white border-slate-200 text-slate-600'}`}>
-              <button onClick={() => setActiveStore(s.name)} className="font-medium">{s.name}</button>
-              <span className="text-slate-400">{s.days || 0}d</span>
-              <button onClick={() => handleDeleteStore(s.name)} className="text-slate-300 hover:text-red-500" title="Delete store"><Trash2 className="w-3 h-3" /></button>
-            </span>
-          ))}
-          {!stores.length && <span className="text-sm text-slate-400">先创建一个店铺。</span>}
+      <section className="card p-5 space-y-4">
+        <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+          <div>
+            <h2 className="font-semibold text-slate-800">Stores</h2>
+            <p className="text-xs text-slate-400 mt-0.5">选择一个店铺后，上传、产品档案和数据分析都会绑定到这个店铺。</p>
+          </div>
+          <button onClick={() => setStoreSettingsOpen((v) => !v)} className="btn-secondary text-xs px-3 py-1.5">
+            Store Settings
+          </button>
         </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+          {stores.map((s) => (
+            <button
+              key={s.name}
+              onClick={() => setActiveStore(s.name)}
+              className={`text-left rounded-lg border px-4 py-3 transition ${activeStore === s.name ? 'bg-blue-50 border-blue-300 text-blue-800 shadow-sm' : 'bg-white border-slate-200 text-slate-600 hover:border-slate-300'}`}
+            >
+              <div className="font-semibold truncate">{s.name}</div>
+              <div className="text-xs mt-1 text-slate-400">{s.days || 0} saved days</div>
+            </button>
+          ))}
+          {!stores.length && <div className="rounded-lg border border-dashed border-slate-200 p-4 text-sm text-slate-400">先到 Store Settings 里创建一个店铺。</div>}
+        </div>
+
+        {storeSettingsOpen && (
+          <div className="rounded-lg border border-slate-200 bg-slate-50/70 p-4 space-y-4">
+            <div>
+              <h3 className="font-semibold text-slate-700">Create Store</h3>
+              <div className="mt-2 flex flex-wrap gap-2">
+                <input className="metric-input" placeholder="New store name" value={newStore} onChange={(e) => setNewStore(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') handleCreateStore() }} />
+                <button className="btn-primary text-sm px-3 py-2" onClick={handleCreateStore}><Plus className="w-4 h-4" /> Create store</button>
+              </div>
+            </div>
+            <div className="border-t border-slate-200 pt-4">
+              <h3 className="font-semibold text-red-700">Danger Zone</h3>
+              <p className="text-xs text-slate-500 mt-1">删除店铺会删除它的每日数据、产品档案和分析目标。操作前必须输入完整店铺名。</p>
+              <button onClick={() => handleDeleteStore(activeStore)} disabled={!activeStore} className="mt-3 inline-flex items-center gap-2 rounded-lg border border-red-200 bg-white px-3 py-2 text-sm text-red-700 disabled:opacity-40">
+                <Trash2 className="w-4 h-4" /> Delete current store
+              </button>
+            </div>
+          </div>
+        )}
 
         {activeStore && storeDays.length > 0 && (
           <div className="flex flex-wrap gap-1.5">
@@ -818,6 +947,13 @@ export default function MetricsAnalytics() {
           )}
         </div>
       </section>
+
+      <ProductCatalogEditor
+        activeStore={activeStore}
+        products={products}
+        onSave={handleSaveProduct}
+        onDelete={handleDeleteProduct}
+      />
 
       <section className="card p-5 space-y-4">
         <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-3">
@@ -955,6 +1091,161 @@ export default function MetricsAnalytics() {
         </>
       )}
     </div>
+  )
+}
+
+function ProductCatalogEditor({ activeStore, products, onSave, onDelete }) {
+  const [query, setQuery] = useState('')
+  const [draft, setDraft] = useState(null)
+  const [isNew, setIsNew] = useState(false)
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    return products
+      .filter((p) => {
+        if (!q) return true
+        return [p.spu, p.sku, p.productName, p.notes, p.category, p.lifecycle, p.skuType]
+          .some((v) => String(v || '').toLowerCase().includes(q))
+      })
+      .sort((a, b) => String(a.sku || a.spu).localeCompare(String(b.sku || b.spu)))
+  }, [products, query])
+
+  useEffect(() => {
+    setDraft(null)
+    setIsNew(false)
+    setQuery('')
+  }, [activeStore])
+
+  const startNew = () => {
+    setDraft(blankProduct(activeStore))
+    setIsNew(true)
+  }
+
+  const startEdit = (product) => {
+    setDraft({ ...blankProduct(activeStore), ...product, store: activeStore })
+    setIsNew(false)
+  }
+
+  const setField = (key, value, type) => {
+    setDraft((prev) => {
+      const next = { ...(prev || blankProduct(activeStore)) }
+      if (type === 'number') next[key] = value === '' ? '' : Number(value)
+      else if (type === 'percent') next[key] = value === '' ? '' : Number(value) / 100
+      else next[key] = value
+      return next
+    })
+  }
+
+  const saveDraftProduct = async () => {
+    if (!draft) return
+    const ok = await onSave(draft)
+    if (ok) {
+      setDraft(null)
+      setIsNew(false)
+    }
+  }
+
+  const deleteDraftProduct = async () => {
+    if (!draft || isNew) return
+    const ok = await onDelete(draft)
+    if (ok) setDraft(null)
+  }
+
+  return (
+    <section className="card p-5 space-y-4">
+      <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+        <div>
+          <h2 className="font-semibold text-slate-800">SPU Product Catalog</h2>
+          <p className="text-xs text-slate-400 mt-0.5">修改上新计划里的 SPU 档案。这里的 SKU、商品名、备注、价格和毛利会用于后续分析。</p>
+        </div>
+        <button onClick={startNew} disabled={!activeStore} className="btn-primary text-xs px-3 py-1.5 disabled:opacity-40">
+          <Plus className="w-3.5 h-3.5" /> Add SPU
+        </button>
+      </div>
+
+      {!activeStore ? (
+        <div className="rounded-lg border border-dashed border-slate-200 p-5 text-center text-sm text-slate-400">先选择店铺，再编辑这个店铺的 SPU 档案。</div>
+      ) : (
+        <div className="grid grid-cols-1 xl:grid-cols-5 gap-4">
+          <div className="xl:col-span-2 rounded-lg border border-slate-200 p-3">
+            <div className="flex items-center justify-between gap-2 mb-3">
+              <input className="metric-input !py-1.5 flex-1" placeholder="Search SPU / SKU / name" value={query} onChange={(e) => setQuery(e.target.value)} />
+              <span className="text-xs text-slate-400 whitespace-nowrap">{filtered.length} / {products.length}</span>
+            </div>
+            <div className="max-h-96 overflow-y-auto divide-y divide-slate-100">
+              {filtered.slice(0, 80).map((product) => (
+                <button
+                  key={product.spu}
+                  onClick={() => startEdit(product)}
+                  className={`w-full text-left px-3 py-2 rounded-md ${draft?.spu === product.spu ? 'bg-blue-50 text-blue-800' : 'hover:bg-slate-50 text-slate-600'}`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-medium truncate">{product.sku || product.spu}</span>
+                    <span className="text-[11px] text-slate-400">SPU {product.spu}</span>
+                  </div>
+                  <div className="text-xs text-slate-400 truncate">{product.productName || product.notes || 'No name yet'}</div>
+                </button>
+              ))}
+              {!filtered.length && <div className="py-8 text-center text-sm text-slate-400">没有匹配的 SPU。</div>}
+            </div>
+          </div>
+
+          <div className="xl:col-span-3 rounded-lg border border-slate-200 p-4">
+            {!draft ? (
+              <div className="h-full min-h-72 flex items-center justify-center text-sm text-slate-400">选择一个 SPU 修改，或新增遗漏的 SPU。</div>
+            ) : (
+              <div className="space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h3 className="font-semibold text-slate-700">{isNew ? 'Add New SPU' : `Edit ${draft.sku || draft.spu}`}</h3>
+                    <p className="text-xs text-slate-400 mt-0.5">{isNew ? '新增后会保存到当前店铺。' : 'SPU 会锁定，避免历史数据无法匹配。'}</p>
+                  </div>
+                  <div className="flex gap-2">
+                    <button onClick={saveDraftProduct} className="btn-primary text-xs px-3 py-1.5"><Save className="w-3.5 h-3.5" /> Save</button>
+                    {!isNew && <button onClick={deleteDraftProduct} className="btn-secondary text-xs px-3 py-1.5 text-red-600"><Trash2 className="w-3.5 h-3.5" /> Delete</button>}
+                    <button onClick={() => { setDraft(null); setIsNew(false) }} className="btn-secondary text-xs px-3 py-1.5">Cancel</button>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                  <label className="flex flex-col gap-1">
+                    <span className="text-xs text-slate-500 font-medium">SPU</span>
+                    <input
+                      className="metric-input"
+                      value={draft.spu || ''}
+                      disabled={!isNew}
+                      onChange={(e) => setField('spu', e.target.value, 'text')}
+                    />
+                  </label>
+                  {PRODUCT_EDIT_FIELDS.map(([key, label, type]) => {
+                    const value = type === 'percent' ? (Number(draft[key]) || 0) * 100 : draft[key] ?? ''
+                    if (type === 'textarea') {
+                      return (
+                        <label key={key} className="sm:col-span-2 lg:col-span-3 flex flex-col gap-1">
+                          <span className="text-xs text-slate-500 font-medium">{label}</span>
+                          <textarea className="metric-input min-h-20" value={value} onChange={(e) => setField(key, e.target.value, type)} />
+                        </label>
+                      )
+                    }
+                    return (
+                      <label key={key} className="flex flex-col gap-1">
+                        <span className="text-xs text-slate-500 font-medium">{label}</span>
+                        <input
+                          type={type === 'text' ? 'text' : 'number'}
+                          step={type === 'percent' ? '0.1' : '0.01'}
+                          className="metric-input"
+                          value={Number.isFinite(value) || typeof value === 'string' ? value : ''}
+                          onChange={(e) => setField(key, e.target.value, type)}
+                        />
+                      </label>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </section>
   )
 }
 
