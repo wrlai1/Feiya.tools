@@ -24,6 +24,8 @@ const todayISO = () => {
 
 const MONEY_COLS = ['花费', '销售额', '申报价', '成本', '价格', '毛利', '售价', 'Coupon']
 const RATE_COLS = ['率', '费比', '折扣']
+const DEFAULT_CNY_TO_USD = 0.14
+const DEFAULT_MONEY_CURRENCY = 'CNY'
 const DEFAULT_TARGETS = {
   ctrTarget: 0.03,
   conversionTarget: 0.02,
@@ -100,6 +102,35 @@ function toNumber(v, key = '') {
   const n = Number(cleaned)
   if (!Number.isFinite(n)) return null
   return hadPercent || isRateColumn(key) ? n / 100 : n
+}
+
+function detectCurrency(v, key = '', fileName = '') {
+  const text = `${v ?? ''} ${key} ${fileName}`.toUpperCase()
+  if (/USD|US\$|\$/.test(text)) return 'USD'
+  if (/RMB|CNY|CN¥|¥|￥/.test(text)) return 'CNY'
+  return DEFAULT_MONEY_CURRENCY
+}
+
+function moneyToUsd(v, key = '', fileName = '') {
+  const amount = toNumber(v, key)
+  if (amount == null) return { value: null, currency: detectCurrency(v, key, fileName), rate: null, original: null }
+  const currency = detectCurrency(v, key, fileName)
+  const rate = currency === 'CNY' ? DEFAULT_CNY_TO_USD : 1
+  return { value: amount * rate, currency, rate, original: amount }
+}
+
+function summarizeCurrencies(rows) {
+  const counts = rows.reduce((acc, row) => {
+    const currency = row.sourceCurrency || DEFAULT_MONEY_CURRENCY
+    acc[currency] = (acc[currency] || 0) + 1
+    return acc
+  }, {})
+  const currencies = Object.keys(counts)
+  return {
+    primary: currencies.length === 1 ? currencies[0] : 'MIXED',
+    counts,
+    cnyToUsd: DEFAULT_CNY_TO_USD,
+  }
 }
 
 function money(v) {
@@ -187,20 +218,30 @@ async function parsePerformanceFile(file) {
     .map((r) => {
       const spu = normalizeId(r['SPU ID'] ?? r['SPU/款号'] ?? r['SPU'])
       if (!spu) return null
+      const spendMoney = moneyToUsd(r['总花费'], '总花费', file.name)
+      const netSpendMoney = moneyToUsd(r['净总花费'], '净总花费', file.name)
+      const revenueMoney = moneyToUsd(r['申报价销售额（全域）'], '申报价销售额（全域）', file.name)
+      const netRevenueMoney = moneyToUsd(r['净申报价销售额（全域）'], '净申报价销售额（全域）', file.name)
+      const cpaMoney = moneyToUsd(r['每笔成交花费（全域）'], '每笔成交花费（全域）', file.name)
       return {
         spu,
         productId: normalizeId(r['商品ID']),
         productName: String(r['商品名称'] ?? '').trim(),
         region: String(r['当前区域'] ?? '').trim(),
         site: String(r['商品站点'] ?? '').trim(),
-        spend: toNumber(r['总花费'], '花费'),
-        netSpend: toNumber(r['净总花费'], '花费'),
-        revenue: toNumber(r['申报价销售额（全域）'], '销售额'),
-        netRevenue: toNumber(r['净申报价销售额（全域）'], '销售额'),
+        spend: spendMoney.value,
+        spendOriginal: spendMoney.original,
+        netSpend: netSpendMoney.value,
+        netSpendOriginal: netSpendMoney.original,
+        revenue: revenueMoney.value,
+        revenueOriginal: revenueMoney.original,
+        netRevenue: netRevenueMoney.value,
+        netRevenueOriginal: netRevenueMoney.original,
         roas: toNumber(r['投资回报率(ROAS)（全域）']),
         netRoas: toNumber(r['净投资回报率(ROAS)（全域）']),
         costRatio: toNumber(r['费比（全域）'], '费比'),
-        cpa: toNumber(r['每笔成交花费（全域）'], '花费'),
+        cpa: cpaMoney.value,
+        cpaOriginal: cpaMoney.original,
         orders: toNumber(r['子订单数（全域）']),
         units: toNumber(r['件数（全域）']),
         impressions: toNumber(r['曝光（全域）']),
@@ -213,11 +254,13 @@ async function parsePerformanceFile(file) {
         periodStart: start,
         periodEnd: end,
         sourceFile: file.name,
+        sourceCurrency: revenueMoney.currency || spendMoney.currency || DEFAULT_MONEY_CURRENCY,
+        currencyRateToUsd: revenueMoney.rate || spendMoney.rate || DEFAULT_CNY_TO_USD,
       }
     })
     .filter(Boolean)
   if (!rows.length) throw new Error('没有找到带 SPU ID 的商品推广数据')
-  return { rows, start, end, fileName: file.name }
+  return { rows, start, end, fileName: file.name, currencySummary: summarizeCurrencies(rows) }
 }
 
 function sum(rows, key) {
@@ -1035,6 +1078,11 @@ export default function MetricsAnalytics() {
           {draftReport && (
             <div className="mt-3 flex flex-wrap items-center gap-2">
               <span className="text-xs text-slate-500">{draftReport.rows.length} rows from {draftReport.fileName}</span>
+              {draftReport.currencySummary && (
+                <span className="text-xs text-blue-600 bg-blue-50 rounded-lg px-2 py-1">
+                  Currency: {draftReport.currencySummary.primary === 'CNY' ? `RMB -> USD @ ${draftReport.currencySummary.cnyToUsd}` : draftReport.currencySummary.primary === 'USD' ? 'USD' : 'Mixed'}
+                </span>
+              )}
               <label className="inline-flex items-center gap-1.5 text-xs text-slate-500">
                 保存日期
                 <input type="date" className="metric-input !py-1" value={uploadDate} onChange={(e) => setUploadDate(e.target.value)} />
