@@ -143,6 +143,22 @@ export function deleteStoreDay(store, day) {
   return request(`${BASE}/analytics-store?action=delete-day&store=${encodeURIComponent(store)}&day=${day}`, { method: 'DELETE' })
 }
 
+export function deleteStoreRange(store, from, to) {
+  return request(`${BASE}/analytics-store?action=delete-range&store=${encodeURIComponent(store)}&from=${from}&to=${to}`, { method: 'DELETE' })
+}
+
+export function fetchAnalyticsEvents(store = '', limit = 50) {
+  return request(`${BASE}/analytics-store?action=events&store=${encodeURIComponent(store || '')}&limit=${limit}`)
+}
+
+export function restoreAnalyticsEvent(eventId) {
+  return request(`${BASE}/analytics-store?action=restore-event`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ eventId }),
+  })
+}
+
 export function fetchStoreProducts(store) {
   return request(`${BASE}/analytics-store?action=products&store=${encodeURIComponent(store)}`)
 }

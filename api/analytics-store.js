@@ -8,6 +8,9 @@
 //   POST   ?action=save-day {store,day,fileName,rows}  — upsert one day's rows
 //   GET    ?action=range&store=&from=&to=    — all rows across the day range (each tagged with date)
 //   DELETE ?action=delete-day&store=&day=    — remove one saved day
+//   DELETE ?action=delete-range&store=&from=&to= — remove saved days in a date range
+//   GET    ?action=events&store=             — list recent store operation log
+//   POST   ?action=restore-event {eventId}   — restore data from an operation snapshot
 //   GET    ?action=products&store=           — list product catalog rows for a store
 //   POST   ?action=save-products {store,products,fileName} — replace product catalog for a store
 //   GET    ?action=settings&store=           — get scoring/diagnosis settings
@@ -29,6 +32,11 @@ function getSecret() {
 function verifyToken(header, secret) {
   if (!header?.startsWith('Bearer ')) return null
   try { return jwt.verify(header.slice(7), secret) } catch { return null }
+}
+
+function dayString(value) {
+  if (!value) return ''
+  return value instanceof Date ? value.toISOString().slice(0, 10) : String(value).slice(0, 10)
 }
 
 async function ensureTables(sql) {
@@ -71,6 +79,106 @@ async function ensureTables(sql) {
       PRIMARY KEY (username, store)
     )
   `
+  await sql`
+    CREATE TABLE IF NOT EXISTS analytics_store_events (
+      id         BIGSERIAL PRIMARY KEY,
+      username   TEXT NOT NULL,
+      actor      TEXT NOT NULL,
+      store      TEXT,
+      action     TEXT NOT NULL,
+      summary    TEXT,
+      details    JSONB,
+      snapshot   JSONB,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `
+}
+
+async function recordEvent(sql, username, actor, store, action, summary, details = {}, snapshot = null) {
+  const detailsJson = JSON.stringify(details || {})
+  const snapshotJson = snapshot ? JSON.stringify(snapshot) : null
+  await sql`
+    INSERT INTO analytics_store_events (username, actor, store, action, summary, details, snapshot)
+    VALUES (${username}, ${actor}, ${store || null}, ${action}, ${summary || null}, ${detailsJson}::jsonb, ${snapshotJson}::jsonb)
+  `
+}
+
+async function restoreSnapshot(sql, username, snapshot) {
+  if (!snapshot?.type) return { restored: 0 }
+
+  if (snapshot.type === 'days') {
+    let restored = 0
+    for (const item of snapshot.days || []) {
+      const rowsJson = JSON.stringify(item.rows || [])
+      await sql`
+        INSERT INTO analytics_store_days (username, store, day, file_name, rows, updated_at)
+        VALUES (${username}, ${snapshot.store}, ${item.day}, ${item.fileName || null}, ${rowsJson}::jsonb, NOW())
+        ON CONFLICT (username, store, day)
+        DO UPDATE SET rows = EXCLUDED.rows, file_name = EXCLUDED.file_name, updated_at = NOW()
+      `
+      restored += 1
+    }
+    return { restored }
+  }
+
+  if (snapshot.type === 'day') {
+    if (snapshot.previous) {
+      const rowsJson = JSON.stringify(snapshot.previous.rows || [])
+      await sql`
+        INSERT INTO analytics_store_days (username, store, day, file_name, rows, updated_at)
+        VALUES (${username}, ${snapshot.store}, ${snapshot.day}, ${snapshot.previous.fileName || null}, ${rowsJson}::jsonb, NOW())
+        ON CONFLICT (username, store, day)
+        DO UPDATE SET rows = EXCLUDED.rows, file_name = EXCLUDED.file_name, updated_at = NOW()
+      `
+      return { restored: 1 }
+    }
+    await sql`DELETE FROM analytics_store_days WHERE username = ${username} AND store = ${snapshot.store} AND day = ${snapshot.day}`
+    return { restored: 0 }
+  }
+
+  if (snapshot.type === 'products') {
+    await sql`DELETE FROM analytics_store_products WHERE username = ${username} AND store = ${snapshot.store}`
+    for (const product of snapshot.products || []) {
+      const spu = String(product?.spu || product?.data?.spu || '').trim()
+      const data = product?.data || product
+      if (!spu || !data) continue
+      const json = JSON.stringify(data)
+      await sql`
+        INSERT INTO analytics_store_products (username, store, spu, data, file_name, updated_at)
+        VALUES (${username}, ${snapshot.store}, ${spu}, ${json}::jsonb, ${product.fileName || null}, NOW())
+        ON CONFLICT (username, store, spu)
+        DO UPDATE SET data = EXCLUDED.data, file_name = EXCLUDED.file_name, updated_at = NOW()
+      `
+    }
+    return { restored: (snapshot.products || []).length }
+  }
+
+  if (snapshot.type === 'settings') {
+    if (snapshot.previous) {
+      const json = JSON.stringify(snapshot.previous.data || {})
+      await sql`
+        INSERT INTO analytics_store_settings (username, store, data, updated_at)
+        VALUES (${username}, ${snapshot.store}, ${json}::jsonb, NOW())
+        ON CONFLICT (username, store)
+        DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()
+      `
+      return { restored: 1 }
+    }
+    await sql`DELETE FROM analytics_store_settings WHERE username = ${username} AND store = ${snapshot.store}`
+    return { restored: 0 }
+  }
+
+  if (snapshot.type === 'store') {
+    await sql`INSERT INTO analytics_stores (username, name) VALUES (${username}, ${snapshot.store}) ON CONFLICT DO NOTHING`
+    await restoreSnapshot(sql, username, { type: 'days', store: snapshot.store, days: snapshot.days || [] })
+    await restoreSnapshot(sql, username, { type: 'products', store: snapshot.store, products: snapshot.products || [] })
+    if (snapshot.settings) {
+      await restoreSnapshot(sql, username, { type: 'settings', store: snapshot.store, previous: snapshot.settings })
+    }
+    return { restored: 1 }
+  }
+
+  return { restored: 0 }
 }
 
 export default async function handler(req, res) {
@@ -106,16 +214,44 @@ export default async function handler(req, res) {
       const name = String(req.body?.name || '').trim()
       if (!name) return res.status(400).json({ error: 'name is required' })
       await sql`INSERT INTO analytics_stores (username, name) VALUES (${username}, ${name}) ON CONFLICT DO NOTHING`
+      await recordEvent(sql, username, username, name, 'create-store', `Created store ${name}`, { store: name })
       return res.json({ ok: true, name })
     }
 
     if (req.method === 'DELETE' && action === 'delete-store') {
       const name = String(req.query.name || '').trim()
       if (!name) return res.status(400).json({ error: 'name is required' })
+      const dayRows = await sql`
+        SELECT day, file_name, rows FROM analytics_store_days
+        WHERE username = ${username} AND store = ${name}
+        ORDER BY day
+      `
+      const productRows = await sql`
+        SELECT spu, data, file_name FROM analytics_store_products
+        WHERE username = ${username} AND store = ${name}
+        ORDER BY spu
+      `
+      const settingRows = await sql`
+        SELECT data FROM analytics_store_settings
+        WHERE username = ${username} AND store = ${name}
+        LIMIT 1
+      `
+      const snapshot = {
+        type: 'store',
+        store: name,
+        days: dayRows.map((d) => ({ day: dayString(d.day), fileName: d.file_name, rows: Array.isArray(d.rows) ? d.rows : [] })),
+        products: productRows.map((p) => ({ spu: p.spu, data: p.data, fileName: p.file_name })),
+        settings: settingRows[0] ? { data: settingRows[0].data } : null,
+      }
       await sql`DELETE FROM analytics_store_days WHERE username = ${username} AND store = ${name}`
       await sql`DELETE FROM analytics_store_products WHERE username = ${username} AND store = ${name}`
       await sql`DELETE FROM analytics_store_settings WHERE username = ${username} AND store = ${name}`
       await sql`DELETE FROM analytics_stores WHERE username = ${username} AND name = ${name}`
+      await recordEvent(sql, username, username, name, 'delete-store', `Deleted store ${name}`, {
+        store: name,
+        days: snapshot.days.length,
+        products: snapshot.products.length,
+      }, snapshot)
       return res.json({ ok: true })
     }
 
@@ -136,6 +272,11 @@ export default async function handler(req, res) {
       if (!name || !Array.isArray(products)) {
         return res.status(400).json({ error: 'store and products are required' })
       }
+      const previousProducts = await sql`
+        SELECT spu, data, file_name FROM analytics_store_products
+        WHERE username = ${username} AND store = ${name}
+        ORDER BY spu
+      `
       await sql`INSERT INTO analytics_stores (username, name) VALUES (${username}, ${name}) ON CONFLICT DO NOTHING`
       await sql`DELETE FROM analytics_store_products WHERE username = ${username} AND store = ${name}`
       for (const product of products) {
@@ -149,6 +290,15 @@ export default async function handler(req, res) {
           DO UPDATE SET data = EXCLUDED.data, file_name = EXCLUDED.file_name, updated_at = NOW()
         `
       }
+      await recordEvent(sql, username, username, name, 'save-products', `Saved ${products.length} product catalog rows`, {
+        store: name,
+        fileName: fileName || null,
+        count: products.length,
+      }, {
+        type: 'products',
+        store: name,
+        products: previousProducts.map((p) => ({ spu: p.spu, data: p.data, fileName: p.file_name })),
+      })
       return res.json({ ok: true, count: products.length })
     }
 
@@ -167,6 +317,11 @@ export default async function handler(req, res) {
       const { store, settings } = req.body || {}
       const name = String(store || '__global__').trim() || '__global__'
       if (!settings || typeof settings !== 'object') return res.status(400).json({ error: 'settings are required' })
+      const previousSettings = await sql`
+        SELECT data FROM analytics_store_settings
+        WHERE username = ${username} AND store = ${name}
+        LIMIT 1
+      `
       const json = JSON.stringify(settings)
       await sql`
         INSERT INTO analytics_store_settings (username, store, data, updated_at)
@@ -174,6 +329,13 @@ export default async function handler(req, res) {
         ON CONFLICT (username, store)
         DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()
       `
+      await recordEvent(sql, username, username, name, 'save-settings', `Saved analytics settings for ${name}`, {
+        store: name,
+      }, {
+        type: 'settings',
+        store: name,
+        previous: previousSettings[0] ? { data: previousSettings[0].data } : null,
+      })
       return res.json({ ok: true, settings })
     }
 
@@ -183,6 +345,11 @@ export default async function handler(req, res) {
       if (!name || !day || !Array.isArray(rows)) {
         return res.status(400).json({ error: 'store, day and rows are required' })
       }
+      const previousDay = await sql`
+        SELECT day, file_name, rows FROM analytics_store_days
+        WHERE username = ${username} AND store = ${name} AND day = ${day}
+        LIMIT 1
+      `
       await sql`INSERT INTO analytics_stores (username, name) VALUES (${username}, ${name}) ON CONFLICT DO NOTHING`
       const json = JSON.stringify(rows)
       await sql`
@@ -191,6 +358,19 @@ export default async function handler(req, res) {
         ON CONFLICT (username, store, day)
         DO UPDATE SET rows = EXCLUDED.rows, file_name = EXCLUDED.file_name, updated_at = NOW()
       `
+      await recordEvent(sql, username, username, name, 'save-day', `Saved ${rows.length} rows for ${name} on ${day}`, {
+        store: name,
+        day,
+        fileName: fileName || null,
+        rows: rows.length,
+      }, {
+        type: 'day',
+        store: name,
+        day,
+        previous: previousDay[0]
+          ? { day: dayString(previousDay[0].day), fileName: previousDay[0].file_name, rows: Array.isArray(previousDay[0].rows) ? previousDay[0].rows : [] }
+          : null,
+      })
       return res.json({ ok: true })
     }
 
@@ -221,8 +401,87 @@ export default async function handler(req, res) {
       const store = String(req.query.store || '').trim()
       const day   = req.query.day
       if (!store || !day) return res.status(400).json({ error: 'store and day are required' })
+      const dayRows = await sql`
+        SELECT day, file_name, rows FROM analytics_store_days
+        WHERE username = ${username} AND store = ${store} AND day = ${day}
+      `
       await sql`DELETE FROM analytics_store_days WHERE username = ${username} AND store = ${store} AND day = ${day}`
+      const snapshotDays = dayRows.map((d) => ({ day: dayString(d.day), fileName: d.file_name, rows: Array.isArray(d.rows) ? d.rows : [] }))
+      await recordEvent(sql, username, username, store, 'delete-day', `Deleted ${store} data on ${day}`, {
+        store,
+        from: day,
+        to: day,
+        days: snapshotDays.length,
+        rows: snapshotDays.reduce((total, d) => total + d.rows.length, 0),
+      }, { type: 'days', store, days: snapshotDays })
       return res.json({ ok: true })
+    }
+
+    if (req.method === 'DELETE' && action === 'delete-range') {
+      const store = String(req.query.store || '').trim()
+      const from  = req.query.from
+      const to    = req.query.to
+      if (!store || !from || !to) return res.status(400).json({ error: 'store, from and to are required' })
+      const dayRows = await sql`
+        SELECT day, file_name, rows FROM analytics_store_days
+        WHERE username = ${username} AND store = ${store} AND day >= ${from} AND day <= ${to}
+        ORDER BY day
+      `
+      const snapshotDays = dayRows.map((d) => ({ day: dayString(d.day), fileName: d.file_name, rows: Array.isArray(d.rows) ? d.rows : [] }))
+      await sql`
+        DELETE FROM analytics_store_days
+        WHERE username = ${username} AND store = ${store} AND day >= ${from} AND day <= ${to}
+      `
+      const rowCount = snapshotDays.reduce((total, d) => total + d.rows.length, 0)
+      await recordEvent(sql, username, username, store, 'delete-range', `Deleted ${snapshotDays.length} saved days from ${store}`, {
+        store,
+        from,
+        to,
+        days: snapshotDays.length,
+        rows: rowCount,
+      }, { type: 'days', store, days: snapshotDays })
+      return res.json({ ok: true, days: snapshotDays.length, rows: rowCount })
+    }
+
+    if (req.method === 'GET' && action === 'events') {
+      const store = String(req.query.store || '').trim()
+      const limit = Math.min(Math.max(parseInt(req.query.limit || '50', 10) || 50, 1), 100)
+      const rows = store
+        ? await sql`
+            SELECT id, actor, store, action, summary, details, created_at, snapshot IS NOT NULL AS restorable
+            FROM analytics_store_events
+            WHERE username = ${username} AND store = ${store}
+            ORDER BY created_at DESC
+            LIMIT ${limit}
+          `
+        : await sql`
+            SELECT id, actor, store, action, summary, details, created_at, snapshot IS NOT NULL AS restorable
+            FROM analytics_store_events
+            WHERE username = ${username}
+            ORDER BY created_at DESC
+            LIMIT ${limit}
+          `
+      return res.json({ events: rows })
+    }
+
+    if (req.method === 'POST' && action === 'restore-event') {
+      const eventId = Number(req.body?.eventId)
+      if (!eventId) return res.status(400).json({ error: 'eventId is required' })
+      const rows = await sql`
+        SELECT id, store, action, summary, snapshot
+        FROM analytics_store_events
+        WHERE username = ${username} AND id = ${eventId}
+        LIMIT 1
+      `
+      const event = rows[0]
+      if (!event?.snapshot) return res.status(400).json({ error: 'This event has no restore snapshot' })
+      const result = await restoreSnapshot(sql, username, event.snapshot)
+      await recordEvent(sql, username, username, event.store, 'restore-event', `Restored event #${eventId}`, {
+        eventId,
+        restoredFrom: event.action,
+        restored: result.restored,
+      }, null)
+      return res.json({ ok: true, ...result })
     }
 
     return res.status(400).json({ error: 'Unknown action' })
