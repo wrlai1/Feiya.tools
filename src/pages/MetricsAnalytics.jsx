@@ -62,12 +62,13 @@ const TREND_METRICS = [
 ]
 const DEFAULT_TREND_METRICS = ['units', 'revenue', 'spend', 'ctr', 'conversionRate']
 const PRODUCT_TEXT_FIELDS = ['sku', 'productName', 'notes', 'category', 'sizeLine', 'lifecycle', 'skuType']
-const PRODUCT_NUMBER_FIELDS = ['cost', 'declaredPrice', 'frontPrice', 'couponPrice', 'grossProfit']
+const PRODUCT_NUMBER_FIELDS = ['unitMultiplier', 'cost', 'declaredPrice', 'frontPrice', 'couponPrice', 'grossProfit']
 const PRODUCT_PERCENT_FIELDS = ['grossMargin', 'discountRate']
 const PRODUCT_EDIT_FIELDS = [
   ['sku', 'SKU', 'text'],
   ['productName', '商品名', 'text'],
   ['notes', '备注', 'textarea'],
+  ['unitMultiplier', 'Unit 数量', 'number'],
   ['category', '品类', 'text'],
   ['lifecycle', '生命周期', 'text'],
   ['skuType', 'SKU 类型', 'text'],
@@ -154,6 +155,7 @@ async function parseProductPlan(file) {
         sku: normalizeId(r['SKU']),
         productName: String(r['商品名'] ?? r['商品名称'] ?? '').trim(),
         notes: String(r['备注'] ?? r['Notes'] ?? '').trim(),
+        unitMultiplier: toNumber(r['Unit'] ?? r['unit'] ?? r['Unit数量'] ?? r['组合数量'] ?? r['件数倍率']) || 1,
         category: String(r['品类'] ?? '').trim(),
         sizeLine: String(r['尺码线'] ?? '').trim(),
         lifecycle: String(r['生命周期'] ?? '').trim(),
@@ -222,6 +224,11 @@ function sum(rows, key) {
   return rows.reduce((s, r) => s + (Number(r[key]) || 0), 0)
 }
 
+function unitMultiplier(product) {
+  const n = Number(product?.unitMultiplier)
+  return Number.isFinite(n) && n > 0 ? n : 1
+}
+
 function aggregateBySpu(rows, products, settings = DEFAULT_TARGETS) {
   const productMap = new Map(products.map((p) => [p.spu, p]))
   const groups = new Map()
@@ -239,7 +246,9 @@ function aggregateBySpu(rows, products, settings = DEFAULT_TARGETS) {
     const clicks = sum(group, 'clicks')
     const carts = sum(group, 'carts')
     const orders = sum(group, 'orders')
-    const units = sum(group, 'units')
+    const rawUnits = sum(group, 'units')
+    const multiplier = unitMultiplier(product)
+    const units = rawUnits * multiplier
     const grossProfitEstimate = product.grossProfit ? product.grossProfit * units : null
     const out = {
       spu,
@@ -248,6 +257,7 @@ function aggregateBySpu(rows, products, settings = DEFAULT_TARGETS) {
       category: product.category || '',
       lifecycle: product.lifecycle || '',
       skuType: product.skuType || '',
+      unitMultiplier: multiplier,
       frontPrice: product.frontPrice ?? null,
       couponPrice: product.couponPrice ?? null,
       grossMargin: product.grossMargin ?? null,
@@ -257,6 +267,7 @@ function aggregateBySpu(rows, products, settings = DEFAULT_TARGETS) {
       clicks,
       carts,
       orders,
+      rawUnits,
       units,
       ctr: impressions ? clicks / impressions : null,
       conversionRate: clicks ? orders / clicks : null,
@@ -317,14 +328,18 @@ function diagnoseProduct(p, settings = DEFAULT_TARGETS) {
   return { score, grade: band.label, status: band.status, decision: band.label === 'Potential' ? '有潜力，继续测试' : '稳定观察', reason: '没有明显异常，继续按当前目标积累数据。' }
 }
 
-function aggregateTotals(rows) {
+function aggregateTotals(rows, products = []) {
+  const productMap = new Map(products.map((p) => [p.spu, p]))
   const spend = sum(rows, 'spend')
   const revenue = sum(rows, 'revenue')
   const impressions = sum(rows, 'impressions')
   const clicks = sum(rows, 'clicks')
   const carts = sum(rows, 'carts')
   const orders = sum(rows, 'orders')
-  const units = sum(rows, 'units')
+  const units = rows.reduce((total, row) => {
+    const product = productMap.get(row.spu)
+    return total + ((Number(row.units) || 0) * unitMultiplier(product))
+  }, 0)
   return {
     spend, revenue, impressions, clicks, carts, orders, units,
     ctr: impressions ? clicks / impressions : null,
@@ -438,6 +453,7 @@ function blankProduct(store) {
     sku: '',
     productName: '',
     notes: '',
+    unitMultiplier: 1,
     category: '',
     sizeLine: '',
     lifecycle: '',
@@ -461,6 +477,7 @@ function normalizeProductDraft(draft, store) {
   PRODUCT_NUMBER_FIELDS.forEach((key) => {
     product[key] = toNumber(draft?.[key], '价格')
   })
+  product.unitMultiplier = Number(product.unitMultiplier) > 0 ? Number(product.unitMultiplier) : 1
   PRODUCT_PERCENT_FIELDS.forEach((key) => {
     const n = Number(draft?.[key])
     product[key] = Number.isFinite(n) ? n : null
@@ -468,7 +485,7 @@ function normalizeProductDraft(draft, store) {
   return product
 }
 
-function daySeries(rows) {
+function daySeries(rows, products = []) {
   const days = new Map()
   for (const r of rows) {
     const day = r.date || r.periodEnd || todayISO()
@@ -476,7 +493,7 @@ function daySeries(rows) {
     days.get(day).push(r)
   }
   return [...days.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([day, rs]) => {
-    const t = aggregateTotals(rs)
+    const t = aggregateTotals(rs, products)
     return {
       day,
       units: t.units,
@@ -609,7 +626,7 @@ export default function MetricsAnalytics() {
     () => unmatchedPerformanceGroups(draftReport?.rows || [], products),
     [draftReport, products],
   )
-  const totals = useMemo(() => aggregateTotals(visibleRows), [visibleRows])
+  const totals = useMemo(() => aggregateTotals(visibleRows, products), [visibleRows, products])
   const productRows = useMemo(() => aggregateBySpu(visibleRows, products, targets), [visibleRows, products, targets])
   const productChoices = useMemo(() => {
     const map = new Map()
@@ -636,13 +653,13 @@ export default function MetricsAnalytics() {
     if (!q) return []
     return visibleRows.filter((r) => selectedSpus.has(r.spu) || normalizeId(r.spu) === q)
   }, [visibleRows, selectedProduct, selectedSpus])
-  const selectedTotals = useMemo(() => aggregateTotals(selectedRows), [selectedRows])
-  const selectedTrends = useMemo(() => daySeries(selectedRows), [selectedRows])
+  const selectedTotals = useMemo(() => aggregateTotals(selectedRows, products), [selectedRows, products])
+  const selectedTrends = useMemo(() => daySeries(selectedRows, products), [selectedRows, products])
   const selectedProductSummary = useMemo(
     () => aggregateBySpu(selectedRows, products, targets)[0] || selectedProductMatches[0] || null,
     [selectedRows, products, selectedProductMatches, targets],
   )
-  const trends = useMemo(() => daySeries(visibleRows), [visibleRows])
+  const trends = useMemo(() => daySeries(visibleRows, products), [visibleRows, products])
   const relationPoints = useMemo(() => productRows
     .map((p) => ({ ...p, x: p[metricX], y: p.units }))
     .filter((p) => p.x != null && p.y != null), [productRows, metricX])
@@ -686,7 +703,7 @@ export default function MetricsAnalytics() {
           if (!matchingRows.length && !matchingProducts.length) continue
           const summary = aggregateBySpu(matchingRows, matchingProducts, targets)[0] || {
             ...(matchingProducts[0] || { spu: query, sku: query }),
-            ...aggregateTotals(matchingRows),
+            ...aggregateTotals(matchingRows, matchingProducts),
           }
           rows.push({ store: storeName, ...summary, rows: matchingRows.length })
         }
@@ -1627,6 +1644,7 @@ function SelectedProductPanel({ product, rows, totals, trends, activeStore }) {
         <div className="grid grid-cols-2 gap-2 mt-4 text-sm">
           <MetricCell label="Store" value={activeStore || '-'} />
           <MetricCell label="Rows" value={count(rows.length)} />
+          <MetricCell label="Unit Qty" value={`x${product?.unitMultiplier || 1}`} />
           <MetricCell label="Units" value={count(totals.units)} />
           <MetricCell label="Orders" value={count(totals.orders)} />
           <MetricCell label="Revenue" value={money(totals.revenue)} />
@@ -2005,7 +2023,7 @@ function ProductMatrix({ products, filter, setFilter, sort, setSort, query, setQ
                 <td className="py-3 pr-4 min-w-64">
                   <div className="font-medium text-slate-700">{p.sku || p.spu}</div>
                   <div className="text-xs text-slate-400 line-clamp-2">{p.productName}</div>
-                  <div className="text-[11px] text-slate-400 mt-0.5">SPU {p.spu}</div>
+                  <div className="text-[11px] text-slate-400 mt-0.5">SPU {p.spu} · Unit x{p.unitMultiplier || 1}</div>
                 </td>
                 <td className="py-3 pr-4 text-xs text-slate-500">
                   <div>{p.category || '-'}</div>
