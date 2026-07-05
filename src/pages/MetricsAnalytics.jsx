@@ -645,6 +645,26 @@ function timeframeRange(tf, customFrom, customTo) {
   return { from: to, to }
 }
 
+function addDaysISO(day, amount) {
+  const d = new Date(`${day}T00:00:00`)
+  d.setDate(d.getDate() + amount)
+  d.setMinutes(d.getMinutes() - d.getTimezoneOffset())
+  return d.toISOString().slice(0, 10)
+}
+
+function dateSpan(from, to, maxDays = 62) {
+  if (!from || !to) return []
+  const start = from <= to ? from : to
+  const end = from <= to ? to : from
+  const out = []
+  let current = start
+  while (current <= end && out.length < maxDays) {
+    out.push(current)
+    current = addDaysISO(current, 1)
+  }
+  return out
+}
+
 export default function MetricsAnalytics() {
   const toast = useToast()
   const [stores, setStores] = useState([])
@@ -1383,6 +1403,7 @@ export default function MetricsAnalytics() {
             loadWindow={loadWindow}
             activeStore={activeStore}
             loading={loading}
+            storeDays={storeDays}
           />
           <div className="card p-8 text-center text-slate-400">
             {activeStore ? '上传一份表现数据，或选择有数据的时间范围。' : '先创建或选择店铺。'}
@@ -1400,6 +1421,7 @@ export default function MetricsAnalytics() {
             loadWindow={loadWindow}
             activeStore={activeStore}
             loading={loading}
+            storeDays={storeDays}
           />
           <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
             <KPICard title="Units" value={count(totals.units)} subtitle={`${count(totals.orders)} orders`} icon={Package} color="blue" />
@@ -1758,8 +1780,12 @@ function DateRangeControl({
   loadWindow,
   activeStore,
   loading,
+  storeDays,
 }) {
   const range = timeframeRange(timeframe, customFrom, customTo)
+  const days = dateSpan(range.from, range.to, 62)
+  const savedDayMap = new Map((storeDays || []).map((d) => [d.day, d]))
+  const missingCount = days.filter((day) => !savedDayMap.has(day)).length
   const options = [
     ['7d', '7 天'],
     ['14d', '14 天'],
@@ -1776,6 +1802,11 @@ function DateRangeControl({
           <p className="text-xs text-slate-400 mt-0.5">
             当前显示：{range.from && range.to ? `${range.from} 到 ${range.to}` : '请选择开始和结束日期'}
           </p>
+          {days.length > 0 && (
+            <p className="text-xs text-slate-400 mt-0.5">
+              {savedDayMap.size} 天已上传 · {missingCount} 天需要补
+            </p>
+          )}
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <div className="inline-flex flex-wrap gap-1 rounded-lg bg-slate-100 p-1">
@@ -1802,6 +1833,41 @@ function DateRangeControl({
           </button>
         </div>
       </div>
+      {days.length > 0 && (
+        <div className="mt-4">
+          <div className="grid grid-cols-7 gap-1.5">
+            {days.map((day) => {
+              const saved = savedDayMap.get(day)
+              const isToday = day === todayISO()
+              return (
+                <button
+                  key={day}
+                  type="button"
+                  onClick={() => {
+                    setTimeframe('custom')
+                    setCustomFrom(day)
+                    setCustomTo(day)
+                  }}
+                  className={`min-h-12 rounded-md border px-1.5 py-1 text-left text-xs transition ${
+                    saved
+                      ? 'border-blue-200 bg-blue-50 text-blue-700 hover:border-blue-300'
+                      : 'border-slate-200 bg-slate-100 text-slate-400 hover:border-slate-300'
+                  } ${isToday ? 'ring-1 ring-blue-400' : ''}`}
+                  title={saved ? `${day} · ${saved.rowCount || 0} rows uploaded` : `${day} · no data uploaded`}
+                >
+                  <span className="block font-semibold">{day.slice(5).replace('-', '/')}</span>
+                  <span className="mt-1 block text-[10px]">
+                    {saved ? `${saved.rowCount || 0} rows` : 'No data'}
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+          {dateSpan(range.from, range.to, 63).length > 62 && (
+            <p className="mt-2 text-xs text-slate-400">自定义范围太长，日历先显示前 62 天。</p>
+          )}
+        </div>
+      )}
     </section>
   )
 }
