@@ -48,6 +48,19 @@ const TARGET_FIELDS = [
   ['targetUnits', '销量目标', 'integer'],
   ['newProductDays', '新品观察天数', 'integer'],
 ]
+const TREND_METRICS = [
+  { key: 'units', label: 'Units', type: 'count', axis: 'left', color: '#2563eb' },
+  { key: 'revenue', label: 'Revenue', type: 'money', axis: 'left', color: '#14b8a6' },
+  { key: 'spend', label: 'Spend', type: 'money', axis: 'left', color: '#8b5cf6' },
+  { key: 'ctr', label: 'CTR', type: 'percent', axis: 'right', color: '#22c55e' },
+  { key: 'conversionRate', label: 'Conversion', type: 'percent', axis: 'right', color: '#f97316' },
+  { key: 'orders', label: 'Orders', type: 'count', axis: 'left', color: '#0f766e' },
+  { key: 'roas', label: 'ROAS', type: 'ratio', axis: 'right', color: '#dc2626' },
+  { key: 'impressions', label: 'Impressions', type: 'count', axis: 'left', color: '#64748b' },
+  { key: 'clicks', label: 'Clicks', type: 'count', axis: 'left', color: '#0ea5e9' },
+  { key: 'carts', label: 'Carts', type: 'count', axis: 'left', color: '#f59e0b' },
+]
+const DEFAULT_TREND_METRICS = ['units', 'revenue', 'spend', 'ctr', 'conversionRate']
 
 function normalizeId(v) {
   const s = String(v ?? '').trim()
@@ -891,24 +904,13 @@ export default function MetricsAnalytics() {
           <ActionList products={productRows} />
 
           <section className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-            <div className="card p-5 lg:col-span-2">
-              <div className="flex items-center justify-between mb-3">
-                <h2 className="font-semibold text-slate-800">Daily Trend</h2>
-                <span className="text-xs text-slate-400">{draftReport ? 'Preview upload' : `${storeDays.length} saved days`}</span>
-              </div>
-              <ResponsiveContainer width="100%" height={300}>
-                <LineChart data={trends} margin={{ top: 8, right: 8, left: -8, bottom: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#eef2f7" />
-                  <XAxis dataKey="day" tick={{ fontSize: 11 }} />
-                  <YAxis yAxisId="left" tick={{ fontSize: 11 }} />
-                  <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 11 }} tickFormatter={ratio} />
-                  <Tooltip formatter={(v, k) => k === 'roas' ? ratio(v) : count(v)} />
-                  <Line yAxisId="left" type="monotone" dataKey="units" stroke="#2563eb" strokeWidth={2} name="Units" />
-                  <Line yAxisId="left" type="monotone" dataKey="orders" stroke="#14b8a6" strokeWidth={2} name="Orders" />
-                  <Line yAxisId="right" type="monotone" dataKey="roas" stroke="#f97316" strokeWidth={2} name="ROAS" />
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
+            <TrendChartCard
+              className="card p-5 lg:col-span-2"
+              title="Daily Trend"
+              subtitle={draftReport ? 'Preview upload' : `${storeDays.length} saved days`}
+              trends={trends}
+              height={300}
+            />
 
             <FunnelCard totals={totals} trends={trends} />
           </section>
@@ -1015,6 +1017,95 @@ function DateRangeControl({
   )
 }
 
+function trendConfig(key) {
+  return TREND_METRICS.find((m) => m.key === key) || TREND_METRICS[0]
+}
+
+function trendValue(value, type) {
+  if (type === 'money') return money(value)
+  if (type === 'percent') return pct(value)
+  if (type === 'ratio') return ratio(value)
+  return count(value)
+}
+
+function axisTickFormatter(axis, selectedMetrics) {
+  const metrics = selectedMetrics.map(trendConfig).filter((m) => m.axis === axis)
+  if (!metrics.length) return count
+  const types = new Set(metrics.map((m) => m.type))
+  if (types.size === 1) {
+    const [type] = [...types]
+    if (type === 'money') return (v) => '$' + Number(v || 0).toLocaleString('en-US', { maximumFractionDigits: 0 })
+    if (type === 'percent') return pct
+    if (type === 'ratio') return ratio
+  }
+  return (v) => Number(v || 0).toLocaleString('en-US', { maximumFractionDigits: 1 })
+}
+
+function TrendChartCard({ className, title, subtitle, trends, height = 300, emptyMessage = '当前时间范围没有趋势数据。' }) {
+  const [selectedMetrics, setSelectedMetrics] = useState(DEFAULT_TREND_METRICS)
+  const activeMetrics = TREND_METRICS.filter((m) => selectedMetrics.includes(m.key))
+  const toggleMetric = (key) => {
+    setSelectedMetrics((prev) => {
+      if (prev.includes(key)) return prev.length === 1 ? prev : prev.filter((m) => m !== key)
+      return [...prev, key]
+    })
+  }
+  return (
+    <div className={className}>
+      <div className="flex flex-col xl:flex-row xl:items-start xl:justify-between gap-3 mb-3">
+        <div>
+          <h2 className="font-semibold text-slate-800">{title}</h2>
+          <p className="text-xs text-slate-400 mt-0.5">{subtitle}</p>
+        </div>
+        <div className="flex flex-wrap gap-1.5">
+          {TREND_METRICS.map((metric) => {
+            const active = selectedMetrics.includes(metric.key)
+            return (
+              <button
+                key={metric.key}
+                onClick={() => toggleMetric(metric.key)}
+                className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs ${active ? 'bg-white border-slate-300 text-slate-700 shadow-sm' : 'bg-slate-50 border-slate-200 text-slate-400'}`}
+              >
+                <span className="h-2 w-2 rounded-full" style={{ backgroundColor: active ? metric.color : '#cbd5e1' }} />
+                {metric.label}
+              </button>
+            )
+          })}
+        </div>
+      </div>
+      {trends.length ? (
+        <ResponsiveContainer width="100%" height={height}>
+          <LineChart data={trends} margin={{ top: 8, right: 8, left: -8, bottom: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#eef2f7" />
+            <XAxis dataKey="day" tick={{ fontSize: 11 }} />
+            <YAxis yAxisId="left" tick={{ fontSize: 11 }} tickFormatter={axisTickFormatter('left', selectedMetrics)} />
+            <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 11 }} tickFormatter={axisTickFormatter('right', selectedMetrics)} />
+            <Tooltip formatter={(v, _name, props) => {
+              const config = trendConfig(props.dataKey)
+              return [trendValue(v, config.type), config.label]
+            }} />
+            {activeMetrics.map((metric) => (
+              <Line
+                key={metric.key}
+                yAxisId={metric.axis}
+                type="monotone"
+                dataKey={metric.key}
+                stroke={metric.color}
+                strokeWidth={2}
+                dot={{ r: 2 }}
+                activeDot={{ r: 4 }}
+                name={metric.label}
+              />
+            ))}
+          </LineChart>
+        </ResponsiveContainer>
+      ) : (
+        <div className="h-60 flex items-center justify-center text-sm text-slate-400">{emptyMessage}</div>
+      )}
+    </div>
+  )
+}
+
 function SelectedProductPanel({ product, rows, totals, trends, activeStore }) {
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
@@ -1044,28 +1135,14 @@ function SelectedProductPanel({ product, rows, totals, trends, activeStore }) {
         )}
       </div>
 
-      <div className="rounded-lg border border-slate-200 p-4 lg:col-span-2">
-        <div className="flex items-center justify-between mb-3">
-          <h3 className="font-semibold text-slate-800">Single Product Trend</h3>
-          <span className="text-xs text-slate-400">{trends.length} day{trends.length !== 1 ? 's' : ''}</span>
-        </div>
-        {trends.length ? (
-          <ResponsiveContainer width="100%" height={240}>
-            <LineChart data={trends} margin={{ top: 8, right: 8, left: -8, bottom: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#eef2f7" />
-              <XAxis dataKey="day" tick={{ fontSize: 11 }} />
-              <YAxis yAxisId="left" tick={{ fontSize: 11 }} />
-              <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 11 }} tickFormatter={ratio} />
-              <Tooltip formatter={(v, k) => k === 'roas' ? ratio(v) : count(v)} />
-              <Line yAxisId="left" type="monotone" dataKey="units" stroke="#2563eb" strokeWidth={2} name="Units" />
-              <Line yAxisId="left" type="monotone" dataKey="orders" stroke="#14b8a6" strokeWidth={2} name="Orders" />
-              <Line yAxisId="right" type="monotone" dataKey="roas" stroke="#f97316" strokeWidth={2} name="ROAS" />
-            </LineChart>
-          </ResponsiveContainer>
-        ) : (
-          <div className="h-60 flex items-center justify-center text-sm text-slate-400">当前店铺和时间范围没有这个产品的数据。</div>
-        )}
-      </div>
+      <TrendChartCard
+        className="rounded-lg border border-slate-200 p-4 lg:col-span-2"
+        title="Single Product Trend"
+        subtitle={`${trends.length} day${trends.length !== 1 ? 's' : ''}`}
+        trends={trends}
+        height={240}
+        emptyMessage="当前店铺和时间范围没有这个产品的数据。"
+      />
     </div>
   )
 }
