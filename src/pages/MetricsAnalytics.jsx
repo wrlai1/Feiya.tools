@@ -24,10 +24,9 @@ const todayISO = () => {
 
 const MONEY_COLS = ['花费', '销售额', '申报价', '成本', '价格', '毛利', '售价', 'Coupon']
 const RATE_COLS = ['率', '费比', '折扣']
-const DEFAULT_CNY_TO_USD = 0.14
+const FALLBACK_CNY_TO_USD = 0.14
 const DEFAULT_MONEY_CURRENCY = 'CNY'
 const DEFAULT_TARGETS = {
-  legacyCurrency: DEFAULT_MONEY_CURRENCY,
   ctrTarget: 0.03,
   conversionTarget: 0.02,
   cartRateTarget: 0.08,
@@ -67,6 +66,19 @@ const DEFAULT_TREND_METRICS = ['units', 'revenue', 'spend', 'ctr', 'conversionRa
 const PRODUCT_TEXT_FIELDS = ['sku', 'productName', 'notes', 'category', 'sizeLine', 'lifecycle', 'skuType']
 const PRODUCT_NUMBER_FIELDS = ['unitMultiplier', 'cost', 'declaredPrice', 'frontPrice', 'couponPrice', 'grossProfit']
 const PRODUCT_PERCENT_FIELDS = ['grossMargin', 'discountRate']
+const EXCHANGE_RATE_SOURCES = [
+  {
+    name: 'Frankfurter',
+    url: 'https://api.frankfurter.app/latest?from=CNY&to=USD',
+    read: (data) => data?.rates?.USD,
+  },
+  {
+    name: 'open.er-api.com',
+    url: 'https://open.er-api.com/v6/latest/CNY',
+    read: (data) => data?.rates?.USD,
+  },
+]
+let exchangeRateCache = null
 const PRODUCT_EDIT_FIELDS = [
   ['sku', 'SKU', 'text'],
   ['productName', '商品名', 'text'],
@@ -112,15 +124,58 @@ function detectCurrency(v, key = '', fileName = '') {
   return DEFAULT_MONEY_CURRENCY
 }
 
-function moneyToUsd(v, key = '', fileName = '') {
+async function fetchCnyToUsdRate() {
+  const today = todayISO()
+  if (exchangeRateCache?.date === today) return exchangeRateCache
+
+  for (const source of EXCHANGE_RATE_SOURCES) {
+    try {
+      const res = await fetch(source.url, { cache: 'no-store' })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      const rate = Number(source.read(data))
+      if (Number.isFinite(rate) && rate > 0) {
+        exchangeRateCache = {
+          date: today,
+          rate,
+          source: source.name,
+          fetchedAt: new Date().toISOString(),
+          fallback: false,
+        }
+        return exchangeRateCache
+      }
+    } catch {
+      // Try the next public exchange-rate source, then fall back below.
+    }
+  }
+
+  exchangeRateCache = {
+    date: today,
+    rate: FALLBACK_CNY_TO_USD,
+    source: 'fallback',
+    fetchedAt: new Date().toISOString(),
+    fallback: true,
+  }
+  return exchangeRateCache
+}
+
+function moneyToUsd(v, key = '', fileName = '', exchangeRate = { rate: FALLBACK_CNY_TO_USD, source: 'fallback', fallback: true }) {
   const amount = toNumber(v, key)
   if (amount == null) return { value: null, currency: detectCurrency(v, key, fileName), rate: null, original: null }
   const currency = detectCurrency(v, key, fileName)
-  const rate = currency === 'CNY' ? DEFAULT_CNY_TO_USD : 1
-  return { value: amount * rate, currency, rate, original: amount }
+  const rate = currency === 'CNY' ? exchangeRate.rate : 1
+  return {
+    value: amount * rate,
+    currency,
+    rate,
+    original: amount,
+    rateSource: currency === 'CNY' ? exchangeRate.source : 'native USD',
+    rateFetchedAt: currency === 'CNY' ? exchangeRate.fetchedAt : null,
+    rateFallback: currency === 'CNY' ? exchangeRate.fallback : false,
+  }
 }
 
-function summarizeCurrencies(rows) {
+function summarizeCurrencies(rows, exchangeRate) {
   const counts = rows.reduce((acc, row) => {
     const currency = row.sourceCurrency || DEFAULT_MONEY_CURRENCY
     acc[currency] = (acc[currency] || 0) + 1
@@ -130,41 +185,11 @@ function summarizeCurrencies(rows) {
   return {
     primary: currencies.length === 1 ? currencies[0] : 'MIXED',
     counts,
-    cnyToUsd: DEFAULT_CNY_TO_USD,
+    cnyToUsd: exchangeRate?.rate || FALLBACK_CNY_TO_USD,
+    rateSource: exchangeRate?.source || 'fallback',
+    rateFallback: Boolean(exchangeRate?.fallback),
+    rateFetchedAt: exchangeRate?.fetchedAt || null,
   }
-}
-
-function legacyCurrencyRate(currency) {
-  return currency === 'CNY' ? DEFAULT_CNY_TO_USD : 1
-}
-
-function convertLegacyMoney(value, currency) {
-  if (value == null || Number.isNaN(Number(value))) return value
-  return Number(value) * legacyCurrencyRate(currency)
-}
-
-function normalizeLegacyMoneyRows(rows, settings = DEFAULT_TARGETS) {
-  const legacyCurrency = settings.legacyCurrency || DEFAULT_MONEY_CURRENCY
-  const rate = legacyCurrencyRate(legacyCurrency)
-  return (rows || []).map((row) => {
-    if (row.sourceCurrency) return row
-    return {
-      ...row,
-      spendOriginal: row.spend,
-      netSpendOriginal: row.netSpend,
-      revenueOriginal: row.revenue,
-      netRevenueOriginal: row.netRevenue,
-      cpaOriginal: row.cpa,
-      spend: convertLegacyMoney(row.spend, legacyCurrency),
-      netSpend: convertLegacyMoney(row.netSpend, legacyCurrency),
-      revenue: convertLegacyMoney(row.revenue, legacyCurrency),
-      netRevenue: convertLegacyMoney(row.netRevenue, legacyCurrency),
-      cpa: convertLegacyMoney(row.cpa, legacyCurrency),
-      sourceCurrency: legacyCurrency,
-      currencyRateToUsd: rate,
-      legacyCurrencyConverted: legacyCurrency === 'CNY',
-    }
-  })
 }
 
 function money(v) {
@@ -245,6 +270,7 @@ async function parseProductPlan(file) {
 }
 
 async function parsePerformanceFile(file) {
+  const exchangeRate = await fetchCnyToUsdRate()
   const raw = await readSheetRows(file)
   const { start, end } = dateRangeFromFileName(file.name)
   const rows = raw
@@ -252,11 +278,11 @@ async function parsePerformanceFile(file) {
     .map((r) => {
       const spu = normalizeId(r['SPU ID'] ?? r['SPU/款号'] ?? r['SPU'])
       if (!spu) return null
-      const spendMoney = moneyToUsd(r['总花费'], '总花费', file.name)
-      const netSpendMoney = moneyToUsd(r['净总花费'], '净总花费', file.name)
-      const revenueMoney = moneyToUsd(r['申报价销售额（全域）'], '申报价销售额（全域）', file.name)
-      const netRevenueMoney = moneyToUsd(r['净申报价销售额（全域）'], '净申报价销售额（全域）', file.name)
-      const cpaMoney = moneyToUsd(r['每笔成交花费（全域）'], '每笔成交花费（全域）', file.name)
+      const spendMoney = moneyToUsd(r['总花费'], '总花费', file.name, exchangeRate)
+      const netSpendMoney = moneyToUsd(r['净总花费'], '净总花费', file.name, exchangeRate)
+      const revenueMoney = moneyToUsd(r['申报价销售额（全域）'], '申报价销售额（全域）', file.name, exchangeRate)
+      const netRevenueMoney = moneyToUsd(r['净申报价销售额（全域）'], '净申报价销售额（全域）', file.name, exchangeRate)
+      const cpaMoney = moneyToUsd(r['每笔成交花费（全域）'], '每笔成交花费（全域）', file.name, exchangeRate)
       return {
         spu,
         productId: normalizeId(r['商品ID']),
@@ -289,12 +315,15 @@ async function parsePerformanceFile(file) {
         periodEnd: end,
         sourceFile: file.name,
         sourceCurrency: revenueMoney.currency || spendMoney.currency || DEFAULT_MONEY_CURRENCY,
-        currencyRateToUsd: revenueMoney.rate || spendMoney.rate || DEFAULT_CNY_TO_USD,
+        currencyRateToUsd: revenueMoney.rate || spendMoney.rate || exchangeRate.rate,
+        currencyRateSource: revenueMoney.rateSource || spendMoney.rateSource || exchangeRate.source,
+        currencyRateFetchedAt: revenueMoney.rateFetchedAt || spendMoney.rateFetchedAt || exchangeRate.fetchedAt,
+        currencyRateFallback: revenueMoney.rateFallback || spendMoney.rateFallback || exchangeRate.fallback,
       }
     })
     .filter(Boolean)
   if (!rows.length) throw new Error('没有找到带 SPU ID 的商品推广数据')
-  return { rows, start, end, fileName: file.name, currencySummary: summarizeCurrencies(rows) }
+  return { rows, start, end, fileName: file.name, currencySummary: summarizeCurrencies(rows, exchangeRate) }
 }
 
 function sum(rows, key) {
@@ -698,11 +727,7 @@ export default function MetricsAnalytics() {
     return () => { cancelled = true }
   }, [activeStore])
 
-  const normalizedStoreRows = useMemo(
-    () => normalizeLegacyMoneyRows(storeRows, targets),
-    [storeRows, targets],
-  )
-  const visibleRows = draftReport?.rows?.length ? draftReport.rows : normalizedStoreRows
+  const visibleRows = draftReport?.rows?.length ? draftReport.rows : storeRows
   const unmatchedDraftSpus = useMemo(
     () => unmatchedPerformanceGroups(draftReport?.rows || [], products),
     [draftReport, products],
@@ -773,19 +798,16 @@ export default function MetricsAnalytics() {
         const rows = []
         for (const store of stores) {
           const storeName = store.name
-          const [productRes, rangeRes, settingsRes] = await Promise.all([
+          const [productRes, rangeRes] = await Promise.all([
             fetchStoreProducts(storeName).catch(() => ({ products: [] })),
             fetchStoreRange(storeName, from, to).catch(() => ({ rows: [] })),
-            fetchAnalyticsSettings(storeName).catch(() => ({ settings: {} })),
           ])
-          const storeTargets = { ...DEFAULT_TARGETS, ...(settingsRes.settings || {}) }
           const storeProducts = productRes.products || []
           const matchingProducts = storeProducts.filter((p) => matchesProductKey(p, query))
           const matchingSpus = new Set(matchingProducts.map((p) => p.spu))
-          const normalizedRows = normalizeLegacyMoneyRows(rangeRes.rows || [], storeTargets)
-          const matchingRows = normalizedRows.filter((r) => matchingSpus.has(r.spu) || normalizeId(r.spu) === query)
+          const matchingRows = (rangeRes.rows || []).filter((r) => matchingSpus.has(r.spu) || normalizeId(r.spu) === query)
           if (!matchingRows.length && !matchingProducts.length) continue
-          const summary = aggregateBySpu(matchingRows, matchingProducts, storeTargets)[0] || {
+          const summary = aggregateBySpu(matchingRows, matchingProducts, targets)[0] || {
             ...(matchingProducts[0] || { spu: query, sku: query }),
             ...aggregateTotals(matchingRows, matchingProducts),
           }
@@ -1077,7 +1099,6 @@ export default function MetricsAnalytics() {
             <TargetPill label="CVR" value={pct(targets.conversionTarget)} />
             <TargetPill label="ROAS" value={ratio(targets.roasTarget)} />
             <TargetPill label="Stop" value={money(targets.stopLossSpend)} />
-            <TargetPill label="Old data" value={targets.legacyCurrency || DEFAULT_MONEY_CURRENCY} />
             <button onClick={() => setSettingsOpen((v) => !v)} className="btn-secondary text-xs px-3 py-1.5">
               {settingsOpen ? 'Hide settings' : 'Edit targets'}
             </button>
@@ -1122,7 +1143,11 @@ export default function MetricsAnalytics() {
               <span className="text-xs text-slate-500">{draftReport.rows.length} rows from {draftReport.fileName}</span>
               {draftReport.currencySummary && (
                 <span className="text-xs text-blue-600 bg-blue-50 rounded-lg px-2 py-1">
-                  Currency: {draftReport.currencySummary.primary === 'CNY' ? `RMB -> USD @ ${draftReport.currencySummary.cnyToUsd}` : draftReport.currencySummary.primary === 'USD' ? 'USD' : 'Mixed'}
+                  Currency: {draftReport.currencySummary.primary === 'CNY'
+                    ? `RMB -> USD @ ${Number(draftReport.currencySummary.cnyToUsd).toFixed(4)} (${draftReport.currencySummary.rateSource}${draftReport.currencySummary.rateFallback ? ' fallback' : ''})`
+                    : draftReport.currencySummary.primary === 'USD'
+                      ? 'USD'
+                      : `Mixed · RMB -> USD @ ${Number(draftReport.currencySummary.cnyToUsd).toFixed(4)} (${draftReport.currencySummary.rateSource}${draftReport.currencySummary.rateFallback ? ' fallback' : ''})`}
                 </span>
               )}
               <label className="inline-flex items-center gap-1.5 text-xs text-slate-500">
@@ -1874,28 +1899,12 @@ function SettingsPanel({ targets, activeStore, onSave, onReset }) {
         <div>
           <h3 className="font-semibold text-slate-700">Scoring Rules</h3>
           <p className="text-xs text-slate-400 mt-0.5">
-            {activeStore ? `这些目标和旧数据币种会保存到 ${activeStore}。` : '未选择店铺时保存为默认设置。'}
+            {activeStore ? `这些目标会保存到 ${activeStore}。` : '未选择店铺时保存为默认目标。'}
           </p>
         </div>
         <div className="flex gap-2">
           <button onClick={() => onSave(draft)} className="btn-primary text-xs px-3 py-1.5"><Save className="w-3.5 h-3.5" /> Save targets</button>
           <button onClick={onReset} className="btn-secondary text-xs px-3 py-1.5">Reset default</button>
-        </div>
-      </div>
-      <div className="mb-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
-        <label className="flex flex-col gap-1">
-          <span className="text-xs text-slate-500 font-medium">旧数据币种</span>
-          <select
-            className="metric-input"
-            value={draft.legacyCurrency || DEFAULT_MONEY_CURRENCY}
-            onChange={(e) => setDraft((prev) => ({ ...prev, legacyCurrency: e.target.value }))}
-          >
-            <option value="CNY">RMB / ¥ old data</option>
-            <option value="USD">USD / $ old data</option>
-          </select>
-        </label>
-        <div className="sm:col-span-2 lg:col-span-4 rounded-md border border-slate-200 bg-white px-3 py-2 text-xs text-slate-500">
-          旧数据没有币种标记，会按这里的选择显示；新上传的数据已经带币种，不会重复转换。
         </div>
       </div>
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
