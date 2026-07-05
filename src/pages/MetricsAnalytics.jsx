@@ -383,15 +383,36 @@ function daySeries(rows) {
   }
   return [...days.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([day, rs]) => {
     const t = aggregateTotals(rs)
-    return { day, units: t.units, orders: t.orders, spend: t.spend, revenue: t.revenue, roas: t.roas || 0, ctr: t.ctr || 0, conversionRate: t.conversionRate || 0 }
+    return {
+      day,
+      units: t.units,
+      orders: t.orders,
+      spend: t.spend,
+      revenue: t.revenue,
+      impressions: t.impressions,
+      clicks: t.clicks,
+      carts: t.carts,
+      roas: t.roas || 0,
+      ctr: t.ctr || 0,
+      cartRate: t.cartRate || 0,
+      conversionRate: t.conversionRate || 0,
+    }
   })
 }
 
 function timeframeRange(tf, customFrom, customTo) {
   const to = todayISO()
-  if (tf === '7d' || tf === '14d') {
+  if (tf === 'yesterday') {
     const d = new Date()
-    d.setDate(d.getDate() - (tf === '7d' ? 6 : 13))
+    d.setDate(d.getDate() - 1)
+    d.setMinutes(d.getMinutes() - d.getTimezoneOffset())
+    const day = d.toISOString().slice(0, 10)
+    return { from: day, to: day }
+  }
+  if (tf === '7d' || tf === '14d' || tf === '30d') {
+    const d = new Date()
+    const days = tf === '7d' ? 7 : tf === '14d' ? 14 : 30
+    d.setDate(d.getDate() - (days - 1))
     d.setMinutes(d.getMinutes() - d.getTimezoneOffset())
     return { from: d.toISOString().slice(0, 10), to }
   }
@@ -415,6 +436,8 @@ export default function MetricsAnalytics() {
   const [loading, setLoading] = useState(false)
   const [metricX, setMetricX] = useState('ctr')
   const [tableFilter, setTableFilter] = useState('all')
+  const [matrixSort, setMatrixSort] = useState('units_desc')
+  const [matrixQuery, setMatrixQuery] = useState('')
   const [selectedProduct, setSelectedProduct] = useState('')
   const [storeComparison, setStoreComparison] = useState([])
   const [comparisonLoading, setComparisonLoading] = useState(false)
@@ -516,9 +539,21 @@ export default function MetricsAnalytics() {
     .map((p) => ({ ...p, x: p[metricX], y: p.units }))
     .filter((p) => p.x != null && p.y != null), [productRows, metricX])
   const filteredProducts = useMemo(() => {
-    if (tableFilter === 'all') return productRows
-    return productRows.filter((p) => p.status === tableFilter)
-  }, [productRows, tableFilter])
+    const q = matrixQuery.trim().toLowerCase()
+    const filtered = productRows.filter((p) => {
+      if (tableFilter !== 'all' && p.status !== tableFilter) return false
+      if (!q) return true
+      return [p.spu, p.sku, p.productName, p.category, p.lifecycle, p.decision]
+        .some((v) => String(v || '').toLowerCase().includes(q))
+    })
+    const [key, dir] = matrixSort.split('_')
+    const sorted = [...filtered].sort((a, b) => {
+      const av = Number(a[key]) || 0
+      const bv = Number(b[key]) || 0
+      return dir === 'asc' ? av - bv : bv - av
+    })
+    return sorted
+  }, [productRows, tableFilter, matrixSort, matrixQuery])
 
   useEffect(() => {
     let cancelled = false
@@ -692,29 +727,6 @@ export default function MetricsAnalytics() {
           {!stores.length && <span className="text-sm text-slate-400">先创建一个店铺。</span>}
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-xs font-semibold text-slate-500 uppercase">Range</span>
-          {[
-            ['today', 'Daily'],
-            ['7d', '7 days'],
-            ['14d', '14 days'],
-            ['custom', 'Custom'],
-          ].map(([key, label]) => (
-            <button key={key} onClick={() => setTimeframe(key)} className={`text-xs px-3 py-1.5 rounded-lg border ${timeframe === key ? 'bg-blue-50 border-blue-300 text-blue-700' : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'}`}>
-              {label}
-            </button>
-          ))}
-          {timeframe === 'custom' && (
-            <span className="inline-flex items-center gap-2 text-xs text-slate-500">
-              <Calendar className="w-3.5 h-3.5" />
-              <input type="date" className="metric-input !py-1" value={customFrom} onChange={(e) => setCustomFrom(e.target.value)} />
-              <span>to</span>
-              <input type="date" className="metric-input !py-1" value={customTo} onChange={(e) => setCustomTo(e.target.value)} />
-            </span>
-          )}
-          <button onClick={loadWindow} disabled={!activeStore || loading} className="btn-secondary text-xs px-3 py-1.5 disabled:opacity-40">Refresh</button>
-        </div>
-
         {activeStore && storeDays.length > 0 && (
           <div className="flex flex-wrap gap-1.5">
             {storeDays.map((d) => (
@@ -837,13 +849,37 @@ export default function MetricsAnalytics() {
       </section>
 
       {!visibleRows.length ? (
-        <div className="card p-8 text-center text-slate-400">
-          {activeStore ? '上传一份表现数据，或选择有数据的时间范围。' : '先创建或选择店铺。'}
-        </div>
+        <>
+          <DateRangeControl
+            timeframe={timeframe}
+            setTimeframe={setTimeframe}
+            customFrom={customFrom}
+            customTo={customTo}
+            setCustomFrom={setCustomFrom}
+            setCustomTo={setCustomTo}
+            loadWindow={loadWindow}
+            activeStore={activeStore}
+            loading={loading}
+            storeDays={storeDays}
+          />
+          <div className="card p-8 text-center text-slate-400">
+            {activeStore ? '上传一份表现数据，或选择有数据的时间范围。' : '先创建或选择店铺。'}
+          </div>
+        </>
       ) : (
         <>
-          <ActionList products={productRows} />
-
+          <DateRangeControl
+            timeframe={timeframe}
+            setTimeframe={setTimeframe}
+            customFrom={customFrom}
+            customTo={customTo}
+            setCustomFrom={setCustomFrom}
+            setCustomTo={setCustomTo}
+            loadWindow={loadWindow}
+            activeStore={activeStore}
+            loading={loading}
+            storeDays={storeDays}
+          />
           <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
             <KPICard title="Units" value={count(totals.units)} subtitle={`${count(totals.orders)} orders`} icon={Package} color="blue" />
             <KPICard title="Revenue" value={money(totals.revenue)} subtitle={`${ratio(totals.roas)} ROAS`} icon={TrendingUp} color="teal" />
@@ -851,6 +887,8 @@ export default function MetricsAnalytics() {
             <KPICard title="CTR" value={pct(totals.ctr)} subtitle={`${count(totals.clicks)} clicks`} icon={Upload} color="green" />
             <KPICard title="Conversion" value={pct(totals.conversionRate)} subtitle={`${count(totals.carts)} carts`} icon={CheckCircle} color="orange" />
           </section>
+
+          <ActionList products={productRows} />
 
           <section className="grid grid-cols-1 lg:grid-cols-3 gap-4">
             <div className="card p-5 lg:col-span-2">
@@ -872,7 +910,7 @@ export default function MetricsAnalytics() {
               </ResponsiveContainer>
             </div>
 
-            <FunnelCard totals={totals} />
+            <FunnelCard totals={totals} trends={trends} />
           </section>
 
           <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -903,10 +941,77 @@ export default function MetricsAnalytics() {
             <TopProductsChart products={productRows} />
           </section>
 
-          <ProductMatrix products={filteredProducts} filter={tableFilter} setFilter={setTableFilter} />
+          <ProductMatrix
+            products={filteredProducts}
+            filter={tableFilter}
+            setFilter={setTableFilter}
+            sort={matrixSort}
+            setSort={setMatrixSort}
+            query={matrixQuery}
+            setQuery={setMatrixQuery}
+          />
         </>
       )}
     </div>
+  )
+}
+
+function DateRangeControl({
+  timeframe,
+  setTimeframe,
+  customFrom,
+  customTo,
+  setCustomFrom,
+  setCustomTo,
+  loadWindow,
+  activeStore,
+  loading,
+  storeDays,
+}) {
+  const range = timeframeRange(timeframe, customFrom, customTo)
+  const options = [
+    ['7d', '7 天'],
+    ['14d', '14 天'],
+    ['30d', '30 天'],
+    ['today', '今天'],
+    ['yesterday', '昨天'],
+    ['custom', '自定义'],
+  ]
+  return (
+    <section className="card p-4">
+      <div className="flex flex-col xl:flex-row xl:items-center xl:justify-between gap-3">
+        <div>
+          <h2 className="font-semibold text-slate-800">数据时间</h2>
+          <p className="text-xs text-slate-400 mt-0.5">
+            {range.from && range.to ? `${range.from} 到 ${range.to}` : '请选择开始和结束日期'} · {storeDays.length} 个已保存日期
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="inline-flex flex-wrap gap-1 rounded-lg bg-slate-100 p-1">
+            {options.map(([key, label]) => (
+              <button
+                key={key}
+                onClick={() => setTimeframe(key)}
+                className={`text-xs px-3 py-1.5 rounded-md ${timeframe === key ? 'bg-white text-blue-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {timeframe === 'custom' && (
+            <span className="inline-flex flex-wrap items-center gap-2 text-xs text-slate-500">
+              <Calendar className="w-3.5 h-3.5" />
+              <input type="date" className="metric-input !py-1" value={customFrom} onChange={(e) => setCustomFrom(e.target.value)} />
+              <span>to</span>
+              <input type="date" className="metric-input !py-1" value={customTo} onChange={(e) => setCustomTo(e.target.value)} />
+            </span>
+          )}
+          <button onClick={loadWindow} disabled={!activeStore || loading} className="btn-secondary text-xs px-3 py-1.5 disabled:opacity-40">
+            {loading ? 'Loading' : 'Refresh'}
+          </button>
+        </div>
+      </div>
+    </section>
   )
 }
 
@@ -1163,7 +1268,7 @@ function metricLabel(key) {
   }[key] || key
 }
 
-function FunnelCard({ totals }) {
+function FunnelCard({ totals, trends }) {
   const steps = [
     ['曝光', totals.impressions, null],
     ['点击', totals.clicks, totals.ctr],
@@ -1173,7 +1278,10 @@ function FunnelCard({ totals }) {
   const max = Math.max(totals.impressions || 1, 1)
   return (
     <div className="card p-5">
-      <h2 className="font-semibold text-slate-800 mb-3">Traffic Funnel</h2>
+      <div className="flex items-center justify-between gap-3 mb-3">
+        <h2 className="font-semibold text-slate-800">Traffic Funnel</h2>
+        <span className="text-xs text-slate-400">{trends.length} days</span>
+      </div>
       <div className="space-y-3">
         {steps.map(([label, value, rate]) => (
           <div key={label}>
@@ -1187,7 +1295,34 @@ function FunnelCard({ totals }) {
           </div>
         ))}
       </div>
-      <p className="text-xs text-slate-400 mt-4">如果曝光够但点击率低，先改主图/标题；如果点击够但转化低，先看价格、页面和评价。</p>
+      <div className="mt-5">
+        <h3 className="text-xs font-semibold text-slate-500 uppercase mb-2">Daily funnel trend</h3>
+        <ResponsiveContainer width="100%" height={170}>
+          <BarChart data={trends} margin={{ top: 8, right: 8, left: -8, bottom: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#eef2f7" />
+            <XAxis dataKey="day" tick={{ fontSize: 10 }} />
+            <YAxis tick={{ fontSize: 10 }} />
+            <Tooltip formatter={(v, k) => [count(v), { impressions: '曝光', clicks: '点击', carts: '加购', orders: '订单' }[k] || k]} />
+            <Bar dataKey="impressions" fill="#bfdbfe" radius={[3, 3, 0, 0]} name="曝光" />
+            <Bar dataKey="clicks" fill="#60a5fa" radius={[3, 3, 0, 0]} name="点击" />
+            <Bar dataKey="carts" fill="#2dd4bf" radius={[3, 3, 0, 0]} name="加购" />
+            <Bar dataKey="orders" fill="#f97316" radius={[3, 3, 0, 0]} name="订单" />
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+      <div className="mt-3 max-h-44 overflow-y-auto divide-y divide-slate-100">
+        {trends.map((d) => (
+          <div key={d.day} className="grid grid-cols-5 gap-2 py-2 text-xs">
+            <span className="font-medium text-slate-600">{d.day}</span>
+            <span className="text-right text-slate-500">{count(d.impressions)} 曝光</span>
+            <span className="text-right text-slate-500">{pct(d.ctr)} CTR</span>
+            <span className="text-right text-slate-500">{pct(d.cartRate)} 加购</span>
+            <span className="text-right text-slate-500">{pct(d.conversionRate)} CVR</span>
+          </div>
+        ))}
+        {!trends.length && <div className="py-4 text-center text-xs text-slate-400">暂无每日漏斗数据。</div>}
+      </div>
+      <p className="text-xs text-slate-400 mt-4">如果某一天曝光够但 CTR 掉下去，优先看主图/标题；如果点击和加购正常但 CVR 掉下去，优先看价格、页面和评价。</p>
     </div>
   )
 }
@@ -1214,27 +1349,51 @@ function TopProductsChart({ products }) {
   )
 }
 
-function ProductMatrix({ products, filter, setFilter }) {
+function ProductMatrix({ products, filter, setFilter, sort, setSort, query, setQuery }) {
   const filters = [
     ['all', 'All'],
     ['good', '机会'],
     ['warn', '观察'],
     ['bad', '需要修改'],
   ]
+  const sorts = [
+    ['units_desc', 'Units 最多'],
+    ['revenue_desc', 'Revenue 最高'],
+    ['roas_desc', 'ROAS 最高'],
+    ['score_desc', 'Score 最高'],
+    ['ctr_desc', 'CTR 最高'],
+    ['conversionRate_desc', 'CVR 最高'],
+    ['spend_desc', 'Spend 最高'],
+    ['spend_asc', 'Spend 最低'],
+  ]
   return (
     <section className="card p-5">
       <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
         <div>
           <h2 className="font-semibold text-slate-800">Product Performance Matrix</h2>
-          <p className="text-xs text-slate-400 mt-0.5">每一行是一个 SPU，最后一列是系统根据当前数据给出的操作方向。</p>
+          <p className="text-xs text-slate-400 mt-0.5">筛出销量最多、花费最高、转化最好或需要修改的款。</p>
         </div>
-        <div className="flex gap-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <input
+            className="metric-input !py-1.5 w-44"
+            placeholder="Search SPU / SKU"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+          <select className="metric-input !py-1.5" value={sort} onChange={(e) => setSort(e.target.value)}>
+            {sorts.map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+          </select>
+        </div>
+      </div>
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
+        <div className="flex flex-wrap gap-1">
           {filters.map(([key, label]) => (
             <button key={key} onClick={() => setFilter(key)} className={`text-xs px-3 py-1.5 rounded-lg border ${filter === key ? 'bg-blue-50 border-blue-300 text-blue-700' : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'}`}>
               {label}
             </button>
           ))}
         </div>
+        <span className="text-xs text-slate-400">{products.length} products</span>
       </div>
       <div className="overflow-x-auto">
         <table className="min-w-full text-sm">
