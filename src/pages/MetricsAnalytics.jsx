@@ -27,6 +27,7 @@ const RATE_COLS = ['率', '费比', '折扣']
 const DEFAULT_CNY_TO_USD = 0.14
 const DEFAULT_MONEY_CURRENCY = 'CNY'
 const DEFAULT_TARGETS = {
+  legacyCurrency: DEFAULT_MONEY_CURRENCY,
   ctrTarget: 0.03,
   conversionTarget: 0.02,
   cartRateTarget: 0.08,
@@ -131,6 +132,39 @@ function summarizeCurrencies(rows) {
     counts,
     cnyToUsd: DEFAULT_CNY_TO_USD,
   }
+}
+
+function legacyCurrencyRate(currency) {
+  return currency === 'CNY' ? DEFAULT_CNY_TO_USD : 1
+}
+
+function convertLegacyMoney(value, currency) {
+  if (value == null || Number.isNaN(Number(value))) return value
+  return Number(value) * legacyCurrencyRate(currency)
+}
+
+function normalizeLegacyMoneyRows(rows, settings = DEFAULT_TARGETS) {
+  const legacyCurrency = settings.legacyCurrency || DEFAULT_MONEY_CURRENCY
+  const rate = legacyCurrencyRate(legacyCurrency)
+  return (rows || []).map((row) => {
+    if (row.sourceCurrency) return row
+    return {
+      ...row,
+      spendOriginal: row.spend,
+      netSpendOriginal: row.netSpend,
+      revenueOriginal: row.revenue,
+      netRevenueOriginal: row.netRevenue,
+      cpaOriginal: row.cpa,
+      spend: convertLegacyMoney(row.spend, legacyCurrency),
+      netSpend: convertLegacyMoney(row.netSpend, legacyCurrency),
+      revenue: convertLegacyMoney(row.revenue, legacyCurrency),
+      netRevenue: convertLegacyMoney(row.netRevenue, legacyCurrency),
+      cpa: convertLegacyMoney(row.cpa, legacyCurrency),
+      sourceCurrency: legacyCurrency,
+      currencyRateToUsd: rate,
+      legacyCurrencyConverted: legacyCurrency === 'CNY',
+    }
+  })
 }
 
 function money(v) {
@@ -664,7 +698,11 @@ export default function MetricsAnalytics() {
     return () => { cancelled = true }
   }, [activeStore])
 
-  const visibleRows = draftReport?.rows?.length ? draftReport.rows : storeRows
+  const normalizedStoreRows = useMemo(
+    () => normalizeLegacyMoneyRows(storeRows, targets),
+    [storeRows, targets],
+  )
+  const visibleRows = draftReport?.rows?.length ? draftReport.rows : normalizedStoreRows
   const unmatchedDraftSpus = useMemo(
     () => unmatchedPerformanceGroups(draftReport?.rows || [], products),
     [draftReport, products],
@@ -735,16 +773,19 @@ export default function MetricsAnalytics() {
         const rows = []
         for (const store of stores) {
           const storeName = store.name
-          const [productRes, rangeRes] = await Promise.all([
+          const [productRes, rangeRes, settingsRes] = await Promise.all([
             fetchStoreProducts(storeName).catch(() => ({ products: [] })),
             fetchStoreRange(storeName, from, to).catch(() => ({ rows: [] })),
+            fetchAnalyticsSettings(storeName).catch(() => ({ settings: {} })),
           ])
+          const storeTargets = { ...DEFAULT_TARGETS, ...(settingsRes.settings || {}) }
           const storeProducts = productRes.products || []
           const matchingProducts = storeProducts.filter((p) => matchesProductKey(p, query))
           const matchingSpus = new Set(matchingProducts.map((p) => p.spu))
-          const matchingRows = (rangeRes.rows || []).filter((r) => matchingSpus.has(r.spu) || normalizeId(r.spu) === query)
+          const normalizedRows = normalizeLegacyMoneyRows(rangeRes.rows || [], storeTargets)
+          const matchingRows = normalizedRows.filter((r) => matchingSpus.has(r.spu) || normalizeId(r.spu) === query)
           if (!matchingRows.length && !matchingProducts.length) continue
-          const summary = aggregateBySpu(matchingRows, matchingProducts, targets)[0] || {
+          const summary = aggregateBySpu(matchingRows, matchingProducts, storeTargets)[0] || {
             ...(matchingProducts[0] || { spu: query, sku: query }),
             ...aggregateTotals(matchingRows, matchingProducts),
           }
@@ -1036,6 +1077,7 @@ export default function MetricsAnalytics() {
             <TargetPill label="CVR" value={pct(targets.conversionTarget)} />
             <TargetPill label="ROAS" value={ratio(targets.roasTarget)} />
             <TargetPill label="Stop" value={money(targets.stopLossSpend)} />
+            <TargetPill label="Old data" value={targets.legacyCurrency || DEFAULT_MONEY_CURRENCY} />
             <button onClick={() => setSettingsOpen((v) => !v)} className="btn-secondary text-xs px-3 py-1.5">
               {settingsOpen ? 'Hide settings' : 'Edit targets'}
             </button>
@@ -1832,12 +1874,28 @@ function SettingsPanel({ targets, activeStore, onSave, onReset }) {
         <div>
           <h3 className="font-semibold text-slate-700">Scoring Rules</h3>
           <p className="text-xs text-slate-400 mt-0.5">
-            {activeStore ? `这些目标会保存到 ${activeStore}。` : '未选择店铺时保存为默认目标。'}
+            {activeStore ? `这些目标和旧数据币种会保存到 ${activeStore}。` : '未选择店铺时保存为默认设置。'}
           </p>
         </div>
         <div className="flex gap-2">
           <button onClick={() => onSave(draft)} className="btn-primary text-xs px-3 py-1.5"><Save className="w-3.5 h-3.5" /> Save targets</button>
           <button onClick={onReset} className="btn-secondary text-xs px-3 py-1.5">Reset default</button>
+        </div>
+      </div>
+      <div className="mb-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+        <label className="flex flex-col gap-1">
+          <span className="text-xs text-slate-500 font-medium">旧数据币种</span>
+          <select
+            className="metric-input"
+            value={draft.legacyCurrency || DEFAULT_MONEY_CURRENCY}
+            onChange={(e) => setDraft((prev) => ({ ...prev, legacyCurrency: e.target.value }))}
+          >
+            <option value="CNY">RMB / ¥ old data</option>
+            <option value="USD">USD / $ old data</option>
+          </select>
+        </label>
+        <div className="sm:col-span-2 lg:col-span-4 rounded-md border border-slate-200 bg-white px-3 py-2 text-xs text-slate-500">
+          旧数据没有币种标记，会按这里的选择显示；新上传的数据已经带币种，不会重复转换。
         </div>
       </div>
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
