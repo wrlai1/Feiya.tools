@@ -459,7 +459,8 @@ app.all('/api/analytics-store', async (req, res) => {
     const sql     = getDB();
     const payload = verifyToken(req.headers.authorization, getSecret());
     if (!payload) return res.status(401).json({ error: 'Not authenticated' });
-    const username = payload.username;
+    const actor = payload.username;
+    const username = payload.role === 'admin' ? 'admin' : payload.username;
     const action   = req.query.action;
     await ensureAnalyticsStoreTables(sql);
 
@@ -478,7 +479,7 @@ app.all('/api/analytics-store', async (req, res) => {
       const name = String(req.body?.name || '').trim();
       if (!name) return res.status(400).json({ error: 'name is required' });
       await sql`INSERT INTO analytics_stores (username, name) VALUES (${username}, ${name}) ON CONFLICT DO NOTHING`;
-      await recordAnalyticsEvent(sql, username, username, name, 'create-store', `Created store ${name}`, { store: name });
+      await recordAnalyticsEvent(sql, username, actor, name, 'create-store', `Created store ${name}`, { store: name });
       return res.json({ ok: true, name });
     }
 
@@ -511,7 +512,7 @@ app.all('/api/analytics-store', async (req, res) => {
       await sql`DELETE FROM analytics_store_products WHERE username = ${username} AND store = ${name}`;
       await sql`DELETE FROM analytics_store_settings WHERE username = ${username} AND store = ${name}`;
       await sql`DELETE FROM analytics_stores WHERE username = ${username} AND name = ${name}`;
-      await recordAnalyticsEvent(sql, username, username, name, 'delete-store', `Deleted store ${name}`, {
+      await recordAnalyticsEvent(sql, username, actor, name, 'delete-store', `Deleted store ${name}`, {
         store: name,
         days: snapshot.days.length,
         products: snapshot.products.length,
@@ -552,7 +553,7 @@ app.all('/api/analytics-store', async (req, res) => {
           DO UPDATE SET data = EXCLUDED.data, file_name = EXCLUDED.file_name, updated_at = NOW()
         `;
       }
-      await recordAnalyticsEvent(sql, username, username, name, 'save-products', `Saved ${products.length} product catalog rows`, {
+      await recordAnalyticsEvent(sql, username, actor, name, 'save-products', `Saved ${products.length} product catalog rows`, {
         store: name,
         fileName: fileName || null,
         count: products.length,
@@ -591,7 +592,7 @@ app.all('/api/analytics-store', async (req, res) => {
         ON CONFLICT (username, store)
         DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()
       `;
-      await recordAnalyticsEvent(sql, username, username, name, 'save-settings', `Saved analytics settings for ${name}`, {
+      await recordAnalyticsEvent(sql, username, actor, name, 'save-settings', `Saved analytics settings for ${name}`, {
         store: name,
       }, {
         type: 'settings',
@@ -617,7 +618,7 @@ app.all('/api/analytics-store', async (req, res) => {
         VALUES (${username}, ${name}, ${day}, ${fileName || null}, ${json}::jsonb, NOW())
         ON CONFLICT (username, store, day) DO UPDATE SET rows = EXCLUDED.rows, file_name = EXCLUDED.file_name, updated_at = NOW()
       `;
-      await recordAnalyticsEvent(sql, username, username, name, 'save-day', `Saved ${rows.length} rows for ${name} on ${day}`, {
+      await recordAnalyticsEvent(sql, username, actor, name, 'save-day', `Saved ${rows.length} rows for ${name} on ${day}`, {
         store: name,
         day,
         fileName: fileName || null,
@@ -662,7 +663,7 @@ app.all('/api/analytics-store', async (req, res) => {
       `;
       await sql`DELETE FROM analytics_store_days WHERE username = ${username} AND store = ${store} AND day = ${day}`;
       const snapshotDays = dayRows.map((d) => ({ day: analyticsDayString(d.day), fileName: d.file_name, rows: Array.isArray(d.rows) ? d.rows : [] }));
-      await recordAnalyticsEvent(sql, username, username, store, 'delete-day', `Deleted ${store} data on ${day}`, {
+      await recordAnalyticsEvent(sql, username, actor, store, 'delete-day', `Deleted ${store} data on ${day}`, {
         store,
         from: day,
         to: day,
@@ -687,7 +688,7 @@ app.all('/api/analytics-store', async (req, res) => {
         WHERE username = ${username} AND store = ${store} AND day >= ${from} AND day <= ${to}
       `;
       const rowCount = snapshotDays.reduce((total, d) => total + d.rows.length, 0);
-      await recordAnalyticsEvent(sql, username, username, store, 'delete-range', `Deleted ${snapshotDays.length} saved days from ${store}`, {
+      await recordAnalyticsEvent(sql, username, actor, store, 'delete-range', `Deleted ${snapshotDays.length} saved days from ${store}`, {
         store,
         from,
         to,
@@ -730,7 +731,7 @@ app.all('/api/analytics-store', async (req, res) => {
       const event = rows[0];
       if (!event?.snapshot) return res.status(400).json({ error: 'This event has no restore snapshot' });
       const result = await restoreAnalyticsSnapshot(sql, username, event.snapshot);
-      await recordAnalyticsEvent(sql, username, username, event.store, 'restore-event', `Restored event #${eventId}`, {
+      await recordAnalyticsEvent(sql, username, actor, event.store, 'restore-event', `Restored event #${eventId}`, {
         eventId,
         restoredFrom: event.action,
         restored: result.restored,

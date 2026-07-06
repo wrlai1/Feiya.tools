@@ -191,7 +191,8 @@ export default async function handler(req, res) {
     const sql     = getDB()
     const payload = verifyToken(req.headers.authorization, getSecret())
     if (!payload) return res.status(401).json({ error: 'Not authenticated' })
-    const username = payload.username
+    const actor = payload.username
+    const username = payload.role === 'admin' ? 'admin' : payload.username
     const action   = req.query.action
     await ensureTables(sql)
 
@@ -214,7 +215,7 @@ export default async function handler(req, res) {
       const name = String(req.body?.name || '').trim()
       if (!name) return res.status(400).json({ error: 'name is required' })
       await sql`INSERT INTO analytics_stores (username, name) VALUES (${username}, ${name}) ON CONFLICT DO NOTHING`
-      await recordEvent(sql, username, username, name, 'create-store', `Created store ${name}`, { store: name })
+      await recordEvent(sql, username, actor, name, 'create-store', `Created store ${name}`, { store: name })
       return res.json({ ok: true, name })
     }
 
@@ -247,7 +248,7 @@ export default async function handler(req, res) {
       await sql`DELETE FROM analytics_store_products WHERE username = ${username} AND store = ${name}`
       await sql`DELETE FROM analytics_store_settings WHERE username = ${username} AND store = ${name}`
       await sql`DELETE FROM analytics_stores WHERE username = ${username} AND name = ${name}`
-      await recordEvent(sql, username, username, name, 'delete-store', `Deleted store ${name}`, {
+      await recordEvent(sql, username, actor, name, 'delete-store', `Deleted store ${name}`, {
         store: name,
         days: snapshot.days.length,
         products: snapshot.products.length,
@@ -290,7 +291,7 @@ export default async function handler(req, res) {
           DO UPDATE SET data = EXCLUDED.data, file_name = EXCLUDED.file_name, updated_at = NOW()
         `
       }
-      await recordEvent(sql, username, username, name, 'save-products', `Saved ${products.length} product catalog rows`, {
+      await recordEvent(sql, username, actor, name, 'save-products', `Saved ${products.length} product catalog rows`, {
         store: name,
         fileName: fileName || null,
         count: products.length,
@@ -329,7 +330,7 @@ export default async function handler(req, res) {
         ON CONFLICT (username, store)
         DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()
       `
-      await recordEvent(sql, username, username, name, 'save-settings', `Saved analytics settings for ${name}`, {
+      await recordEvent(sql, username, actor, name, 'save-settings', `Saved analytics settings for ${name}`, {
         store: name,
       }, {
         type: 'settings',
@@ -358,7 +359,7 @@ export default async function handler(req, res) {
         ON CONFLICT (username, store, day)
         DO UPDATE SET rows = EXCLUDED.rows, file_name = EXCLUDED.file_name, updated_at = NOW()
       `
-      await recordEvent(sql, username, username, name, 'save-day', `Saved ${rows.length} rows for ${name} on ${day}`, {
+      await recordEvent(sql, username, actor, name, 'save-day', `Saved ${rows.length} rows for ${name} on ${day}`, {
         store: name,
         day,
         fileName: fileName || null,
@@ -407,7 +408,7 @@ export default async function handler(req, res) {
       `
       await sql`DELETE FROM analytics_store_days WHERE username = ${username} AND store = ${store} AND day = ${day}`
       const snapshotDays = dayRows.map((d) => ({ day: dayString(d.day), fileName: d.file_name, rows: Array.isArray(d.rows) ? d.rows : [] }))
-      await recordEvent(sql, username, username, store, 'delete-day', `Deleted ${store} data on ${day}`, {
+      await recordEvent(sql, username, actor, store, 'delete-day', `Deleted ${store} data on ${day}`, {
         store,
         from: day,
         to: day,
@@ -433,7 +434,7 @@ export default async function handler(req, res) {
         WHERE username = ${username} AND store = ${store} AND day >= ${from} AND day <= ${to}
       `
       const rowCount = snapshotDays.reduce((total, d) => total + d.rows.length, 0)
-      await recordEvent(sql, username, username, store, 'delete-range', `Deleted ${snapshotDays.length} saved days from ${store}`, {
+      await recordEvent(sql, username, actor, store, 'delete-range', `Deleted ${snapshotDays.length} saved days from ${store}`, {
         store,
         from,
         to,
@@ -476,7 +477,7 @@ export default async function handler(req, res) {
       const event = rows[0]
       if (!event?.snapshot) return res.status(400).json({ error: 'This event has no restore snapshot' })
       const result = await restoreSnapshot(sql, username, event.snapshot)
-      await recordEvent(sql, username, username, event.store, 'restore-event', `Restored event #${eventId}`, {
+      await recordEvent(sql, username, actor, event.store, 'restore-event', `Restored event #${eventId}`, {
         eventId,
         restoredFrom: event.action,
         restored: result.restored,
