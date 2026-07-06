@@ -675,6 +675,17 @@ function missingDaysInRange(range, savedDays) {
   return days.filter((day) => !saved.has(day))
 }
 
+function alertMetricsForProduct(p) {
+  return [
+    ['Clicks', count(p.clicks)],
+    ['CTR', pct(p.ctr)],
+    ['CVR', pct(p.conversionRate)],
+    ['Spend', money(p.spend)],
+    ['Orders', count(p.orders)],
+    ['ROAS', ratio(p.roas)],
+  ]
+}
+
 function buildAnomalies(products, trends, totals, storeDays, range, settings = DEFAULT_TARGETS) {
   const items = []
   const missing = missingDaysInRange(range, storeDays)
@@ -684,19 +695,53 @@ function buildAnomalies(products, trends, totals, storeDays, range, settings = D
       severity: 'warn',
       title: `${missing.length} 天没有上传数据`,
       detail: `需要补：${missing.slice(0, 6).join(', ')}${missing.length > 6 ? ' ...' : ''}`,
+      recommendation: '先补齐每日数据，再判断产品趋势。缺数据会让 7/14/30 天趋势和报警失真。',
+      daily: missing.slice(0, 10).map((day) => ({ day, status: 'Missing' })),
     })
   }
 
   for (const p of products) {
     const label = p.sku || p.spu
     if ((p.spend || 0) >= settings.stopLossSpend && (p.orders || 0) === 0) {
-      items.push({ type: 'spend', severity: 'bad', title: `${label} 花费无单`, detail: `${money(p.spend)} spend · 0 orders` })
+      items.push({
+        type: 'spend',
+        severity: 'bad',
+        title: `${label} 花费无单`,
+        detail: `${money(p.spend)} spend · 0 orders`,
+        metrics: alertMetricsForProduct(p),
+        benchmark: `止损线 ${money(settings.stopLossSpend)}，当前 ${money(p.spend)} 且 0 单。`,
+        recommendation: '先降低预算或暂停测试，再检查价格、首图、coupon、评价和落地页承接。如果点击也少，先不要直接判断转化。',
+      })
     } else if ((p.clicks || 0) >= settings.minClicks && (p.conversionRate ?? 0) < settings.conversionTarget) {
-      items.push({ type: 'conversion', severity: 'bad', title: `${label} 点击有，转化弱`, detail: `${count(p.clicks)} clicks · ${pct(p.conversionRate)} CVR` })
+      items.push({
+        type: 'conversion',
+        severity: 'bad',
+        title: `${label} 点击有，转化弱`,
+        detail: `${count(p.clicks)} clicks · ${pct(p.conversionRate)} CVR`,
+        metrics: alertMetricsForProduct(p),
+        benchmark: `转化目标 ${pct(settings.conversionTarget)}，当前 ${pct(p.conversionRate)}。`,
+        recommendation: '优先看价格是否偏高、coupon 是否弱、尺码/颜色是否缺、评价和详情页是否影响下单。CTR 不低但 CVR 低时，通常不是流量问题。',
+      })
     } else if ((p.impressions || 0) >= settings.minImpressions && (p.ctr ?? 0) < settings.ctrTarget) {
-      items.push({ type: 'ctr', severity: 'warn', title: `${label} 曝光够但 CTR 低`, detail: `${count(p.impressions)} impressions · ${pct(p.ctr)} CTR` })
+      items.push({
+        type: 'ctr',
+        severity: 'warn',
+        title: `${label} 曝光够但 CTR 低`,
+        detail: `${count(p.impressions)} impressions · ${pct(p.ctr)} CTR`,
+        metrics: alertMetricsForProduct(p),
+        benchmark: `CTR 目标 ${pct(settings.ctrTarget)}，当前 ${pct(p.ctr)}。`,
+        recommendation: '优先改主图、标题关键词、首图卖点和价格展示。CTR 低说明曝光有了，但用户不想点。',
+      })
     } else if ((p.cartRate ?? 0) >= settings.cartRateTarget && (p.conversionRate ?? 0) < settings.conversionTarget) {
-      items.push({ type: 'cart', severity: 'warn', title: `${label} 加购不成单`, detail: `${pct(p.cartRate)} cart · ${pct(p.conversionRate)} CVR` })
+      items.push({
+        type: 'cart',
+        severity: 'warn',
+        title: `${label} 加购不成单`,
+        detail: `${pct(p.cartRate)} cart · ${pct(p.conversionRate)} CVR`,
+        metrics: alertMetricsForProduct(p),
+        benchmark: `加购率 ${pct(p.cartRate)} 达标，但 CVR ${pct(p.conversionRate)} 低于 ${pct(settings.conversionTarget)}。`,
+        recommendation: '用户有兴趣但没付款，优先检查最终价格、coupon、运费/承诺、竞品价差和尺码库存。',
+      })
     }
   }
 
@@ -710,6 +755,9 @@ function buildAnomalies(products, trends, totals, storeDays, range, settings = D
         severity: 'warn',
         title: `${last.day} 花费上升但订单没涨`,
         detail: `${money(prev.spend)} -> ${money(last.spend)} · orders ${count(prev.orders)} -> ${count(last.orders)}`,
+        metrics: [['Prev spend', money(prev.spend)], ['Last spend', money(last.spend)], ['Prev orders', count(prev.orders)], ['Last orders', count(last.orders)], ['Last CTR', pct(last.ctr)], ['Last CVR', pct(last.conversionRate)]],
+        daily: [prev, last],
+        recommendation: '先确认是不是预算或流量突然放大。如果点击增长但订单没涨，看 CVR；如果曝光涨但点击没涨，看 CTR 和主图。',
       })
     }
     if ((prev.conversionRate || 0) > 0 && (last.conversionRate || 0) < prev.conversionRate * 0.6) {
@@ -718,12 +766,23 @@ function buildAnomalies(products, trends, totals, storeDays, range, settings = D
         severity: 'warn',
         title: `${last.day} 转化率明显下降`,
         detail: `${pct(prev.conversionRate)} -> ${pct(last.conversionRate)}`,
+        metrics: [['Prev CVR', pct(prev.conversionRate)], ['Last CVR', pct(last.conversionRate)], ['Last clicks', count(last.clicks)], ['Last orders', count(last.orders)], ['Last spend', money(last.spend)], ['Last ROAS', ratio(last.roas)]],
+        daily: [prev, last],
+        recommendation: '检查当天价格、coupon、库存、竞品活动、页面评价或物流承诺是否变化。点击还在但转化掉，通常是承接问题。',
       })
     }
   }
 
   if ((totals.spend || 0) > 0 && (totals.roas || 0) < settings.roasTarget * 0.6) {
-    items.push({ type: 'store-roas', severity: 'bad', title: '当前时间范围 ROAS 偏低', detail: `${ratio(totals.roas)} vs target ${ratio(settings.roasTarget)}` })
+    items.push({
+      type: 'store-roas',
+      severity: 'bad',
+      title: '当前时间范围 ROAS 偏低',
+      detail: `${ratio(totals.roas)} vs target ${ratio(settings.roasTarget)}`,
+      metrics: [['Spend', money(totals.spend)], ['Revenue', money(totals.revenue)], ['Orders', count(totals.orders)], ['Units', count(totals.units)], ['CTR', pct(totals.ctr)], ['CVR', pct(totals.conversionRate)]],
+      benchmark: `目标 ROAS ${ratio(settings.roasTarget)}，当前 ${ratio(totals.roas)}。`,
+      recommendation: '先从高花费低转化的 SPU 下手，不要平均降预算。保留 ROAS 好的款，暂停或降预算拖累整体的款。',
+    })
   }
 
   return items.slice(0, 12)
@@ -2415,14 +2474,25 @@ function NeedsAttentionPanel({ items }) {
       {items.length ? (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
           {items.map((item, index) => (
-            <div key={`${item.type}-${index}`} className={`rounded-lg border p-3 ${item.severity === 'bad' ? 'border-red-200 bg-red-50' : 'border-amber-200 bg-amber-50'}`}>
+            <div key={`${item.type}-${index}`} className={`group relative rounded-lg border p-3 ${item.severity === 'bad' ? 'border-red-200 bg-red-50' : 'border-amber-200 bg-amber-50'}`}>
               <div className="flex items-start gap-2">
                 <AlertTriangle className={`mt-0.5 h-4 w-4 ${item.severity === 'bad' ? 'text-red-600' : 'text-amber-600'}`} />
-                <div>
+                <div className="min-w-0 flex-1">
                   <div className="text-sm font-semibold text-slate-800">{item.title}</div>
                   <div className="text-xs text-slate-500 mt-0.5">{item.detail}</div>
+                  {item.metrics && (
+                    <div className="mt-2 grid grid-cols-2 gap-1.5">
+                      {item.metrics.slice(0, 4).map(([label, value]) => (
+                        <MetricMini key={label} label={label} value={value} />
+                      ))}
+                    </div>
+                  )}
+                  {item.recommendation && (
+                    <div className="mt-2 text-[11px] leading-4 text-slate-600 line-clamp-2">{item.recommendation}</div>
+                  )}
                 </div>
               </div>
+              <AttentionTooltip item={item} />
             </div>
           ))}
         </div>
@@ -2432,6 +2502,47 @@ function NeedsAttentionPanel({ items }) {
         </div>
       )}
     </section>
+  )
+}
+
+function AttentionTooltip({ item }) {
+  if (!item.metrics && !item.daily && !item.recommendation && !item.benchmark) return null
+  return (
+    <div className="pointer-events-none absolute left-3 right-3 top-full z-20 mt-2 hidden rounded-lg border border-slate-200 bg-white p-3 text-xs text-slate-600 shadow-xl group-hover:block">
+      {item.benchmark && (
+        <div className="mb-2 rounded-md bg-slate-50 px-2 py-1.5">
+          <div className="font-semibold text-slate-700">差在哪里</div>
+          <div className="mt-0.5">{item.benchmark}</div>
+        </div>
+      )}
+      {item.metrics && (
+        <div className="mb-2 grid grid-cols-2 gap-1.5">
+          {item.metrics.map(([label, value]) => (
+            <MetricMini key={label} label={label} value={value} />
+          ))}
+        </div>
+      )}
+      {item.daily && item.daily.length > 0 && (
+        <div className="mb-2">
+          <div className="font-semibold text-slate-700 mb-1">每日数据</div>
+          <div className="space-y-1">
+            {item.daily.slice(-5).map((day) => (
+              <div key={day.day} className="rounded-md bg-slate-50 px-2 py-1">
+                {day.status
+                  ? `${day.day}: ${day.status}`
+                  : `${day.day}: clicks ${count(day.clicks)} · CTR ${pct(day.ctr)} · CVR ${pct(day.conversionRate)} · orders ${count(day.orders)} · spend ${money(day.spend)}`}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {item.recommendation && (
+        <div>
+          <div className="font-semibold text-slate-700">建议动作</div>
+          <div className="mt-0.5 leading-5">{item.recommendation}</div>
+        </div>
+      )}
+    </div>
   )
 }
 
