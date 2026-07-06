@@ -669,6 +669,66 @@ function dateSpan(from, to, maxDays = 62) {
   return out
 }
 
+function missingDaysInRange(range, savedDays) {
+  const days = dateSpan(range.from, range.to, 62)
+  const saved = new Set((savedDays || []).map((d) => d.day))
+  return days.filter((day) => !saved.has(day))
+}
+
+function buildAnomalies(products, trends, totals, storeDays, range, settings = DEFAULT_TARGETS) {
+  const items = []
+  const missing = missingDaysInRange(range, storeDays)
+  if (missing.length) {
+    items.push({
+      type: 'missing',
+      severity: 'warn',
+      title: `${missing.length} 天没有上传数据`,
+      detail: `需要补：${missing.slice(0, 6).join(', ')}${missing.length > 6 ? ' ...' : ''}`,
+    })
+  }
+
+  for (const p of products) {
+    const label = p.sku || p.spu
+    if ((p.spend || 0) >= settings.stopLossSpend && (p.orders || 0) === 0) {
+      items.push({ type: 'spend', severity: 'bad', title: `${label} 花费无单`, detail: `${money(p.spend)} spend · 0 orders` })
+    } else if ((p.clicks || 0) >= settings.minClicks && (p.conversionRate ?? 0) < settings.conversionTarget) {
+      items.push({ type: 'conversion', severity: 'bad', title: `${label} 点击有，转化弱`, detail: `${count(p.clicks)} clicks · ${pct(p.conversionRate)} CVR` })
+    } else if ((p.impressions || 0) >= settings.minImpressions && (p.ctr ?? 0) < settings.ctrTarget) {
+      items.push({ type: 'ctr', severity: 'warn', title: `${label} 曝光够但 CTR 低`, detail: `${count(p.impressions)} impressions · ${pct(p.ctr)} CTR` })
+    } else if ((p.cartRate ?? 0) >= settings.cartRateTarget && (p.conversionRate ?? 0) < settings.conversionTarget) {
+      items.push({ type: 'cart', severity: 'warn', title: `${label} 加购不成单`, detail: `${pct(p.cartRate)} cart · ${pct(p.conversionRate)} CVR` })
+    }
+  }
+
+  const sortedTrends = [...(trends || [])].sort((a, b) => String(a.day).localeCompare(String(b.day)))
+  const last = sortedTrends[sortedTrends.length - 1]
+  const prev = sortedTrends[sortedTrends.length - 2]
+  if (last && prev) {
+    if ((last.spend || 0) > (prev.spend || 0) * 1.5 && (last.orders || 0) <= (prev.orders || 0)) {
+      items.push({
+        type: 'daily-spend',
+        severity: 'warn',
+        title: `${last.day} 花费上升但订单没涨`,
+        detail: `${money(prev.spend)} -> ${money(last.spend)} · orders ${count(prev.orders)} -> ${count(last.orders)}`,
+      })
+    }
+    if ((prev.conversionRate || 0) > 0 && (last.conversionRate || 0) < prev.conversionRate * 0.6) {
+      items.push({
+        type: 'daily-cvr',
+        severity: 'warn',
+        title: `${last.day} 转化率明显下降`,
+        detail: `${pct(prev.conversionRate)} -> ${pct(last.conversionRate)}`,
+      })
+    }
+  }
+
+  if ((totals.spend || 0) > 0 && (totals.roas || 0) < settings.roasTarget * 0.6) {
+    items.push({ type: 'store-roas', severity: 'bad', title: '当前时间范围 ROAS 偏低', detail: `${ratio(totals.roas)} vs target ${ratio(settings.roasTarget)}` })
+  }
+
+  return items.slice(0, 12)
+}
+
 export default function MetricsAnalytics() {
   const toast = useToast()
   const [stores, setStores] = useState([])
@@ -698,6 +758,9 @@ export default function MetricsAnalytics() {
   const [analyticsEvents, setAnalyticsEvents] = useState([])
   const [eventsLoading, setEventsLoading] = useState(false)
   const [uploadConflict, setUploadConflict] = useState(null)
+  const [uploadSummary, setUploadSummary] = useState(null)
+  const [storeHealth, setStoreHealth] = useState([])
+  const [storeHealthLoading, setStoreHealthLoading] = useState(false)
 
   const currentRange = useMemo(
     () => timeframeRange(timeframe, customFrom, customTo),
@@ -831,6 +894,10 @@ export default function MetricsAnalytics() {
     [selectedRows, products, selectedProductMatches, targets],
   )
   const trends = useMemo(() => daySeries(visibleRows, products), [visibleRows, products])
+  const anomalies = useMemo(
+    () => buildAnomalies(productRows, trends, totals, storeDays, currentRange, targets),
+    [productRows, trends, totals, storeDays, currentRange, targets],
+  )
   const relationPoints = useMemo(() => productRows
     .map((p) => ({ ...p, x: p[metricX], y: p.units }))
     .filter((p) => p.x != null && p.y != null), [productRows, metricX])
@@ -886,6 +953,46 @@ export default function MetricsAnalytics() {
     loadStoreComparison()
     return () => { cancelled = true }
   }, [selectedProduct, stores, timeframe, customFrom, customTo, targets])
+
+  useEffect(() => {
+    let cancelled = false
+    async function loadStoreHealth() {
+      if (!stores.length) { setStoreHealth([]); return }
+      const { from, to } = timeframeRange(timeframe, customFrom, customTo)
+      if (!from || !to) return
+      setStoreHealthLoading(true)
+      try {
+        const rangeDays = dateSpan(from, to, 62)
+        const rows = await Promise.all(stores.map(async (store) => {
+          const storeName = store.name
+          const [productRes, rangeRes] = await Promise.all([
+            fetchStoreProducts(storeName).catch(() => ({ products: [] })),
+            fetchStoreRange(storeName, from, to).catch(() => ({ rows: [], days: [] })),
+          ])
+          const storeProducts = productRes.products || []
+          const rangeRows = rangeRes.rows || []
+          const totalsForStore = aggregateTotals(rangeRows, storeProducts)
+          const productsForStore = aggregateBySpu(rangeRows, storeProducts, targets)
+          const saved = new Set((rangeRes.days || []).map((d) => d.day))
+          const missing = rangeDays.filter((day) => !saved.has(day))
+          const attention = productsForStore.filter((p) => p.status === 'bad' || p.decision === '点击有，转化弱' || p.decision === '花费无单，控预算').length
+          return {
+            store: storeName,
+            spuCount: store.spuCount || storeProducts.length || 0,
+            days: rangeRes.days?.length || 0,
+            missingDays: missing.length,
+            attention,
+            ...totalsForStore,
+          }
+        }))
+        if (!cancelled) setStoreHealth(rows.sort((a, b) => (b.units || 0) - (a.units || 0)))
+      } finally {
+        if (!cancelled) setStoreHealthLoading(false)
+      }
+    }
+    loadStoreHealth()
+    return () => { cancelled = true }
+  }, [stores, timeframe, customFrom, customTo, targets])
 
   const saveTargets = async (nextTargets) => {
     const normalized = { ...DEFAULT_TARGETS, ...nextTargets }
@@ -1091,6 +1198,17 @@ export default function MetricsAnalytics() {
       const rows = mode === 'append' ? [...existingRows, ...nextRows] : nextRows
       await saveStoreDay(activeStore, saveDate, draftReport.fileName, rows)
       toast.success(`${rows.length} 行保存到 ${activeStore} (${saveDate})`, mode === 'append' ? '已加到原有数据' : '每日数据已保存')
+      setUploadSummary({
+        store: activeStore,
+        day: saveDate,
+        mode,
+        fileName: draftReport.fileName,
+        newRows: nextRows.length,
+        previousRows: existingRows.length,
+        savedRows: rows.length,
+        currencySummary: draftReport.currencySummary,
+        unmatched: unmatchedDraftSpus.length,
+      })
       setUploadConflict(null)
       setDraftReport(null)
       await reloadStores()
@@ -1182,6 +1300,13 @@ export default function MetricsAnalytics() {
           ))}
           {!stores.length && <div className="rounded-lg border border-dashed border-slate-200 p-4 text-sm text-slate-400">先到 Store Settings 里创建一个店铺。</div>}
         </div>
+
+        <StoreHealthOverview
+          rows={storeHealth}
+          loading={storeHealthLoading}
+          activeStore={activeStore}
+          setActiveStore={setActiveStore}
+        />
 
         {storeSettingsOpen && (
           <div className="rounded-lg border border-slate-200 bg-slate-50/70 p-4 space-y-4">
@@ -1385,6 +1510,9 @@ export default function MetricsAnalytics() {
               onRename={renameDraftSpu}
             />
           )}
+          {uploadSummary && !draftReport && (
+            <UploadSummaryCard summary={uploadSummary} onClear={() => setUploadSummary(null)} />
+          )}
         </div>
       </section>
 
@@ -1476,6 +1604,8 @@ export default function MetricsAnalytics() {
             <KPICard title="CTR" value={pct(totals.ctr)} subtitle={`${count(totals.clicks)} clicks`} icon={Upload} color="green" />
             <KPICard title="Conversion" value={pct(totals.conversionRate)} subtitle={`${count(totals.carts)} carts`} icon={CheckCircle} color="orange" />
           </section>
+
+          <NeedsAttentionPanel items={anomalies} />
 
           <ActionList products={productRows} />
 
@@ -2184,6 +2314,124 @@ function SettingsPanel({ targets, activeStore, onSave, onReset }) {
         })}
       </div>
     </div>
+  )
+}
+
+function StoreHealthOverview({ rows, loading, activeStore, setActiveStore }) {
+  if (!rows.length && !loading) return null
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white p-4">
+      <div className="flex items-center justify-between gap-3 mb-3">
+        <div>
+          <h3 className="font-semibold text-slate-800">Store Health</h3>
+          <p className="text-xs text-slate-400 mt-0.5">按当前时间范围对比每家店的数据完整度和表现。</p>
+        </div>
+        {loading && <span className="text-xs text-slate-400">Loading...</span>}
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
+        {rows.map((row) => {
+          const weak = row.missingDays > 0 || row.attention > 0 || ((row.roas || 0) > 0 && row.roas < 1)
+          return (
+            <button
+              key={row.store}
+              type="button"
+              onClick={() => setActiveStore(row.store)}
+              className={`text-left rounded-lg border p-3 transition ${activeStore === row.store ? 'border-blue-300 bg-blue-50' : weak ? 'border-amber-200 bg-amber-50/60 hover:border-amber-300' : 'border-slate-200 bg-slate-50 hover:border-slate-300'}`}
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <div className="font-semibold text-slate-800 truncate">{row.store}</div>
+                  <div className="text-xs text-slate-400 mt-0.5">{row.spuCount || 0} SPU · {row.days || 0} days</div>
+                </div>
+                <span className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${weak ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700'}`}>
+                  {weak ? 'Check' : 'OK'}
+                </span>
+              </div>
+              <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
+                <MetricMini label="Units" value={count(row.units)} />
+                <MetricMini label="Revenue" value={money(row.revenue)} />
+                <MetricMini label="ROAS" value={ratio(row.roas)} />
+                <MetricMini label="Missing" value={count(row.missingDays)} />
+              </div>
+              {row.attention > 0 && <div className="mt-2 text-xs text-amber-700">{row.attention} products need attention</div>}
+            </button>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+function MetricMini({ label, value }) {
+  return (
+    <div className="rounded-md bg-white/70 px-2 py-1">
+      <div className="text-[10px] text-slate-400">{label}</div>
+      <div className="font-semibold text-slate-700 truncate">{value}</div>
+    </div>
+  )
+}
+
+function UploadSummaryCard({ summary, onClear }) {
+  const currency = summary.currencySummary
+  const currencyText = currency?.primary === 'CNY'
+    ? `RMB -> USD @ ${Number(currency.cnyToUsd).toFixed(4)}`
+    : currency?.primary === 'USD'
+      ? 'USD'
+      : currency?.primary ? `Mixed @ ${Number(currency.cnyToUsd).toFixed(4)}` : '-'
+  return (
+    <div className="mt-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3">
+      <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+        <div>
+          <p className="text-sm font-semibold text-emerald-800">Upload saved</p>
+          <p className="text-xs text-emerald-700 mt-0.5">
+            {summary.store} · {summary.day} · {summary.mode === 'append' ? 'Append' : '覆盖'} · {summary.savedRows} rows saved
+          </p>
+        </div>
+        <button onClick={onClear} className="btn-secondary text-xs px-3 py-1.5">Dismiss</button>
+      </div>
+      <div className="mt-3 grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+        <MetricMini label="This upload" value={`${summary.newRows} rows`} />
+        <MetricMini label="Before" value={`${summary.previousRows} rows`} />
+        <MetricMini label="Saved total" value={`${summary.savedRows} rows`} />
+        <MetricMini label="Currency" value={currencyText} />
+      </div>
+      <div className="mt-2 text-[11px] text-emerald-700 truncate">{summary.fileName}</div>
+    </div>
+  )
+}
+
+function NeedsAttentionPanel({ items }) {
+  return (
+    <section className="card p-5">
+      <div className="flex items-center justify-between mb-4">
+        <div>
+          <h2 className="font-semibold text-slate-800">Needs Attention</h2>
+          <p className="text-xs text-slate-400 mt-0.5">自动找出缺数据、花费异常、点击转化弱和日趋势异常。</p>
+        </div>
+        <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${items.length ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700'}`}>
+          {items.length ? `${items.length} alerts` : 'OK'}
+        </span>
+      </div>
+      {items.length ? (
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+          {items.map((item, index) => (
+            <div key={`${item.type}-${index}`} className={`rounded-lg border p-3 ${item.severity === 'bad' ? 'border-red-200 bg-red-50' : 'border-amber-200 bg-amber-50'}`}>
+              <div className="flex items-start gap-2">
+                <AlertTriangle className={`mt-0.5 h-4 w-4 ${item.severity === 'bad' ? 'text-red-600' : 'text-amber-600'}`} />
+                <div>
+                  <div className="text-sm font-semibold text-slate-800">{item.title}</div>
+                  <div className="text-xs text-slate-500 mt-0.5">{item.detail}</div>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="rounded-lg border border-emerald-100 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
+          当前时间范围没有明显异常。
+        </div>
+      )}
+    </section>
   )
 }
 
