@@ -102,6 +102,10 @@ function normalizeId(v) {
   return s.replace(/\.0$/, '')
 }
 
+function normalizeStoreName(v) {
+  return String(v ?? '').trim().toLowerCase()
+}
+
 function isRateColumn(key) {
   return RATE_COLS.some((x) => String(key).includes(x))
 }
@@ -971,6 +975,17 @@ export default function MetricsAnalytics() {
     if (!activeStore) { toast.error('请先选择或创建店铺', '不能保存上新计划'); return }
     try {
       const rows = await parseProductPlan(file)
+      const fileStores = [...new Set(rows.map((r) => String(r.store || '').trim()).filter(Boolean))]
+      const mismatchedStores = fileStores.filter((name) => normalizeStoreName(name) !== normalizeStoreName(activeStore))
+      if (mismatchedStores.length) {
+        const ok = window.confirm(
+          `这个上新计划文件里的店铺名称和当前店铺不一致。\n\n当前选择店铺：${activeStore}\n文件里的店铺：${mismatchedStores.slice(0, 6).join(', ')}${mismatchedStores.length > 6 ? ' ...' : ''}\n\n点击 OK = 仍然上传到当前店铺\n点击 Cancel = 取消上传，先检查店铺`,
+        )
+        if (!ok) {
+          toast.info('已取消上传，请确认当前店铺是否正确。', '上新计划未保存')
+          return
+        }
+      }
       const scoped = rows.map((r) => ({ ...r, store: activeStore }))
       const { rows: uniqueRows, duplicateSpus } = uniqueProductPlanRows(scoped)
       if (duplicateSpus.length) {
@@ -1004,7 +1019,7 @@ export default function MetricsAnalytics() {
       const report = await parsePerformanceFile(file)
       setDraftReport(report)
       setUploadConflict(null)
-      setUploadDate(todayISO())
+      setUploadDate(report.start === report.end ? report.start : report.end || todayISO())
       toast.success(`${report.rows.length} 个商品 · ${report.start} 到 ${report.end}`, '表现数据已读取')
     } catch (err) {
       toast.error(err.message, '表现数据读取失败')
