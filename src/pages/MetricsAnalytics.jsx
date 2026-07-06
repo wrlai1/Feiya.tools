@@ -693,6 +693,7 @@ export default function MetricsAnalytics() {
   const [deleteTo, setDeleteTo] = useState('')
   const [analyticsEvents, setAnalyticsEvents] = useState([])
   const [eventsLoading, setEventsLoading] = useState(false)
+  const [uploadConflict, setUploadConflict] = useState(null)
 
   const currentRange = useMemo(
     () => timeframeRange(timeframe, customFrom, customTo),
@@ -1002,6 +1003,7 @@ export default function MetricsAnalytics() {
     try {
       const report = await parsePerformanceFile(file)
       setDraftReport(report)
+      setUploadConflict(null)
       setUploadDate(todayISO())
       toast.success(`${report.rows.length} 个商品 · ${report.start} 到 ${report.end}`, '表现数据已读取')
     } catch (err) {
@@ -1045,7 +1047,7 @@ export default function MetricsAnalytics() {
     toast.success(`${fromSpu} 已改成 ${product.spu}`, '上传 SPU 已修改')
   }
 
-  const saveDraft = async () => {
+  const saveDraft = async (saveMode = null) => {
     if (!activeStore || !draftReport) return
     if (!draftReport.rows.length) {
       toast.error('本次上传已经没有可保存的数据行。', '不能保存每日数据')
@@ -1060,15 +1062,21 @@ export default function MetricsAnalytics() {
       const existing = await fetchStoreRange(activeStore, saveDate, saveDate).catch(() => ({ rows: [] }))
       const existingRows = Array.isArray(existing.rows) ? existing.rows : []
       const hasExisting = existingRows.length > 0
-      let mode = 'overwrite'
-      if (hasExisting) {
-        const overwrite = window.confirm(`${activeStore} 在 ${saveDate} 已经有 ${existingRows.length} 行数据。\n\n点击 OK = 覆盖这一天\n点击 Cancel = 加到原有数据后面`)
-        mode = overwrite ? 'overwrite' : 'append'
+      if (hasExisting && !saveMode) {
+        setUploadConflict({
+          store: activeStore,
+          day: saveDate,
+          existingRows: existingRows.length,
+          newRows: draftReport.rows.length,
+        })
+        return
       }
+      const mode = saveMode || 'overwrite'
       const nextRows = draftReport.rows.map((r) => ({ ...r, date: saveDate, reportDate: saveDate }))
       const rows = mode === 'append' ? [...existingRows, ...nextRows] : nextRows
       await saveStoreDay(activeStore, saveDate, draftReport.fileName, rows)
       toast.success(`${rows.length} 行保存到 ${activeStore} (${saveDate})`, mode === 'append' ? '已加到原有数据' : '每日数据已保存')
+      setUploadConflict(null)
       setDraftReport(null)
       await reloadStores()
       await loadWindow()
@@ -1321,13 +1329,36 @@ export default function MetricsAnalytics() {
               )}
               <label className="inline-flex items-center gap-1.5 text-xs text-slate-500">
                 保存日期
-                <input type="date" className="metric-input !py-1" value={uploadDate} onChange={(e) => setUploadDate(e.target.value)} />
+                <input type="date" className="metric-input !py-1" value={uploadDate} onChange={(e) => { setUploadDate(e.target.value); setUploadConflict(null) }} />
               </label>
-              <button onClick={saveDraft} disabled={!activeStore || unmatchedDraftSpus.length > 0} className="btn-primary text-xs px-3 py-1.5 disabled:opacity-40"><Save className="w-3.5 h-3.5" /> Save to {activeStore || 'store'}</button>
-              <button onClick={() => setDraftReport(null)} className="btn-secondary text-xs px-3 py-1.5">Clear preview</button>
+              <button onClick={() => saveDraft()} disabled={!activeStore || unmatchedDraftSpus.length > 0} className="btn-primary text-xs px-3 py-1.5 disabled:opacity-40"><Save className="w-3.5 h-3.5" /> Save to {activeStore || 'store'}</button>
+              <button onClick={() => { setDraftReport(null); setUploadConflict(null) }} className="btn-secondary text-xs px-3 py-1.5">Clear preview</button>
               {draftReport.start !== draftReport.end && (
                 <span className="inline-flex items-center gap-1 text-xs text-amber-600"><AlertTriangle className="w-3.5 h-3.5" /> 这是区间报表，请确认保存日期。</span>
               )}
+            </div>
+          )}
+          {draftReport && uploadConflict && (
+            <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3">
+              <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold text-amber-800">这一天已经有数据</p>
+                  <p className="text-xs text-amber-700 mt-0.5">
+                    {uploadConflict.store} · {uploadConflict.day} 已有 {uploadConflict.existingRows} 行；这次上传 {uploadConflict.newRows} 行。
+                  </p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <button onClick={() => saveDraft('overwrite')} className="btn-primary text-xs px-3 py-1.5">
+                    覆盖
+                  </button>
+                  <button onClick={() => saveDraft('append')} className="btn-secondary text-xs px-3 py-1.5">
+                    Append
+                  </button>
+                  <button onClick={() => setUploadConflict(null)} className="btn-secondary text-xs px-3 py-1.5">
+                    取消
+                  </button>
+                </div>
+              </div>
             </div>
           )}
           {draftReport && unmatchedDraftSpus.length > 0 && (
