@@ -278,6 +278,17 @@ export default async function handler(req, res) {
         WHERE username = ${username} AND store = ${name}
         ORDER BY spu
       `
+      const previousSpus = new Set(previousProducts.map((p) => String(p.spu || p.data?.spu || '').trim()).filter(Boolean))
+      const newProducts = products
+        .filter((product) => {
+          const spu = String(product?.spu || '').trim()
+          return spu && !previousSpus.has(spu)
+        })
+        .map((product) => ({
+          spu: String(product?.spu || '').trim(),
+          sku: String(product?.sku || '').trim(),
+          name: String(product?.newProductName || product?.productName || product?.sku || product?.spu || '').trim(),
+        }))
       await sql`INSERT INTO analytics_stores (username, name) VALUES (${username}, ${name}) ON CONFLICT DO NOTHING`
       await sql`DELETE FROM analytics_store_products WHERE username = ${username} AND store = ${name}`
       for (const product of products) {
@@ -295,6 +306,8 @@ export default async function handler(req, res) {
         store: name,
         fileName: fileName || null,
         count: products.length,
+        newCount: newProducts.length,
+        newProducts: newProducts.slice(0, 50),
       }, {
         type: 'products',
         store: name,

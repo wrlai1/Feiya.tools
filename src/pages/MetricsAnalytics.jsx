@@ -52,6 +52,7 @@ const TARGET_FIELDS = [
   ['newProductDays', '新品观察天数', 'integer'],
 ]
 const TREND_METRICS = [
+  { key: 'dailyUnits', label: 'Daily Units', type: 'count', axis: 'left', color: '#1d4ed8' },
   { key: 'units', label: 'Units', type: 'count', axis: 'left', color: '#2563eb' },
   { key: 'revenue', label: 'Revenue', type: 'money', axis: 'left', color: '#14b8a6' },
   { key: 'spend', label: 'Spend', type: 'money', axis: 'left', color: '#8b5cf6' },
@@ -63,7 +64,7 @@ const TREND_METRICS = [
   { key: 'clicks', label: 'Clicks', type: 'count', axis: 'left', color: '#0ea5e9' },
   { key: 'carts', label: 'Carts', type: 'count', axis: 'left', color: '#f59e0b' },
 ]
-const DEFAULT_TREND_METRICS = ['units', 'revenue', 'spend', 'ctr', 'conversionRate']
+const DEFAULT_TREND_METRICS = ['dailyUnits', 'revenue', 'spend', 'ctr', 'conversionRate']
 const PRODUCT_TEXT_FIELDS = ['sku', 'productName', 'notes', 'category', 'sizeLine', 'lifecycle', 'skuType']
 const PRODUCT_NUMBER_FIELDS = ['unitMultiplier', 'cost', 'declaredPrice', 'frontPrice', 'couponPrice', 'grossProfit']
 const PRODUCT_PERCENT_FIELDS = ['grossMargin', 'discountRate']
@@ -534,6 +535,36 @@ function mergeProductPlans(existing, incoming, overwriteDuplicates) {
   return [...base, ...additions]
 }
 
+function annotateNewProductPlans(existing, incoming, fileName) {
+  const existingSpus = new Set(existing.map((p) => productIdentity(p).spu).filter(Boolean))
+  const existingSkus = new Set(existing.map((p) => productIdentity(p).sku).filter(Boolean))
+  const importedAt = new Date().toISOString()
+  return incoming.map((product) => {
+    const { spu, sku } = productIdentity(product)
+    const isNew = (spu && !existingSpus.has(spu)) && (!sku || !existingSkus.has(sku))
+    if (!isNew) return product
+    const name = product.productName || product.sku || product.spu
+    return {
+      ...product,
+      newProductName: name,
+      newProductImportedAt: importedAt,
+      newProductSourceFile: fileName || null,
+    }
+  })
+}
+
+function newProductPlanNames(existing, incoming) {
+  const existingSpus = new Set(existing.map((p) => productIdentity(p).spu).filter(Boolean))
+  const existingSkus = new Set(existing.map((p) => productIdentity(p).sku).filter(Boolean))
+  return incoming
+    .filter((product) => {
+      const { spu, sku } = productIdentity(product)
+      return (spu && !existingSpus.has(spu)) && (!sku || !existingSkus.has(sku))
+    })
+    .map((product) => product.productName || product.sku || product.spu)
+    .filter(Boolean)
+}
+
 function duplicatePreview(rows) {
   return rows.slice(0, 6).map((r) => r.sku || r.spu).filter(Boolean).join(', ')
 }
@@ -618,6 +649,7 @@ function daySeries(rows, products = []) {
       orders: t.orders,
       spend: t.spend,
       revenue: t.revenue,
+      dailyUnits: t.units,
       impressions: t.impressions,
       clicks: t.clicks,
       carts: t.carts,
@@ -807,6 +839,7 @@ export default function MetricsAnalytics() {
   const [matrixSort, setMatrixSort] = useState('units_desc')
   const [matrixQuery, setMatrixQuery] = useState('')
   const [selectedProduct, setSelectedProduct] = useState('')
+  const [autoFocusProduct, setAutoFocusProduct] = useState(true)
   const [storeComparison, setStoreComparison] = useState([])
   const [comparisonLoading, setComparisonLoading] = useState(false)
   const [targets, setTargets] = useState(DEFAULT_TARGETS)
@@ -921,6 +954,7 @@ export default function MetricsAnalytics() {
   )
   const totals = useMemo(() => aggregateTotals(visibleRows, products), [visibleRows, products])
   const productRows = useMemo(() => aggregateBySpu(visibleRows, products, targets), [visibleRows, products, targets])
+  const starProduct = productRows[0] || null
   const productChoices = useMemo(() => {
     const map = new Map()
     for (const p of [...products, ...productRows]) {
@@ -976,6 +1010,16 @@ export default function MetricsAnalytics() {
     })
     return sorted
   }, [productRows, tableFilter, matrixSort, matrixQuery])
+
+  useEffect(() => {
+    setAutoFocusProduct(true)
+    setSelectedProduct('')
+  }, [activeStore, timeframe, customFrom, customTo])
+
+  useEffect(() => {
+    if (!autoFocusProduct || selectedProduct || !starProduct) return
+    setSelectedProduct(starProduct.sku || starProduct.spu)
+  }, [autoFocusProduct, selectedProduct, starProduct])
 
   useEffect(() => {
     let cancelled = false
@@ -1164,7 +1208,9 @@ export default function MetricsAnalytics() {
       if (duplicates.length) {
         overwriteDuplicates = window.confirm(`${activeStore} 已经有 ${duplicates.length} 个相同 SPU/SKU。\n\n重复项：${duplicatePreview(duplicates) || '见上传文件'}${duplicates.length > 6 ? ' ...' : ''}\n\n点击 OK = 覆盖这些重复产品\n点击 Cancel = 跳过这些重复产品，只导入新产品`)
       }
-      const merged = mergeProductPlans(existingProducts, uniqueRows, overwriteDuplicates).map((r) => ({ ...r, store: activeStore }))
+      const annotatedRows = annotateNewProductPlans(existingProducts, uniqueRows, file.name)
+      const newNames = newProductPlanNames(existingProducts, uniqueRows)
+      const merged = mergeProductPlans(existingProducts, annotatedRows, overwriteDuplicates).map((r) => ({ ...r, store: activeStore }))
       const addedCount = Math.max(0, merged.length - existingProducts.length)
       const skippedCount = overwriteDuplicates ? 0 : duplicates.length
       await saveStoreProducts(activeStore, merged, file.name)
@@ -1172,7 +1218,7 @@ export default function MetricsAnalytics() {
       await reloadStores()
       await loadAnalyticsEvents()
       toast.success(
-        `${uniqueRows.length - skippedCount} 个 SPU 已保存到 ${activeStore}${skippedCount ? `，跳过 ${skippedCount} 个重复` : ''}${addedCount ? `，新增 ${addedCount} 个` : ''}`,
+        `${uniqueRows.length - skippedCount} 个 SPU 已保存到 ${activeStore}${skippedCount ? `，跳过 ${skippedCount} 个重复` : ''}${addedCount ? `，新增 ${addedCount} 个` : ''}${newNames.length ? `：${newNames.slice(0, 3).join(', ')}${newNames.length > 3 ? ' ...' : ''}` : ''}`,
         overwriteDuplicates ? '重复产品已覆盖' : '上新计划已导入',
       )
     } catch (err) {
@@ -1594,7 +1640,7 @@ export default function MetricsAnalytics() {
               list="analytics-product-options"
               placeholder="输入或选择 SPU / SKU"
               value={selectedProduct}
-              onChange={(e) => setSelectedProduct(e.target.value)}
+              onChange={(e) => { setAutoFocusProduct(false); setSelectedProduct(e.target.value) }}
             />
             <datalist id="analytics-product-options">
               {productChoices.map((p) => (
@@ -1602,7 +1648,12 @@ export default function MetricsAnalytics() {
               ))}
               {productChoices.map((p) => p.sku ? <option key={`${p.spu}-spu`} value={p.spu}>{productKeyLabel(p)}</option> : null)}
             </datalist>
-            {selectedProduct && <button className="btn-secondary text-xs px-3 py-1.5" onClick={() => setSelectedProduct('')}>Clear</button>}
+            {selectedProduct && <button className="btn-secondary text-xs px-3 py-1.5" onClick={() => { setAutoFocusProduct(false); setSelectedProduct('') }}>Clear</button>}
+            {starProduct && !autoFocusProduct && (
+              <button className="btn-secondary text-xs px-3 py-1.5" onClick={() => { setAutoFocusProduct(true); setSelectedProduct(starProduct.sku || starProduct.spu) }}>
+                明星款
+              </button>
+            )}
           </div>
         </div>
 
@@ -1679,6 +1730,8 @@ export default function MetricsAnalytics() {
 
             <FunnelCard totals={totals} trends={trends} />
           </section>
+
+          <DailyUnitsChart trends={trends} />
 
           <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <div className="card p-5">
@@ -1840,7 +1893,7 @@ function ProductCatalogEditor({ activeStore, products, onSave, onDelete }) {
     return products
       .filter((p) => {
         if (!q) return true
-        return [p.spu, p.sku, p.productName, p.notes, p.category, p.lifecycle, p.skuType]
+        return [p.spu, p.sku, p.productName, p.newProductName, p.notes, p.category, p.lifecycle, p.skuType]
           .some((v) => String(v || '').toLowerCase().includes(q))
       })
       .sort((a, b) => String(a.sku || a.spu).localeCompare(String(b.sku || b.spu)))
@@ -1939,6 +1992,9 @@ function ProductCatalogEditor({ activeStore, products, onSave, onDelete }) {
                     <span className="text-[11px] text-slate-400">SPU {product.spu}</span>
                   </div>
                   <div className="text-xs text-slate-400 truncate">{product.productName || product.notes || 'No name yet'}</div>
+                  {product.newProductName && (
+                    <div className="mt-1 text-[11px] text-emerald-700 truncate">New: {product.newProductName}</div>
+                  )}
                 </button>
               ))}
               {!filtered.length && <div className="py-8 text-center text-sm text-slate-400">没有匹配的 SPU。</div>}
@@ -1963,6 +2019,12 @@ function ProductCatalogEditor({ activeStore, products, onSave, onDelete }) {
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                  {draft.newProductName && (
+                    <div className="sm:col-span-2 lg:col-span-3 rounded-lg border border-emerald-100 bg-emerald-50 px-3 py-2 text-xs text-emerald-700">
+                      新 SPU 名称已保存：{draft.newProductName}
+                      {draft.newProductSourceFile ? ` · ${draft.newProductSourceFile}` : ''}
+                    </div>
+                  )}
                   <label className="flex flex-col gap-1">
                     <span className="text-xs text-slate-500 font-medium">SPU</span>
                     <input
@@ -2196,44 +2258,138 @@ function TrendChartCard({ className, title, subtitle, trends, height = 300, empt
   )
 }
 
+function DailyUnitsChart({ trends }) {
+  const data = trends.map((d) => ({
+    day: d.day,
+    dailyUnits: d.dailyUnits ?? d.units ?? 0,
+    orders: d.orders || 0,
+    revenue: d.revenue || 0,
+  }))
+  const total = data.reduce((s, d) => s + d.dailyUnits, 0)
+  const avg = data.length ? total / data.length : 0
+  const best = data.reduce((max, d) => d.dailyUnits > (max?.dailyUnits || 0) ? d : max, null)
+  return (
+    <section className="card p-5">
+      <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-3 mb-3">
+        <div>
+          <h2 className="font-semibold text-slate-800">Daily Units Comparison</h2>
+          <p className="text-xs text-slate-400 mt-0.5">每天卖出多少件，用同一张图比较波动。</p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <TargetPill label="Total" value={count(total)} />
+          <TargetPill label="Avg/day" value={count(avg)} />
+          <TargetPill label="Best" value={best ? `${best.day.slice(5)} · ${count(best.dailyUnits)}` : '-'} />
+        </div>
+      </div>
+      {data.length ? (
+        <ResponsiveContainer width="100%" height={260}>
+          <BarChart data={data} margin={{ top: 8, right: 8, left: -8, bottom: 8 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#eef2f7" />
+            <XAxis dataKey="day" tick={{ fontSize: 11 }} />
+            <YAxis tick={{ fontSize: 11 }} tickFormatter={count} />
+            <Tooltip formatter={(v, k) => {
+              if (k === 'revenue') return [money(v), 'Revenue']
+              return [count(v), k === 'orders' ? 'Orders' : 'Daily Units']
+            }} />
+            <Bar dataKey="dailyUnits" fill="#2563eb" name="Daily Units" radius={[4, 4, 0, 0]} />
+          </BarChart>
+        </ResponsiveContainer>
+      ) : (
+        <div className="h-40 flex items-center justify-center text-sm text-slate-400">当前时间范围没有 daily units。</div>
+      )}
+    </section>
+  )
+}
+
 function SelectedProductPanel({ product, rows, totals, trends, activeStore }) {
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-      <div className="rounded-lg border border-slate-200 p-4">
-        <p className="text-xs text-slate-400 mb-1">当前店铺单品</p>
-        <h3 className="font-semibold text-slate-800">{product?.sku || product?.spu || 'No match'}</h3>
-        <p className="text-xs text-slate-400 mt-1 line-clamp-3">{product?.productName || '当前时间范围里没有匹配数据。'}</p>
-        <div className="grid grid-cols-2 gap-2 mt-4 text-sm">
-          <MetricCell label="Store" value={activeStore || '-'} />
-          <MetricCell label="Rows" value={count(rows.length)} />
-          <MetricCell label="Unit Qty" value={`x${product?.unitMultiplier || 1}`} />
-          <MetricCell label="Units" value={count(totals.units)} />
-          <MetricCell label="Orders" value={count(totals.orders)} />
-          <MetricCell label="Revenue" value={money(totals.revenue)} />
-          <MetricCell label="Spend" value={money(totals.spend)} />
-          <MetricCell label="ROAS" value={ratio(totals.roas)} />
-          <MetricCell label="CVR" value={pct(totals.conversionRate)} />
-          <MetricCell label="Score" value={product?.score != null ? `${product.score} · ${product.grade || ''}` : '-'} />
-        </div>
-        {product?.decision && (
-          <div className="mt-4">
-            <span className={`inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-xs font-medium ${statusClass(product.status)}`}>
-              {product.status === 'good' ? <CheckCircle className="w-3 h-3" /> : <AlertTriangle className="w-3 h-3" />}
-              {product.decision}
-            </span>
-            <p className="text-xs text-slate-400 mt-1">{product.reason}</p>
+    <div className="space-y-4">
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <div className="rounded-lg border border-slate-200 p-4">
+          <p className="text-xs text-slate-400 mb-1">当前店铺单品</p>
+          <h3 className="font-semibold text-slate-800">{product?.sku || product?.spu || 'No match'}</h3>
+          <p className="text-xs text-slate-400 mt-1 line-clamp-3">{product?.productName || '当前时间范围里没有匹配数据。'}</p>
+          <div className="grid grid-cols-2 gap-2 mt-4 text-sm">
+            <MetricCell label="Store" value={activeStore || '-'} />
+            <MetricCell label="Rows" value={count(rows.length)} />
+            <MetricCell label="Unit Qty" value={`x${product?.unitMultiplier || 1}`} />
+            <MetricCell label="Units" value={count(totals.units)} />
+            <MetricCell label="Orders" value={count(totals.orders)} />
+            <MetricCell label="Revenue" value={money(totals.revenue)} />
+            <MetricCell label="Spend" value={money(totals.spend)} />
+            <MetricCell label="ROAS" value={ratio(totals.roas)} />
+            <MetricCell label="CVR" value={pct(totals.conversionRate)} />
+            <MetricCell label="Score" value={product?.score != null ? `${product.score} · ${product.grade || ''}` : '-'} />
           </div>
-        )}
-      </div>
+          {product?.decision && (
+            <div className="mt-4">
+              <span className={`inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-xs font-medium ${statusClass(product.status)}`}>
+                {product.status === 'good' ? <CheckCircle className="w-3 h-3" /> : <AlertTriangle className="w-3 h-3" />}
+                {product.decision}
+              </span>
+              <p className="text-xs text-slate-400 mt-1">{product.reason}</p>
+            </div>
+          )}
+        </div>
 
-      <TrendChartCard
-        className="rounded-lg border border-slate-200 p-4 lg:col-span-2"
-        title="Single Product Trend"
-        subtitle={`${trends.length} day${trends.length !== 1 ? 's' : ''}`}
-        trends={trends}
-        height={240}
-        emptyMessage="当前店铺和时间范围没有这个产品的数据。"
-      />
+        <TrendChartCard
+          className="rounded-lg border border-slate-200 p-4 lg:col-span-2"
+          title="Single Product Trend"
+          subtitle={`${trends.length} day${trends.length !== 1 ? 's' : ''} · daily units graph`}
+          trends={trends}
+          height={240}
+          emptyMessage="当前店铺和时间范围没有这个产品的数据。"
+        />
+      </div>
+      <StyleDailyPerformanceTable trends={trends} />
+    </div>
+  )
+}
+
+function StyleDailyPerformanceTable({ trends }) {
+  const rows = [...trends].sort((a, b) => String(b.day).localeCompare(String(a.day)))
+  return (
+    <div className="rounded-lg border border-slate-200 p-4">
+      <div className="flex items-center justify-between gap-3 mb-3">
+        <div>
+          <h3 className="font-semibold text-slate-800">Style Daily Performance</h3>
+          <p className="text-xs text-slate-400 mt-0.5">最近每天这个款卖了多少，用 daily units 做日对比。</p>
+        </div>
+        <span className="text-xs text-slate-400">{rows.length} days</span>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="min-w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs text-slate-400 border-b border-slate-100">
+              <th className="py-2 pr-4">Day</th>
+              <th className="py-2 pr-4 text-right">Daily Units</th>
+              <th className="py-2 pr-4 text-right">Orders</th>
+              <th className="py-2 pr-4 text-right">Revenue</th>
+              <th className="py-2 pr-4 text-right">Spend</th>
+              <th className="py-2 pr-4 text-right">ROAS</th>
+              <th className="py-2 pr-4 text-right">CTR</th>
+              <th className="py-2 pr-4 text-right">CVR</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {rows.map((row) => (
+              <tr key={row.day}>
+                <td className="py-3 pr-4 font-medium text-slate-700">{row.day}</td>
+                <td className="py-3 pr-4 text-right font-semibold text-slate-700">{count(row.dailyUnits ?? row.units)}</td>
+                <td className="py-3 pr-4 text-right">{count(row.orders)}</td>
+                <td className="py-3 pr-4 text-right">{money(row.revenue)}</td>
+                <td className="py-3 pr-4 text-right">{money(row.spend)}</td>
+                <td className="py-3 pr-4 text-right">{ratio(row.roas)}</td>
+                <td className="py-3 pr-4 text-right">{pct(row.ctr)}</td>
+                <td className="py-3 pr-4 text-right">{pct(row.conversionRate)}</td>
+              </tr>
+            ))}
+            {!rows.length && (
+              <tr><td colSpan="8" className="py-8 text-center text-slate-400">当前款式没有每日表现数据。</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
     </div>
   )
 }
