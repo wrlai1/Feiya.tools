@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react'
 import {
-  BarChart, Bar, LineChart, Line, ScatterChart, Scatter,
+  BarChart, Bar, ComposedChart, Legend, LineChart, Line, ScatterChart, Scatter,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
 } from 'recharts'
 import {
@@ -2344,20 +2344,41 @@ function ProductExposureChart({ trends }) {
         <div className="flex flex-wrap gap-2">
           <TargetPill label="Impressions" value={count(totalImpressions)} />
           <TargetPill label="Clicks" value={count(totalClicks)} />
-          <TargetPill label="CTR" value={pct(avgCtr)} />
+          <TargetPill label="CTR %" value={pct(avgCtr)} />
         </div>
       </div>
       {rows.length ? (
-        <ResponsiveContainer width="100%" height={220}>
-          <BarChart data={rows} margin={{ top: 8, right: 8, left: -8, bottom: 8 }}>
+        <ResponsiveContainer width="100%" height={240}>
+          <ComposedChart data={rows} margin={{ top: 8, right: 22, left: 4, bottom: 8 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#eef2f7" />
             <XAxis dataKey="day" tick={{ fontSize: 11 }} />
-            <YAxis yAxisId="left" tick={{ fontSize: 11 }} tickFormatter={count} />
-            <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 11 }} tickFormatter={count} />
-            <Tooltip formatter={(v, k) => [k === 'ctr' ? pct(v) : count(v), k === 'impressions' ? 'Impressions' : k === 'clicks' ? 'Clicks' : 'CTR']} />
-            <Bar yAxisId="left" dataKey="impressions" fill="#93c5fd" name="Impressions" radius={[4, 4, 0, 0]} />
-            <Bar yAxisId="right" dataKey="clicks" fill="#2563eb" name="Clicks" radius={[4, 4, 0, 0]} />
-          </BarChart>
+            <YAxis
+              yAxisId="left"
+              tick={{ fontSize: 11 }}
+              tickFormatter={count}
+              label={{ value: 'Impressions / Clicks', angle: -90, position: 'insideLeft', style: { fontSize: 11, fill: '#64748b' } }}
+            />
+            <YAxis
+              yAxisId="right"
+              orientation="right"
+              tick={{ fontSize: 11 }}
+              tickFormatter={pct}
+              label={{ value: 'CTR %', angle: 90, position: 'insideRight', style: { fontSize: 11, fill: '#64748b' } }}
+            />
+            <Tooltip formatter={(v, k) => {
+              if (k === 'ctr') return [pct(v), 'CTR %']
+              if (k === 'impressions') return [count(v), '曝光量 Impressions']
+              return [count(v), '点击量 Clicks']
+            }} />
+            <Legend verticalAlign="top" height={28} formatter={(value) => ({
+              impressions: '曝光量 Impressions',
+              clicks: '点击量 Clicks',
+              ctr: 'CTR %',
+            }[value] || value)} />
+            <Bar yAxisId="left" dataKey="impressions" fill="#93c5fd" name="impressions" radius={[4, 4, 0, 0]} />
+            <Bar yAxisId="left" dataKey="clicks" fill="#2563eb" name="clicks" radius={[4, 4, 0, 0]} />
+            <Line yAxisId="right" type="monotone" dataKey="ctr" stroke="#16a34a" strokeWidth={2} dot={{ r: 2 }} name="ctr" />
+          </ComposedChart>
         </ResponsiveContainer>
       ) : (
         <div className="h-28 flex items-center justify-center text-sm text-slate-400">当前款式没有曝光数据。</div>
