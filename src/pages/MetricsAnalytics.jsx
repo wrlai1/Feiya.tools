@@ -709,6 +709,7 @@ function missingDaysInRange(range, savedDays) {
 
 function alertMetricsForProduct(p) {
   return [
+    ['Impressions', count(p.impressions)],
     ['Clicks', count(p.clicks)],
     ['CTR', pct(p.ctr)],
     ['CVR', pct(p.conversionRate)],
@@ -734,13 +735,17 @@ function buildAnomalies(products, trends, totals, storeDays, range, settings = D
 
   for (const p of products) {
     const label = p.sku || p.spu
+    const productMeta = { spu: p.spu, sku: p.sku, label, productName: p.productName }
+    const exposureAnalysis = `${count(p.impressions)} impressions · ${pct(p.ctr)} CTR · ${count(p.clicks)} clicks. 曝光够但 CTR 低时先看主图/标题；曝光少但 CVR 好时更像是缺流量。`
     if ((p.spend || 0) >= settings.stopLossSpend && (p.orders || 0) === 0) {
       items.push({
         type: 'spend',
         severity: 'bad',
+        product: productMeta,
         title: `${label} 花费无单`,
-        detail: `${money(p.spend)} spend · 0 orders`,
+        detail: `${money(p.spend)} spend · ${count(p.impressions)} impressions · 0 orders`,
         metrics: alertMetricsForProduct(p),
+        exposureAnalysis,
         benchmark: `止损线 ${money(settings.stopLossSpend)}，当前 ${money(p.spend)} 且 0 单。`,
         recommendation: '先降低预算或暂停测试，再检查价格、首图、coupon、评价和落地页承接。如果点击也少，先不要直接判断转化。',
       })
@@ -748,9 +753,11 @@ function buildAnomalies(products, trends, totals, storeDays, range, settings = D
       items.push({
         type: 'conversion',
         severity: 'bad',
+        product: productMeta,
         title: `${label} 点击有，转化弱`,
-        detail: `${count(p.clicks)} clicks · ${pct(p.conversionRate)} CVR`,
+        detail: `${count(p.impressions)} impressions · ${count(p.clicks)} clicks · ${pct(p.conversionRate)} CVR`,
         metrics: alertMetricsForProduct(p),
+        exposureAnalysis,
         benchmark: `转化目标 ${pct(settings.conversionTarget)}，当前 ${pct(p.conversionRate)}。`,
         recommendation: '优先看价格是否偏高、coupon 是否弱、尺码/颜色是否缺、评价和详情页是否影响下单。CTR 不低但 CVR 低时，通常不是流量问题。',
       })
@@ -758,19 +765,23 @@ function buildAnomalies(products, trends, totals, storeDays, range, settings = D
       items.push({
         type: 'ctr',
         severity: 'warn',
+        product: productMeta,
         title: `${label} 曝光够但 CTR 低`,
         detail: `${count(p.impressions)} impressions · ${pct(p.ctr)} CTR`,
         metrics: alertMetricsForProduct(p),
-        benchmark: `CTR 目标 ${pct(settings.ctrTarget)}，当前 ${pct(p.ctr)}。`,
+        exposureAnalysis,
+        benchmark: `曝光判断量 ${count(settings.minImpressions)}，当前 ${count(p.impressions)}；CTR 目标 ${pct(settings.ctrTarget)}，当前 ${pct(p.ctr)}。`,
         recommendation: '优先改主图、标题关键词、首图卖点和价格展示。CTR 低说明曝光有了，但用户不想点。',
       })
     } else if ((p.cartRate ?? 0) >= settings.cartRateTarget && (p.conversionRate ?? 0) < settings.conversionTarget) {
       items.push({
         type: 'cart',
         severity: 'warn',
+        product: productMeta,
         title: `${label} 加购不成单`,
-        detail: `${pct(p.cartRate)} cart · ${pct(p.conversionRate)} CVR`,
+        detail: `${count(p.impressions)} impressions · ${pct(p.cartRate)} cart · ${pct(p.conversionRate)} CVR`,
         metrics: alertMetricsForProduct(p),
+        exposureAnalysis,
         benchmark: `加购率 ${pct(p.cartRate)} 达标，但 CVR ${pct(p.conversionRate)} 低于 ${pct(settings.conversionTarget)}。`,
         recommendation: '用户有兴趣但没付款，优先检查最终价格、coupon、运费/承诺、竞品价差和尺码库存。',
       })
@@ -787,7 +798,7 @@ function buildAnomalies(products, trends, totals, storeDays, range, settings = D
         severity: 'warn',
         title: `${last.day} 花费上升但订单没涨`,
         detail: `${money(prev.spend)} -> ${money(last.spend)} · orders ${count(prev.orders)} -> ${count(last.orders)}`,
-        metrics: [['Prev spend', money(prev.spend)], ['Last spend', money(last.spend)], ['Prev orders', count(prev.orders)], ['Last orders', count(last.orders)], ['Last CTR', pct(last.ctr)], ['Last CVR', pct(last.conversionRate)]],
+        metrics: [['Prev spend', money(prev.spend)], ['Last spend', money(last.spend)], ['Prev impressions', count(prev.impressions)], ['Last impressions', count(last.impressions)], ['Prev orders', count(prev.orders)], ['Last orders', count(last.orders)], ['Last CTR', pct(last.ctr)], ['Last CVR', pct(last.conversionRate)]],
         daily: [prev, last],
         recommendation: '先确认是不是预算或流量突然放大。如果点击增长但订单没涨，看 CVR；如果曝光涨但点击没涨，看 CTR 和主图。',
       })
@@ -798,7 +809,7 @@ function buildAnomalies(products, trends, totals, storeDays, range, settings = D
         severity: 'warn',
         title: `${last.day} 转化率明显下降`,
         detail: `${pct(prev.conversionRate)} -> ${pct(last.conversionRate)}`,
-        metrics: [['Prev CVR', pct(prev.conversionRate)], ['Last CVR', pct(last.conversionRate)], ['Last clicks', count(last.clicks)], ['Last orders', count(last.orders)], ['Last spend', money(last.spend)], ['Last ROAS', ratio(last.roas)]],
+        metrics: [['Prev CVR', pct(prev.conversionRate)], ['Last CVR', pct(last.conversionRate)], ['Prev impressions', count(prev.impressions)], ['Last impressions', count(last.impressions)], ['Last clicks', count(last.clicks)], ['Last orders', count(last.orders)], ['Last spend', money(last.spend)], ['Last ROAS', ratio(last.roas)]],
         daily: [prev, last],
         recommendation: '检查当天价格、coupon、库存、竞品活动、页面评价或物流承诺是否变化。点击还在但转化掉，通常是承接问题。',
       })
@@ -1108,6 +1119,16 @@ export default function MetricsAnalytics() {
       toast.error(err.message, '目标保存失败')
     }
   }
+
+  const focusProduct = useCallback((product) => {
+    const value = product?.sku || product?.spu || product?.label || ''
+    if (!value) return
+    setAutoFocusProduct(false)
+    setSelectedProduct(value)
+    window.requestAnimationFrame(() => {
+      document.getElementById('spu-sku-focus')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
+  }, [])
 
   const handleCreateStore = async () => {
     const name = newStore.trim()
@@ -1628,7 +1649,7 @@ export default function MetricsAnalytics() {
         onDelete={handleDeleteProduct}
       />
 
-      <section className="card p-5 space-y-4">
+      <section id="spu-sku-focus" className="card p-5 space-y-4 scroll-mt-6">
         <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-3">
           <div>
             <h2 className="font-semibold text-slate-800">SPU / SKU Focus</h2>
@@ -1715,7 +1736,7 @@ export default function MetricsAnalytics() {
             <KPICard title="Conversion" value={pct(totals.conversionRate)} subtitle={`${count(totals.carts)} carts`} icon={CheckCircle} color="orange" />
           </section>
 
-          <NeedsAttentionPanel items={anomalies} />
+          <NeedsAttentionPanel items={anomalies} onFocusProduct={focusProduct} />
 
           <ActionList products={productRows} />
 
@@ -1730,8 +1751,6 @@ export default function MetricsAnalytics() {
 
             <FunnelCard totals={totals} trends={trends} />
           </section>
-
-          <DailyUnitsChart trends={trends} />
 
           <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <div className="card p-5">
@@ -2193,8 +2212,8 @@ function axisTickFormatter(axis, selectedMetrics) {
   return (v) => Number(v || 0).toLocaleString('en-US', { maximumFractionDigits: 1 })
 }
 
-function TrendChartCard({ className, title, subtitle, trends, height = 300, emptyMessage = '当前时间范围没有趋势数据。' }) {
-  const [selectedMetrics, setSelectedMetrics] = useState(DEFAULT_TREND_METRICS)
+function TrendChartCard({ className, title, subtitle, trends, height = 300, emptyMessage = '当前时间范围没有趋势数据。', initialMetrics = DEFAULT_TREND_METRICS }) {
+  const [selectedMetrics, setSelectedMetrics] = useState(() => initialMetrics)
   const activeMetrics = TREND_METRICS.filter((m) => selectedMetrics.includes(m.key))
   const toggleMetric = (key) => {
     setSelectedMetrics((prev) => {
@@ -2258,49 +2277,6 @@ function TrendChartCard({ className, title, subtitle, trends, height = 300, empt
   )
 }
 
-function DailyUnitsChart({ trends }) {
-  const data = trends.map((d) => ({
-    day: d.day,
-    dailyUnits: d.dailyUnits ?? d.units ?? 0,
-    orders: d.orders || 0,
-    revenue: d.revenue || 0,
-  }))
-  const total = data.reduce((s, d) => s + d.dailyUnits, 0)
-  const avg = data.length ? total / data.length : 0
-  const best = data.reduce((max, d) => d.dailyUnits > (max?.dailyUnits || 0) ? d : max, null)
-  return (
-    <section className="card p-5">
-      <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-3 mb-3">
-        <div>
-          <h2 className="font-semibold text-slate-800">Daily Units Comparison</h2>
-          <p className="text-xs text-slate-400 mt-0.5">每天卖出多少件，用同一张图比较波动。</p>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <TargetPill label="Total" value={count(total)} />
-          <TargetPill label="Avg/day" value={count(avg)} />
-          <TargetPill label="Best" value={best ? `${best.day.slice(5)} · ${count(best.dailyUnits)}` : '-'} />
-        </div>
-      </div>
-      {data.length ? (
-        <ResponsiveContainer width="100%" height={260}>
-          <BarChart data={data} margin={{ top: 8, right: 8, left: -8, bottom: 8 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#eef2f7" />
-            <XAxis dataKey="day" tick={{ fontSize: 11 }} />
-            <YAxis tick={{ fontSize: 11 }} tickFormatter={count} />
-            <Tooltip formatter={(v, k) => {
-              if (k === 'revenue') return [money(v), 'Revenue']
-              return [count(v), k === 'orders' ? 'Orders' : 'Daily Units']
-            }} />
-            <Bar dataKey="dailyUnits" fill="#2563eb" name="Daily Units" radius={[4, 4, 0, 0]} />
-          </BarChart>
-        </ResponsiveContainer>
-      ) : (
-        <div className="h-40 flex items-center justify-center text-sm text-slate-400">当前时间范围没有 daily units。</div>
-      )}
-    </section>
-  )
-}
-
 function SelectedProductPanel({ product, rows, totals, trends, activeStore }) {
   return (
     <div className="space-y-4">
@@ -2335,13 +2311,57 @@ function SelectedProductPanel({ product, rows, totals, trends, activeStore }) {
         <TrendChartCard
           className="rounded-lg border border-slate-200 p-4 lg:col-span-2"
           title="Single Product Trend"
-          subtitle={`${trends.length} day${trends.length !== 1 ? 's' : ''} · daily units graph`}
+          subtitle={`${trends.length} day${trends.length !== 1 ? 's' : ''} · daily units / exposure`}
           trends={trends}
           height={240}
           emptyMessage="当前店铺和时间范围没有这个产品的数据。"
+          initialMetrics={['dailyUnits', 'impressions', 'clicks', 'ctr', 'conversionRate']}
         />
       </div>
+      <ProductExposureChart trends={trends} />
       <StyleDailyPerformanceTable trends={trends} />
+    </div>
+  )
+}
+
+function ProductExposureChart({ trends }) {
+  const rows = trends.map((row) => ({
+    day: row.day,
+    impressions: row.impressions || 0,
+    clicks: row.clicks || 0,
+    ctr: row.ctr || 0,
+  }))
+  const totalImpressions = rows.reduce((sum, row) => sum + row.impressions, 0)
+  const totalClicks = rows.reduce((sum, row) => sum + row.clicks, 0)
+  const avgCtr = totalImpressions ? totalClicks / totalImpressions : null
+  return (
+    <div className="rounded-lg border border-slate-200 p-4">
+      <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-3 mb-3">
+        <div>
+          <h3 className="font-semibold text-slate-800">Exposure Comparison</h3>
+          <p className="text-xs text-slate-400 mt-0.5">按天比较曝光量，同时看点击是否跟着曝光走。</p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <TargetPill label="Impressions" value={count(totalImpressions)} />
+          <TargetPill label="Clicks" value={count(totalClicks)} />
+          <TargetPill label="CTR" value={pct(avgCtr)} />
+        </div>
+      </div>
+      {rows.length ? (
+        <ResponsiveContainer width="100%" height={220}>
+          <BarChart data={rows} margin={{ top: 8, right: 8, left: -8, bottom: 8 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#eef2f7" />
+            <XAxis dataKey="day" tick={{ fontSize: 11 }} />
+            <YAxis yAxisId="left" tick={{ fontSize: 11 }} tickFormatter={count} />
+            <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 11 }} tickFormatter={count} />
+            <Tooltip formatter={(v, k) => [k === 'ctr' ? pct(v) : count(v), k === 'impressions' ? 'Impressions' : k === 'clicks' ? 'Clicks' : 'CTR']} />
+            <Bar yAxisId="left" dataKey="impressions" fill="#93c5fd" name="Impressions" radius={[4, 4, 0, 0]} />
+            <Bar yAxisId="right" dataKey="clicks" fill="#2563eb" name="Clicks" radius={[4, 4, 0, 0]} />
+          </BarChart>
+        </ResponsiveContainer>
+      ) : (
+        <div className="h-28 flex items-center justify-center text-sm text-slate-400">当前款式没有曝光数据。</div>
+      )}
     </div>
   )
 }
@@ -2363,6 +2383,7 @@ function StyleDailyPerformanceTable({ trends }) {
             <tr className="text-left text-xs text-slate-400 border-b border-slate-100">
               <th className="py-2 pr-4">Day</th>
               <th className="py-2 pr-4 text-right">Daily Units</th>
+              <th className="py-2 pr-4 text-right">Impressions</th>
               <th className="py-2 pr-4 text-right">Orders</th>
               <th className="py-2 pr-4 text-right">Revenue</th>
               <th className="py-2 pr-4 text-right">Spend</th>
@@ -2376,6 +2397,7 @@ function StyleDailyPerformanceTable({ trends }) {
               <tr key={row.day}>
                 <td className="py-3 pr-4 font-medium text-slate-700">{row.day}</td>
                 <td className="py-3 pr-4 text-right font-semibold text-slate-700">{count(row.dailyUnits ?? row.units)}</td>
+                <td className="py-3 pr-4 text-right">{count(row.impressions)}</td>
                 <td className="py-3 pr-4 text-right">{count(row.orders)}</td>
                 <td className="py-3 pr-4 text-right">{money(row.revenue)}</td>
                 <td className="py-3 pr-4 text-right">{money(row.spend)}</td>
@@ -2385,7 +2407,7 @@ function StyleDailyPerformanceTable({ trends }) {
               </tr>
             ))}
             {!rows.length && (
-              <tr><td colSpan="8" className="py-8 text-center text-slate-400">当前款式没有每日表现数据。</td></tr>
+              <tr><td colSpan="9" className="py-8 text-center text-slate-400">当前款式没有每日表现数据。</td></tr>
             )}
           </tbody>
         </table>
@@ -2615,7 +2637,7 @@ function UploadSummaryCard({ summary, onClear }) {
   )
 }
 
-function NeedsAttentionPanel({ items }) {
+function NeedsAttentionPanel({ items, onFocusProduct }) {
   return (
     <section className="card p-5">
       <div className="flex items-center justify-between mb-4">
@@ -2636,6 +2658,15 @@ function NeedsAttentionPanel({ items }) {
                 <div className="min-w-0 flex-1">
                   <div className="text-sm font-semibold text-slate-800">{item.title}</div>
                   <div className="text-xs text-slate-500 mt-0.5">{item.detail}</div>
+                  {item.product?.spu && (
+                    <button
+                      type="button"
+                      onClick={() => onFocusProduct?.(item.product)}
+                      className="mt-2 inline-flex rounded-md border border-white/70 bg-white/80 px-2 py-1 text-[11px] font-semibold text-blue-700 shadow-sm hover:border-blue-200 hover:bg-blue-50"
+                    >
+                      SPU {item.product.spu}
+                    </button>
+                  )}
                   {item.metrics && (
                     <div className="mt-2 grid grid-cols-2 gap-1.5">
                       {item.metrics.slice(0, 4).map(([label, value]) => (
@@ -2671,6 +2702,18 @@ function AttentionTooltip({ item }) {
           <div className="mt-0.5">{item.benchmark}</div>
         </div>
       )}
+      {item.product?.spu && (
+        <div className="mb-2 rounded-md bg-blue-50 px-2 py-1.5 text-blue-700">
+          <div className="font-semibold">SPU {item.product.spu}</div>
+          <div className="mt-0.5">{item.product.productName || item.product.sku || item.product.label}</div>
+        </div>
+      )}
+      {item.exposureAnalysis && (
+        <div className="mb-2 rounded-md bg-slate-50 px-2 py-1.5">
+          <div className="font-semibold text-slate-700">曝光分析</div>
+          <div className="mt-0.5">{item.exposureAnalysis}</div>
+        </div>
+      )}
       {item.metrics && (
         <div className="mb-2 grid grid-cols-2 gap-1.5">
           {item.metrics.map(([label, value]) => (
@@ -2686,7 +2729,7 @@ function AttentionTooltip({ item }) {
               <div key={day.day} className="rounded-md bg-slate-50 px-2 py-1">
                 {day.status
                   ? `${day.day}: ${day.status}`
-                  : `${day.day}: clicks ${count(day.clicks)} · CTR ${pct(day.ctr)} · CVR ${pct(day.conversionRate)} · orders ${count(day.orders)} · spend ${money(day.spend)}`}
+                  : `${day.day}: impressions ${count(day.impressions)} · clicks ${count(day.clicks)} · CTR ${pct(day.ctr)} · CVR ${pct(day.conversionRate)} · orders ${count(day.orders)} · spend ${money(day.spend)}`}
               </div>
             ))}
           </div>
