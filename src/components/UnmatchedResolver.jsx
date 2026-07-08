@@ -134,25 +134,137 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
     onDone(items, skipped)
   }
 
+  function compactText(value) {
+    return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '')
+  }
+
+  function looseText(value) {
+    return String(value || '').toLowerCase().trim()
+  }
+
+  function lcsRatio(a, b) {
+    if (!a || !b) return 0
+    const prev = new Array(a.length + 1).fill(0)
+    const curr = new Array(a.length + 1).fill(0)
+    for (let j = 1; j <= b.length; j++) {
+      curr[0] = 0
+      for (let i = 1; i <= a.length; i++) {
+        curr[i] = a[i - 1] === b[j - 1] ? prev[i - 1] + 1 : Math.max(curr[i - 1], prev[i])
+      }
+      for (let i = 0; i <= a.length; i++) { prev[i] = curr[i]; curr[i] = 0 }
+    }
+    return prev[a.length] / Math.min(a.length, b.length)
+  }
+
+  function styleSearchScore(style, query) {
+    if (!query) return 0
+    const styleN = compactText(style)
+    if (!styleN) return 0
+    if (styleN === query) return 1000
+    if (styleN.startsWith(query)) return 900
+    if (styleN.includes(query)) return 800
+    if (query.length >= 4 && styleN.length >= 4) {
+      const ratio = lcsRatio(styleN, query)
+      if (ratio >= 0.78) return Math.round(600 + ratio * 100)
+    }
+    return 0
+  }
+
+  function styleSearchTerms(query, compactQuery) {
+    const terms = [compactQuery]
+    for (const part of query.split(/\s+/)) {
+      const compact = compactText(part)
+      if (compact.length >= 3) terms.push(compact)
+    }
+    if (/set/.test(compactQuery)) {
+      const beforeSet = compactQuery.replace(/set.*$/, '')
+      if (beforeSet.length >= 3) terms.push(beforeSet)
+    }
+    return [...new Set(terms.filter(Boolean))]
+  }
+
+  function textSearchScore(value, query, compactQuery) {
+    if (!query && !compactQuery) return 0
+    const loose = looseText(value)
+    const compact = compactText(value)
+    if (query && loose === query) return 500
+    if (compactQuery && compact === compactQuery) return 500
+    if (query && loose.includes(query)) return 350
+    if (compactQuery && compact.includes(compactQuery)) return 350
+    if (compactQuery?.length >= 4 && compact.length >= 4) {
+      const ratio = lcsRatio(compact, compactQuery)
+      if (ratio >= 0.82) return Math.round(220 + ratio * 80)
+    }
+    return 0
+  }
+
+  function sourceColorScore(templateColor, sourceColor) {
+    const template = compactText(templateColor)
+    const source = compactText(sourceColor)
+    if (!template || !source) return 0
+    if (template === source) return 300
+    if (template.includes(source) || source.includes(template)) return 220
+    const ratio = lcsRatio(template, source)
+    return ratio >= 0.78 ? Math.round(120 + ratio * 80) : 0
+  }
+
   // Filter template entries for the search box
   function getMatches(i, row) {
-    const q    = searches[i].toLowerCase().trim()
-    const ns   = (row.style || '').toLowerCase().replace(/[^a-z0-9]/g, '')
+    const q = looseText(searches[i])
+    const nq = compactText(q)
+    const ns = compactText(row.style)
     // Start with candidates that share the same normalized style prefix (≥4 chars)
     let pool = normTemplate
-    if (ns.length >= 4) {
+    if (!q && ns.length >= 4) {
       const stylePre = pool.filter(t =>
-        t.STYLE.toLowerCase().replace(/[^a-z0-9]/g, '').startsWith(ns) ||
-        t.STYLE.toLowerCase().replace(/[^a-z0-9]/g, '').startsWith(ns.slice(0, 4))
+        compactText(t.STYLE).startsWith(ns) ||
+        compactText(t.STYLE).startsWith(ns.slice(0, 4))
       )
       if (stylePre.length) pool = stylePre
+      return pool
+        .map(t => ({ ...t, _score: sourceColorScore(t.COLOR, row.color) + textSearchScore(t.SIZE, looseText(row.size), compactText(row.size)) }))
+        .sort((a, b) => b._score - a._score || a.STYLE.localeCompare(b.STYLE) || a.COLOR.localeCompare(b.COLOR))
+        .slice(0, 30)
+        .map(({ _score, ...t }) => t)
     }
     if (q) {
-      pool = pool.filter(t =>
-        t.STYLE.toLowerCase().includes(q) ||
-        t.COLOR.toLowerCase().includes(q) ||
-        t.SIZE.toLowerCase().includes(q)
-      )
+      const styleTerms = styleSearchTerms(q, nq)
+      const rankedByStyle = normTemplate
+        .map(t => ({
+          ...t,
+          _styleScore: Math.max(...styleTerms.map(term => styleSearchScore(t.STYLE, term))),
+          _colorScore: sourceColorScore(t.COLOR, row.color),
+          _sizeScore: textSearchScore(t.SIZE, looseText(row.size), compactText(row.size)),
+        }))
+        .filter(t => t._styleScore > 0)
+        .sort((a, b) =>
+          b._styleScore - a._styleScore ||
+          b._colorScore - a._colorScore ||
+          b._sizeScore - a._sizeScore ||
+          a.STYLE.localeCompare(b.STYLE) ||
+          a.COLOR.localeCompare(b.COLOR)
+        )
+
+      if (rankedByStyle.length) {
+        return rankedByStyle.slice(0, 30).map(({ _styleScore, _colorScore, _sizeScore, ...t }) => t)
+      }
+
+      pool = normTemplate
+        .map(t => ({
+          ...t,
+          _colorQueryScore: textSearchScore(t.COLOR, q, nq),
+          _sizeQueryScore: textSearchScore(t.SIZE, q, nq),
+          _sourceColorScore: sourceColorScore(t.COLOR, row.color),
+        }))
+        .filter(t => t._colorQueryScore > 0 || t._sizeQueryScore > 0)
+        .sort((a, b) =>
+          b._colorQueryScore - a._colorQueryScore ||
+          b._sizeQueryScore - a._sizeQueryScore ||
+          b._sourceColorScore - a._sourceColorScore ||
+          a.STYLE.localeCompare(b.STYLE) ||
+          a.COLOR.localeCompare(b.COLOR)
+        )
+      return pool.slice(0, 30).map(({ _colorQueryScore, _sizeQueryScore, _sourceColorScore, ...t }) => t)
     }
     return pool.slice(0, 30)
   }
