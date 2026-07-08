@@ -286,22 +286,45 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
       if (prefixCandidates.length) candidates = prefixCandidates
     }
 
-    // ── Learned alias — a previous human "Link" wins outright ──────────────────
+    // ── Learned alias — a previous human "Link" or "Combo" wins outright ────────
     // If the user has taught us what this (style, color) means, fill that template
-    // color directly and skip fuzzy scoring. No-op if the aliased color isn't in
-    // this size's bucket (then fall through to normal matching).
+    // color directly and skip fuzzy scoring. Combo aliases split one source row into
+    // multiple template rows, each receiving the source quantity.
     const aliasTarget = aliases[aliasKey(style, color, normSize)] || aliases[aliasKey(style, color)]
     const target = typeof aliasTarget === 'string' ? { COLOR: aliasTarget } : aliasTarget
     const applyAliasTarget = (pool = []) => {
+      const matchTarget = (wanted, items) => {
+        const wantStyle = normalizeStyle(wanted.STYLE || '')
+        const wantColor = normalizeColor(wanted.COLOR || '')
+        const wantSize = normalizeSize(wanted.SIZE || normSize)
+        return items.find(c => {
+          const styleOk = !wantStyle || normalizeStyle(c.style) === wantStyle
+          const colorOk = !wantColor || normalizeColor(c.color) === wantColor
+          const sizeOk = !wantSize || normalizeSize(c.size) === wantSize
+          return styleOk && colorOk && sizeOk
+        })
+      }
+
+      if (Array.isArray(target?.components) && target.components.length) {
+        const matches = target.components.map(component => matchTarget(component, entries))
+        if (matches.some(match => !match)) return false
+        for (const matched of matches) matched.qty += qty
+        filledTotal += qty
+        matchLog.push({
+          style,
+          salesColor: color,
+          size: normSize,
+          qty,
+          matchedTo: target.components.map(c => `${c.STYLE}/${c.COLOR}/${c.SIZE}`).join(' + '),
+          via: 'alias combo',
+        })
+        return true
+      }
+
       const wantStyle = normalizeStyle(target.STYLE || '')
       const wantColor = normalizeColor(target.COLOR || '')
       const wantSize = normalizeSize(target.SIZE || normSize)
-      const matchIn = (items) => items.find(c => {
-        const styleOk = !wantStyle || normalizeStyle(c.style) === wantStyle
-        const colorOk = !wantColor || normalizeColor(c.color) === wantColor
-        const sizeOk = !wantSize || normalizeSize(c.size) === wantSize
-        return styleOk && colorOk && sizeOk
-      })
+      const matchIn = (items) => matchTarget({ STYLE: wantStyle, COLOR: wantColor, SIZE: wantSize }, items)
       const matched = matchIn(pool) || (wantStyle ? matchIn(entries) : null)
       if (matched) {
         matched.qty += qty

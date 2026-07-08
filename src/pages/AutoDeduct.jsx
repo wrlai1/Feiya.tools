@@ -208,6 +208,14 @@ export default function AutoDeduct() {
     if (!resolvedExtras?.length) return result.filledRows
     const rows = result.filledRows.map(r => ({ ...r }))
     for (const extra of resolvedExtras) {
+      if (extra._isCombo && Array.isArray(extra.components)) {
+        for (const component of extra.components) {
+          const found = rows.find(r => r.STYLE === component.STYLE && r.COLOR === component.COLOR && r.SIZE === component.SIZE)
+          if (found) found.QTY = (found.QTY || 0) + extra.QTY
+          else rows.push({ STYLE: component.STYLE, COLOR: component.COLOR, SIZE: component.SIZE, QTY: extra.QTY })
+        }
+        continue
+      }
       if (extra._isNew) {
         rows.push({ STYLE: extra.STYLE, COLOR: extra.COLOR, SIZE: extra.SIZE, QTY: extra.QTY })
       } else {
@@ -306,17 +314,21 @@ export default function AutoDeduct() {
     const learned = {}
     for (const item of items) {
       if (!item._learnAlias || !item._source) continue
-      learned[aliasKey(item._source.style, item._source.color)] = {
-        STYLE: item.STYLE,
-        COLOR: item.COLOR,
-        _isNew: !!item._isNew,
+      const aliasValue = item._isCombo
+        ? { components: item.components || [] }
+        : {
+          STYLE: item.STYLE,
+          COLOR: item.COLOR,
+          SIZE: item.SIZE,
+          _isNew: !!item._isNew,
+        }
+      if (!item._isCombo || !item._source.size) {
+        learned[aliasKey(item._source.style, item._source.color)] = {
+          ...aliasValue,
+          SIZE: undefined,
+        }
       }
-      learned[aliasKey(item._source.style, item._source.color, item._source.size)] = {
-        STYLE: item.STYLE,
-        COLOR: item.COLOR,
-        SIZE: item.SIZE,
-        _isNew: !!item._isNew,
-      }
+      learned[aliasKey(item._source.style, item._source.color, item._source.size)] = aliasValue
     }
     const learnedCount = items.filter((item) => item._learnAlias && item._source).length
     if (learnedCount) {

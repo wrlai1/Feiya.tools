@@ -6,20 +6,24 @@ import { Search, Plus, SkipForward, CheckCircle, X, Link2 } from 'lucide-react'
  *
  * For each row the auto-matcher couldn't place, the user can:
  *   Link   — pick an existing template entry to assign the QTY to
+ *   Combo  — pick multiple existing template entries; each gets the source QTY
  *   Create — manually specify STYLE / COLOR / SIZE (new row appended to output)
  *   Skip   — discard the row
  *
  * onDone(resolvedItems) is called when the user clicks "Apply".
- * resolvedItems: Array of { STYLE, COLOR, SIZE, QTY, _isNew? }
+ * resolvedItems: Array of { STYLE, COLOR, SIZE, QTY, _isNew? } or
+ *                { components: [{STYLE,COLOR,SIZE}], QTY, _isCombo: true }
  */
 export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone }) {
-  // resolved[i] = { type: 'link'|'create'|'skip', entry: {STYLE,COLOR,SIZE} } | null
-  const [resolved,    setResolved]    = useState(() => Array(unmatchedRows.length).fill(null))
-  const [searches,    setSearches]    = useState(() => Array(unmatchedRows.length).fill(''))
-  const [createForms, setCreateForms] = useState(() => Array(unmatchedRows.length).fill(null))
+  // resolved[i] = { type: 'link'|'combo'|'create'|'skip', entry } | null
+  const [resolved,        setResolved]        = useState(() => Array(unmatchedRows.length).fill(null))
+  const [searches,        setSearches]        = useState(() => Array(unmatchedRows.length).fill(''))
+  const [createForms,     setCreateForms]     = useState(() => Array(unmatchedRows.length).fill(null))
+  const [comboSelections, setComboSelections] = useState(() => Array(unmatchedRows.length).fill(null).map(() => []))
 
   const pending   = resolved.filter(r => !r).length
   const linked    = resolved.filter(r => r?.type === 'link').length
+  const comboed   = resolved.filter(r => r?.type === 'combo').length
   const created   = resolved.filter(r => r?.type === 'create').length
   const skipped   = resolved.filter(r => r?.type === 'skip').length
 
@@ -69,6 +73,34 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
     resolve(i, 'create', { STYLE: form.STYLE, COLOR: form.COLOR, SIZE: form.SIZE })
   }
 
+  function componentKey(entry) {
+    return [entry.STYLE, entry.COLOR, entry.SIZE].map(v => String(v || '').trim().toLowerCase()).join('||')
+  }
+
+  function addComboComponent(i, entry) {
+    setComboSelections(prev => {
+      const next = [...prev]
+      const current = next[i] || []
+      if (current.some(item => componentKey(item) === componentKey(entry))) return next
+      next[i] = [...current, entry]
+      return next
+    })
+  }
+
+  function removeComboComponent(i, entry) {
+    setComboSelections(prev => {
+      const next = [...prev]
+      next[i] = (next[i] || []).filter(item => componentKey(item) !== componentKey(entry))
+      return next
+    })
+  }
+
+  function confirmCombo(i) {
+    const components = comboSelections[i] || []
+    if (!components.length) return
+    resolve(i, 'combo', { components })
+  }
+
   function handleApply() {
     const items   = []
     const skipped = []   // original sales rows the user chose NOT to resolve —
@@ -77,6 +109,16 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
       const r = resolved[i]
       if (!r || r.type === 'skip') {
         skipped.push({ style: row.style, color: row.color, size: row.size, qty: row.qty })
+        continue
+      }
+      if (r.type === 'combo') {
+        items.push({
+          components: r.entry.components,
+          QTY: row.qty,
+          _isCombo: true,
+          _source: { style: row.style, color: row.color, size: row.size },
+          _learnAlias: true,
+        })
         continue
       }
       items.push({
@@ -123,8 +165,8 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
           <h3 className="font-semibold text-slate-800">Review Unmatched Rows</h3>
           <p className="text-sm text-slate-500 mt-0.5">
             {pending > 0
-              ? `${pending} remaining · ${linked} linked · ${created} created · ${skipped} skipped`
-              : `All resolved — ${linked} linked, ${created} new, ${skipped} skipped`}
+              ? `${pending} remaining · ${linked} linked · ${comboed} combo · ${created} created · ${skipped} skipped`
+              : `All resolved — ${linked} linked, ${comboed} combo, ${created} new, ${skipped} skipped`}
           </p>
         </div>
         <button
@@ -133,7 +175,7 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
           className="btn-primary text-sm px-5 py-2 disabled:opacity-40 disabled:cursor-not-allowed"
         >
           <CheckCircle className="w-4 h-4" />
-          Apply {linked + created} Resolutions
+          Apply {linked + comboed + created} Resolutions
         </button>
       </div>
 
@@ -150,12 +192,14 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
           const isCreate = !!createForms[i]
           const form     = createForms[i]
           const matches  = getMatches(i, row)
+          const comboComponents = comboSelections[i] || []
 
           return (
             <div
               key={i}
               className={`card p-4 space-y-3 transition-colors ${
                 r?.type === 'link'   ? 'border-blue-200 bg-blue-50/40' :
+                r?.type === 'combo'  ? 'border-indigo-200 bg-indigo-50/40' :
                 r?.type === 'create' ? 'border-green-200 bg-green-50/40' :
                 r?.type === 'skip'   ? 'border-slate-100 bg-slate-50 opacity-60' :
                 'border-slate-200'
@@ -179,6 +223,15 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
                 <div className="flex items-center gap-2 text-sm">
                   {r.type === 'skip' ? (
                     <span className="text-slate-400 italic">Skipped</span>
+                  ) : r.type === 'combo' ? (
+                    <>
+                      <Link2 className="w-3.5 h-3.5 text-indigo-500 shrink-0" />
+                      <span className="font-medium text-indigo-700">Combo set</span>
+                      <span className="text-slate-400">→</span>
+                      <span className="text-slate-600 truncate">
+                        {r.entry.components.map(c => `${c.STYLE}/${c.COLOR}/${c.SIZE}`).join(' + ')}
+                      </span>
+                    </>
                   ) : (
                     <>
                       {r.type === 'link'
@@ -238,6 +291,38 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
               ) : (
                 /* Link search + action buttons */
                 <div className="space-y-2">
+                  {comboComponents.length > 0 && (
+                    <div className="rounded-lg border border-indigo-100 bg-indigo-50 px-3 py-2">
+                      <div className="flex items-center justify-between gap-2 mb-2">
+                        <p className="text-xs font-medium text-indigo-700">Combo components</p>
+                        <button
+                          onClick={() => confirmCombo(i)}
+                          className="btn-primary text-xs px-3 py-1.5"
+                        >
+                          Confirm combo
+                        </button>
+                      </div>
+                      <div className="space-y-1.5">
+                        {comboComponents.map(component => (
+                          <div key={componentKey(component)} className="flex items-center gap-2 rounded-md bg-white px-2 py-1 text-xs">
+                            <span className="font-mono text-slate-700">{component.STYLE}</span>
+                            <span className="text-slate-400">/</span>
+                            <span className="text-slate-600 truncate">{component.COLOR}</span>
+                            <span className="text-slate-400">/</span>
+                            <span className="text-slate-600">{component.SIZE}</span>
+                            <button
+                              onClick={() => removeComboComponent(i, component)}
+                              className="ml-auto text-slate-300 hover:text-red-500"
+                              title="Remove component"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
                   <div className="relative">
                     <Search className="absolute left-3 top-2.5 w-3.5 h-3.5 text-slate-400 pointer-events-none" />
                     <input
@@ -253,15 +338,23 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
                   {matches.length > 0 && (
                     <div className="border border-slate-100 rounded-lg overflow-hidden max-h-44 overflow-y-auto divide-y divide-slate-50">
                       {matches.map((t, j) => (
-                        <button
-                          key={j}
-                          onClick={() => resolve(i, 'link', t)}
-                          className="w-full text-left px-3 py-2 text-sm hover:bg-blue-50 flex items-center gap-3"
-                        >
-                          <span className="font-mono font-medium text-slate-700 shrink-0 w-20 truncate">{t.STYLE}</span>
-                          <span className="text-slate-500 flex-1 truncate">{t.COLOR}</span>
-                          <span className="text-slate-400 shrink-0">{t.SIZE}</span>
-                        </button>
+                        <div key={j} className="flex items-center">
+                          <button
+                            onClick={() => resolve(i, 'link', t)}
+                            className="flex-1 text-left px-3 py-2 text-sm hover:bg-blue-50 flex items-center gap-3 min-w-0"
+                          >
+                            <span className="font-mono font-medium text-slate-700 shrink-0 w-20 truncate">{t.STYLE}</span>
+                            <span className="text-slate-500 flex-1 truncate">{t.COLOR}</span>
+                            <span className="text-slate-400 shrink-0">{t.SIZE}</span>
+                          </button>
+                          <button
+                            onClick={() => addComboComponent(i, t)}
+                            className="mr-2 shrink-0 rounded-md border border-indigo-100 px-2 py-1 text-xs text-indigo-600 hover:bg-indigo-50"
+                            title="Add this row to a combo set"
+                          >
+                            Set +
+                          </button>
+                        </div>
                       ))}
                     </div>
                   )}
