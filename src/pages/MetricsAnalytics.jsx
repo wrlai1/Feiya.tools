@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react'
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import {
   BarChart, Bar, ComposedChart, Legend, LineChart, Line, ScatterChart, Scatter,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -16,6 +17,7 @@ import {
   fetchStoreProducts, saveStoreProducts, fetchAnalyticsSettings, saveAnalyticsSettings,
   fetchAnalyticsEvents, restoreAnalyticsEvent,
 } from '../utils/api.js'
+import { formatISODate, loadSalesSummary } from '../utils/salesSummary.js'
 
 const todayISO = () => {
   const d = new Date()
@@ -300,6 +302,7 @@ async function parsePerformanceFile(file) {
         spu,
         productId: normalizeId(r['商品ID']),
         productName: String(r['商品名称'] ?? '').trim(),
+        color: String(r['颜色'] ?? r['商品颜色'] ?? r['SKU颜色'] ?? r['Color'] ?? r['color'] ?? '').trim(),
         region: String(r['当前区域'] ?? '').trim(),
         site: String(r['商品站点'] ?? '').trim(),
         spend: spendMoney.value,
@@ -661,21 +664,15 @@ function daySeries(rows, products = []) {
   })
 }
 
-function timeframeRange(tf, customFrom, customTo) {
-  const to = todayISO()
+function timeframeRange(tf, customFrom, customTo, anchorDay = todayISO()) {
+  const to = anchorDay || todayISO()
   if (tf === 'yesterday') {
-    const d = new Date()
-    d.setDate(d.getDate() - 1)
-    d.setMinutes(d.getMinutes() - d.getTimezoneOffset())
-    const day = d.toISOString().slice(0, 10)
+    const day = addDaysISO(to, -1)
     return { from: day, to: day }
   }
   if (tf === '7d' || tf === '14d' || tf === '30d') {
-    const d = new Date()
     const days = tf === '7d' ? 7 : tf === '14d' ? 14 : 30
-    d.setDate(d.getDate() - (days - 1))
-    d.setMinutes(d.getMinutes() - d.getTimezoneOffset())
-    return { from: d.toISOString().slice(0, 10), to }
+    return { from: addDaysISO(to, -(days - 1)), to }
   }
   if (tf === 'custom') return { from: customFrom, to: customTo }
   return { from: to, to }
@@ -833,8 +830,12 @@ function buildAnomalies(products, trends, totals, storeDays, range, settings = D
 
 export default function MetricsAnalytics() {
   const toast = useToast()
+  const [searchParams] = useSearchParams()
+  const initialStore = searchParams.get('store') || ''
+  const initialProduct = normalizeId(searchParams.get('spu'))
+  const deepLinkScrollPending = useRef(Boolean(initialProduct))
   const [stores, setStores] = useState([])
-  const [activeStore, setActiveStore] = useState('')
+  const [activeStore, setActiveStore] = useState(initialStore)
   const [newStore, setNewStore] = useState('')
   const [products, setProducts] = useState([])
   const [storeRows, setStoreRows] = useState([])
@@ -849,8 +850,8 @@ export default function MetricsAnalytics() {
   const [tableFilter, setTableFilter] = useState('all')
   const [matrixSort, setMatrixSort] = useState('units_desc')
   const [matrixQuery, setMatrixQuery] = useState('')
-  const [selectedProduct, setSelectedProduct] = useState('')
-  const [autoFocusProduct, setAutoFocusProduct] = useState(true)
+  const [selectedProduct, setSelectedProduct] = useState(initialProduct)
+  const [autoFocusProduct, setAutoFocusProduct] = useState(!initialProduct)
   const [storeComparison, setStoreComparison] = useState([])
   const [comparisonLoading, setComparisonLoading] = useState(false)
   const [targets, setTargets] = useState(DEFAULT_TARGETS)
@@ -864,10 +865,16 @@ export default function MetricsAnalytics() {
   const [uploadSummary, setUploadSummary] = useState(null)
   const [storeHealth, setStoreHealth] = useState([])
   const [storeHealthLoading, setStoreHealthLoading] = useState(false)
+  const [salesSummary, setSalesSummary] = useState(null)
+  const [salesSummaryLoading, setSalesSummaryLoading] = useState(false)
 
+  const activeDataDay = useMemo(() => {
+    const value = stores.find((store) => store.name === activeStore)?.last_day
+    return String(value || todayISO()).slice(0, 10)
+  }, [stores, activeStore])
   const currentRange = useMemo(
-    () => timeframeRange(timeframe, customFrom, customTo),
-    [timeframe, customFrom, customTo],
+    () => timeframeRange(timeframe, customFrom, customTo, activeDataDay),
+    [timeframe, customFrom, customTo, activeDataDay],
   )
 
   const reloadStores = useCallback(async () => {
@@ -885,6 +892,20 @@ export default function MetricsAnalytics() {
   }, [])
 
   useEffect(() => { reloadStores() }, [reloadStores])
+
+  useEffect(() => {
+    let cancelled = false
+    if (!stores.length) {
+      setSalesSummary(null)
+      return () => { cancelled = true }
+    }
+    setSalesSummaryLoading(true)
+    loadSalesSummary(stores)
+      .then((summary) => { if (!cancelled) setSalesSummary(summary) })
+      .catch(() => { if (!cancelled) setSalesSummary(null) })
+      .finally(() => { if (!cancelled) setSalesSummaryLoading(false) })
+    return () => { cancelled = true }
+  }, [stores])
 
   const loadProducts = useCallback(async (store) => {
     if (!store) { setProducts([]); return }
@@ -910,7 +931,7 @@ export default function MetricsAnalytics() {
 
   const loadWindow = useCallback(async () => {
     if (!activeStore) { setStoreRows([]); setStoreDays([]); return }
-    const { from, to } = timeframeRange(timeframe, customFrom, customTo)
+    const { from, to } = timeframeRange(timeframe, customFrom, customTo, activeDataDay)
     if (!from || !to) return
     setLoading(true)
     try {
@@ -923,7 +944,7 @@ export default function MetricsAnalytics() {
     } finally {
       setLoading(false)
     }
-  }, [activeStore, timeframe, customFrom, customTo])
+  }, [activeStore, timeframe, customFrom, customTo, activeDataDay])
 
   useEffect(() => {
     loadProducts(activeStore)
@@ -1023,9 +1044,25 @@ export default function MetricsAnalytics() {
   }, [productRows, tableFilter, matrixSort, matrixQuery])
 
   useEffect(() => {
+    const isInitialDeepLink = initialProduct
+      && activeStore === initialStore
+      && timeframe === '7d'
+      && !customFrom
+      && !customTo
+    if (isInitialDeepLink) {
+      setAutoFocusProduct(false)
+      setSelectedProduct(initialProduct)
+      return
+    }
     setAutoFocusProduct(true)
     setSelectedProduct('')
-  }, [activeStore, timeframe, customFrom, customTo])
+  }, [activeStore, timeframe, customFrom, customTo, initialProduct, initialStore])
+
+  useEffect(() => {
+    if (!deepLinkScrollPending.current || !selectedProduct || !productChoices.length) return
+    deepLinkScrollPending.current = false
+    document.getElementById('spu-sku-focus')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }, [selectedProduct, productChoices])
 
   useEffect(() => {
     if (!autoFocusProduct || selectedProduct || !starProduct) return
@@ -1037,7 +1074,7 @@ export default function MetricsAnalytics() {
     async function loadStoreComparison() {
       const query = normalizeId(selectedProduct)
       if (!query || !stores.length) { setStoreComparison([]); return }
-      const { from, to } = timeframeRange(timeframe, customFrom, customTo)
+      const { from, to } = currentRange
       if (!from || !to) return
       setComparisonLoading(true)
       try {
@@ -1066,13 +1103,13 @@ export default function MetricsAnalytics() {
     }
     loadStoreComparison()
     return () => { cancelled = true }
-  }, [selectedProduct, stores, timeframe, customFrom, customTo, targets])
+  }, [selectedProduct, stores, currentRange, targets])
 
   useEffect(() => {
     let cancelled = false
     async function loadStoreHealth() {
       if (!stores.length) { setStoreHealth([]); return }
-      const { from, to } = timeframeRange(timeframe, customFrom, customTo)
+      const { from, to } = currentRange
       if (!from || !to) return
       setStoreHealthLoading(true)
       try {
@@ -1106,7 +1143,7 @@ export default function MetricsAnalytics() {
     }
     loadStoreHealth()
     return () => { cancelled = true }
-  }, [stores, timeframe, customFrom, customTo, targets])
+  }, [stores, currentRange, targets])
 
   const saveTargets = async (nextTargets) => {
     const normalized = { ...DEFAULT_TARGETS, ...nextTargets }
@@ -1346,7 +1383,7 @@ export default function MetricsAnalytics() {
   }
 
   const applyDeletePreset = (preset) => {
-    const range = timeframeRange(preset, customFrom, customTo)
+    const range = timeframeRange(preset, customFrom, customTo, activeDataDay)
     if (range.from && range.to) {
       setDeleteFrom(range.from)
       setDeleteTo(range.to)
@@ -1389,7 +1426,13 @@ export default function MetricsAnalytics() {
 
   return (
     <div className="space-y-6 max-w-7xl">
-      <FloatingStoreSwitcher stores={stores} activeStore={activeStore} setActiveStore={setActiveStore} />
+      <FloatingStoreSwitcher
+        stores={stores}
+        activeStore={activeStore}
+        setActiveStore={setActiveStore}
+        summary={salesSummary}
+        loading={salesSummaryLoading}
+      />
 
       <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-4">
         <div>
@@ -1398,13 +1441,27 @@ export default function MetricsAnalytics() {
         </div>
       </div>
 
+      <DateRangeControl
+        timeframe={timeframe}
+        setTimeframe={setTimeframe}
+        customFrom={customFrom}
+        customTo={customTo}
+        setCustomFrom={setCustomFrom}
+        setCustomTo={setCustomTo}
+        loadWindow={loadWindow}
+        activeStore={activeStore}
+        loading={loading}
+        storeDays={storeDays}
+        anchorDay={activeDataDay}
+      />
+
       <section className="card p-5 space-y-4">
         <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
           <div>
             <h2 className="font-semibold text-slate-800">Stores</h2>
             <p className="text-xs text-slate-400 mt-0.5">
               {activeStore
-                ? `当前店铺：${activeStore} · 显示数据：${currentRange.from && currentRange.to ? `${currentRange.from} 到 ${currentRange.to}` : '请选择时间'}`
+                ? `当前店铺：${activeStore} · 显示数据：${currentRange.from && currentRange.to ? `${formatISODate(currentRange.from)} - ${formatISODate(currentRange.to)}` : '请选择时间'}`
                 : '选择一个店铺后，上传、产品档案和数据分析都会绑定到这个店铺。'}
             </p>
           </div>
@@ -1697,37 +1754,11 @@ export default function MetricsAnalytics() {
       </section>
 
       {!visibleRows.length ? (
-        <>
-          <DateRangeControl
-            timeframe={timeframe}
-            setTimeframe={setTimeframe}
-            customFrom={customFrom}
-            customTo={customTo}
-            setCustomFrom={setCustomFrom}
-            setCustomTo={setCustomTo}
-            loadWindow={loadWindow}
-            activeStore={activeStore}
-            loading={loading}
-            storeDays={storeDays}
-          />
-          <div className="card p-8 text-center text-slate-400">
-            {activeStore ? '上传一份表现数据，或选择有数据的时间范围。' : '先创建或选择店铺。'}
-          </div>
-        </>
+        <div className="card p-8 text-center text-slate-400">
+          {activeStore ? '上传一份表现数据，或选择有数据的时间范围。' : '先创建或选择店铺。'}
+        </div>
       ) : (
         <>
-          <DateRangeControl
-            timeframe={timeframe}
-            setTimeframe={setTimeframe}
-            customFrom={customFrom}
-            customTo={customTo}
-            setCustomFrom={setCustomFrom}
-            setCustomTo={setCustomTo}
-            loadWindow={loadWindow}
-            activeStore={activeStore}
-            loading={loading}
-            storeDays={storeDays}
-          />
           <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
             <KPICard title="Units" value={count(totals.units)} subtitle={`${count(totals.orders)} orders`} icon={Package} color="blue" />
             <KPICard title="Revenue" value={money(totals.revenue)} subtitle={`${ratio(totals.roas)} ROAS`} icon={TrendingUp} color="teal" />
@@ -1795,13 +1826,14 @@ export default function MetricsAnalytics() {
   )
 }
 
-function FloatingStoreSwitcher({ stores, activeStore, setActiveStore }) {
+function FloatingStoreSwitcher({ stores, activeStore, setActiveStore, summary, loading }) {
   const [open, setOpen] = useState(false)
   const active = stores.find((s) => s.name === activeStore)
+  const trend = summary?.trend?.slice(-14) || []
   return (
-    <div className="fixed right-5 bottom-5 z-40">
+    <div className="fixed bottom-3 right-3 z-40 w-64 max-w-[calc(100vw-1.5rem)] sm:w-72 lg:bottom-5 lg:right-5">
       {open && (
-        <div className="mb-2 w-72 rounded-lg border border-slate-200 bg-white shadow-xl overflow-hidden">
+        <div className="mb-2 rounded-lg border border-slate-200 bg-white shadow-xl overflow-hidden">
           <div className="px-3 py-2 border-b border-slate-100">
             <div className="text-xs font-semibold text-slate-500 uppercase">Switch Store</div>
           </div>
@@ -1822,12 +1854,70 @@ function FloatingStoreSwitcher({ stores, activeStore, setActiveStore }) {
       )}
       <button
         onClick={() => setOpen((v) => !v)}
-        className="rounded-lg border border-blue-200 bg-white px-4 py-3 text-left shadow-xl hover:border-blue-300 min-w-56"
+        className="grid w-full grid-cols-3 items-center gap-2 rounded-lg border border-blue-200 bg-white px-3 py-2 text-left shadow-xl sm:hidden"
       >
-        <div className="text-[11px] uppercase font-semibold text-blue-500">Current Store</div>
-        <div className="font-semibold text-slate-800 truncate">{activeStore || '未选择店铺'}</div>
-        <div className="text-xs text-slate-400 mt-0.5">{active ? `${active.days || 0} days · ${active.spuCount || 0} SPU` : 'Click to switch'}</div>
+        <div>
+          <div className="text-[9px] font-semibold uppercase text-blue-500">Latest {summary?.latestDay?.slice(5).replace('-', '/') || '-'}</div>
+          <div className="text-lg font-bold text-slate-800">{loading ? '-' : count(summary?.latestUnits || 0)}</div>
+        </div>
+        <div className="border-x border-slate-100 px-2 text-center">
+          <div className="text-[9px] uppercase text-slate-400">7-day avg</div>
+          <div className="text-lg font-semibold text-teal-700">{loading ? '-' : count(summary?.sevenDayAverage || 0)}</div>
+        </div>
+        <div className="min-w-0 text-right">
+          <div className="text-[9px] uppercase text-slate-400">Store</div>
+          <div className="truncate text-xs font-semibold text-slate-700">{activeStore || '未选择'}</div>
+        </div>
       </button>
+      <div className="hidden overflow-hidden rounded-lg border border-blue-200 bg-white shadow-xl sm:block">
+        <div className="px-3 py-2 sm:px-4 sm:pb-0 sm:pt-3">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <div className="text-[11px] font-semibold uppercase text-blue-500">All Stores Sales</div>
+              <div className="mt-1 text-xl font-bold text-slate-800 sm:text-2xl">
+                {loading ? '-' : count(summary?.latestUnits || 0)}
+                <span className="ml-1 text-xs font-medium text-slate-400">units</span>
+              </div>
+              <div className="text-[11px] text-slate-400">
+                Latest day {summary?.latestDay ? formatISODate(summary.latestDay) : '-'}
+              </div>
+            </div>
+            <div className="text-right">
+              <div className="text-[10px] uppercase text-slate-400">7-day avg</div>
+              <div className="text-lg font-semibold text-teal-700">{loading ? '-' : count(summary?.sevenDayAverage || 0)}</div>
+              <div className="text-[10px] text-slate-400">units / day</div>
+            </div>
+          </div>
+          <div className="mt-2 hidden h-20 sm:block">
+            {trend.length ? (
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={trend} margin={{ top: 6, right: 3, left: 3, bottom: 2 }}>
+                  <Tooltip
+                    formatter={(value) => [count(value), 'All-store units']}
+                    labelFormatter={(label) => formatISODate(label)}
+                    contentStyle={{ borderRadius: 8, borderColor: '#e2e8f0', fontSize: 11 }}
+                  />
+                  <Line type="monotone" dataKey="units" stroke="#2563eb" strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
+                </LineChart>
+              </ResponsiveContainer>
+            ) : (
+              <div className="flex h-full items-center justify-center text-xs text-slate-400">No daily sales trend</div>
+            )}
+          </div>
+        </div>
+        <button
+          onClick={() => setOpen((v) => !v)}
+          className="flex w-full items-center justify-between border-t border-slate-100 px-4 py-2.5 text-left hover:bg-slate-50"
+        >
+          <div className="min-w-0">
+            <div className="text-[10px] font-semibold uppercase text-slate-400">Current Store</div>
+            <div className="truncate text-sm font-semibold text-slate-700">{activeStore || '未选择店铺'}</div>
+          </div>
+          <div className="ml-3 flex-shrink-0 text-right text-[10px] text-slate-400">
+            {active ? `${active.days || 0} days · ${active.spuCount || 0} SPU` : 'Switch store'}
+          </div>
+        </button>
+      </div>
     </div>
   )
 }
@@ -2097,8 +2187,9 @@ function DateRangeControl({
   activeStore,
   loading,
   storeDays,
+  anchorDay,
 }) {
-  const range = timeframeRange(timeframe, customFrom, customTo)
+  const range = timeframeRange(timeframe, customFrom, customTo, anchorDay)
   const days = dateSpan(range.from, range.to, 62)
   const savedDayMap = new Map((storeDays || []).map((d) => [d.day, d]))
   const missingCount = days.filter((day) => !savedDayMap.has(day)).length
@@ -2116,7 +2207,7 @@ function DateRangeControl({
         <div>
           <h2 className="font-semibold text-slate-800">数据时间</h2>
           <p className="text-xs text-slate-400 mt-0.5">
-            当前显示：{range.from && range.to ? `${range.from} 到 ${range.to}` : '请选择开始和结束日期'}
+            当前显示：{range.from && range.to ? `${formatISODate(range.from)} - ${formatISODate(range.to)}` : '请选择开始和结束日期'}
           </p>
           {days.length > 0 && (
             <p className="text-xs text-slate-400 mt-0.5">
@@ -2154,7 +2245,7 @@ function DateRangeControl({
           <div className="grid grid-cols-7 gap-1.5">
             {days.map((day) => {
               const saved = savedDayMap.get(day)
-              const isToday = day === todayISO()
+              const isLatest = day === anchorDay
               return (
                 <button
                   key={day}
@@ -2168,7 +2259,7 @@ function DateRangeControl({
                     saved
                       ? 'border-blue-200 bg-blue-50 text-blue-700 hover:border-blue-300'
                       : 'border-slate-200 bg-slate-100 text-slate-400 hover:border-slate-300'
-                  } ${isToday ? 'ring-1 ring-blue-400' : ''}`}
+                  } ${isLatest ? 'ring-1 ring-blue-400' : ''}`}
                   title={saved ? `${day} · ${saved.rowCount || 0} rows uploaded` : `${day} · no data uploaded`}
                 >
                   <span className="block font-semibold">{day.slice(5).replace('-', '/')}</span>

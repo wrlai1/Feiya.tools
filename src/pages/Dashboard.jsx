@@ -1,249 +1,260 @@
-import React, { useMemo, useState, useEffect } from 'react'
+import React, { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
-  BarChart,
-  Bar,
+  CartesianGrid,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
   XAxis,
   YAxis,
-  CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
 } from 'recharts'
 import {
-  Package,
-  Hash,
-  AlertTriangle,
-  MapPin,
+  ArrowDownRight,
   ArrowRight,
-  Truck,
-  MessageSquare,
-  Clock,
+  ArrowUpRight,
+  BarChart3,
+  CalendarDays,
+  Package,
+  Palette,
+  TrendingUp,
 } from 'lucide-react'
 import KPICard from '../components/KPICard.jsx'
-import { relativeTime, getGreeting } from '../utils/dateUtils.js'
-import { fetchInventory, fetchMessages } from '../utils/api.js'
+import { fetchStores } from '../utils/api.js'
+import { formatISODate, loadSalesSummary, shiftISODate } from '../utils/salesSummary.js'
 
-const SAMPLE_CHART_DATA = [
-  { location: 'Warehouse A', count: 342 },
-  { location: 'Warehouse B', count: 218 },
-  { location: 'Section C',   count: 156 },
-  { location: 'Storage D',   count: 89  },
-  { location: 'Floor E',     count: 67  },
-  { location: 'Zone F',      count: 45  },
-]
-
-const CustomTooltip = ({ active, payload, label }) => {
-  if (active && payload && payload.length) {
-    return (
-      <div className="bg-white border border-slate-200 rounded-lg shadow-lg px-3 py-2">
-        <p className="text-xs font-semibold text-slate-700">{label}</p>
-        <p className="text-sm text-blue-600 font-bold mt-0.5">{payload[0].value} items</p>
-      </div>
-    )
-  }
-  return null
+const EMPTY_SUMMARY = {
+  latestDay: '',
+  from: '',
+  trend: [],
+  latestUnits: 0,
+  sevenDayTotal: 0,
+  thirtyDayAverage: 0,
+  topProducts: [],
+  topColors: [],
+  storeCount: 0,
+  latestStoreCount: 0,
+  availableDayCount: 0,
 }
 
-const activityTypeIcon = (type) => {
-  switch (type) {
-    case 'upload':   return <Package       className="w-4 h-4 text-blue-500"   />
-    case 'tracking': return <Truck         className="w-4 h-4 text-teal-500"   />
-    case 'note':     return <MessageSquare className="w-4 h-4 text-purple-500" />
-    case 'search':   return <Hash          className="w-4 h-4 text-orange-500" />
-    default:         return <Clock         className="w-4 h-4 text-slate-400"  />
+function units(value) {
+  return Math.round(Number(value) || 0).toLocaleString('en-US')
+}
+
+function shortDate(day) {
+  return day ? day.slice(5).replace('-', '/') : '-'
+}
+
+function changeLabel(row) {
+  if (row.isNew) return { text: 'New', className: 'text-blue-600 bg-blue-50', icon: TrendingUp }
+  if (row.change == null) return { text: '-', className: 'text-slate-400 bg-slate-50', icon: null }
+  const up = row.change >= 0
+  return {
+    text: `${up ? '+' : ''}${(row.change * 100).toFixed(0)}%`,
+    className: up ? 'text-green-700 bg-green-50' : 'text-red-700 bg-red-50',
+    icon: up ? ArrowUpRight : ArrowDownRight,
   }
+}
+
+function colorSwatch(name) {
+  const value = String(name || '').toLowerCase()
+  const colors = [
+    ['black', '#111827'], ['white', '#ffffff'], ['navy', '#1e3a8a'], ['blue', '#3b82f6'],
+    ['red', '#ef4444'], ['green', '#22c55e'], ['pink', '#ec4899'], ['purple', '#a855f7'],
+    ['yellow', '#eab308'], ['orange', '#f97316'], ['brown', '#92400e'], ['khaki', '#b9a66a'],
+    ['beige', '#d6c7a1'], ['gray', '#94a3b8'], ['grey', '#94a3b8'],
+    ['黑', '#111827'], ['白', '#ffffff'], ['蓝', '#3b82f6'], ['红', '#ef4444'],
+    ['绿', '#22c55e'], ['粉', '#ec4899'], ['紫', '#a855f7'], ['黄', '#eab308'],
+  ]
+  return colors.find(([key]) => value.includes(key))?.[1] || '#cbd5e1'
+}
+
+function SalesTooltip({ active, payload, label }) {
+  if (!active || !payload?.length) return null
+  const row = payload[0]?.payload || {}
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 shadow-lg">
+      <p className="text-xs font-semibold text-slate-700">{formatISODate(label)}</p>
+      <p className="mt-0.5 text-sm font-bold text-blue-700">{units(payload[0].value)} units</p>
+      <p className="text-[11px] text-slate-400">{row.storeCount || 0} stores reported</p>
+    </div>
+  )
+}
+
+function RankingList({ title, icon: Icon, rows, type }) {
+  return (
+    <section className="card p-4">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <Icon className="h-4 w-4 text-slate-500" />
+          <h3 className="font-semibold text-slate-800">{title}</h3>
+        </div>
+        <span className="text-[11px] text-slate-400">Last 7 days</span>
+      </div>
+      <div className="divide-y divide-slate-100">
+        {rows.map((row, index) => {
+          const change = changeLabel(row)
+          const ChangeIcon = change.icon
+          const content = (
+            <>
+              <div className="flex min-w-0 flex-1 items-center gap-2.5">
+                <span className="w-4 flex-shrink-0 text-xs font-semibold text-slate-400">{index + 1}</span>
+                {type === 'color' && (
+                  <span
+                    className="h-4 w-4 flex-shrink-0 rounded-sm border border-slate-300"
+                    style={{ backgroundColor: colorSwatch(row.label) }}
+                    title={row.label}
+                  />
+                )}
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-medium text-slate-700">
+                    {type === 'product' ? row.sku || row.spu : row.label}
+                  </p>
+                  {type === 'product' && (
+                    <p className="truncate text-[11px] text-slate-400">{row.productName || `SPU ${row.spu}`}</p>
+                  )}
+                </div>
+              </div>
+              <div className="ml-3 flex flex-shrink-0 items-center gap-2">
+                <span className="text-sm font-semibold text-slate-700">{units(row.units)}</span>
+                <span className={`inline-flex min-w-12 items-center justify-center gap-0.5 rounded-md px-1.5 py-0.5 text-[10px] font-semibold ${change.className}`}>
+                  {ChangeIcon && <ChangeIcon className="h-3 w-3" />}
+                  {change.text}
+                </span>
+                {type === 'product' && <ArrowRight className="h-3.5 w-3.5 text-slate-300" />}
+              </div>
+            </>
+          )
+          return type === 'product' ? (
+            <Link
+              key={row.key}
+              to={`/analytics?store=${encodeURIComponent(row.topStore)}&spu=${encodeURIComponent(row.spu)}`}
+              className="flex min-h-12 items-center py-2 hover:bg-slate-50"
+            >
+              {content}
+            </Link>
+          ) : (
+            <div key={row.key} className="flex min-h-12 items-center py-2">{content}</div>
+          )
+        })}
+        {!rows.length && (
+          <div className="flex min-h-28 items-center justify-center px-4 text-center text-sm text-slate-400">
+            {type === 'color' ? '销售报表暂时没有颜色数据' : '最近 7 天没有款式销量数据'}
+          </div>
+        )}
+      </div>
+    </section>
+  )
 }
 
 export default function Dashboard() {
-  const [inventoryData, setInventoryData] = useState([])
-  const [notes, setNotes] = useState([])
-  const [isLoading, setIsLoading] = useState(true)
+  const [summary, setSummary] = useState(EMPTY_SUMMARY)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
 
   useEffect(() => {
     let cancelled = false
     async function load() {
+      setLoading(true)
       try {
-        const [invResult, msgs] = await Promise.all([fetchInventory(), fetchMessages()])
+        const storeResult = await fetchStores()
+        const next = await loadSalesSummary(storeResult.stores || [])
+        if (!cancelled) setSummary(next)
+      } catch (err) {
         if (!cancelled) {
-          setInventoryData(invResult.rows || [])
-          setNotes(msgs)
+          setSummary(EMPTY_SUMMARY)
+          setError('Sales data could not be loaded. Please refresh the page.')
         }
-      } catch {
-        // fail silently — dashboard is read-only
       } finally {
-        if (!cancelled) setIsLoading(false)
+        if (!cancelled) setLoading(false)
       }
     }
     load()
     return () => { cancelled = true }
   }, [])
 
-  const kpis = useMemo(() => {
-    if (!inventoryData.length) return { totalSKUs: 0, totalItems: 0, lowStock: 0, locations: 0 }
-    return {
-      totalSKUs:  new Set(inventoryData.map((r) => r.style)).size,
-      totalItems: inventoryData.reduce((s, r) => s + (r.quantity || 0), 0),
-      lowStock:   inventoryData.filter((r) => r.quantity < 10 && r.quantity >= 0).length,
-      locations:  new Set(inventoryData.map((r) => r.location).filter(Boolean)).size,
-    }
-  }, [inventoryData])
-
-  const chartData = useMemo(() => {
-    if (!inventoryData.length) return SAMPLE_CHART_DATA
-    const byLocation = {}
-    inventoryData.forEach((r) => {
-      if (r.location) byLocation[r.location] = (byLocation[r.location] || 0) + (r.quantity || 0)
-    })
-    return Object.entries(byLocation)
-      .sort(([, a], [, b]) => b - a)
-      .slice(0, 8)
-      .map(([location, count]) => ({ location, count }))
-  }, [inventoryData])
-
-  // Build recent activity feed from notes + inventory presence
-  const recentActivity = useMemo(() => {
-    const items = []
-    if (inventoryData.length > 0) {
-      items.push({ id: 'inv', text: `Inventory loaded — ${inventoryData.length.toLocaleString()} rows`, time: new Date().toISOString(), type: 'upload' })
-    }
-    notes.slice(-4).reverse().forEach((msg) => {
-      items.push({ id: msg.id, text: `${msg.name}: "${msg.text}"`, time: msg.created_at, type: 'note' })
-    })
-    return items.slice(0, 5)
-  }, [inventoryData, notes])
-
-  const isDemo = inventoryData.length === 0
+  const sevenFrom = summary.latestDay ? shiftISODate(summary.latestDay, -6) : ''
+  const dateRange = summary.latestDay
+    ? `${formatISODate(summary.from)} - ${formatISODate(summary.latestDay)}`
+    : 'No sales dates available'
 
   return (
-    <div className="space-y-6 max-w-7xl">
-      {/* Greeting */}
-      <div>
-        <h2 className="text-2xl font-bold text-slate-800">
-          {getGreeting()}, Feiya Team 👋
-        </h2>
-        <p className="text-slate-500 text-sm mt-1">
-          {isLoading
-            ? 'Loading shared data…'
-            : isDemo
-            ? 'Welcome! Upload your inventory file to get started.'
-            : `You have ${kpis.lowStock} low stock alert${kpis.lowStock !== 1 ? 's' : ''} to review.`}
-        </p>
+    <div className="max-w-7xl space-y-5">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <h2 className="text-2xl font-bold text-slate-800">Sales Overview</h2>
+          <p className="mt-1 text-sm text-slate-500">All stores combined. Open Analytics for product and store details.</p>
+        </div>
+        <div className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 shadow-sm">
+          <CalendarDays className="h-4 w-4 text-blue-600" />
+          <div>
+            <p className="text-[10px] font-semibold uppercase text-slate-400">Data period</p>
+            <p className="text-sm font-semibold text-slate-700">{loading ? 'Loading...' : dateRange}</p>
+          </div>
+        </div>
       </div>
 
-      {/* KPI Cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+      {error && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">{error}</div>
+      )}
+
+      <section className="grid grid-cols-1 gap-4 sm:grid-cols-3">
         <KPICard
-          title="Total SKUs"
-          value={kpis.totalSKUs}
-          subtitle={isDemo ? 'Upload inventory to populate' : 'Unique style numbers'}
-          icon={Hash}
+          title="Latest Day Sales"
+          value={loading ? '-' : units(summary.latestUnits)}
+          subtitle={summary.latestDay ? `${formatISODate(summary.latestDay)} · ${summary.latestStoreCount}/${summary.storeCount} stores` : 'No sales data'}
+          icon={Package}
           color="blue"
         />
         <KPICard
-          title="Total Items"
-          value={kpis.totalItems}
-          subtitle={isDemo ? 'Upload inventory to populate' : 'Across all locations'}
-          icon={Package}
+          title="Last 7 Days"
+          value={loading ? '-' : units(summary.sevenDayTotal)}
+          subtitle={summary.latestDay ? `${formatISODate(sevenFrom)} - ${formatISODate(summary.latestDay)}` : 'No sales data'}
+          icon={BarChart3}
           color="teal"
         />
         <KPICard
-          title="Low Stock Alerts"
-          value={kpis.lowStock}
-          subtitle="Items with quantity < 10"
-          icon={AlertTriangle}
-          color={kpis.lowStock > 0 ? 'orange' : 'green'}
+          title="30-Day Daily Average"
+          value={loading ? '-' : units(summary.thirtyDayAverage)}
+          subtitle={summary.availableDayCount ? `Based on ${summary.availableDayCount} days with data` : 'No sales data'}
+          icon={TrendingUp}
+          color="orange"
         />
-        <KPICard
-          title="Active Locations"
-          value={kpis.locations}
-          subtitle="Warehouse locations"
-          icon={MapPin}
-          color="purple"
-        />
-      </div>
+      </section>
 
-      {/* Chart + Activity */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <div className="card p-5 lg:col-span-2">
-          <div className="flex items-center justify-between mb-4">
+      <section className="grid grid-cols-1 gap-4 xl:grid-cols-3">
+        <div className="card p-5 xl:col-span-2">
+          <div className="mb-4 flex items-start justify-between gap-3">
             <div>
-              <h3 className="font-semibold text-slate-800">Inventory by Location</h3>
-              {isDemo && <p className="text-xs text-slate-400 mt-0.5">Showing sample data</p>}
+              <h3 className="font-semibold text-slate-800">Daily Sales Trend</h3>
+              <p className="mt-0.5 text-xs text-slate-400">Daily units from all stores</p>
             </div>
+            <Link to="/analytics" className="inline-flex items-center gap-1 text-xs font-medium text-blue-600 hover:text-blue-700">
+              Analytics <ArrowRight className="h-3.5 w-3.5" />
+            </Link>
           </div>
-          <ResponsiveContainer width="100%" height={240}>
-            <BarChart data={chartData} margin={{ top: 4, right: 8, left: -16, bottom: 4 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
-              <XAxis dataKey="location" tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
-              <YAxis tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
-              <Tooltip content={<CustomTooltip />} cursor={{ fill: '#f1f5f9' }} />
-              <Bar dataKey="count" fill="#2563eb" radius={[4, 4, 0, 0]} maxBarSize={48} />
-            </BarChart>
-          </ResponsiveContainer>
+          {summary.trend.length ? (
+            <ResponsiveContainer width="100%" height={310}>
+              <LineChart data={summary.trend} margin={{ top: 8, right: 12, left: -8, bottom: 4 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
+                <XAxis dataKey="day" tickFormatter={shortDate} tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} minTickGap={24} />
+                <YAxis tickFormatter={units} tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} width={52} />
+                <Tooltip content={<SalesTooltip />} />
+                <Line type="monotone" dataKey="units" name="Daily Units" stroke="#2563eb" strokeWidth={2.5} dot={{ r: 2.5, fill: '#ffffff', strokeWidth: 2 }} activeDot={{ r: 5 }} />
+              </LineChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="flex h-[310px] items-center justify-center text-sm text-slate-400">
+              {loading ? 'Loading sales trend...' : 'No sales trend available'}
+            </div>
+          )}
         </div>
 
-        <div className="card p-5">
-          <h3 className="font-semibold text-slate-800 mb-4">Recent Activity</h3>
-          <div className="space-y-3">
-            {recentActivity.length === 0 ? (
-              <p className="text-sm text-slate-400 py-4 text-center">No activity yet</p>
-            ) : (
-              recentActivity.map((item) => (
-                <div key={item.id} className="flex items-start gap-3">
-                  <div className="w-7 h-7 rounded-lg bg-slate-100 flex items-center justify-center flex-shrink-0 mt-0.5">
-                    {activityTypeIcon(item.type)}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm text-slate-700 leading-snug truncate">{item.text}</p>
-                    <p className="text-xs text-slate-400 mt-0.5">{relativeTime(item.time)}</p>
-                  </div>
-                </div>
-              ))
-            )}
-          </div>
+        <div className="space-y-4">
+          <RankingList title="Top Styles" icon={Package} rows={summary.topProducts} type="product" />
+          <RankingList title="Top Colors" icon={Palette} rows={summary.topColors} type="color" />
         </div>
-      </div>
-
-      {/* Quick Actions */}
-      <div className="card p-5">
-        <h3 className="font-semibold text-slate-800 mb-4">Quick Actions</h3>
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-          <Link to="/inventory" className="flex items-center gap-3 p-4 rounded-xl bg-blue-50 hover:bg-blue-100 border border-blue-200 transition-colors group">
-            <div className="w-10 h-10 rounded-xl bg-blue-600 flex items-center justify-center shadow-sm">
-              <Package className="w-5 h-5 text-white" />
-            </div>
-            <div className="flex-1 min-w-0">
-              <p className="text-sm font-semibold text-blue-800">Check Inventory</p>
-              <p className="text-xs text-blue-500">Upload & search stock</p>
-            </div>
-            <ArrowRight className="w-4 h-4 text-blue-400 group-hover:translate-x-1 transition-transform" />
-          </Link>
-
-          <Link to="/tracking" className="flex items-center gap-3 p-4 rounded-xl bg-teal-50 hover:bg-teal-100 border border-teal-200 transition-colors group">
-            <div className="w-10 h-10 rounded-xl bg-teal-600 flex items-center justify-center shadow-sm">
-              <Truck className="w-5 h-5 text-white" />
-            </div>
-            <div className="flex-1 min-w-0">
-              <p className="text-sm font-semibold text-teal-800">Search Tracking</p>
-              <p className="text-xs text-teal-500">Look up shipments</p>
-            </div>
-            <ArrowRight className="w-4 h-4 text-teal-400 group-hover:translate-x-1 transition-transform" />
-          </Link>
-
-          <Link to="/notes" className="flex items-center gap-3 p-4 rounded-xl bg-purple-50 hover:bg-purple-100 border border-purple-200 transition-colors group">
-            <div className="w-10 h-10 rounded-xl bg-purple-600 flex items-center justify-center shadow-sm">
-              <MessageSquare className="w-5 h-5 text-white" />
-            </div>
-            <div className="flex-1 min-w-0">
-              <p className="text-sm font-semibold text-purple-800">Add Note</p>
-              <p className="text-xs text-purple-500">
-                {notes.length > 0 ? `${notes.length} team message${notes.length !== 1 ? 's' : ''}` : 'Low inventory alerts'}
-              </p>
-            </div>
-            <ArrowRight className="w-4 h-4 text-purple-400 group-hover:translate-x-1 transition-transform" />
-          </Link>
-        </div>
-      </div>
+      </section>
     </div>
   )
 }
