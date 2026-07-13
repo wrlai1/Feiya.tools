@@ -18,6 +18,7 @@ import {
   fetchAnalyticsEvents, restoreAnalyticsEvent,
 } from '../utils/api.js'
 import { formatISODate, loadSalesSummary } from '../utils/salesSummary.js'
+import { buildSmartDecisions } from '../utils/smartDecisionEngine.js'
 
 const todayISO = () => {
   const d = new Date()
@@ -379,6 +380,8 @@ function aggregateBySpu(rows, products, settings = DEFAULT_TARGETS) {
       category: product.category || '',
       lifecycle: product.lifecycle || '',
       skuType: product.skuType || '',
+      newProductImportedAt: product.newProductImportedAt || null,
+      isNewProduct: Boolean(product.newProductImportedAt || /新品|new/i.test(product.lifecycle || '')),
       unitMultiplier: multiplier,
       frontPrice: product.frontPrice ?? null,
       couponPrice: product.couponPrice ?? null,
@@ -704,130 +707,6 @@ function missingDaysInRange(range, savedDays) {
   return days.filter((day) => !saved.has(day))
 }
 
-function alertMetricsForProduct(p) {
-  return [
-    ['Impressions', count(p.impressions)],
-    ['Clicks', count(p.clicks)],
-    ['CTR', pct(p.ctr)],
-    ['CVR', pct(p.conversionRate)],
-    ['Spend', money(p.spend)],
-    ['Orders', count(p.orders)],
-    ['ROAS', ratio(p.roas)],
-  ]
-}
-
-function buildAnomalies(products, trends, totals, storeDays, range, settings = DEFAULT_TARGETS) {
-  const items = []
-  const missing = missingDaysInRange(range, storeDays)
-  if (missing.length) {
-    items.push({
-      type: 'missing',
-      severity: 'warn',
-      title: `${missing.length} 天没有上传数据`,
-      detail: `需要补：${missing.slice(0, 6).join(', ')}${missing.length > 6 ? ' ...' : ''}`,
-      recommendation: '先补齐每日数据，再判断产品趋势。缺数据会让 7/14/30 天趋势和报警失真。',
-      daily: missing.slice(0, 10).map((day) => ({ day, status: 'Missing' })),
-    })
-  }
-
-  for (const p of products) {
-    const label = p.sku || p.spu
-    const productMeta = { spu: p.spu, sku: p.sku, label, productName: p.productName }
-    const exposureAnalysis = `${count(p.impressions)} impressions · ${pct(p.ctr)} CTR · ${count(p.clicks)} clicks. 曝光够但 CTR 低时先看主图/标题；曝光少但 CVR 好时更像是缺流量。`
-    if ((p.spend || 0) >= settings.stopLossSpend && (p.orders || 0) === 0) {
-      items.push({
-        type: 'spend',
-        severity: 'bad',
-        product: productMeta,
-        title: `${label} 花费无单`,
-        detail: `${money(p.spend)} spend · ${count(p.impressions)} impressions · 0 orders`,
-        metrics: alertMetricsForProduct(p),
-        exposureAnalysis,
-        benchmark: `止损线 ${money(settings.stopLossSpend)}，当前 ${money(p.spend)} 且 0 单。`,
-        recommendation: '先降低预算或暂停测试，再检查价格、首图、coupon、评价和落地页承接。如果点击也少，先不要直接判断转化。',
-      })
-    } else if ((p.clicks || 0) >= settings.minClicks && (p.conversionRate ?? 0) < settings.conversionTarget) {
-      items.push({
-        type: 'conversion',
-        severity: 'bad',
-        product: productMeta,
-        title: `${label} 点击有，转化弱`,
-        detail: `${count(p.impressions)} impressions · ${count(p.clicks)} clicks · ${pct(p.conversionRate)} CVR`,
-        metrics: alertMetricsForProduct(p),
-        exposureAnalysis,
-        benchmark: `转化目标 ${pct(settings.conversionTarget)}，当前 ${pct(p.conversionRate)}。`,
-        recommendation: '优先看价格是否偏高、coupon 是否弱、尺码/颜色是否缺、评价和详情页是否影响下单。CTR 不低但 CVR 低时，通常不是流量问题。',
-      })
-    } else if ((p.impressions || 0) >= settings.minImpressions && (p.ctr ?? 0) < settings.ctrTarget) {
-      items.push({
-        type: 'ctr',
-        severity: 'warn',
-        product: productMeta,
-        title: `${label} 曝光够但 CTR 低`,
-        detail: `${count(p.impressions)} impressions · ${pct(p.ctr)} CTR`,
-        metrics: alertMetricsForProduct(p),
-        exposureAnalysis,
-        benchmark: `曝光判断量 ${count(settings.minImpressions)}，当前 ${count(p.impressions)}；CTR 目标 ${pct(settings.ctrTarget)}，当前 ${pct(p.ctr)}。`,
-        recommendation: '优先改主图、标题关键词、首图卖点和价格展示。CTR 低说明曝光有了，但用户不想点。',
-      })
-    } else if ((p.cartRate ?? 0) >= settings.cartRateTarget && (p.conversionRate ?? 0) < settings.conversionTarget) {
-      items.push({
-        type: 'cart',
-        severity: 'warn',
-        product: productMeta,
-        title: `${label} 加购不成单`,
-        detail: `${count(p.impressions)} impressions · ${pct(p.cartRate)} cart · ${pct(p.conversionRate)} CVR`,
-        metrics: alertMetricsForProduct(p),
-        exposureAnalysis,
-        benchmark: `加购率 ${pct(p.cartRate)} 达标，但 CVR ${pct(p.conversionRate)} 低于 ${pct(settings.conversionTarget)}。`,
-        recommendation: '用户有兴趣但没付款，优先检查最终价格、coupon、运费/承诺、竞品价差和尺码库存。',
-      })
-    }
-  }
-
-  const sortedTrends = [...(trends || [])].sort((a, b) => String(a.day).localeCompare(String(b.day)))
-  const last = sortedTrends[sortedTrends.length - 1]
-  const prev = sortedTrends[sortedTrends.length - 2]
-  if (last && prev) {
-    if ((last.spend || 0) > (prev.spend || 0) * 1.5 && (last.orders || 0) <= (prev.orders || 0)) {
-      items.push({
-        type: 'daily-spend',
-        severity: 'warn',
-        title: `${last.day} 花费上升但订单没涨`,
-        detail: `${money(prev.spend)} -> ${money(last.spend)} · orders ${count(prev.orders)} -> ${count(last.orders)}`,
-        metrics: [['Prev spend', money(prev.spend)], ['Last spend', money(last.spend)], ['Prev impressions', count(prev.impressions)], ['Last impressions', count(last.impressions)], ['Prev orders', count(prev.orders)], ['Last orders', count(last.orders)], ['Last CTR', pct(last.ctr)], ['Last CVR', pct(last.conversionRate)]],
-        daily: [prev, last],
-        recommendation: '先确认是不是预算或流量突然放大。如果点击增长但订单没涨，看 CVR；如果曝光涨但点击没涨，看 CTR 和主图。',
-      })
-    }
-    if ((prev.conversionRate || 0) > 0 && (last.conversionRate || 0) < prev.conversionRate * 0.6) {
-      items.push({
-        type: 'daily-cvr',
-        severity: 'warn',
-        title: `${last.day} 转化率明显下降`,
-        detail: `${pct(prev.conversionRate)} -> ${pct(last.conversionRate)}`,
-        metrics: [['Prev CVR', pct(prev.conversionRate)], ['Last CVR', pct(last.conversionRate)], ['Prev impressions', count(prev.impressions)], ['Last impressions', count(last.impressions)], ['Last clicks', count(last.clicks)], ['Last orders', count(last.orders)], ['Last spend', money(last.spend)], ['Last ROAS', ratio(last.roas)]],
-        daily: [prev, last],
-        recommendation: '检查当天价格、coupon、库存、竞品活动、页面评价或物流承诺是否变化。点击还在但转化掉，通常是承接问题。',
-      })
-    }
-  }
-
-  if ((totals.spend || 0) > 0 && (totals.roas || 0) < settings.roasTarget * 0.6) {
-    items.push({
-      type: 'store-roas',
-      severity: 'bad',
-      title: '当前时间范围 ROAS 偏低',
-      detail: `${ratio(totals.roas)} vs target ${ratio(settings.roasTarget)}`,
-      metrics: [['Spend', money(totals.spend)], ['Revenue', money(totals.revenue)], ['Orders', count(totals.orders)], ['Units', count(totals.units)], ['CTR', pct(totals.ctr)], ['CVR', pct(totals.conversionRate)]],
-      benchmark: `目标 ROAS ${ratio(settings.roasTarget)}，当前 ${ratio(totals.roas)}。`,
-      recommendation: '先从高花费低转化的 SPU 下手，不要平均降预算。保留 ROAS 好的款，暂停或降预算拖累整体的款。',
-    })
-  }
-
-  return items.slice(0, 12)
-}
-
 export default function MetricsAnalytics() {
   const toast = useToast()
   const [searchParams] = useSearchParams()
@@ -840,6 +719,8 @@ export default function MetricsAnalytics() {
   const [products, setProducts] = useState([])
   const [storeRows, setStoreRows] = useState([])
   const [storeDays, setStoreDays] = useState([])
+  const [previousStoreRows, setPreviousStoreRows] = useState([])
+  const [previousStoreDays, setPreviousStoreDays] = useState(null)
   const [draftReport, setDraftReport] = useState(null)
   const [uploadDate, setUploadDate] = useState(todayISO())
   const [timeframe, setTimeframe] = useState('7d')
@@ -865,6 +746,7 @@ export default function MetricsAnalytics() {
   const [uploadSummary, setUploadSummary] = useState(null)
   const [storeHealth, setStoreHealth] = useState([])
   const [storeHealthLoading, setStoreHealthLoading] = useState(false)
+  const [crossStoreProducts, setCrossStoreProducts] = useState([])
   const [salesSummary, setSalesSummary] = useState(null)
   const [salesSummaryLoading, setSalesSummaryLoading] = useState(false)
 
@@ -876,6 +758,14 @@ export default function MetricsAnalytics() {
     () => timeframeRange(timeframe, customFrom, customTo, activeDataDay),
     [timeframe, customFrom, customTo, activeDataDay],
   )
+  const previousRange = useMemo(() => {
+    const days = dateSpan(currentRange.from, currentRange.to, 62).length
+    if (!days || !currentRange.from) return { from: '', to: '' }
+    return {
+      from: addDaysISO(currentRange.from, -days),
+      to: addDaysISO(currentRange.from, -1),
+    }
+  }, [currentRange])
 
   const reloadStores = useCallback(async () => {
     try {
@@ -955,6 +845,31 @@ export default function MetricsAnalytics() {
   }, [loadWindow])
 
   useEffect(() => {
+    let cancelled = false
+    if (!activeStore || !previousRange.from || !previousRange.to) {
+      setPreviousStoreRows([])
+      setPreviousStoreDays(null)
+      return () => { cancelled = true }
+    }
+    setPreviousStoreRows([])
+    setPreviousStoreDays(null)
+    fetchStoreRange(activeStore, previousRange.from, previousRange.to)
+      .then((res) => {
+        if (!cancelled) {
+          setPreviousStoreRows(res.rows || [])
+          setPreviousStoreDays(res.days || [])
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setPreviousStoreRows([])
+          setPreviousStoreDays([])
+        }
+      })
+    return () => { cancelled = true }
+  }, [activeStore, previousRange])
+
+  useEffect(() => {
     if (storeSettingsOpen) loadAnalyticsEvents()
   }, [storeSettingsOpen, loadAnalyticsEvents])
 
@@ -986,6 +901,10 @@ export default function MetricsAnalytics() {
   )
   const totals = useMemo(() => aggregateTotals(visibleRows, products), [visibleRows, products])
   const productRows = useMemo(() => aggregateBySpu(visibleRows, products, targets), [visibleRows, products, targets])
+  const previousProductRows = useMemo(
+    () => aggregateBySpu(previousStoreRows, products, targets),
+    [previousStoreRows, products, targets],
+  )
   const starProduct = productRows[0] || null
   const productChoices = useMemo(() => {
     const map = new Map()
@@ -1020,8 +939,18 @@ export default function MetricsAnalytics() {
   )
   const trends = useMemo(() => daySeries(visibleRows, products), [visibleRows, products])
   const anomalies = useMemo(
-    () => buildAnomalies(productRows, trends, totals, storeDays, currentRange, targets),
-    [productRows, trends, totals, storeDays, currentRange, targets],
+    () => buildSmartDecisions({
+      products: productRows,
+      previousProducts: previousProductRows,
+      crossStoreProducts,
+      activeStore,
+      missingDays: missingDaysInRange(currentRange, storeDays),
+      previousMissingDays: previousStoreDays === null ? null : missingDaysInRange(previousRange, previousStoreDays),
+      totals,
+      trends,
+      settings: targets,
+    }),
+    [productRows, previousProductRows, crossStoreProducts, activeStore, totals, trends, storeDays, previousStoreDays, currentRange, previousRange, targets],
   )
   const relationPoints = useMemo(() => productRows
     .map((p) => ({ ...p, x: p[metricX], y: p.units }))
@@ -1108,13 +1037,14 @@ export default function MetricsAnalytics() {
   useEffect(() => {
     let cancelled = false
     async function loadStoreHealth() {
-      if (!stores.length) { setStoreHealth([]); return }
+      if (!stores.length) { setStoreHealth([]); setCrossStoreProducts([]); return }
       const { from, to } = currentRange
       if (!from || !to) return
       setStoreHealthLoading(true)
+      setCrossStoreProducts([])
       try {
         const rangeDays = dateSpan(from, to, 62)
-        const rows = await Promise.all(stores.map(async (store) => {
+        const results = await Promise.all(stores.map(async (store) => {
           const storeName = store.name
           const [productRes, rangeRes] = await Promise.all([
             fetchStoreProducts(storeName).catch(() => ({ products: [] })),
@@ -1128,15 +1058,21 @@ export default function MetricsAnalytics() {
           const missing = rangeDays.filter((day) => !saved.has(day))
           const attention = productsForStore.filter((p) => p.status === 'bad' || p.decision === '点击有，转化弱' || p.decision === '花费无单，控预算').length
           return {
-            store: storeName,
-            spuCount: store.spuCount || storeProducts.length || 0,
-            days: rangeRes.days?.length || 0,
-            missingDays: missing.length,
-            attention,
-            ...totalsForStore,
+            health: {
+              store: storeName,
+              spuCount: store.spuCount || storeProducts.length || 0,
+              days: rangeRes.days?.length || 0,
+              missingDays: missing.length,
+              attention,
+              ...totalsForStore,
+            },
+            products: productsForStore.map((product) => ({ ...product, store: storeName })),
           }
         }))
-        if (!cancelled) setStoreHealth(rows.sort((a, b) => (b.units || 0) - (a.units || 0)))
+        if (!cancelled) {
+          setStoreHealth(results.map((result) => result.health).sort((a, b) => (b.units || 0) - (a.units || 0)))
+          setCrossStoreProducts(results.flatMap((result) => result.products))
+        }
       } finally {
         if (!cancelled) setStoreHealthLoading(false)
       }
@@ -2750,35 +2686,69 @@ function UploadSummaryCard({ summary, onClear }) {
 }
 
 function NeedsAttentionPanel({ items, onFocusProduct }) {
+  const confidenceText = { high: 'High confidence', medium: 'Medium confidence', low: 'Low confidence' }
+  const confidenceClass = {
+    high: 'bg-emerald-100 text-emerald-700',
+    medium: 'bg-amber-100 text-amber-700',
+    low: 'bg-slate-100 text-slate-600',
+  }
+  const severityClass = {
+    bad: 'border-red-200 bg-red-50/70',
+    warn: 'border-amber-200 bg-amber-50/70',
+    watch: 'border-blue-200 bg-blue-50/60',
+  }
+  const iconClass = { bad: 'text-red-600', warn: 'text-amber-600', watch: 'text-blue-600' }
   return (
     <section className="card p-5">
       <div className="flex items-center justify-between mb-4">
         <div>
-          <h2 className="font-semibold text-slate-800">Needs Attention</h2>
-          <p className="text-xs text-slate-400 mt-0.5">自动找出缺数据、花费异常、点击转化弱和日趋势异常。</p>
+          <h2 className="font-semibold text-slate-800">Needs Attention · Smart Decision Maker</h2>
+          <p className="text-xs text-slate-400 mt-0.5">用漏斗、前一周期、店内基准和跨店同款，给出一个最优先动作。</p>
         </div>
         <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${items.length ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700'}`}>
-          {items.length ? `${items.length} alerts` : 'OK'}
+          {items.length ? `${items.length} decisions` : 'OK'}
         </span>
       </div>
       {items.length ? (
-        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+        <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
           {items.map((item, index) => (
-            <div key={`${item.type}-${index}`} className={`group relative rounded-lg border p-3 ${item.severity === 'bad' ? 'border-red-200 bg-red-50' : 'border-amber-200 bg-amber-50'}`}>
+            <article key={`${item.type}-${item.product?.spu || index}`} className={`rounded-lg border p-4 ${severityClass[item.severity] || severityClass.warn}`}>
               <div className="flex items-start gap-2">
-                <AlertTriangle className={`mt-0.5 h-4 w-4 ${item.severity === 'bad' ? 'text-red-600' : 'text-amber-600'}`} />
+                <AlertTriangle className={`mt-0.5 h-4 w-4 flex-shrink-0 ${iconClass[item.severity] || iconClass.warn}`} />
                 <div className="min-w-0 flex-1">
-                  <div className="text-sm font-semibold text-slate-800">{item.title}</div>
-                  <div className="text-xs text-slate-500 mt-0.5">{item.detail}</div>
-                  {item.product?.spu && (
-                    <button
-                      type="button"
-                      onClick={() => onFocusProduct?.(item.product)}
-                      className="mt-2 inline-flex rounded-md border border-white/70 bg-white/80 px-2 py-1 text-[11px] font-semibold text-blue-700 shadow-sm hover:border-blue-200 hover:bg-blue-50"
-                    >
-                      SPU {item.product.spu}
-                    </button>
-                  )}
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div>
+                      <div className="text-sm font-semibold text-slate-800">{item.title || item.product?.label || 'Store decision'}</div>
+                      {item.product?.productName && <div className="mt-0.5 line-clamp-1 text-[11px] text-slate-500">{item.product.productName}</div>}
+                    </div>
+                    <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${confidenceClass[item.confidence?.level] || confidenceClass.low}`}>
+                      {confidenceText[item.confidence?.level] || confidenceText.low}
+                    </span>
+                  </div>
+
+                  <div className="mt-3 rounded-md bg-white/80 px-3 py-2">
+                    <div className="text-[10px] font-semibold uppercase text-blue-600">Smart Decision</div>
+                    <div className="mt-0.5 text-sm font-bold text-slate-800">{item.decision}</div>
+                    <p className="mt-1 text-xs leading-5 text-slate-600">{item.cause}</p>
+                  </div>
+
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    {item.product?.spu && (
+                      <button
+                        type="button"
+                        onClick={() => onFocusProduct?.(item.product)}
+                        className="inline-flex rounded-md border border-white bg-white/90 px-2 py-1 text-[11px] font-semibold text-blue-700 shadow-sm hover:border-blue-200 hover:bg-blue-50"
+                      >
+                        SPU {item.product.spu}
+                      </button>
+                    )}
+                    {item.estimateUnits > 0 && (
+                      <span className="rounded-md bg-emerald-100 px-2 py-1 text-[11px] font-semibold text-emerald-700">
+                        Estimated opportunity +{count(item.estimateUnits)} units
+                      </span>
+                    )}
+                  </div>
+
                   {item.metrics && (
                     <div className="mt-2 grid grid-cols-2 gap-1.5">
                       {item.metrics.slice(0, 4).map(([label, value]) => (
@@ -2786,13 +2756,66 @@ function NeedsAttentionPanel({ items, onFocusProduct }) {
                       ))}
                     </div>
                   )}
-                  {item.recommendation && (
-                    <div className="mt-2 text-[11px] leading-4 text-slate-600 line-clamp-2">{item.recommendation}</div>
-                  )}
+
+                  <div className="mt-3 text-xs leading-5 text-slate-700">
+                    <span className="font-semibold">Next action: </span>{item.action}
+                  </div>
+
+                  <details className="mt-3 rounded-md border border-white/80 bg-white/60 px-3 py-2 text-xs text-slate-600">
+                    <summary className="cursor-pointer font-semibold text-slate-700">查看完整判断依据</summary>
+                    <div className="mt-3 space-y-3">
+                      <div>
+                        <div className="font-semibold text-slate-700">可信度</div>
+                        <p className="mt-0.5 leading-5">{item.confidence?.reason}</p>
+                      </div>
+                      {item.evidence?.length > 0 && (
+                        <div>
+                          <div className="font-semibold text-slate-700">比较依据</div>
+                          <ul className="mt-1 space-y-1 pl-4 list-disc">
+                            {item.evidence.map((evidence) => <li key={evidence}>{evidence}</li>)}
+                          </ul>
+                        </div>
+                      )}
+                      {item.possibleCauses?.length > 0 && (
+                        <div>
+                          <div className="font-semibold text-slate-700">可能原因</div>
+                          <ul className="mt-1 space-y-1 pl-4 list-disc">
+                            {item.possibleCauses.map((cause) => <li key={cause}>{cause}</li>)}
+                          </ul>
+                        </div>
+                      )}
+                      {item.metrics?.length > 4 && (
+                        <div className="grid grid-cols-2 gap-1.5">
+                          {item.metrics.slice(4).map(([label, value]) => <MetricMini key={label} label={label} value={value} />)}
+                        </div>
+                      )}
+                      {item.daily?.length > 0 && (
+                        <div>
+                          <div className="font-semibold text-slate-700">每日数据</div>
+                          <div className="mt-1 space-y-1">
+                            {item.daily.slice(-5).map((day) => (
+                              <div key={day.day} className="rounded-md bg-white/80 px-2 py-1">
+                                {day.status
+                                  ? `${day.day}: ${day.status}`
+                                  : `${day.day}: ${count(day.units)} units · ${count(day.impressions)} impressions · ${pct(day.ctr)} CTR · ${pct(day.conversionRate)} CVR`}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      <div>
+                        <div className="font-semibold text-slate-700">不要同时做</div>
+                        <p className="mt-0.5 leading-5">{item.avoid}</p>
+                      </div>
+                      <div>
+                        <div className="font-semibold text-slate-700">复查条件</div>
+                        <p className="mt-0.5 leading-5">{item.review}</p>
+                      </div>
+                    </div>
+                  </details>
                 </div>
               </div>
-              <AttentionTooltip item={item} />
-            </div>
+            </article>
           ))}
         </div>
       ) : (
@@ -2801,59 +2824,6 @@ function NeedsAttentionPanel({ items, onFocusProduct }) {
         </div>
       )}
     </section>
-  )
-}
-
-function AttentionTooltip({ item }) {
-  if (!item.metrics && !item.daily && !item.recommendation && !item.benchmark) return null
-  return (
-    <div className="pointer-events-none absolute left-3 right-3 top-full z-20 mt-2 hidden rounded-lg border border-slate-200 bg-white p-3 text-xs text-slate-600 shadow-xl group-hover:block">
-      {item.benchmark && (
-        <div className="mb-2 rounded-md bg-slate-50 px-2 py-1.5">
-          <div className="font-semibold text-slate-700">差在哪里</div>
-          <div className="mt-0.5">{item.benchmark}</div>
-        </div>
-      )}
-      {item.product?.spu && (
-        <div className="mb-2 rounded-md bg-blue-50 px-2 py-1.5 text-blue-700">
-          <div className="font-semibold">SPU {item.product.spu}</div>
-          <div className="mt-0.5">{item.product.productName || item.product.sku || item.product.label}</div>
-        </div>
-      )}
-      {item.exposureAnalysis && (
-        <div className="mb-2 rounded-md bg-slate-50 px-2 py-1.5">
-          <div className="font-semibold text-slate-700">曝光分析</div>
-          <div className="mt-0.5">{item.exposureAnalysis}</div>
-        </div>
-      )}
-      {item.metrics && (
-        <div className="mb-2 grid grid-cols-2 gap-1.5">
-          {item.metrics.map(([label, value]) => (
-            <MetricMini key={label} label={label} value={value} />
-          ))}
-        </div>
-      )}
-      {item.daily && item.daily.length > 0 && (
-        <div className="mb-2">
-          <div className="font-semibold text-slate-700 mb-1">每日数据</div>
-          <div className="space-y-1">
-            {item.daily.slice(-5).map((day) => (
-              <div key={day.day} className="rounded-md bg-slate-50 px-2 py-1">
-                {day.status
-                  ? `${day.day}: ${day.status}`
-                  : `${day.day}: impressions ${count(day.impressions)} · clicks ${count(day.clicks)} · CTR ${pct(day.ctr)} · CVR ${pct(day.conversionRate)} · orders ${count(day.orders)} · spend ${money(day.spend)}`}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-      {item.recommendation && (
-        <div>
-          <div className="font-semibold text-slate-700">建议动作</div>
-          <div className="mt-0.5 leading-5">{item.recommendation}</div>
-        </div>
-      )}
-    </div>
   )
 }
 
