@@ -6,7 +6,7 @@ import {
 } from 'recharts'
 import {
   AlertTriangle, BarChart3, Calendar, CheckCircle, Package, Plus,
-  History, RotateCcw, Save, Trash2, TrendingUp, Upload,
+  Download, History, NotebookPen, RotateCcw, Save, Trash2, TrendingUp, Upload, X,
 } from 'lucide-react'
 import FileUploadZone from '../components/FileUploadZone.jsx'
 import KPICard from '../components/KPICard.jsx'
@@ -15,7 +15,7 @@ import { parseCSV } from '../utils/autoDeductEngine.js'
 import {
   fetchStores, createStore, deleteStore, saveStoreDay, fetchStoreRange, deleteStoreRange,
   fetchStoreProducts, saveStoreProducts, fetchAnalyticsSettings, saveAnalyticsSettings,
-  fetchAnalyticsEvents, restoreAnalyticsEvent,
+  fetchAnalyticsEvents, restoreAnalyticsEvent, fetchDailyLogs, saveDailyLog as saveDailyLogApi,
 } from '../utils/api.js'
 import { formatISODate, loadSalesSummary } from '../utils/salesSummary.js'
 import { buildSmartDecisions } from '../utils/smartDecisionEngine.js'
@@ -719,6 +719,8 @@ export default function MetricsAnalytics() {
   const [products, setProducts] = useState([])
   const [storeRows, setStoreRows] = useState([])
   const [storeDays, setStoreDays] = useState([])
+  const [dailyLogs, setDailyLogs] = useState([])
+  const [dailyLogSaving, setDailyLogSaving] = useState(false)
   const [previousStoreRows, setPreviousStoreRows] = useState([])
   const [previousStoreDays, setPreviousStoreDays] = useState(null)
   const [draftReport, setDraftReport] = useState(null)
@@ -820,21 +822,46 @@ export default function MetricsAnalytics() {
   }, [activeStore])
 
   const loadWindow = useCallback(async () => {
-    if (!activeStore) { setStoreRows([]); setStoreDays([]); return }
+    if (!activeStore) { setStoreRows([]); setStoreDays([]); setDailyLogs([]); return }
     const { from, to } = timeframeRange(timeframe, customFrom, customTo, activeDataDay)
     if (!from || !to) return
     setLoading(true)
     try {
-      const res = await fetchStoreRange(activeStore, from, to)
+      const [res, logRes] = await Promise.all([
+        fetchStoreRange(activeStore, from, to),
+        fetchDailyLogs(activeStore, from, to).catch(() => ({ logs: [] })),
+      ])
       setStoreRows(res.rows || [])
       setStoreDays(res.days || [])
+      setDailyLogs(logRes.logs || [])
     } catch (err) {
       toast.error(err.message, '表现数据读取失败')
-      setStoreRows([]); setStoreDays([])
+      setStoreRows([]); setStoreDays([]); setDailyLogs([])
     } finally {
       setLoading(false)
     }
   }, [activeStore, timeframe, customFrom, customTo, activeDataDay])
+
+  const handleSaveDailyLog = async (day, note) => {
+    if (!activeStore || !day) return false
+    setDailyLogSaving(true)
+    try {
+      await saveDailyLogApi(activeStore, day, note)
+      const trimmed = note.trim()
+      setDailyLogs((current) => {
+        const next = current.filter((item) => item.day !== day)
+        if (trimmed) next.push({ day, note: trimmed })
+        return next.sort((a, b) => a.day.localeCompare(b.day))
+      })
+      toast.success(trimmed ? `${day} 的日志已保存` : `${day} 的日志已清除`, 'Daily Log')
+      return true
+    } catch (err) {
+      toast.error(err.message, '日志保存失败')
+      return false
+    } finally {
+      setDailyLogSaving(false)
+    }
+  }
 
   useEffect(() => {
     loadProducts(activeStore)
@@ -938,6 +965,11 @@ export default function MetricsAnalytics() {
     [selectedRows, products, selectedProductMatches, targets],
   )
   const trends = useMemo(() => daySeries(visibleRows, products), [visibleRows, products])
+  const dailyStats = useMemo(() => {
+    const map = {}
+    for (const item of daySeries(storeRows, products)) map[item.day] = item
+    return map
+  }, [storeRows, products])
   const anomalies = useMemo(
     () => buildSmartDecisions({
       products: productRows,
@@ -1389,6 +1421,10 @@ export default function MetricsAnalytics() {
         loading={loading}
         storeDays={storeDays}
         anchorDay={activeDataDay}
+        dailyLogs={dailyLogs}
+        dailyStats={dailyStats}
+        onSaveLog={handleSaveDailyLog}
+        logSaving={dailyLogSaving}
       />
 
       <section className="card p-5 space-y-4">
@@ -2124,11 +2160,22 @@ function DateRangeControl({
   loading,
   storeDays,
   anchorDay,
+  dailyLogs,
+  dailyStats,
+  onSaveLog,
+  logSaving,
 }) {
+  const [editingDay, setEditingDay] = useState('')
+  const [noteDraft, setNoteDraft] = useState('')
   const range = timeframeRange(timeframe, customFrom, customTo, anchorDay)
   const days = dateSpan(range.from, range.to, 62)
   const savedDayMap = new Map((storeDays || []).map((d) => [d.day, d]))
+  const logMap = new Map((dailyLogs || []).map((item) => [item.day, item]))
   const missingCount = days.filter((day) => !savedDayMap.has(day)).length
+  const loggedDays = days.filter((day) => logMap.get(day)?.note)
+  const summaryUnits = days.reduce((total, day) => total + (Number(dailyStats?.[day]?.units) || 0), 0)
+  const summaryRevenue = days.reduce((total, day) => total + (Number(dailyStats?.[day]?.revenue) || 0), 0)
+  const recentLogs = loggedDays.slice(-3).reverse()
   const options = [
     ['7d', '7 天'],
     ['14d', '14 天'],
@@ -2137,6 +2184,39 @@ function DateRangeControl({
     ['yesterday', '昨天'],
     ['custom', '自定义'],
   ]
+
+  useEffect(() => {
+    setEditingDay('')
+    setNoteDraft('')
+  }, [activeStore])
+
+  const openEditor = (day) => {
+    setEditingDay(day)
+    setNoteDraft(logMap.get(day)?.note || '')
+  }
+
+  const saveLog = async () => {
+    const saved = await onSaveLog(editingDay, noteDraft)
+    if (saved) setEditingDay('')
+  }
+
+  const exportDailyLog = () => {
+    const csvCell = (value) => `"${String(value ?? '').replace(/"/g, '""')}"`
+    const rows = days.map((day) => [
+      day,
+      Number(dailyStats?.[day]?.units) || 0,
+      (Number(dailyStats?.[day]?.revenue) || 0).toFixed(2),
+      logMap.get(day)?.note || '',
+    ])
+    const csv = `\ufeff日期,销量,销售额,Daily Log\n${rows.map((row) => row.map(csvCell).join(',')).join('\n')}`
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }))
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${activeStore || 'store'}-daily-log-${range.from}-${range.to}.csv`
+    link.click()
+    URL.revokeObjectURL(url)
+  }
+
   return (
     <section className="card p-4">
       <div className="flex flex-col xl:flex-row xl:items-center xl:justify-between gap-3">
@@ -2179,33 +2259,113 @@ function DateRangeControl({
       {days.length > 0 && (
         <div className="mt-4">
           <div className="grid grid-cols-7 gap-1.5">
-            {days.map((day) => {
+            {days.map((day, index) => {
               const saved = savedDayMap.get(day)
+              const log = logMap.get(day)
+              const stats = dailyStats?.[day]
               const isLatest = day === anchorDay
               return (
-                <button
-                  key={day}
-                  type="button"
-                  onClick={() => {
-                    setTimeframe('custom')
-                    setCustomFrom(day)
-                    setCustomTo(day)
-                  }}
-                  className={`min-h-12 rounded-md border px-1.5 py-1 text-left text-xs transition ${
-                    saved
-                      ? 'border-blue-200 bg-blue-50 text-blue-700 hover:border-blue-300'
-                      : 'border-slate-200 bg-slate-100 text-slate-400 hover:border-slate-300'
-                  } ${isLatest ? 'ring-1 ring-blue-400' : ''}`}
-                  title={saved ? `${day} · ${saved.rowCount || 0} rows uploaded` : `${day} · no data uploaded`}
-                >
-                  <span className="block font-semibold">{day.slice(5).replace('-', '/')}</span>
-                  <span className="mt-1 block text-[10px]">
-                    {saved ? `${saved.rowCount || 0} rows` : 'No data'}
-                  </span>
-                </button>
+                <div key={day} className="group relative">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setTimeframe('custom')
+                      setCustomFrom(day)
+                      setCustomTo(day)
+                    }}
+                    className={`min-h-12 w-full rounded-md border px-1.5 py-1 text-left text-xs transition ${
+                      saved
+                        ? 'border-blue-200 bg-blue-50 text-blue-700 hover:border-blue-300'
+                        : 'border-slate-200 bg-slate-100 text-slate-400 hover:border-slate-300'
+                    } ${isLatest ? 'ring-1 ring-blue-400' : ''}`}
+                  >
+                    <span className="flex items-center justify-between gap-1 font-semibold">
+                      {day.slice(5).replace('-', '/')}
+                      {log?.note && <NotebookPen className="h-3 w-3 text-amber-500" />}
+                    </span>
+                    <span className="mt-1 block truncate text-[10px]">
+                      {saved ? `销量 ${count(stats?.units || 0)}` : 'No data'}
+                    </span>
+                  </button>
+                  <div className={`pointer-events-none absolute top-full z-30 w-64 pt-1 opacity-0 transition group-hover:pointer-events-auto group-hover:opacity-100 ${index % 7 >= 5 ? 'right-0' : 'left-0'}`}>
+                    <div className="rounded-lg border border-slate-200 bg-white p-3 text-left shadow-xl">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-semibold text-slate-700">{formatISODate(day)}</span>
+                        <span className="text-[10px] text-slate-400">{saved ? '已上传数据' : '未上传数据'}</span>
+                      </div>
+                      <div className="mt-2 grid grid-cols-2 gap-2">
+                        <div className="rounded-md bg-blue-50 px-2 py-1.5">
+                          <div className="text-[10px] text-blue-500">销量</div>
+                          <div className="text-sm font-semibold text-blue-700">{count(stats?.units || 0)}</div>
+                        </div>
+                        <div className="rounded-md bg-emerald-50 px-2 py-1.5">
+                          <div className="text-[10px] text-emerald-500">销售额</div>
+                          <div className="text-sm font-semibold text-emerald-700">{money(stats?.revenue || 0)}</div>
+                        </div>
+                      </div>
+                      <div className="mt-2 rounded-md bg-amber-50 px-2 py-2">
+                        <div className="text-[10px] font-medium text-amber-600">Daily Log</div>
+                        <p className="mt-1 max-h-20 overflow-hidden whitespace-pre-wrap text-xs text-slate-600">
+                          {log?.note || '今天还没有记录。'}
+                        </p>
+                      </div>
+                      <button type="button" onClick={() => openEditor(day)} disabled={!activeStore} className="btn-secondary mt-2 w-full justify-center text-xs disabled:opacity-40">
+                        <NotebookPen className="h-3.5 w-3.5" /> {!activeStore ? '请先选择店铺' : log?.note ? '编辑日志' : '写日志'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
               )
             })}
           </div>
+          <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+              <div>
+                <div className="text-xs font-semibold text-slate-700">区间总结</div>
+                <p className="mt-1 text-xs text-slate-500">
+                  {days.length} 天 · 销量 {count(summaryUnits)} · 销售额 {money(summaryRevenue)} · {loggedDays.length} 天有日志
+                </p>
+                {recentLogs.length > 0 && (
+                  <div className="mt-2 space-y-1">
+                    {recentLogs.map((day) => (
+                      <p key={day} className="max-w-3xl truncate text-xs text-slate-600">
+                        <span className="font-medium text-slate-500">{day.slice(5).replace('-', '/')}：</span>{logMap.get(day)?.note}
+                      </p>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <button type="button" onClick={exportDailyLog} disabled={!activeStore} className="btn-secondary shrink-0 text-xs disabled:opacity-40">
+                <Download className="h-3.5 w-3.5" /> 导出 Daily Log
+              </button>
+            </div>
+          </div>
+          {editingDay && (
+            <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-semibold text-slate-700">{formatISODate(editingDay)} · Daily Log</div>
+                  <p className="text-xs text-slate-500">简单记录今天上了哪些款、调了什么设置、做了哪些动作。</p>
+                </div>
+                <button type="button" onClick={() => setEditingDay('')} className="rounded p-1 text-slate-400 hover:bg-white hover:text-slate-600">
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+              <textarea
+                className="metric-input mt-3 min-h-24 w-full"
+                maxLength={2000}
+                placeholder={'例如：\n• 上新 3 款：A123、A124、A125\n• 调整 A123 广告预算\n• 主图换成新版'}
+                value={noteDraft}
+                onChange={(event) => setNoteDraft(event.target.value)}
+              />
+              <div className="mt-2 flex items-center justify-between gap-3">
+                <span className="text-[10px] text-slate-400">{noteDraft.length}/2000 · 清空后保存可删除日志</span>
+                <button type="button" onClick={saveLog} disabled={logSaving} className="btn-primary text-xs disabled:opacity-50">
+                  <Save className="h-3.5 w-3.5" /> {logSaving ? '保存中' : '保存日志'}
+                </button>
+              </div>
+            </div>
+          )}
           {dateSpan(range.from, range.to, 63).length > 62 && (
             <p className="mt-2 text-xs text-slate-400">自定义范围太长，日历先显示前 62 天。</p>
           )}

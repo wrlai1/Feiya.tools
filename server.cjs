@@ -365,6 +365,17 @@ async function ensureAnalyticsStoreTables(sql) {
       created_at TIMESTAMPTZ DEFAULT NOW()
     )
   `;
+  await sql`
+    CREATE TABLE IF NOT EXISTS analytics_daily_logs (
+      username   TEXT NOT NULL,
+      store      TEXT NOT NULL,
+      day        DATE NOT NULL,
+      note       TEXT NOT NULL,
+      updated_by TEXT,
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (username, store, day)
+    )
+  `;
 }
 
 async function recordAnalyticsEvent(sql, username, actor, store, action, summary, details = {}, snapshot = null) {
@@ -651,6 +662,45 @@ app.all('/api/analytics-store', async (req, res) => {
         for (const r of dayRows) rows.push({ ...r, date: dayStr });
       }
       return res.json({ days: summary, rows });
+    }
+
+    if (req.method === 'GET' && action === 'daily-logs') {
+      const store = String(req.query.store || '').trim();
+      const { from, to } = req.query;
+      if (!store || !from || !to) return res.status(400).json({ error: 'store, from and to are required' });
+      const rows = await sql`
+        SELECT day, note, updated_by, updated_at
+        FROM analytics_daily_logs
+        WHERE username = ${username} AND store = ${store} AND day >= ${from} AND day <= ${to}
+        ORDER BY day
+      `;
+      return res.json({
+        logs: rows.map((row) => ({
+          day: analyticsDayString(row.day),
+          note: row.note,
+          updatedBy: row.updated_by,
+          updatedAt: row.updated_at,
+        })),
+      });
+    }
+
+    if (req.method === 'POST' && action === 'save-daily-log') {
+      const store = String(req.body?.store || '').trim();
+      const day = String(req.body?.day || '').slice(0, 10);
+      const note = String(req.body?.note || '').trim();
+      if (!store || !/^\d{4}-\d{2}-\d{2}$/.test(day)) return res.status(400).json({ error: 'store and a valid day are required' });
+      await sql`INSERT INTO analytics_stores (username, name) VALUES (${username}, ${store}) ON CONFLICT DO NOTHING`;
+      if (!note) {
+        await sql`DELETE FROM analytics_daily_logs WHERE username = ${username} AND store = ${store} AND day = ${day}`;
+        return res.json({ ok: true, deleted: true });
+      }
+      await sql`
+        INSERT INTO analytics_daily_logs (username, store, day, note, updated_by, updated_at)
+        VALUES (${username}, ${store}, ${day}, ${note}, ${actor}, NOW())
+        ON CONFLICT (username, store, day)
+        DO UPDATE SET note = EXCLUDED.note, updated_by = EXCLUDED.updated_by, updated_at = NOW()
+      `;
+      return res.json({ ok: true, log: { day, note, updatedBy: actor } });
     }
 
     if (req.method === 'DELETE' && action === 'delete-day') {
