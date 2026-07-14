@@ -1427,6 +1427,14 @@ export default function MetricsAnalytics() {
         logSaving={dailyLogSaving}
       />
 
+      <StoreDailyLogCard
+        stores={stores}
+        activeStore={activeStore}
+        setActiveStore={setActiveStore}
+        onSaveLog={handleSaveDailyLog}
+        saving={dailyLogSaving}
+      />
+
       <section className="card p-5 space-y-4">
         <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
           <div>
@@ -2371,6 +2379,80 @@ function DateRangeControl({
           )}
         </div>
       )}
+    </section>
+  )
+}
+
+function StoreDailyLogCard({ stores, activeStore, setActiveStore, onSaveLog, saving }) {
+  const [day, setDay] = useState(todayISO())
+  const [note, setNote] = useState('')
+  const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    if (!activeStore || !day) {
+      setNote('')
+      return () => { cancelled = true }
+    }
+    setLoading(true)
+    fetchDailyLogs(activeStore, day, day)
+      .then((result) => {
+        if (!cancelled) setNote(result.logs?.[0]?.note || '')
+      })
+      .catch(() => {
+        if (!cancelled) setNote('')
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+    return () => { cancelled = true }
+  }, [activeStore, day])
+
+  const save = async () => {
+    await onSaveLog(day, note)
+  }
+
+  return (
+    <section className="card p-5">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div>
+          <div className="flex items-center gap-2">
+            <NotebookPen className="h-5 w-5 text-amber-500" />
+            <h2 className="font-semibold text-slate-800">店铺 Daily Log</h2>
+          </div>
+          <p className="mt-1 text-xs text-slate-400">每家店、每一天单独保存。切换店铺或日期会自动载入之前的记录。</p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <select
+            className="metric-input min-w-44 !py-1.5 text-sm"
+            value={activeStore}
+            onChange={(event) => setActiveStore(event.target.value)}
+          >
+            <option value="">选择店铺</option>
+            {(stores || []).map((store) => <option key={store.name} value={store.name}>{store.name}</option>)}
+          </select>
+          <input type="date" className="metric-input !py-1.5 text-sm" value={day} onChange={(event) => setDay(event.target.value)} />
+        </div>
+      </div>
+
+      <div className="mt-4">
+        <textarea
+          className="metric-input min-h-28 w-full"
+          maxLength={2000}
+          disabled={!activeStore || loading}
+          placeholder={activeStore ? '记录今天上了哪些款、做了哪些调整、发现了什么问题……' : '请先选择一家店铺'}
+          value={note}
+          onChange={(event) => setNote(event.target.value)}
+        />
+        <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <span className="text-xs text-slate-400">
+            {loading ? '正在载入记录…' : activeStore ? `当前店铺：${activeStore} · ${note.length}/2000` : '每家店的日志互不影响'}
+          </span>
+          <button type="button" onClick={save} disabled={!activeStore || !day || loading || saving} className="btn-primary text-xs disabled:opacity-40">
+            <Save className="h-3.5 w-3.5" /> {saving ? '保存中' : '保存这家店的日志'}
+          </button>
+        </div>
+      </div>
     </section>
   )
 }
