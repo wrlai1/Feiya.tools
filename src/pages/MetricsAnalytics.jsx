@@ -68,6 +68,7 @@ const TREND_METRICS = [
   { key: 'carts', label: 'Carts', type: 'count', axis: 'left', color: '#f59e0b' },
 ]
 const DEFAULT_TREND_METRICS = ['dailyUnits', 'revenue', 'spend', 'ctr', 'conversionRate']
+const DAILY_LOG_TAGS = ['上新', '广告', '价格', '库存', '素材']
 const PRODUCT_TEXT_FIELDS = ['sku', 'productName', 'notes', 'category', 'sizeLine', 'lifecycle', 'skuType']
 const PRODUCT_NUMBER_FIELDS = ['unitMultiplier', 'cost', 'declaredPrice', 'frontPrice', 'couponPrice', 'grossProfit']
 const PRODUCT_PERCENT_FIELDS = ['grossMargin', 'discountRate']
@@ -842,18 +843,24 @@ export default function MetricsAnalytics() {
     }
   }, [activeStore, timeframe, customFrom, customTo, activeDataDay])
 
-  const handleSaveDailyLog = async (day, note) => {
+  const handleSaveDailyLog = async (day, note, details = null) => {
     if (!activeStore || !day) return false
     setDailyLogSaving(true)
     try {
-      await saveDailyLogApi(activeStore, day, note)
       const trimmed = note.trim()
+      const existing = dailyLogs.find((item) => item.day === day)
+      const metadata = details || {
+        tags: existing?.tags || [],
+        followUp: existing?.followUp || '',
+        followUpDone: Boolean(existing?.followUpDone),
+      }
+      await saveDailyLogApi(activeStore, day, trimmed, metadata)
       setDailyLogs((current) => {
         const next = current.filter((item) => item.day !== day)
-        if (trimmed) next.push({ day, note: trimmed })
+        if (trimmed || metadata.followUp) next.push({ day, note: trimmed, ...metadata })
         return next.sort((a, b) => a.day.localeCompare(b.day))
       })
-      toast.success(trimmed ? `${day} 的日志已保存` : `${day} 的日志已清除`, 'Daily Log')
+      toast.success(trimmed || metadata.followUp ? `${day} 的日志已保存` : `${day} 的日志已清除`, 'Daily Log')
       return true
     } catch (err) {
       toast.error(err.message, '日志保存失败')
@@ -2184,6 +2191,14 @@ function DateRangeControl({
   const summaryUnits = days.reduce((total, day) => total + (Number(dailyStats?.[day]?.units) || 0), 0)
   const summaryRevenue = days.reduce((total, day) => total + (Number(dailyStats?.[day]?.revenue) || 0), 0)
   const recentLogs = loggedDays.slice(-3).reverse()
+  const logImpacts = loggedDays.map((day) => {
+    const nextDay = addDaysISO(day, 1)
+    const units = Number(dailyStats?.[day]?.units) || 0
+    const nextUnits = Number(dailyStats?.[nextDay]?.units) || 0
+    if (!units || !dailyStats?.[nextDay]) return null
+    const change = (nextUnits - units) / units
+    return Math.abs(change) >= 0.2 ? { day, nextDay, change } : null
+  }).filter(Boolean).slice(-3).reverse()
   const options = [
     ['7d', '7 天'],
     ['14d', '14 天'],
@@ -2214,9 +2229,12 @@ function DateRangeControl({
       day,
       Number(dailyStats?.[day]?.units) || 0,
       (Number(dailyStats?.[day]?.revenue) || 0).toFixed(2),
+      (logMap.get(day)?.tags || []).join(' / '),
       logMap.get(day)?.note || '',
+      logMap.get(day)?.followUp || '',
+      logMap.get(day)?.followUpDone ? '已完成' : logMap.get(day)?.followUp ? '未完成' : '',
     ])
-    const csv = `\ufeff日期,销量,销售额,Daily Log\n${rows.map((row) => row.map(csvCell).join(',')).join('\n')}`
+    const csv = `\ufeff日期,销量,销售额,标签,Daily Log,后续动作,状态\n${rows.map((row) => row.map(csvCell).join(',')).join('\n')}`
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }))
     const link = document.createElement('a')
     link.href = url
@@ -2313,9 +2331,15 @@ function DateRangeControl({
                       </div>
                       <div className="mt-2 rounded-md bg-amber-50 px-2 py-2">
                         <div className="text-[10px] font-medium text-amber-600">Daily Log</div>
+                        {log?.tags?.length > 0 && (
+                          <div className="mt-1 flex flex-wrap gap-1">
+                            {log.tags.map((tag) => <span key={tag} className="rounded bg-white px-1.5 py-0.5 text-[10px] text-amber-700">{tag}</span>)}
+                          </div>
+                        )}
                         <p className="mt-1 max-h-20 overflow-hidden whitespace-pre-wrap text-xs text-slate-600">
                           {log?.note || '今天还没有记录。'}
                         </p>
+                        {log?.followUp && <p className="mt-1 text-[10px] text-slate-500">后续：{log.followUpDone ? '✓ ' : ''}{log.followUp}</p>}
                       </div>
                       <button type="button" onClick={() => openEditor(day)} disabled={!activeStore} className="btn-secondary mt-2 w-full justify-center text-xs disabled:opacity-40">
                         <NotebookPen className="h-3.5 w-3.5" /> {!activeStore ? '请先选择店铺' : log?.note ? '编辑日志' : '写日志'}
@@ -2338,6 +2362,16 @@ function DateRangeControl({
                     {recentLogs.map((day) => (
                       <p key={day} className="max-w-3xl truncate text-xs text-slate-600">
                         <span className="font-medium text-slate-500">{day.slice(5).replace('-', '/')}：</span>{logMap.get(day)?.note}
+                      </p>
+                    ))}
+                  </div>
+                )}
+                {logImpacts.length > 0 && (
+                  <div className="mt-2 rounded-md border border-violet-100 bg-violet-50 px-2.5 py-2">
+                    <div className="text-[10px] font-semibold text-violet-600">日志关联提醒（仅表示时间关联）</div>
+                    {logImpacts.map((impact) => (
+                      <p key={impact.day} className="mt-1 text-xs text-violet-700">
+                        {impact.day.slice(5).replace('-', '/')} 记录操作后，次日销量{impact.change >= 0 ? '上升' : '下降'} {Math.abs(impact.change * 100).toFixed(0)}%
                       </p>
                     ))}
                   </div>
@@ -2385,32 +2419,50 @@ function DateRangeControl({
 
 function StoreDailyLogCard({ stores, activeStore, setActiveStore, onSaveLog, saving }) {
   const [day, setDay] = useState(todayISO())
-  const [note, setNote] = useState('')
-  const [savedNote, setSavedNote] = useState('')
+  const [entry, setEntry] = useState({ note: '', tags: [], followUp: '', followUpDone: false })
+  const [savedEntry, setSavedEntry] = useState({ note: '', tags: [], followUp: '', followUpDone: false })
+  const [carryFrom, setCarryFrom] = useState('')
   const [loading, setLoading] = useState(false)
-  const hasSavedLog = Boolean(savedNote)
-  const hasChanges = note !== savedNote
+  const hasSavedLog = Boolean(savedEntry.note || savedEntry.followUp)
+  const hasChanges = JSON.stringify(entry) !== JSON.stringify(savedEntry)
 
   useEffect(() => {
     let cancelled = false
+    const empty = { note: '', tags: [], followUp: '', followUpDone: false }
     if (!activeStore || !day) {
-      setNote('')
-      setSavedNote('')
+      setEntry(empty)
+      setSavedEntry(empty)
+      setCarryFrom('')
       return () => { cancelled = true }
     }
     setLoading(true)
-    fetchDailyLogs(activeStore, day, day)
-      .then((result) => {
+    Promise.all([
+      fetchDailyLogs(activeStore, day, day),
+      fetchDailyLogs(activeStore, addDaysISO(day, -1), addDaysISO(day, -1)),
+    ])
+      .then(([currentResult, previousResult]) => {
         if (!cancelled) {
-          const existing = result.logs?.[0]?.note || ''
-          setNote(existing)
-          setSavedNote(existing)
+          const current = currentResult.logs?.[0]
+          const previous = previousResult.logs?.[0]
+          const existing = current ? {
+            note: current.note || '',
+            tags: current.tags || [],
+            followUp: current.followUp || '',
+            followUpDone: Boolean(current.followUpDone),
+          } : empty
+          const carried = !current && previous?.followUp && !previous.followUpDone
+            ? { ...empty, followUp: previous.followUp }
+            : existing
+          setEntry(carried)
+          setSavedEntry(existing)
+          setCarryFrom(carried !== existing ? addDaysISO(day, -1) : '')
         }
       })
       .catch(() => {
         if (!cancelled) {
-          setNote('')
-          setSavedNote('')
+          setEntry(empty)
+          setSavedEntry(empty)
+          setCarryFrom('')
         }
       })
       .finally(() => {
@@ -2420,22 +2472,36 @@ function StoreDailyLogCard({ stores, activeStore, setActiveStore, onSaveLog, sav
   }, [activeStore, day])
 
   const save = async () => {
-    const trimmed = note.trim()
-    if (!trimmed) return
-    const saved = await onSaveLog(day, trimmed)
+    const next = { ...entry, note: entry.note.trim(), followUp: entry.followUp.trim() }
+    if (!next.note && !next.followUp) return
+    const saved = await onSaveLog(day, next.note, {
+      tags: next.tags,
+      followUp: next.followUp,
+      followUpDone: next.followUpDone,
+    })
     if (saved) {
-      setNote(trimmed)
-      setSavedNote(trimmed)
+      setEntry(next)
+      setSavedEntry(next)
+      setCarryFrom('')
     }
   }
 
   const deleteLog = async () => {
     if (!hasSavedLog || !window.confirm(`确认删除 ${activeStore} 在 ${day} 的 Daily Log？`)) return
-    const deleted = await onSaveLog(day, '')
+    const deleted = await onSaveLog(day, '', { tags: [], followUp: '', followUpDone: false })
     if (deleted) {
-      setNote('')
-      setSavedNote('')
+      const empty = { note: '', tags: [], followUp: '', followUpDone: false }
+      setEntry(empty)
+      setSavedEntry(empty)
+      setCarryFrom('')
     }
+  }
+
+  const toggleTag = (tag) => {
+    setEntry((current) => ({
+      ...current,
+      tags: current.tags.includes(tag) ? current.tags.filter((item) => item !== tag) : [...current.tags, tag],
+    }))
   }
 
   return (
@@ -2462,17 +2528,46 @@ function StoreDailyLogCard({ stores, activeStore, setActiveStore, onSaveLog, sav
       </div>
 
       <div className="mt-4">
+        <div className="mb-3">
+          <div className="text-xs font-medium text-slate-500">今天主要做了什么？</div>
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {DAILY_LOG_TAGS.map((tag) => {
+              const selected = entry.tags.includes(tag)
+              return (
+                <button key={tag} type="button" onClick={() => toggleTag(tag)} disabled={!activeStore || loading} className={`rounded-full border px-2.5 py-1 text-xs transition ${selected ? 'border-amber-300 bg-amber-100 text-amber-700' : 'border-slate-200 bg-white text-slate-500 hover:border-slate-300'}`}>
+                  {tag}
+                </button>
+              )
+            })}
+          </div>
+        </div>
         <textarea
           className="metric-input min-h-28 w-full"
           maxLength={2000}
           disabled={!activeStore || loading}
           placeholder={activeStore ? '记录今天上了哪些款、做了哪些调整、发现了什么问题……' : '请先选择一家店铺'}
-          value={note}
-          onChange={(event) => setNote(event.target.value)}
+          value={entry.note}
+          onChange={(event) => setEntry((current) => ({ ...current, note: event.target.value }))}
         />
+        <div className="mt-3 rounded-lg border border-blue-100 bg-blue-50 p-3">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            <input
+              className="metric-input flex-1 !bg-white"
+              disabled={!activeStore || loading}
+              placeholder="后续动作，例如：明天检查 A123 广告转化"
+              value={entry.followUp}
+              onChange={(event) => setEntry((current) => ({ ...current, followUp: event.target.value, followUpDone: false }))}
+            />
+            <label className="inline-flex shrink-0 items-center gap-2 text-xs text-slate-600">
+              <input type="checkbox" disabled={!entry.followUp || loading} checked={entry.followUpDone} onChange={(event) => setEntry((current) => ({ ...current, followUpDone: event.target.checked }))} />
+              已完成
+            </label>
+          </div>
+          {carryFrom && <p className="mt-2 text-xs text-blue-600">已自动带入 {carryFrom.slice(5).replace('-', '/')} 未完成的后续动作。</p>}
+        </div>
         <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <div className="text-xs text-slate-400">
-            <span>{loading ? '正在载入记录…' : activeStore ? `当前店铺：${activeStore} · ${note.length}/2000` : '每家店的日志互不影响'}</span>
+            <span>{loading ? '正在载入记录…' : activeStore ? `当前店铺：${activeStore} · ${entry.note.length}/2000` : '每家店的日志互不影响'}</span>
             {!loading && activeStore && (
               <span className={`ml-2 font-medium ${hasChanges ? 'text-amber-600' : hasSavedLog ? 'text-emerald-600' : 'text-slate-400'}`}>
                 {hasChanges ? '有未保存修改' : hasSavedLog ? '已保存，可直接修改' : '当天尚未记录'}
@@ -2485,7 +2580,7 @@ function StoreDailyLogCard({ stores, activeStore, setActiveStore, onSaveLog, sav
                 <Trash2 className="h-3.5 w-3.5" /> 删除日志
               </button>
             )}
-            <button type="button" onClick={save} disabled={!activeStore || !day || !note.trim() || !hasChanges || loading || saving} className="btn-primary text-xs disabled:opacity-40">
+            <button type="button" onClick={save} disabled={!activeStore || !day || (!entry.note.trim() && !entry.followUp.trim()) || !hasChanges || loading || saving} className="btn-primary text-xs disabled:opacity-40">
               <Save className="h-3.5 w-3.5" /> {saving ? '保存中' : hasSavedLog ? '更新日志' : '新建日志'}
             </button>
           </div>

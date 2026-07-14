@@ -100,11 +100,17 @@ async function ensureTables(sql) {
       store      TEXT NOT NULL,
       day        DATE NOT NULL,
       note       TEXT NOT NULL,
+      tags       JSONB NOT NULL DEFAULT '[]'::jsonb,
+      follow_up  TEXT,
+      follow_up_done BOOLEAN NOT NULL DEFAULT FALSE,
       updated_by TEXT,
       updated_at TIMESTAMPTZ DEFAULT NOW(),
       PRIMARY KEY (username, store, day)
     )
   `
+  await sql`ALTER TABLE analytics_daily_logs ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '[]'::jsonb`
+  await sql`ALTER TABLE analytics_daily_logs ADD COLUMN IF NOT EXISTS follow_up TEXT`
+  await sql`ALTER TABLE analytics_daily_logs ADD COLUMN IF NOT EXISTS follow_up_done BOOLEAN NOT NULL DEFAULT FALSE`
 }
 
 async function recordEvent(sql, username, actor, store, action, summary, details = {}, snapshot = null) {
@@ -430,7 +436,7 @@ export default async function handler(req, res) {
       const to = req.query.to
       if (!store || !from || !to) return res.status(400).json({ error: 'store, from and to are required' })
       const rows = await sql`
-        SELECT day, note, updated_by, updated_at
+        SELECT day, note, tags, follow_up, follow_up_done, updated_by, updated_at
         FROM analytics_daily_logs
         WHERE username = ${username} AND store = ${store} AND day >= ${from} AND day <= ${to}
         ORDER BY day
@@ -439,6 +445,9 @@ export default async function handler(req, res) {
         logs: rows.map((row) => ({
           day: dayString(row.day),
           note: row.note,
+          tags: Array.isArray(row.tags) ? row.tags : [],
+          followUp: row.follow_up || '',
+          followUpDone: Boolean(row.follow_up_done),
           updatedBy: row.updated_by,
           updatedAt: row.updated_at,
         })),
@@ -449,21 +458,25 @@ export default async function handler(req, res) {
       const store = String(req.body?.store || '').trim()
       const day = String(req.body?.day || '').slice(0, 10)
       const note = String(req.body?.note || '').trim()
+      const tags = Array.isArray(req.body?.tags) ? req.body.tags.map((tag) => String(tag).trim()).filter(Boolean).slice(0, 10) : []
+      const followUp = String(req.body?.followUp || '').trim()
+      const followUpDone = Boolean(req.body?.followUpDone)
       if (!store || !/^\d{4}-\d{2}-\d{2}$/.test(day)) {
         return res.status(400).json({ error: 'store and a valid day are required' })
       }
       await sql`INSERT INTO analytics_stores (username, name) VALUES (${username}, ${store}) ON CONFLICT DO NOTHING`
-      if (!note) {
+      if (!note && !followUp) {
         await sql`DELETE FROM analytics_daily_logs WHERE username = ${username} AND store = ${store} AND day = ${day}`
         return res.json({ ok: true, deleted: true })
       }
       await sql`
-        INSERT INTO analytics_daily_logs (username, store, day, note, updated_by, updated_at)
-        VALUES (${username}, ${store}, ${day}, ${note}, ${actor}, NOW())
+        INSERT INTO analytics_daily_logs (username, store, day, note, tags, follow_up, follow_up_done, updated_by, updated_at)
+        VALUES (${username}, ${store}, ${day}, ${note}, ${JSON.stringify(tags)}::jsonb, ${followUp || null}, ${followUpDone}, ${actor}, NOW())
         ON CONFLICT (username, store, day)
-        DO UPDATE SET note = EXCLUDED.note, updated_by = EXCLUDED.updated_by, updated_at = NOW()
+        DO UPDATE SET note = EXCLUDED.note, tags = EXCLUDED.tags, follow_up = EXCLUDED.follow_up,
+          follow_up_done = EXCLUDED.follow_up_done, updated_by = EXCLUDED.updated_by, updated_at = NOW()
       `
-      return res.json({ ok: true, log: { day, note, updatedBy: actor } })
+      return res.json({ ok: true, log: { day, note, tags, followUp, followUpDone, updatedBy: actor } })
     }
 
     if (req.method === 'DELETE' && action === 'delete-day') {

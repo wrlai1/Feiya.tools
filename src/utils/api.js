@@ -143,10 +143,10 @@ export function fetchDailyLogs(store, from, to) {
   return request(`${BASE}/analytics-store?action=daily-logs&store=${encodeURIComponent(store)}&from=${from}&to=${to}`)
 }
 
-export function saveDailyLog(store, day, note) {
+export function saveDailyLog(store, day, note, details = {}) {
   return request(`${BASE}/analytics-store?action=save-daily-log`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ store, day, note }),
+    body: JSON.stringify({ store, day, note, ...details }),
   })
 }
 
