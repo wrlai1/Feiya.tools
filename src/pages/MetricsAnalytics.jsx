@@ -2386,21 +2386,32 @@ function DateRangeControl({
 function StoreDailyLogCard({ stores, activeStore, setActiveStore, onSaveLog, saving }) {
   const [day, setDay] = useState(todayISO())
   const [note, setNote] = useState('')
+  const [savedNote, setSavedNote] = useState('')
   const [loading, setLoading] = useState(false)
+  const hasSavedLog = Boolean(savedNote)
+  const hasChanges = note !== savedNote
 
   useEffect(() => {
     let cancelled = false
     if (!activeStore || !day) {
       setNote('')
+      setSavedNote('')
       return () => { cancelled = true }
     }
     setLoading(true)
     fetchDailyLogs(activeStore, day, day)
       .then((result) => {
-        if (!cancelled) setNote(result.logs?.[0]?.note || '')
+        if (!cancelled) {
+          const existing = result.logs?.[0]?.note || ''
+          setNote(existing)
+          setSavedNote(existing)
+        }
       })
       .catch(() => {
-        if (!cancelled) setNote('')
+        if (!cancelled) {
+          setNote('')
+          setSavedNote('')
+        }
       })
       .finally(() => {
         if (!cancelled) setLoading(false)
@@ -2409,7 +2420,22 @@ function StoreDailyLogCard({ stores, activeStore, setActiveStore, onSaveLog, sav
   }, [activeStore, day])
 
   const save = async () => {
-    await onSaveLog(day, note)
+    const trimmed = note.trim()
+    if (!trimmed) return
+    const saved = await onSaveLog(day, trimmed)
+    if (saved) {
+      setNote(trimmed)
+      setSavedNote(trimmed)
+    }
+  }
+
+  const deleteLog = async () => {
+    if (!hasSavedLog || !window.confirm(`确认删除 ${activeStore} 在 ${day} 的 Daily Log？`)) return
+    const deleted = await onSaveLog(day, '')
+    if (deleted) {
+      setNote('')
+      setSavedNote('')
+    }
   }
 
   return (
@@ -2445,12 +2471,24 @@ function StoreDailyLogCard({ stores, activeStore, setActiveStore, onSaveLog, sav
           onChange={(event) => setNote(event.target.value)}
         />
         <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-          <span className="text-xs text-slate-400">
-            {loading ? '正在载入记录…' : activeStore ? `当前店铺：${activeStore} · ${note.length}/2000` : '每家店的日志互不影响'}
-          </span>
-          <button type="button" onClick={save} disabled={!activeStore || !day || loading || saving} className="btn-primary text-xs disabled:opacity-40">
-            <Save className="h-3.5 w-3.5" /> {saving ? '保存中' : '保存这家店的日志'}
-          </button>
+          <div className="text-xs text-slate-400">
+            <span>{loading ? '正在载入记录…' : activeStore ? `当前店铺：${activeStore} · ${note.length}/2000` : '每家店的日志互不影响'}</span>
+            {!loading && activeStore && (
+              <span className={`ml-2 font-medium ${hasChanges ? 'text-amber-600' : hasSavedLog ? 'text-emerald-600' : 'text-slate-400'}`}>
+                {hasChanges ? '有未保存修改' : hasSavedLog ? '已保存，可直接修改' : '当天尚未记录'}
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            {hasSavedLog && (
+              <button type="button" onClick={deleteLog} disabled={loading || saving} className="btn-secondary text-xs text-red-600 disabled:opacity-40">
+                <Trash2 className="h-3.5 w-3.5" /> 删除日志
+              </button>
+            )}
+            <button type="button" onClick={save} disabled={!activeStore || !day || !note.trim() || !hasChanges || loading || saving} className="btn-primary text-xs disabled:opacity-40">
+              <Save className="h-3.5 w-3.5" /> {saving ? '保存中' : hasSavedLog ? '更新日志' : '新建日志'}
+            </button>
+          </div>
         </div>
       </div>
     </section>
