@@ -8,6 +8,7 @@ import UnmatchedResolver from '../components/UnmatchedResolver.jsx'
 import { useToast } from '../hooks/useToast.js'
 import { useAuth } from '../context/AuthContext.jsx'
 import { parseCSV, fillTemplate, generateExcel, aliasKey } from '../utils/autoDeductEngine.js'
+import ConsolidateStep from '../components/ConsolidateStep.jsx'
 
 const BASE = '/api'
 
@@ -433,6 +434,9 @@ export default function AutoDeduct() {
           </div>
         </div>
       )}
+
+      {/* 第一步（可选）：原始导出 → consolidated CSV */}
+      <ConsolidateStep />
 
       {/* Upload card */}
       <div className="card p-5 space-y-4">
