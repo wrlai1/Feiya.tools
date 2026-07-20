@@ -58,6 +58,21 @@ async function ensureTables(sql) {
       applied_at       TIMESTAMPTZ DEFAULT NOW()
     )
   `
+  // Per-SKU movement log — one row per (style,color,size) per apply. This is the
+  // source for sales-velocity / return-rate / days-of-stock analytics ("动销").
+  await sql`
+    CREATE TABLE IF NOT EXISTS inventory_txn_rows (
+      id          BIGSERIAL PRIMARY KEY,
+      txn_type    TEXT NOT NULL,
+      style       TEXT NOT NULL,
+      color       TEXT NOT NULL,
+      size        TEXT NOT NULL,
+      qty         INTEGER NOT NULL,
+      source_file TEXT,
+      applied_by  TEXT,
+      applied_at  TIMESTAMPTZ DEFAULT NOW()
+    )
+  `
   // Migrations: drop stale columns and add ones introduced after initial creation.
   await sql`ALTER TABLE inventory_transactions DROP COLUMN IF EXISTS ts`
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS applied_by TEXT`
@@ -275,6 +290,12 @@ export default async function handler(req, res) {
           `
         }
         appliedUnits += qty
+
+        // 动销流水：每个 SKU 一行，apply 时间戳即记账日期
+        await sql`
+          INSERT INTO inventory_txn_rows (txn_type, style, color, size, qty, source_file, applied_by)
+          VALUES (${txnType}, ${String(r.STYLE)}, ${String(r.COLOR)}, ${String(r.SIZE)}, ${qty}, ${sourceName}, ${payload.username})
+        `
       }
 
       await sql`
@@ -282,6 +303,19 @@ export default async function handler(req, res) {
         VALUES (${txnType}, ${sourceName}, ${appliedUnits}, ${payload.username})
       `
       return res.json({ ok: true, applied_units: appliedUnits })
+    }
+
+    // ── GET movements — per-SKU dated flow for the 动销 view ─────────────────
+    if (req.method === 'GET' && action === 'movements') {
+      const days = Math.min(Math.max(parseInt(req.query.days, 10) || 30, 1), 365)
+      const from = new Date(Date.now() - days * 86400000).toISOString()
+      const rows = await sql`
+        SELECT txn_type, style, color, size, qty, applied_at::date AS day
+        FROM inventory_txn_rows
+        WHERE applied_at >= ${from}
+        ORDER BY applied_at
+      `
+      return res.json({ days, rows })
     }
 
     // ── GET transactions ──────────────────────────────────────────────────────

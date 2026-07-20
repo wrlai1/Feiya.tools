@@ -1131,6 +1131,19 @@ async function ensureInventoryTables(sql) {
     )
   `;
   await sql`
+    CREATE TABLE IF NOT EXISTS inventory_txn_rows (
+      id          BIGSERIAL PRIMARY KEY,
+      txn_type    TEXT NOT NULL,
+      style       TEXT NOT NULL,
+      color       TEXT NOT NULL,
+      size        TEXT NOT NULL,
+      qty         INTEGER NOT NULL,
+      source_file TEXT,
+      applied_by  TEXT,
+      applied_at  TIMESTAMPTZ DEFAULT NOW()
+    )
+  `;
+  await sql`
     CREATE TABLE IF NOT EXISTS inventory_snapshots (
       id          SERIAL PRIMARY KEY,
       label       TEXT,
@@ -1309,6 +1322,12 @@ app.all('/api/inventory-balance', async (req, res) => {
           `;
         }
         appliedUnits += qty;
+
+        // 动销流水：每个 SKU 一行，apply 时间戳即记账日期
+        await sql`
+          INSERT INTO inventory_txn_rows (txn_type, style, color, size, qty, source_file, applied_by)
+          VALUES (${txnType}, ${String(r.STYLE)}, ${String(r.COLOR)}, ${String(r.SIZE)}, ${qty}, ${sourceName}, ${payload.username})
+        `;
       }
 
       await sql`
@@ -1316,6 +1335,19 @@ app.all('/api/inventory-balance', async (req, res) => {
         VALUES (${txnType}, ${sourceName}, ${appliedUnits}, ${payload.username})
       `;
       return res.json({ ok: true, applied_units: appliedUnits });
+    }
+
+    // GET movements — 动销流水（per-SKU dated flow）
+    if (req.method === 'GET' && action === 'movements') {
+      const days = Math.min(Math.max(parseInt(req.query.days, 10) || 30, 1), 365);
+      const from = new Date(Date.now() - days * 86400000).toISOString();
+      const rows = await sql`
+        SELECT txn_type, style, color, size, qty, applied_at::date AS day
+        FROM inventory_txn_rows
+        WHERE applied_at >= ${from}
+        ORDER BY applied_at
+      `;
+      return res.json({ days, rows });
     }
 
     // GET transactions

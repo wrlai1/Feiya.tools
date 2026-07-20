@@ -18,6 +18,7 @@ import {
   fetchAnalyticsEvents, restoreAnalyticsEvent, fetchDailyLogs, saveDailyLog as saveDailyLogApi,
 } from '../utils/api.js'
 import { formatISODate, loadSalesSummary } from '../utils/salesSummary.js'
+import MovementAnalytics from '../components/MovementAnalytics.jsx'
 import { buildSmartDecisions } from '../utils/smartDecisionEngine.js'
 
 const todayISO = () => {
@@ -1809,6 +1810,9 @@ export default function MetricsAnalytics() {
           />
         </>
       )}
+
+      {/* 库存动销 — 来自 Auto Deduct 流水，与店铺数据独立 */}
+      <MovementAnalytics />
     </div>
   )
 }

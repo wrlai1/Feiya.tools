@@ -193,3 +193,13 @@ export function saveAnalyticsSettings(store, settings) {
     body: JSON.stringify({ store, settings }),
   })
 }
+
+// ─── 动销（inventory movements）─────────────────────────────────────────────────
+
+export function fetchMovements(days = 30) {
+  return request(`${BASE}/inventory-balance?action=movements&days=${days}`)
+}
+
+export function fetchInventoryBalance() {
+  return request(`${BASE}/inventory-balance?action=list`)
+}
