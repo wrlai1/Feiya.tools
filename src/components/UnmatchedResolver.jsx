@@ -20,6 +20,7 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
   const [searches,        setSearches]        = useState(() => Array(unmatchedRows.length).fill(''))
   const [createForms,     setCreateForms]     = useState(() => Array(unmatchedRows.length).fill(null))
   const [comboSelections, setComboSelections] = useState(() => Array(unmatchedRows.length).fill(null).map(() => []))
+  const [packCounts,      setPackCounts]      = useState(() => unmatchedRows.map(row => row.packCount > 1 ? row.packCount : ''))
 
   const pending   = resolved.filter(r => !r).length
   const linked    = resolved.filter(r => r?.type === 'link').length
@@ -105,9 +106,25 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
     })
   }
 
-  function confirmCombo(i) {
+  function isSetReview(row) {
+    return row.packCount > 1 || /set_components_unknown|cross_style_combo/.test(row.parseIssue || '')
+  }
+
+  function expectedPackCount(i, row) {
+    if (!isSetReview(row)) return null
+    const value = parseInt(packCounts[i], 10)
+    return value > 0 ? value : null
+  }
+
+  function comboMultiplierTotal(i) {
+    return (comboSelections[i] || []).reduce((sum, component) => sum + Math.max(1, parseInt(component.multiplier, 10) || 1), 0)
+  }
+
+  function confirmCombo(i, row) {
     const components = comboSelections[i] || []
     if (!components.length) return
+    const expected = expectedPackCount(i, row)
+    if (isSetReview(row) && (!expected || comboMultiplierTotal(i) !== expected)) return
     resolve(i, 'combo', { components })
   }
 
@@ -118,7 +135,7 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
     for (const [i, row] of unmatchedRows.entries()) {
       const r = resolved[i]
       if (!r || r.type === 'skip') {
-        skipped.push({ style: row.style, color: row.color, size: row.size, qty: row.qty })
+        skipped.push({ style: row.style, color: row.color, size: row.size, qty: row.qty, packCount: row.packCount, parseIssue: row.parseIssue })
         continue
       }
       if (r.type === 'combo') {
@@ -126,7 +143,7 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
           components: r.entry.components,
           QTY: row.qty,
           _isCombo: true,
-          _source: { style: row.style, color: row.color, size: row.size },
+          _source: { style: row.style, color: row.color, size: row.size, packCount: expectedPackCount(i, row) },
           _learnAlias: true,
         })
         continue
@@ -315,6 +332,9 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
           const form     = createForms[i]
           const matches  = getMatches(i, row)
           const comboComponents = comboSelections[i] || []
+          const setReview = isSetReview(row)
+          const expected = expectedPackCount(i, row)
+          const comboTotal = comboMultiplierTotal(i)
 
           return (
             <div
@@ -336,9 +356,25 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
                 <span className="text-slate-300">·</span>
                 <span className="text-sm text-slate-600">{row.size}</span>
                 <span className="ml-auto bg-orange-100 text-orange-700 text-xs font-bold px-2 py-0.5 rounded-full shrink-0">
-                  QTY {row.qty}
+                  {row.packCount > 1 ? `${row.qty} order(s) × ${row.packCount} units` : `QTY ${row.qty}`}
                 </span>
               </div>
+
+              {setReview && !r && (
+                <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span>This set has no confirmed component mapping. Enter units per set, then build the exact combo:</span>
+                    <input
+                      type="number"
+                      min="1"
+                      value={packCounts[i]}
+                      onChange={(e) => setPackCounts(prev => { const next = [...prev]; next[i] = e.target.value; return next })}
+                      className="w-16 rounded border border-amber-200 bg-white px-2 py-1 text-center"
+                      placeholder="?"
+                    />
+                  </div>
+                </div>
+              )}
 
               {/* Resolved state */}
               {r ? (
@@ -418,10 +454,11 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
                       <div className="flex items-center justify-between gap-2 mb-2">
                         <p className="text-xs font-medium text-indigo-700">Combo components</p>
                         <button
-                          onClick={() => confirmCombo(i)}
-                          className="btn-primary text-xs px-3 py-1.5"
+                          onClick={() => confirmCombo(i, row)}
+                          disabled={setReview && (!expected || comboTotal !== expected)}
+                          className="btn-primary text-xs px-3 py-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
                         >
-                          Confirm combo
+                          Confirm combo{setReview && expected ? ` (${comboTotal}/${expected})` : ''}
                         </button>
                       </div>
                       <div className="space-y-1.5">
@@ -472,8 +509,9 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
                       {matches.map((t, j) => (
                         <div key={j} className="flex items-center">
                           <button
-                            onClick={() => resolve(i, 'link', t)}
-                            className="flex-1 text-left px-3 py-2 text-sm hover:bg-blue-50 flex items-center gap-3 min-w-0"
+                            onClick={() => { if (!setReview) resolve(i, 'link', t) }}
+                            disabled={setReview}
+                            className="flex-1 text-left px-3 py-2 text-sm hover:bg-blue-50 flex items-center gap-3 min-w-0 disabled:opacity-50 disabled:cursor-not-allowed"
                           >
                             <span className="font-mono font-medium text-slate-700 shrink-0 w-20 truncate">{t.STYLE}</span>
                             <span className="text-slate-500 flex-1 truncate">{t.COLOR}</span>
@@ -496,13 +534,15 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
                   )}
 
                   <div className="flex gap-2 pt-1">
-                    <button
-                      onClick={() => openCreate(i, row)}
-                      className="flex items-center gap-1.5 text-xs px-3 py-1.5 border border-slate-200 rounded-lg hover:bg-slate-50 text-slate-600"
-                    >
-                      <Plus className="w-3 h-3" />
-                      Create new entry
-                    </button>
+                    {!setReview && (
+                      <button
+                        onClick={() => openCreate(i, row)}
+                        className="flex items-center gap-1.5 text-xs px-3 py-1.5 border border-slate-200 rounded-lg hover:bg-slate-50 text-slate-600"
+                      >
+                        <Plus className="w-3 h-3" />
+                        Create new entry
+                      </button>
+                    )}
                     <button
                       onClick={() => resolve(i, 'skip', null)}
                       className="flex items-center gap-1.5 text-xs px-3 py-1.5 text-slate-400 hover:text-slate-600"

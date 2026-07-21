@@ -132,6 +132,23 @@ function findKey(row, target, aliases = []) {
   return keys.find((k) => wanted.includes(k.trim().toLowerCase()))
 }
 
+function appendIssue(issue, next) {
+  return [...new Set([...(issue ? issue.split(';') : []), next].filter(Boolean))].join(';')
+}
+
+function attributeParts(raw) {
+  const parts = String(raw || '').split('/').map(x => x.trim())
+  const colorText = parts[0] || ''
+  const sizeText = parts.at(-1) || ''
+  const sizeMatch = sizeText.toUpperCase().match(/(?:^|\s)(PXL|PL|PM|PS|3XL|2XL|1XL|XXL|XL|XXS|XS|3X|2X|1X|24W|22W|20W|18W|16W|14W|16P|14P|12P|10P|8P|6P|16R|14R|12R|10R|8R|6R|24|22|20|18|16|14|12|10|8|6|4|2|L|M|S)$/)
+  return {
+    colors: colorText.includes('&') ? colorText.split('&').map(x => x.trim().toLowerCase()).filter(Boolean) : [],
+    size: sizeMatch?.[1] || '',
+    packCount: Number(colorText.match(/\b([2-9])\s*[- ]?(?:piece|pack)\b/i)?.[1] || 0),
+    mentionsSet: /\bset\b/i.test(colorText),
+  }
+}
+
 /**
  * rows: 解析好的对象数组（须含 Style/SKU 列 + Quantity/Qty/数量 列）
  */
@@ -139,6 +156,7 @@ export function consolidateRows(rows) {
   if (!rows.length) throw new Error('文件是空的')
   const styleKey = findKey(rows[0], 'Style', ['SKU', 'SKU货号'])
   const qtyKey = findKey(rows[0], 'Quantity', ['Qty', 'QTY', '数量', '件数', '应履约件数'])
+  const attrKey = findKey(rows[0], 'Product Attribute', ['商品属性', 'Attributes'])
   if (!styleKey) throw new Error('找不到 Style/SKU 列')
   if (!qtyKey) throw new Error('找不到 Quantity/Qty/数量 列')
 
@@ -147,9 +165,16 @@ export function consolidateRows(rows) {
   // 解析每一行
   let parsed = rows.map((r) => {
     const rawStyle = String(r[styleKey] ?? '').trim()
+    const rawAttr = attrKey ? String(r[attrKey] ?? '').trim() : ''
     const qty = Number(r[qtyKey]) || 0
     const p = parseStyleColorSize(rawStyle)
-    return { rawStyle, qty, ...p }
+    const attr = attributeParts(rawAttr)
+    if (!p.size && attr.size) {
+      p.size = attr.size
+      p.color = p.color.replace(/\s+sx$/i, '').trim()
+      p.issue = p.issue.split(';').filter(x => x !== 'no_size_suffix_match').join(';')
+    }
+    return { rawStyle, rawAttr, qty, attr, packCount: 1, ...p }
   })
 
   // 别名款号：改款号 + 颜色加前缀
@@ -184,15 +209,47 @@ export function consolidateRows(rows) {
     p.style = resolveStyle(p.style, p.size)
   }
 
-  // set 展开
+  // Explicit multi-color attributes are safe to split as source data, but the
+  // resulting rows still require an exact database match later. Cross-style SKU
+  // strings are never guessed from the attribute text.
   const expanded = []
   for (const p of parsed) {
+    if (p.style === '62300' && p.color.replace(/[^a-z0-9]/gi, '').toLowerCase() === 'navyx2denim') {
+      expanded.push({ ...p, color: 'navy', qty: p.qty * 2, issue: '', packCount: 1 })
+      expanded.push({ ...p, color: 'denim', issue: '', packCount: 1 })
+      continue
+    }
+
+    const crossStyleCombo = /\d/.test(p.color)
+    if (crossStyleCombo) {
+      expanded.push({ ...p, issue: appendIssue(p.issue, 'cross_style_combo') })
+      continue
+    }
+
+    if (p.attr.colors.length > 1) {
+      for (const color of p.attr.colors) expanded.push({ ...p, color, issue: p.issue, packCount: 1 })
+      continue
+    }
+
+    if (p.color.includes('+')) {
+      const colors = p.color.split('+').map(x => x.trim()).filter(Boolean)
+      if (colors.length > 1) {
+        for (const color of colors) expanded.push({ ...p, color, issue: p.issue, packCount: 1 })
+        continue
+      }
+    }
+
     const map = SET_EXPANSIONS[p.style]
     const colors = map && map[p.color.trim().toLowerCase()]
     if (colors) {
-      for (const color of colors) expanded.push({ ...p, color, issue: '' })
+      for (const color of colors) expanded.push({ ...p, color, issue: '', packCount: 1 })
     } else {
-      expanded.push(p)
+      const unknownSet = p.attr.packCount > 1 || p.attr.mentionsSet || /set/i.test(p.color)
+      expanded.push({
+        ...p,
+        packCount: p.attr.packCount || 1,
+        issue: unknownSet ? appendIssue(p.issue, 'set_components_unknown') : p.issue,
+      })
     }
   }
   parsed = expanded
@@ -200,8 +257,8 @@ export function consolidateRows(rows) {
   // 合并：按 (style,color,size) 汇总
   const groups = new Map()
   for (const p of parsed) {
-    const k = `${p.style}||${p.color}||${p.size}`
-    const g = groups.get(k) || { style: p.style, color: p.color, size: p.size, QTY: 0 }
+    const k = `${p.style}||${p.color}||${p.size}||${p.issue}||${p.packCount}`
+    const g = groups.get(k) || { style: p.style, color: p.color, size: p.size, QTY: 0, pack_count: p.packCount || 1, parse_issue: p.issue || '' }
     g.QTY += p.qty
     groups.set(k, g)
   }
@@ -216,15 +273,15 @@ export function consolidateRows(rows) {
   for (const p of parsed) {
     if (!p.issue) continue
     const k = `${p.rawStyle}||${p.style}||${p.color}||${p.size}||${p.issue}`
-    const g = reviewMap.get(k) || { raw_style: p.rawStyle, style: p.style, color: p.color, size: p.size, parse_issue: p.issue, QTY: 0 }
+    const g = reviewMap.get(k) || { raw_style: p.rawStyle, style: p.style, color: p.color, size: p.size, pack_count: p.packCount || 1, parse_issue: p.issue, QTY: 0 }
     g.QTY += p.qty
     reviewMap.set(k, g)
   }
   const needsReview = [...reviewMap.values()]
     .sort((a, b) => a.parse_issue.localeCompare(b.parse_issue) || a.raw_style.localeCompare(b.raw_style))
 
-  const newTotal = consolidated.reduce((s, r) => s + r.QTY, 0)
-  const expandedTotal = parsed.reduce((s, r) => s + r.qty, 0)
+  const newTotal = consolidated.reduce((s, r) => s + r.QTY * (r.pack_count || 1), 0)
+  const expandedTotal = parsed.reduce((s, r) => s + r.qty * (r.packCount || 1), 0)
 
   return {
     consolidated,
@@ -236,6 +293,11 @@ export function consolidateRows(rows) {
       newTotal,
       qtyOk: Math.abs(expandedTotal - newTotal) < 1e-9,
       reviewRows: needsReview.length,
+      unknownPackRows: needsReview.filter(r => /set_components_unknown|cross_style_combo/.test(r.parse_issue)).length,
+      hasUnknownUnitCounts: needsReview.some(r =>
+        (/set_components_unknown/.test(r.parse_issue) && (r.pack_count || 1) === 1) ||
+        /cross_style_combo/.test(r.parse_issue)
+      ),
     },
   }
 }

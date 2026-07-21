@@ -102,8 +102,7 @@ function colorTokens(raw) {
 // ── Color scoring ─────────────────────────────────────────────────────────────
 
 /** A match is only accepted (auto-filled) when its color score reaches this. */
-export const MATCH_THRESHOLD = 0.95
-export const MATCH_MARGIN = 0.05
+export const MATCH_THRESHOLD = 1
 
 /**
  * Pattern / print qualifier words. When a SINGLE-token sales color (e.g. "black")
@@ -133,10 +132,16 @@ const PATTERN_WORDS = new Set([
  *   5. Proportional substring                                   → < threshold
  */
 function colorScore(templateColor, salesColor) {
+  const exact = (value) => String(value)
+    .toLowerCase()
+    .replace(/#\s*\d+/g, '')
+    .replace(/[^a-z]/g, '')
+  const exactTemplate = exact(templateColor)
+  const exactSales = exact(salesColor)
   const tc = normalizeColor(templateColor)
   const sc = normalizeColor(salesColor)
   if (!tc || !sc) return 0
-  if (tc === sc) return 1.0                            // exact (handles spacing/concat/#)
+  if (exactTemplate && exactTemplate === exactSales) return 1.0
 
   // "near" = same word or a spelling typo (similar length) — NOT subsequence
   // containment, else short words like "blue" match anything holding b-l-u-e
@@ -252,7 +257,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
   let srcTotal    = 0
   let filledTotal = 0
   const unmatchedRows = []
-  const matchLog      = []   // non-exact auto-matches, for human spot-checking
+  const matchLog      = []   // previously confirmed aliases used in this run
 
   salesRows.forEach(row => {
     const style    = String(row.style || row.STYLE || '').trim()
@@ -260,45 +265,28 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
     const rawSize  = String(row.size  || row.SIZE  || '').trim()
     const qty      = parseInt(row.QTY || row.qty || 0, 10) || 0
 
-    if (!style || !qty) return
-    srcTotal += qty
-
+    if (!qty) return
+    const packCount = Math.max(1, parseInt(row.pack_count || row.packCount, 10) || 1)
+    const parseIssue = String(row.parse_issue || row.parseIssue || '')
+    if (!style) {
+      srcTotal += qty * packCount
+      unmatchedRows.push({ style, color, size: normalizeSalesSize(rawSize), qty, packCount, parseIssue: parseIssue || 'missing_style' })
+      return
+    }
     const normStyle = normalizeStyle(style)
     const normSize  = normalizeSalesSize(rawSize)
     const key       = `${normStyle}||${normSize}`
     let candidates = buckets.get(key) || []
-
-    // ── Style-prefix fallback — only when NO exact bucket match ─────────────
-    // Sales CSVs use a shorter style code that is a prefix of the full template
-    // style name. Size disambiguates which variant to route to:
-    //   "M022" + S/M/L/XL → "M022 Missy"   (bstyle m022missy startsWith m022)
-    //   "M022" + 1X/2X/3X → "M022 PLUS"    (bstyle m022plus  startsWith m022)
-    //   "M022" + PS/PM/PL  → "M022 Petite"  (bstyle m022petite startsWith m022)
-    //   "M017" + S/M/L/XL → "M017-MISSY"   (bstyle m017missy startsWith m017)
-    //   "80423" + any      → "80423W"       (bstyle 80423w    startsWith 80423)
-    //
-    // Guard: sales style must be ≥ 4 chars to avoid single/two-char false matches.
-    if (!candidates.length) {
-      const prefixCandidates = []
-      for (const [bkey, bucket] of buckets.entries()) {
-        const sep    = bkey.lastIndexOf('||')
-        const bstyle = bkey.slice(0, sep)
-        const bsize  = bkey.slice(sep + 2)
-        if (bsize !== normSize || bstyle === normStyle) continue
-        if (normStyle.length < 4) continue
-        if (bstyle.startsWith(normStyle)) {
-          prefixCandidates.push(...bucket)
-        }
-      }
-      const distinctStyles = new Set(prefixCandidates.map(c => normalizeStyle(c.style)))
-      if (distinctStyles.size === 1) candidates = prefixCandidates
-    }
+    const aliasTarget = aliases[aliasKey(style, color, normSize)] || aliases[aliasKey(style, color)]
+    const aliasComponentCount = Array.isArray(aliasTarget?.components)
+      ? aliasTarget.components.reduce((sum, component) => sum + Math.max(1, parseInt(component.multiplier, 10) || 1), 0)
+      : 0
+    srcTotal += qty * (aliasComponentCount || packCount)
 
     // ── Learned alias — a previous human "Link" or "Combo" wins outright ────────
     // If the user has taught us what this (style, color) means, fill that template
     // color directly and skip fuzzy scoring. Combo aliases split one source row into
     // multiple template rows, each receiving the source quantity.
-    const aliasTarget = aliases[aliasKey(style, color, normSize)] || aliases[aliasKey(style, color)]
     const target = typeof aliasTarget === 'string' ? { COLOR: aliasTarget } : aliasTarget
     const applyAliasTarget = (pool = []) => {
       const matchTarget = (wanted, items) => {
@@ -320,7 +308,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
           const multiplier = Math.max(1, parseInt(target.components[i].multiplier, 10) || 1)
           matched.qty += qty * multiplier
         }
-        filledTotal += qty
+        filledTotal += qty * target.components.reduce((sum, component) => sum + Math.max(1, parseInt(component.multiplier, 10) || 1), 0)
         matchLog.push({
           style,
           salesColor: color,
@@ -356,8 +344,13 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
       if (applyAliasTarget([])) return
     }
 
+    if (parseIssue && !aliasTarget) {
+      unmatchedRows.push({ style, color, size: normSize, qty, packCount, parseIssue })
+      return
+    }
+
     if (!candidates?.length) {
-      unmatchedRows.push({ style, color, size: normSize, qty })
+      unmatchedRows.push({ style, color, size: normSize, qty, packCount, parseIssue })
       return
     }
 
@@ -385,10 +378,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
     //   • several qualify, but a UNIQUE exact (1.0)     → that exact match wins
     //   • several distinct colors tie below exact      → AMBIGUOUS → review, never guess
     let chosen = -1
-    if (passing.length) {
-      const runnerUp = ranked[1]?.score ?? 0
-      if (passing[0].score - runnerUp >= MATCH_MARGIN) chosen = passing[0].idx
-    }
+    if (passing.length === 1) chosen = passing[0].idx
 
     if (chosen >= 0) {
       candidates[chosen].qty += qty
@@ -398,7 +388,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
         matchLog.push({ style, salesColor: color, size: normSize, qty, matchedTo: candidates[chosen].color, via: `fuzzy ${chosenScore.toFixed(2)}` })
       }
     } else {
-      unmatchedRows.push({ style, color, size: normSize, qty })
+      unmatchedRows.push({ style, color, size: normSize, qty, packCount, parseIssue })
     }
   })
 
@@ -406,7 +396,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
   // would regroup by style+size and scramble the order.
   const filledRows = entries.map(e => ({ STYLE: e.style, COLOR: e.color, SIZE: e.size, QTY: e.qty }))
 
-  const appendTotal = unmatchedRows.reduce((s, r) => s + r.qty, 0)
+  const appendTotal = unmatchedRows.reduce((s, r) => s + r.qty * (r.packCount || 1), 0)
 
   return {
     filledRows,
@@ -417,6 +407,10 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
       filled_total:     filledTotal,
       append_total:     appendTotal,
       reconciled_total: filledTotal + appendTotal,
+      has_unknown_unit_counts: unmatchedRows.some(r =>
+        (/set_components_unknown/.test(r.parseIssue || '') && (r.packCount || 1) === 1) ||
+        /cross_style_combo/.test(r.parseIssue || '')
+      ),
     },
   }
 }

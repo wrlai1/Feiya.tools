@@ -88,12 +88,12 @@ export default function ConsolidateStep() {
               </div>
 
               <div className="flex flex-wrap gap-2">
-                <button onClick={() => download(result.consolidated, ['style', 'color', 'size', 'QTY'], 'consolidated')}
+                <button onClick={() => download(result.consolidated, ['style', 'color', 'size', 'QTY', 'pack_count', 'parse_issue'], 'consolidated')}
                   className="btn-primary text-sm px-4 py-2">
                   <Download className="w-4 h-4" /> 下载 consolidated CSV
                 </button>
                 {result.needsReview.length > 0 && (
-                  <button onClick={() => download(result.needsReview, ['raw_style', 'style', 'color', 'size', 'parse_issue', 'QTY'], 'needs_review')}
+                  <button onClick={() => download(result.needsReview, ['raw_style', 'style', 'color', 'size', 'pack_count', 'parse_issue', 'QTY'], 'needs_review')}
                     className="btn-secondary text-sm px-4 py-2">
                     <Download className="w-4 h-4" /> 下载 needs_review CSV（{result.needsReview.length}）
                   </button>

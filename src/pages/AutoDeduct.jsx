@@ -422,7 +422,7 @@ export default function AutoDeduct() {
         <div>
           <h2 className="text-xl font-bold text-slate-800">Auto Deduct</h2>
           <p className="text-sm text-slate-500 mt-0.5">
-            Upload a TEMU order workbook or consolidated CSV — uncertain matches always require your confirmation
+            Strict mode: only exact or previously confirmed matches are automatic; everything else requires your choice
           </p>
         </div>
         <button onClick={() => setShowSettings(true)} className="btn-secondary text-sm">
@@ -501,7 +501,7 @@ export default function AutoDeduct() {
         <>
           {/* Stats row */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-            <StatCard label="Source Total"  value={stats.src_total}    color="slate" />
+            <StatCard label={stats.has_unknown_unit_counts ? 'Known Units (minimum)' : 'Source Total'} value={stats.src_total} color="slate" />
             <StatCard label="Matched"       value={stats.filled_total} color="green" />
             <StatCard label="Unmatched"     value={stats.append_total} color={stats.append_total > 0 ? 'yellow' : 'slate'} />
             <div className="card px-4 py-3 flex items-center gap-2.5">
@@ -516,6 +516,13 @@ export default function AutoDeduct() {
               </div>
             </div>
           </div>
+
+          {stats.has_unknown_unit_counts && (
+            <div className="flex items-start gap-3 px-4 py-3 bg-amber-50 border border-amber-200 rounded-xl text-sm text-amber-800">
+              <AlertTriangle className="w-5 h-5 flex-shrink-0 mt-0.5" />
+              <p>Some set contents are not confirmed, so this is only the known minimum. Those rows must be completed in the review section before their units can be deducted.</p>
+            </div>
+          )}
 
           {/* Resolver — shown when there are unmatched rows and user hasn't resolved yet */}
           {hasUnresolved && (
