@@ -78,6 +78,7 @@ async function ensureTables(sql) {
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS applied_by TEXT`
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS source_file TEXT`
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS applied_units INTEGER`
+  await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS applied_at TIMESTAMPTZ DEFAULT NOW()`
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS row_count INTEGER`
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS source_hash TEXT`
   await sql`CREATE UNIQUE INDEX IF NOT EXISTS inventory_transactions_source_hash_uq ON inventory_transactions (transaction_type, source_hash) WHERE source_hash IS NOT NULL AND source_hash <> ''`

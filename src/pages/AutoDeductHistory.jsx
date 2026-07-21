@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react'
-import { CheckCircle, History, Minus, RefreshCw, TrendingUp } from 'lucide-react'
+import { Link } from 'react-router-dom'
+import { ArrowLeft, CheckCircle, History, Minus, RefreshCw, TrendingUp } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 
 function formatDate(value) {
@@ -42,10 +43,16 @@ export default function AutoDeductHistory() {
             Only successfully completed inventory updates appear here
           </p>
         </div>
-        <button onClick={loadHistory} disabled={loading} className="btn-secondary text-sm">
-          <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
-          Refresh
-        </button>
+        <div className="flex items-center gap-2">
+          <Link to="/auto-deduct" className="btn-secondary text-sm">
+            <ArrowLeft className="w-4 h-4" />
+            Back to Auto Deduct
+          </Link>
+          <button onClick={loadHistory} disabled={loading} className="btn-secondary text-sm">
+            <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+            Refresh
+          </button>
+        </div>
       </div>
 
       {error && (
