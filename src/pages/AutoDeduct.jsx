@@ -1,7 +1,8 @@
 import React, { useState, useCallback, useEffect, useMemo } from 'react'
+import { Link } from 'react-router-dom'
 import {
   Minus, TrendingUp, RefreshCw, FileDown,
-  CheckCircle, AlertTriangle, Settings, X, Upload, AlertCircle,
+  CheckCircle, AlertTriangle, Settings, X, Upload, AlertCircle, History,
 } from 'lucide-react'
 import FileUploadZone from '../components/FileUploadZone.jsx'
 import UnmatchedResolver from '../components/UnmatchedResolver.jsx'
@@ -426,10 +427,16 @@ export default function AutoDeduct() {
             Strict mode: only exact or previously confirmed matches are automatic; everything else requires your choice
           </p>
         </div>
-        <button onClick={() => setShowSettings(true)} className="btn-secondary text-sm">
-          <Settings className="w-4 h-4" />
-          Settings
-        </button>
+        <div className="flex items-center gap-2">
+          <Link to="/auto-deduct/history" className="btn-secondary text-sm">
+            <History className="w-4 h-4" />
+            History
+          </Link>
+          <button onClick={() => setShowSettings(true)} className="btn-secondary text-sm">
+            <Settings className="w-4 h-4" />
+            Settings
+          </button>
+        </div>
       </div>
 
       {/* Error banner */}
