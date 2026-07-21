@@ -144,7 +144,7 @@ export function parseInventoryWorkbook(buffer) {
   })
 
   if (!rows.some((row) => headerKey(row.sheet) === 'locationfinal')) {
-    throw new Error('没有找到 Location Final Sheet，请确认上传的是每周大库存表。')
+    throw new Error('Location Final was not found. Please upload the weekly master inventory workbook.')
   }
   return rows
 }
@@ -154,7 +154,7 @@ export async function parseInventoryExcel(file) {
     return parseInventoryWorkbook(await file.arrayBuffer())
   } catch (error) {
     if (error.message?.includes('Location Final')) throw error
-    throw new Error(`无法读取 Excel：${error.message}`)
+    throw new Error(`Unable to read the Excel file: ${error.message}`)
   }
 }
 

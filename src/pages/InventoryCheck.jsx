@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState, useTransition } from 
 import {
   Archive, Boxes, CalendarClock, CheckCircle2, ChevronRight,
   AlertCircle, Download, FileSpreadsheet, Layers3, Link2, MapPin,
-  PackageCheck, RefreshCw, Search, Sparkles, Upload, Warehouse, X,
+  PackageCheck, RefreshCw, Search, Upload, Warehouse, X,
 } from 'lucide-react'
 import FileUploadZone from '../components/FileUploadZone.jsx'
 import DataTable from '../components/DataTable.jsx'
@@ -152,7 +152,7 @@ export default function InventoryCheck() {
       setFileName(file.name)
       setActiveSheet('Location final')
       setShowUpload(false)
-      toast.success(`已更新 ${parsed.length.toLocaleString()} 行；旧周数据已被替换。`, 'Weekly Inventory Updated')
+      toast.success(`Updated ${parsed.length.toLocaleString()} rows. The previous weekly file was replaced.`, 'Weekly Inventory Updated')
     } catch (error) {
       toast.error(error.message, 'Upload Error')
     } finally {
@@ -162,7 +162,7 @@ export default function InventoryCheck() {
 
   const handleDownload = useCallback(() => {
     downloadCSV(inventoryToCSV(filteredRows), `${SHEET_LABELS[activeSheet] || activeSheet}_${Date.now()}.csv`)
-    toast.success(`已导出 ${filteredRows.length.toLocaleString()} 行`, 'CSV Exported')
+    toast.success(`Exported ${filteredRows.length.toLocaleString()} rows.`, 'CSV Exported')
   }, [filteredRows, activeSheet, toast])
 
   const pendingSheet = activeSheet === 'Pending Shipment'
@@ -205,12 +205,9 @@ export default function InventoryCheck() {
         <div className="pointer-events-none absolute bottom-0 left-1/3 h-36 w-72 rounded-full bg-cyan-400/10 blur-3xl" />
         <div className="relative flex flex-col gap-6 lg:flex-row lg:items-end lg:justify-between">
           <div>
-            <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/10 px-3 py-1.5 text-xs font-bold uppercase tracking-[0.18em] text-violet-100 backdrop-blur">
-              <Sparkles className="h-3.5 w-3.5" /> Warehouse Intelligence
-            </div>
             <h1 className="text-3xl font-black tracking-tight sm:text-4xl">Inventory Check</h1>
             <p className="mt-2 max-w-2xl text-sm leading-6 text-indigo-100/80 sm:text-base">
-              Location Final 是唯一现货主表。分类 Sheet 自动关联主表，Pending Shipment 单独查看，不会重复计算。
+              Location Final is the single source of truth. Category sheets are linked views, while Pending Shipment is tracked separately to prevent double counting.
             </p>
             <div className="mt-5 flex flex-wrap gap-2">
               {fileName && <InfoPill icon={FileSpreadsheet}>{fileName}</InfoPill>}
@@ -225,15 +222,15 @@ export default function InventoryCheck() {
         </div>
       </section>
 
-      {apiError && <div className="flex items-center gap-3 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700"><AlertCircle className="h-4 w-4" />数据库暂时无法连接：{apiError}</div>}
+      {apiError && <div className="flex items-center gap-3 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700"><AlertCircle className="h-4 w-4" />The database is temporarily unavailable: {apiError}</div>}
 
       {showUpload && (
         <section className="rounded-3xl border border-indigo-100 bg-white p-5 shadow-lg shadow-indigo-950/5">
           <div className="mb-4 flex items-start justify-between gap-4">
-            <div><h2 className="font-bold text-slate-800">Upload weekly workbook</h2><p className="mt-1 text-sm text-slate-500">上传后会整体替换上周 Inventory Check；不会增加到 Stock Management。</p></div>
+            <div><h2 className="font-bold text-slate-800">Upload weekly workbook</h2><p className="mt-1 text-sm text-slate-500">The new upload replaces the previous Inventory Check file. It does not change Stock Management.</p></div>
             <button onClick={() => setShowUpload(false)} className="rounded-lg p-2 text-slate-400 hover:bg-slate-100"><X className="h-4 w-4" /></button>
           </div>
-          {isUploading ? <div className="flex items-center justify-center py-12 text-sm font-medium text-indigo-600"><RefreshCw className="mr-2 h-5 w-5 animate-spin" />正在读取全部 Sheet 并保存…</div> : <FileUploadZone onFile={handleFile} accept=".xlsx,.xls" acceptedTypes="XLSX, XLS" label="Drop the weekly Inventory Update here" sublabel="or click to choose the file" compact />}
+          {isUploading ? <div className="flex items-center justify-center py-12 text-sm font-medium text-indigo-600"><RefreshCw className="mr-2 h-5 w-5 animate-spin" />Reading and saving all sheets…</div> : <FileUploadZone onFile={handleFile} accept=".xlsx,.xls" acceptedTypes="XLSX, XLS" label="Drop the weekly Inventory Update here" sublabel="or click to choose the file" compact />}
         </section>
       )}
 
@@ -283,7 +280,7 @@ export default function InventoryCheck() {
         <button onClick={() => setShowUpload(true)} className="group flex min-h-[340px] w-full flex-col items-center justify-center rounded-3xl border-2 border-dashed border-indigo-200 bg-gradient-to-br from-white to-indigo-50/60 p-8 text-center transition hover:border-indigo-400">
           <span className="flex h-16 w-16 items-center justify-center rounded-2xl bg-indigo-100 text-indigo-600 transition group-hover:scale-105"><Warehouse className="h-8 w-8" /></span>
           <span className="mt-5 text-lg font-bold text-slate-800">Upload your first weekly inventory</span>
-          <span className="mt-2 max-w-md text-sm leading-6 text-slate-500">系统会读取 Location Final 和全部分类 Sheet，并建立可搜索的库存视图。</span>
+          <span className="mt-2 max-w-md text-sm leading-6 text-slate-500">The system will read Location Final and every category sheet to create a searchable inventory view.</span>
         </button>
       )}
 
