@@ -339,11 +339,12 @@ export default function AutoDeduct() {
           SIZE: item.SIZE,
           _isNew: !!item._isNew,
         }
-      if (!item._isCombo || !item._source.size) {
-        learned[aliasKey(item._source.style, item._source.color)] = {
-          ...aliasValue,
-          SIZE: undefined,
-        }
+      // Also remember a style+color rule that can reuse the source size next time.
+      // Never generalise a newly-created SKU: another size must be confirmed first.
+      if (!item._isNew) {
+        learned[aliasKey(item._source.style, item._source.color)] = item._isCombo
+          ? { components: (item.components || []).map(component => ({ ...component, SIZE: undefined })) }
+          : { ...aliasValue, SIZE: undefined }
       }
       learned[aliasKey(item._source.style, item._source.color, item._source.size)] = aliasValue
     }

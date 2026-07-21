@@ -342,6 +342,8 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
 
     if (!candidates?.length && target) {
       if (applyAliasTarget([])) return
+      unmatchedRows.push({ style, color, size: normSize, qty, packCount, parseIssue: parseIssue || 'confirmed_mapping_size_missing' })
+      return
     }
 
     if (parseIssue && !aliasTarget) {
@@ -356,6 +358,8 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
 
     if (aliasTarget) {
       if (applyAliasTarget(candidates)) return
+      unmatchedRows.push({ style, color, size: normSize, qty, packCount, parseIssue: parseIssue || 'confirmed_mapping_size_missing' })
+      return
     }
 
     // Score every candidate, keeping the best score per DISTINCT color (a color's
