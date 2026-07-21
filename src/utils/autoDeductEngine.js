@@ -221,6 +221,38 @@ export function aliasKey(style, salesColor, size = '') {
   return normSize ? `${base}::${normSize}` : base
 }
 
+// Older saved choices only have a size-specific key. Reuse them across sizes
+// when every saved size agrees on the same target style/color (and combo mix).
+function inferLegacyGeneralAlias(aliases, baseKey) {
+  const sourceStyle = baseKey.split('::')[0]
+  const targets = Object.entries(aliases)
+    .filter(([key, value]) => key.startsWith(`${baseKey}::`) && value && !value._isNew)
+    .map(([, value]) => value)
+
+  if (!targets.length) return null
+
+  const fingerprint = (target) => {
+    if (typeof target === 'string') return `single::${sourceStyle}::${normalizeColor(target)}`
+    if (Array.isArray(target.components) && target.components.length) {
+      return `combo::${target.components.map(component => [
+        normalizeStyle(component.STYLE || ''),
+        normalizeColor(component.COLOR || ''),
+        Math.max(1, parseInt(component.multiplier, 10) || 1),
+      ].join('::')).join('||')}`
+    }
+    return `single::${normalizeStyle(target.STYLE || '')}::${normalizeColor(target.COLOR || '')}`
+  }
+
+  if (new Set(targets.map(fingerprint)).size !== 1) return null
+
+  const target = targets[0]
+  if (typeof target === 'string') return target
+  if (Array.isArray(target.components) && target.components.length) {
+    return { components: target.components.map(component => ({ ...component, SIZE: undefined })) }
+  }
+  return { ...target, SIZE: undefined }
+}
+
 /**
  * Match sales rows against the template and accumulate quantities.
  *
@@ -277,7 +309,10 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
     const normSize  = normalizeSalesSize(rawSize)
     const key       = `${normStyle}||${normSize}`
     let candidates = buckets.get(key) || []
-    const aliasTarget = aliases[aliasKey(style, color, normSize)] || aliases[aliasKey(style, color)]
+    const baseAliasKey = aliasKey(style, color)
+    const aliasTarget = aliases[aliasKey(style, color, normSize)]
+      || aliases[baseAliasKey]
+      || inferLegacyGeneralAlias(aliases, baseAliasKey)
     const aliasComponentCount = Array.isArray(aliasTarget?.components)
       ? aliasTarget.components.reduce((sum, component) => sum + Math.max(1, parseInt(component.multiplier, 10) || 1), 0)
       : 0
