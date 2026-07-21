@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react'
+import React, { useEffect, useState, useMemo } from 'react'
 import { ChevronUp, ChevronDown, ChevronLeft, ChevronRight } from 'lucide-react'
 
 export default function DataTable({
@@ -6,11 +6,15 @@ export default function DataTable({
   columns = [],
   pageSize = 50,
   rowClassName,
+  onRowClick,
+  getRowKey,
   emptyMessage = 'No data to display',
 }) {
   const [sortKey, setSortKey] = useState(null)
   const [sortDir, setSortDir] = useState('asc')
   const [page, setPage] = useState(0)
+
+  useEffect(() => setPage(0), [data])
 
   const handleSort = (key) => {
     if (sortKey === key) {
@@ -81,10 +85,11 @@ export default function DataTable({
           <tbody className="divide-y divide-slate-100">
             {paginated.map((row, idx) => (
               <tr
-                key={idx}
+                key={getRowKey ? getRowKey(row) : idx}
+                onClick={() => onRowClick?.(row)}
                 className={`group hover:bg-slate-50 transition-colors ${
                   rowClassName ? rowClassName(row) : ''
-                }`}
+                } ${onRowClick ? 'cursor-pointer' : ''}`}
               >
                 {columns.map((col) => (
                   <td
