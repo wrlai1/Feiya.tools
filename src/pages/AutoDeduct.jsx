@@ -9,6 +9,7 @@ import { useToast } from '../hooks/useToast.js'
 import { useAuth } from '../context/AuthContext.jsx'
 import { parseCSV, fillTemplate, generateExcel, aliasKey } from '../utils/autoDeductEngine.js'
 import ConsolidateStep from '../components/ConsolidateStep.jsx'
+import { consolidateRows } from '../utils/consolidateEngine.js'
 
 const BASE = '/api'
 
@@ -199,6 +200,7 @@ export default function AutoDeduct() {
   const [templateMissing, setTemplateMissing] = useState(false)
   const [showSettings,    setShowSettings]    = useState(false)
   const [aliases,         setAliases]         = useState({})
+  const [sourceHash,      setSourceHash]      = useState('')
   const toast = useToast()
 
   // Merge resolver output into filledRows:
@@ -212,8 +214,10 @@ export default function AutoDeduct() {
       if (extra._isCombo && Array.isArray(extra.components)) {
         for (const component of extra.components) {
           const found = rows.find(r => r.STYLE === component.STYLE && r.COLOR === component.COLOR && r.SIZE === component.SIZE)
-          if (found) found.QTY = (found.QTY || 0) + extra.QTY
-          else rows.push({ STYLE: component.STYLE, COLOR: component.COLOR, SIZE: component.SIZE, QTY: extra.QTY })
+          const multiplier = Math.max(1, parseInt(component.multiplier, 10) || 1)
+          const componentQty = extra.QTY * multiplier
+          if (found) found.QTY = (found.QTY || 0) + componentQty
+          else rows.push({ STYLE: component.STYLE, COLOR: component.COLOR, SIZE: component.SIZE, QTY: componentQty })
         }
         continue
       }
@@ -245,7 +249,7 @@ export default function AutoDeduct() {
   }, [getToken, isMock])
 
   const handleFile = useCallback((file) => {
-    setSrcFile(file); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([])
+    setSrcFile(file); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([]); setSourceHash('')
   }, [])
 
   const handleRun = useCallback(async () => {
@@ -266,9 +270,21 @@ export default function AutoDeduct() {
       const tRows = (tData.rows || []).map(r => ({ STYLE: r.Style, COLOR: r.Color, SIZE: r.Size }))
       setTemplateRows(tRows)
 
-      // 2. Parse sales CSV client-side
-      const salesText = await srcFile.text()
-      const salesRows = parseCSV(salesText)
+      // 2. Parse either a consolidated CSV or a raw TEMU workbook.
+      const bytes = await srcFile.arrayBuffer()
+      const digest = await crypto.subtle.digest('SHA-256', bytes)
+      setSourceHash([...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join(''))
+
+      let salesRows
+      if (/\.csv$/i.test(srcFile.name)) {
+        salesRows = parseCSV(new TextDecoder().decode(bytes))
+      } else {
+        const XLSX = await import('xlsx')
+        const wb = XLSX.read(bytes, { type: 'array' })
+        const sheetName = wb.SheetNames.find(name => name.trim().toUpperCase() === 'TEMU-STYLES') || wb.SheetNames[0]
+        const rawRows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { raw: false, defval: '' })
+        salesRows = consolidateRows(rawRows).consolidated
+      }
 
       // 3. Match & fill — pure JS, no server needed
       const engineResult = fillTemplate(tRows, salesRows, aliases)
@@ -371,6 +387,7 @@ export default function AutoDeduct() {
           filledRows:  mergedFilledRows,
           txnType,
           sourceName:  srcFile?.name || '',
+          sourceHash,
         }),
       })
       const data = await res.json()
@@ -385,7 +402,7 @@ export default function AutoDeduct() {
     } finally {
       setApplying(false)
     }
-  }, [mergedFilledRows, txnType, srcFile, applying, getToken, toast])
+  }, [mergedFilledRows, txnType, srcFile, sourceHash, applying, getToken, toast])
 
   const stats            = result?.stats
   const hasUnresolved    = result?.unmatchedRows?.length > 0 && resolvedExtras === null
@@ -405,7 +422,7 @@ export default function AutoDeduct() {
         <div>
           <h2 className="text-xl font-bold text-slate-800">Auto Deduct</h2>
           <p className="text-sm text-slate-500 mt-0.5">
-            Upload a consolidated sales CSV — matches against your template and fills quantities
+            Upload a TEMU order workbook or consolidated CSV — uncertain matches always require your confirmation
           </p>
         </div>
         <button onClick={() => setShowSettings(true)} className="btn-secondary text-sm">
@@ -459,10 +476,10 @@ export default function AutoDeduct() {
         {/* File upload */}
         <FileUploadZone
           onFile={handleFile}
-          accept=".csv"
-          acceptedTypes="CSV"
-          label="Drag & drop consolidated / return CSV here"
-          sublabel="Columns: style, color, size, QTY"
+          accept=".csv,.xlsx,.xls"
+          acceptedTypes="CSV, XLSX"
+          label="Drag & drop TEMU order / consolidated file here"
+          sublabel="TEMU-STYLES is selected automatically"
           currentFile={srcFile}
           onClear={() => { setSrcFile(null); setResult(null); setApplied(false) }}
         />
@@ -513,6 +530,11 @@ export default function AutoDeduct() {
           {(!hasUnresolved) && (
           <div className="card p-5 space-y-3">
             <h3 className="font-medium text-slate-700 text-sm">Actions</h3>
+
+            <div className="rounded-xl bg-slate-50 px-4 py-3 text-sm text-slate-600">
+              Inventory units to {txnType === 'sales' ? 'deduct' : 'add back'}: <strong className="text-slate-800">{mergedFilledRows.reduce((sum, row) => sum + (Number(row.QTY) || 0), 0).toLocaleString()}</strong>
+              {skippedRows.length > 0 && <span className="ml-2 text-amber-600">· {skippedRows.length} skipped row(s) will not be applied</span>}
+            </div>
 
             <button onClick={handleDownload} className="btn-primary w-full justify-center py-2.5">
               <FileDown className="w-4 h-4" />

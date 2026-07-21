@@ -6,7 +6,7 @@ import { Search, Plus, SkipForward, CheckCircle, X, Link2 } from 'lucide-react'
  *
  * For each row the auto-matcher couldn't place, the user can:
  *   Link   — pick an existing template entry to assign the QTY to
- *   Combo  — pick multiple existing template entries; each gets the source QTY
+ *   Combo  — pick multiple existing template entries with a quantity multiplier
  *   Create — manually specify STYLE / COLOR / SIZE (new row appended to output)
  *   Skip   — discard the row
  *
@@ -82,7 +82,17 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
       const next = [...prev]
       const current = next[i] || []
       if (current.some(item => componentKey(item) === componentKey(entry))) return next
-      next[i] = [...current, entry]
+      next[i] = [...current, { ...entry, multiplier: 1 }]
+      return next
+    })
+  }
+
+  function updateComboMultiplier(i, entry, value) {
+    setComboSelections(prev => {
+      const next = [...prev]
+      next[i] = (next[i] || []).map(item => componentKey(item) === componentKey(entry)
+        ? { ...item, multiplier: Math.max(1, parseInt(value, 10) || 1) }
+        : item)
       return next
     })
   }
@@ -341,7 +351,7 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
                       <span className="font-medium text-indigo-700">Combo set</span>
                       <span className="text-slate-400">→</span>
                       <span className="text-slate-600 truncate">
-                        {r.entry.components.map(c => `${c.STYLE}/${c.COLOR}/${c.SIZE}`).join(' + ')}
+                        {r.entry.components.map(c => `${c.STYLE}/${c.COLOR}/${c.SIZE} ×${c.multiplier || 1}`).join(' + ')}
                       </span>
                     </>
                   ) : (
@@ -422,9 +432,19 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
                             <span className="text-slate-600 truncate">{component.COLOR}</span>
                             <span className="text-slate-400">/</span>
                             <span className="text-slate-600">{component.SIZE}</span>
+                            <label className="ml-auto flex items-center gap-1 text-slate-500">
+                              ×
+                              <input
+                                type="number"
+                                min="1"
+                                value={component.multiplier || 1}
+                                onChange={(e) => updateComboMultiplier(i, component, e.target.value)}
+                                className="w-14 rounded border border-indigo-100 px-1.5 py-1 text-center"
+                              />
+                            </label>
                             <button
                               onClick={() => removeComboComponent(i, component)}
-                              className="ml-auto text-slate-300 hover:text-red-500"
+                              className="text-slate-300 hover:text-red-500"
                               title="Remove component"
                             >
                               <X className="w-3.5 h-3.5" />

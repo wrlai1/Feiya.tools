@@ -23,7 +23,8 @@ export default function ConsolidateStep() {
       } else {
         const XLSX = await import('xlsx')
         const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' })
-        rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { raw: false, defval: '' })
+        const sheetName = wb.SheetNames.find(name => name.trim().toUpperCase() === 'TEMU-STYLES') || wb.SheetNames[0]
+        rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { raw: false, defval: '' })
       }
       const out = consolidateRows(rows)
       setResult({ ...out, baseName: file.name.replace(/\.(csv|xlsx?|xls)$/i, '') })

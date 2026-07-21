@@ -58,6 +58,12 @@ export function normalizeSize(s) {
     .replace(/^([123])XL$/, '$1X')   // 1XL→1X, 2XL→2X, 3XL→3X
 }
 
+/** TEMU petite labels are one step larger than the warehouse labels. */
+export function normalizeSalesSize(s) {
+  const normalized = normalizeSize(s)
+  return ({ PS: 'PS', PM: 'PS', PL: 'PM', PXL: 'PL' })[normalized] || normalized
+}
+
 // ── Fuzzy helpers ─────────────────────────────────────────────────────────────
 
 /**
@@ -96,7 +102,8 @@ function colorTokens(raw) {
 // ── Color scoring ─────────────────────────────────────────────────────────────
 
 /** A match is only accepted (auto-filled) when its color score reaches this. */
-export const MATCH_THRESHOLD = 0.9
+export const MATCH_THRESHOLD = 0.95
+export const MATCH_MARGIN = 0.05
 
 /**
  * Pattern / print qualifier words. When a SINGLE-token sales color (e.g. "black")
@@ -205,7 +212,7 @@ export function parseCSV(text) {
 /** Build the lookup key for a learned alias: style + sales-color + optional size. */
 export function aliasKey(style, salesColor, size = '') {
   const base = `${normalizeStyle(style)}::${normalizeColor(salesColor)}`
-  const normSize = normalizeSize(size)
+  const normSize = normalizeSalesSize(size)
   return normSize ? `${base}::${normSize}` : base
 }
 
@@ -257,7 +264,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
     srcTotal += qty
 
     const normStyle = normalizeStyle(style)
-    const normSize  = normalizeSize(rawSize)
+    const normSize  = normalizeSalesSize(rawSize)
     const key       = `${normStyle}||${normSize}`
     let candidates = buckets.get(key) || []
 
@@ -283,7 +290,8 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
           prefixCandidates.push(...bucket)
         }
       }
-      if (prefixCandidates.length) candidates = prefixCandidates
+      const distinctStyles = new Set(prefixCandidates.map(c => normalizeStyle(c.style)))
+      if (distinctStyles.size === 1) candidates = prefixCandidates
     }
 
     // ── Learned alias — a previous human "Link" or "Combo" wins outright ────────
@@ -308,7 +316,10 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
       if (Array.isArray(target?.components) && target.components.length) {
         const matches = target.components.map(component => matchTarget(component, entries))
         if (matches.some(match => !match)) return false
-        for (const matched of matches) matched.qty += qty
+        for (const [i, matched] of matches.entries()) {
+          const multiplier = Math.max(1, parseInt(target.components[i].multiplier, 10) || 1)
+          matched.qty += qty * multiplier
+        }
         filledTotal += qty
         matchLog.push({
           style,
@@ -365,9 +376,8 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
       if (!cur || s > cur.score) bySig.set(sig, { score: s, idx: i })
     })
 
-    const passing = [...bySig.values()]
-      .filter(x => x.score >= MATCH_THRESHOLD)
-      .sort((a, b) => b.score - a.score)
+    const ranked = [...bySig.values()].sort((a, b) => b.score - a.score)
+    const passing = ranked.filter(x => x.score >= MATCH_THRESHOLD)
 
     // Decide:
     //   • nothing clears the bar                       → review (unmatched)
@@ -375,11 +385,9 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
     //   • several qualify, but a UNIQUE exact (1.0)     → that exact match wins
     //   • several distinct colors tie below exact      → AMBIGUOUS → review, never guess
     let chosen = -1
-    if (passing.length === 1) {
-      chosen = passing[0].idx
-    } else if (passing.length > 1) {
-      const topExact = passing[0].score >= 0.999 && passing[1].score < 0.999
-      if (topExact) chosen = passing[0].idx
+    if (passing.length) {
+      const runnerUp = ranked[1]?.score ?? 0
+      if (passing[0].score - runnerUp >= MATCH_MARGIN) chosen = passing[0].idx
     }
 
     if (chosen >= 0) {

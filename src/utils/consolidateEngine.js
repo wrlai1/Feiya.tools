@@ -26,11 +26,23 @@ const STYLE_NORMALIZE = {
   '0070': '5020070',
   '50070': '5020070',
   '50077': '5010077',
-  '70015': '7010015',
-  '5020071': '5010071',
+  '70015': '5010015-PLUS',
+  '5010071': '5020071',
+  '7010015': '5010015-PLUS',
+  '5010109': 'M022 Missy',
+  '7010109': 'M022 PLUS',
+  '11006': '1106',
   '5020077': '5010077',
   '5028766': '8766',
   '6026015': '6015',
+}
+
+// TEMU petite labels run one size larger than the physical inventory labels.
+const IMPORT_SIZE_NORMALIZE = { PS: 'PS', PM: 'PS', PL: 'PM', PXL: 'PL' }
+
+function normalizeImportedSize(size) {
+  const raw = String(size || '').trim()
+  return IMPORT_SIZE_NORMALIZE[raw.toUpperCase()] || raw
 }
 
 // 真实的 4 位款号，绝不扩展（前导零规则外的双保险）
@@ -125,8 +137,8 @@ function findKey(row, target, aliases = []) {
  */
 export function consolidateRows(rows) {
   if (!rows.length) throw new Error('文件是空的')
-  const styleKey = findKey(rows[0], 'Style', ['SKU'])
-  const qtyKey = findKey(rows[0], 'Quantity', ['Qty', 'QTY', '数量', '件数'])
+  const styleKey = findKey(rows[0], 'Style', ['SKU', 'SKU货号'])
+  const qtyKey = findKey(rows[0], 'Quantity', ['Qty', 'QTY', '数量', '件数', '应履约件数'])
   if (!styleKey) throw new Error('找不到 Style/SKU 列')
   if (!qtyKey) throw new Error('找不到 Quantity/Qty/数量 列')
 
@@ -167,7 +179,10 @@ export function consolidateRows(rows) {
   }
 
   // 款号归一化/扩展
-  for (const p of parsed) p.style = resolveStyle(p.style, p.size)
+  for (const p of parsed) {
+    p.size = normalizeImportedSize(p.size)
+    p.style = resolveStyle(p.style, p.size)
+  }
 
   // set 展开
   const expanded = []

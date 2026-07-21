@@ -1154,6 +1154,8 @@ async function ensureInventoryTables(sql) {
       created_at  TIMESTAMPTZ DEFAULT NOW()
     )
   `;
+  await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS source_hash TEXT`;
+  await sql`CREATE UNIQUE INDEX IF NOT EXISTS inventory_transactions_source_hash_uq ON inventory_transactions (transaction_type, source_hash) WHERE source_hash IS NOT NULL AND source_hash <> ''`;
 }
 
 async function saveInventorySnapshot(sql, label, sourceName = '') {
@@ -1297,7 +1299,12 @@ app.all('/api/inventory-balance', async (req, res) => {
     // POST apply
     if (req.method === 'POST' && action === 'apply') {
       if (!isAdmin) return res.status(403).json({ error: 'Admin access required' });
-      const { filledRows = [], txnType = 'sales', sourceName = '' } = req.body || {};
+      const { filledRows = [], txnType = 'sales', sourceName = '', sourceHash = '' } = req.body || {};
+
+      if (sourceHash) {
+        const duplicate = await sql`SELECT id FROM inventory_transactions WHERE transaction_type = ${txnType} AND source_hash = ${sourceHash} LIMIT 1`;
+        if (duplicate.length) return res.status(409).json({ error: 'This exact file has already been applied. Inventory was not changed.' });
+      }
 
       await saveInventorySnapshot(sql, txnType, sourceName);
 
@@ -1306,21 +1313,13 @@ app.all('/api/inventory-balance', async (req, res) => {
         const qty = parseInt(r.QTY, 10) || 0;
         if (!qty) continue;
 
-        if (txnType === 'sales') {
-          await sql`
-            UPDATE inventory_balance
-            SET quantity   = GREATEST(0, quantity - ${qty}),
-                updated_at = NOW()
-            WHERE style = ${String(r.STYLE)} AND color = ${String(r.COLOR)} AND size = ${String(r.SIZE)}
-          `;
-        } else {
-          await sql`
-            UPDATE inventory_balance
-            SET quantity   = quantity + ${qty},
-                updated_at = NOW()
-            WHERE style = ${String(r.STYLE)} AND color = ${String(r.COLOR)} AND size = ${String(r.SIZE)}
-          `;
-        }
+        const delta = txnType === 'sales' ? -qty : qty;
+        await sql`
+          INSERT INTO inventory_balance (style, color, size, quantity)
+          VALUES (${String(r.STYLE)}, ${String(r.COLOR)}, ${String(r.SIZE)}, ${delta})
+          ON CONFLICT (style, color, size)
+          DO UPDATE SET quantity = inventory_balance.quantity + ${delta}, updated_at = NOW()
+        `;
         appliedUnits += qty;
 
         // 动销流水：每个 SKU 一行，apply 时间戳即记账日期
@@ -1331,8 +1330,8 @@ app.all('/api/inventory-balance', async (req, res) => {
       }
 
       await sql`
-        INSERT INTO inventory_transactions (transaction_type, source_file, applied_units, applied_by)
-        VALUES (${txnType}, ${sourceName}, ${appliedUnits}, ${payload.username})
+        INSERT INTO inventory_transactions (transaction_type, source_file, source_hash, applied_units, applied_by)
+        VALUES (${txnType}, ${sourceName}, ${sourceHash}, ${appliedUnits}, ${payload.username})
       `;
       return res.json({ ok: true, applied_units: appliedUnits });
     }
