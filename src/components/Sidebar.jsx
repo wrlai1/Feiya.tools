@@ -2,7 +2,7 @@ import React, { useState } from 'react'
 import { NavLink } from 'react-router-dom'
 import {
   LayoutDashboard, Package, Truck, MessageSquare,
-  Boxes, Minus, Sparkles, X, Users, LogOut, KeyRound, ShieldCheck, User, Clock, ClipboardList, BarChart3,
+  Boxes, Minus, Sparkles, X, Users, LogOut, KeyRound, ShieldCheck, User, Clock, ClipboardList, BarChart3, History,
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import ChangePasswordModal from './ChangePasswordModal.jsx'
@@ -13,7 +13,8 @@ const ADMIN_NAV = [
   { label: 'Tracking',            to: '/tracking',    icon: Truck },
   { label: 'Low Inventory Notes', to: '/notes',       icon: MessageSquare },
   { label: 'Stock Management',    to: '/stock',       icon: Boxes },
-  { label: 'Auto Deduct',         to: '/auto-deduct', icon: Minus },
+  { label: 'Auto Deduct',         to: '/auto-deduct', icon: Minus, end: true },
+  { label: 'History',             to: '/auto-deduct/history', icon: History },
   { label: 'Analytics',           to: '/analytics',   icon: BarChart3 },
   { label: 'Time Clock',          to: '/timeclock',   icon: Clock },
 ]

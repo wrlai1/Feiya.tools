@@ -10,6 +10,7 @@ import TrackingPage from './pages/TrackingPage.jsx'
 import NotesPage from './pages/NotesPage.jsx'
 import StockManagement from './pages/StockManagement.jsx'
 import AutoDeduct from './pages/AutoDeduct.jsx'
+import AutoDeductHistory from './pages/AutoDeductHistory.jsx'
 import MetricsAnalytics from './pages/MetricsAnalytics.jsx'
 import AutoGenerate from './pages/AutoGenerate.jsx'
 import AdminUsers from './pages/AdminUsers.jsx'
@@ -76,6 +77,7 @@ function AppRoutes() {
         <Route path="notes" element={<NotesPage />} />
         <Route path="stock" element={<RequireAdmin><StockManagement /></RequireAdmin>} />
         <Route path="auto-deduct" element={<RequireAdmin><AutoDeduct /></RequireAdmin>} />
+        <Route path="auto-deduct/history" element={<RequireAdmin><AutoDeductHistory /></RequireAdmin>} />
         <Route path="analytics" element={<RequireAdmin><MetricsAnalytics /></RequireAdmin>} />
         <Route path="auto-generate" element={<RequireAdmin><AutoGenerate /></RequireAdmin>} />
         <Route path="users" element={<RequireAdmin><AdminUsers /></RequireAdmin>} />

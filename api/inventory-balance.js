@@ -78,6 +78,7 @@ async function ensureTables(sql) {
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS applied_by TEXT`
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS source_file TEXT`
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS applied_units INTEGER`
+  await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS row_count INTEGER`
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS source_hash TEXT`
   await sql`CREATE UNIQUE INDEX IF NOT EXISTS inventory_transactions_source_hash_uq ON inventory_transactions (transaction_type, source_hash) WHERE source_hash IS NOT NULL AND source_hash <> ''`
   // sort_order preserves the original SalesTEMPLATE.csv row sequence so the
@@ -277,6 +278,7 @@ export default async function handler(req, res) {
       await saveSnapshot(sql, txnType, sourceName)
 
       let appliedUnits = 0
+      let appliedRows = 0
       for (const r of filledRows) {
         const qty = parseInt(r.QTY, 10) || 0
         if (!qty) continue
@@ -289,6 +291,7 @@ export default async function handler(req, res) {
           DO UPDATE SET quantity = inventory_balance.quantity + ${delta}, updated_at = NOW()
         `
         appliedUnits += qty
+        appliedRows += 1
 
         // 动销流水：每个 SKU 一行，apply 时间戳即记账日期
         await sql`
@@ -298,8 +301,8 @@ export default async function handler(req, res) {
       }
 
       await sql`
-        INSERT INTO inventory_transactions (transaction_type, source_file, source_hash, applied_units, applied_by)
-        VALUES (${txnType}, ${sourceName}, ${sourceHash}, ${appliedUnits}, ${payload.username})
+        INSERT INTO inventory_transactions (transaction_type, source_file, source_hash, applied_units, row_count, applied_by)
+        VALUES (${txnType}, ${sourceName}, ${sourceHash}, ${appliedUnits}, ${appliedRows}, ${payload.username})
       `
       return res.json({ ok: true, applied_units: appliedUnits })
     }
@@ -320,9 +323,9 @@ export default async function handler(req, res) {
     // ── GET transactions ──────────────────────────────────────────────────────
     if (req.method === 'GET' && action === 'transactions') {
       const rows = await sql`
-        SELECT id, transaction_type, source_file, applied_units, applied_by, applied_at
+        SELECT id, transaction_type, source_file, applied_units, row_count, applied_by, applied_at
         FROM inventory_transactions
-        ORDER BY applied_at DESC LIMIT 50
+        ORDER BY applied_at DESC LIMIT 200
       `
       return res.json({
         transactions: rows.map(r => ({

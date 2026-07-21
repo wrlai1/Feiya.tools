@@ -10,6 +10,7 @@ const PAGE_TITLES = {
   '/notes':        'Low Inventory Notes',
   '/stock':        'Stock Management',
   '/auto-deduct':  'Auto Deduct',
+  '/auto-deduct/history': 'Auto Deduct History',
   '/analytics':    'Analytics',
   '/auto-generate':'Auto Generate',
   '/users':        'User Management',
