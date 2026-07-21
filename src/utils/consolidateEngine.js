@@ -46,7 +46,7 @@ function normalizeImportedSize(size) {
 }
 
 // 真实的 4 位款号，绝不扩展（前导零规则外的双保险）
-const NO_EXPAND_STYLES = new Set(['8766', '6015', '1542', '1106'])
+const NO_EXPAND_STYLES = new Set(['0015', '0071', '8766', '6015', '1542', '1106'])
 
 // 款号本身带尾字母的（字母不属于颜色）
 const KNOWN_STYLE_OVERRIDES = ['853106X']
