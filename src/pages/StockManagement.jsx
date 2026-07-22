@@ -81,7 +81,7 @@ function EditQtyModal({ row, onClose, onDone, getToken }) {
         `${row.Style} / ${row.Color} / ${row.Size}: ${data.old_quantity} → ${data.new_quantity}`,
         'Quantity Updated'
       )
-      onDone()
+      onDone({ id: row.id, quantity: Number(data.new_quantity) })
       onClose()
     } catch (err) {
       toast.error(err.message, 'Update Failed')
@@ -905,6 +905,24 @@ export default function StockManagement() {
 
   useEffect(() => { loadBalance() }, [loadBalance])
 
+  const handleQuantityUpdated = useCallback(({ id, quantity }) => {
+    setBalanceData((current) => {
+      if (!current?.rows) return current
+
+      const rows = current.rows.map((row) =>
+        row.id === id ? { ...row, Quantity: quantity } : row
+      )
+
+      return {
+        ...current,
+        rows,
+        total_units: rows.reduce((sum, row) => sum + (Number(row.Quantity) || 0), 0),
+        skus_in_stock: rows.filter((row) => Number(row.Quantity) > 0).length,
+        skus_zero: rows.filter((row) => Number(row.Quantity) <= 0).length,
+      }
+    })
+  }, [])
+
   const handleReset = useCallback(async () => {
     if (!window.confirm('Reset all quantities to zero? This cannot be undone.')) return
     setResetting(true)
@@ -996,7 +1014,12 @@ export default function StockManagement() {
         <RemoveRowsModal onClose={() => setShowRemoveRows(false)} onDone={loadBalance} currentRows={allRows} getToken={getToken} />
       )}
       {editTarget && (
-        <EditQtyModal row={editTarget} onClose={() => setEditTarget(null)} onDone={loadBalance} getToken={getToken} />
+        <EditQtyModal
+          row={editTarget}
+          onClose={() => setEditTarget(null)}
+          onDone={handleQuantityUpdated}
+          getToken={getToken}
+        />
       )}
 
       {/* Header */}
@@ -1125,6 +1148,7 @@ export default function StockManagement() {
               data={displayRows}
               columns={COLUMNS}
               pageSize={50}
+              resetPageKey={`${searchQuery}\u0000${filter}`}
               rowClassName={rowColor}
               emptyMessage={
                 searchQuery || filter !== 'all'
