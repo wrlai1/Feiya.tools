@@ -1,5 +1,31 @@
-import React, { useState, useMemo } from 'react'
-import { Search, Plus, SkipForward, CheckCircle, X, Link2 } from 'lucide-react'
+import React, { useEffect, useState, useMemo } from 'react'
+import { Search, Plus, SkipForward, CheckCircle, X, Link2, ChevronDown, RotateCcw } from 'lucide-react'
+import { findAdditionalSizeMappings } from '../utils/autoDeductRules.js'
+
+function DeferredSearchInput({ value, onCommit, onFocus }) {
+  const [draft, setDraft] = useState(value)
+
+  useEffect(() => setDraft(value), [value])
+  useEffect(() => {
+    if (draft === value) return undefined
+    const timer = window.setTimeout(() => onCommit(draft), 180)
+    return () => window.clearTimeout(timer)
+  }, [draft, value, onCommit])
+
+  return (
+    <div className="relative">
+      <Search className="absolute left-3 top-2.5 w-3.5 h-3.5 text-slate-400 pointer-events-none" />
+      <input
+        type="text"
+        placeholder="Search template (style, color, size)…"
+        value={draft}
+        onFocus={onFocus}
+        onChange={(event) => setDraft(event.target.value)}
+        className="w-full pl-9 pr-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+      />
+    </div>
+  )
+}
 
 /**
  * Interactive panel for resolving unmatched sales rows.
@@ -21,6 +47,8 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
   const [createForms,     setCreateForms]     = useState(() => Array(unmatchedRows.length).fill(null))
   const [comboSelections, setComboSelections] = useState(() => Array(unmatchedRows.length).fill(null).map(() => []))
   const [packCounts,      setPackCounts]      = useState(() => unmatchedRows.map(row => row.packCount > 1 ? row.packCount : ''))
+  const [activeSearch,    setActiveSearch]    = useState(null)
+  const [ruleBatches,     setRuleBatches]     = useState([])
 
   const pending   = resolved.filter(r => !r).length
   const linked    = resolved.filter(r => r?.type === 'link').length
@@ -40,7 +68,66 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
     setCreateForms(prev => { const n = [...prev]; n[i] = null; return n })
   }
 
+  function confirmLink(i, entry) {
+    const additional = findAdditionalSizeMappings({
+      unmatchedRows,
+      templateRows: normTemplate,
+      resolved,
+      sourceIndex: i,
+      targetEntry: entry,
+    })
+    const batchId = `${Date.now()}-${i}`
+    const next = [...resolved]
+    next[i] = { type: 'link', entry, batchId, isBatchSource: additional.length > 0 }
+    for (const match of additional) {
+      next[match.index] = { type: 'link', entry: match.entry, batchId, autoApplied: true }
+    }
+    setResolved(next)
+    setCreateForms(prev => { const forms = [...prev]; forms[i] = null; return forms })
+    if (additional.length) {
+      setRuleBatches(prev => [...prev, {
+        id: batchId,
+        sourceIndex: i,
+        memberIndexes: additional.map(match => match.index),
+        expanded: false,
+      }])
+    }
+  }
+
+  function undoBatch(batchId, includeSource = false) {
+    const batch = ruleBatches.find(item => item.id === batchId)
+    if (!batch) return
+    setResolved(prev => {
+      const next = [...prev]
+      for (const index of batch.memberIndexes) next[index] = null
+      if (includeSource) next[batch.sourceIndex] = null
+      else if (next[batch.sourceIndex]) next[batch.sourceIndex] = { ...next[batch.sourceIndex], batchId: undefined, isBatchSource: false }
+      return next
+    })
+    setRuleBatches(prev => prev.filter(item => item.id !== batchId))
+  }
+
+  function editBatchMember(batchId, index) {
+    setResolved(prev => { const next = [...prev]; next[index] = null; return next })
+    setRuleBatches(prev => prev.flatMap(batch => {
+      if (batch.id !== batchId) return [batch]
+      const memberIndexes = batch.memberIndexes.filter(member => member !== index)
+      return memberIndexes.length ? [{ ...batch, memberIndexes }] : []
+    }))
+    setActiveSearch(index)
+  }
+
+  function toggleBatch(batchId) {
+    setRuleBatches(prev => prev.map(batch => batch.id === batchId ? { ...batch, expanded: !batch.expanded } : batch))
+  }
+
   function unresolve(i) {
+    const batch = ruleBatches.find(item => item.sourceIndex === i || item.memberIndexes.includes(i))
+    if (batch) {
+      if (batch.sourceIndex === i) undoBatch(batch.id, true)
+      else editBatchMember(batch.id, i)
+      return
+    }
     setResolved(prev => { const n = [...prev]; n[i] = null; return n })
   }
 
@@ -330,11 +417,12 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
           const r        = resolved[i]
           const isCreate = !!createForms[i]
           const form     = createForms[i]
-          const matches  = getMatches(i, row)
+          const matches  = activeSearch === i && !r && !isCreate ? getMatches(i, row) : []
           const comboComponents = comboSelections[i] || []
           const setReview = isSetReview(row)
           const expected = expectedPackCount(i, row)
           const comboTotal = comboMultiplierTotal(i)
+          const sourceBatch = ruleBatches.find(batch => batch.sourceIndex === i)
 
           return (
             <div
@@ -492,16 +580,11 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
                     </div>
                   )}
 
-                  <div className="relative">
-                    <Search className="absolute left-3 top-2.5 w-3.5 h-3.5 text-slate-400 pointer-events-none" />
-                    <input
-                      type="text"
-                      placeholder="Search template (style, color, size)…"
-                      value={searches[i]}
-                      onChange={e => setSearch(i, e.target.value)}
-                      className="w-full pl-9 pr-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    />
-                  </div>
+                  <DeferredSearchInput
+                    value={searches[i]}
+                    onCommit={(value) => setSearch(i, value)}
+                    onFocus={() => setActiveSearch(i)}
+                  />
 
                   {/* Template matches */}
                   {matches.length > 0 && (
@@ -509,7 +592,7 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
                       {matches.map((t, j) => (
                         <div key={j} className="flex items-center">
                           <button
-                            onClick={() => { if (!setReview) resolve(i, 'link', t) }}
+                            onClick={() => { if (!setReview) confirmLink(i, t) }}
                             disabled={setReview}
                             className="flex-1 text-left px-3 py-2 text-sm hover:bg-blue-50 flex items-center gap-3 min-w-0 disabled:opacity-50 disabled:cursor-not-allowed"
                           >
@@ -529,7 +612,7 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
                     </div>
                   )}
 
-                  {matches.length === 0 && searches[i] && (
+                  {activeSearch === i && matches.length === 0 && searches[i] && (
                     <p className="text-xs text-slate-400 px-1">No matches — try a different search or create a new entry.</p>
                   )}
 
@@ -551,6 +634,42 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
                       Skip
                     </button>
                   </div>
+                </div>
+              )}
+              {sourceBatch && (
+                <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900">
+                  <div className="flex items-center gap-3 flex-wrap">
+                    <CheckCircle className="w-4 h-4 text-emerald-600 shrink-0" />
+                    <span className="font-medium">
+                      Applied this rule to {sourceBatch.memberIndexes.length} additional size{sourceBatch.memberIndexes.length === 1 ? '' : 's'}
+                    </span>
+                    <div className="ml-auto flex items-center gap-2">
+                      <button onClick={() => toggleBatch(sourceBatch.id)} className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-100">
+                        Review <ChevronDown className={`w-3.5 h-3.5 transition-transform ${sourceBatch.expanded ? 'rotate-180' : ''}`} />
+                      </button>
+                      <button onClick={() => undoBatch(sourceBatch.id)} className="inline-flex items-center gap-1 rounded-lg border border-emerald-200 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50">
+                        <RotateCcw className="w-3.5 h-3.5" /> Undo
+                      </button>
+                    </div>
+                  </div>
+                  {sourceBatch.expanded && (
+                    <div className="mt-3 divide-y divide-emerald-100 rounded-lg border border-emerald-100 bg-white/80 px-3">
+                      {sourceBatch.memberIndexes.map(index => {
+                        const sibling = unmatchedRows[index]
+                        const target = resolved[index]?.entry
+                        if (!sibling || !target) return null
+                        return (
+                          <div key={index} className="flex items-center gap-2 py-2 text-xs">
+                            <span className="font-mono font-semibold text-slate-700">{sibling.style}</span>
+                            <span className="text-slate-500">{sibling.color} / {sibling.size}</span>
+                            <span className="text-slate-300">→</span>
+                            <span className="min-w-0 flex-1 truncate text-emerald-700">{target.STYLE} / {target.COLOR} / {target.SIZE}</span>
+                            <button onClick={() => editBatchMember(sourceBatch.id, index)} className="font-semibold text-blue-600 hover:text-blue-700">Edit</button>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
                 </div>
               )}
             </div>

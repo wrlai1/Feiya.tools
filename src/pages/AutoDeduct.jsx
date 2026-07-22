@@ -202,6 +202,8 @@ export default function AutoDeduct() {
   const [showSettings,    setShowSettings]    = useState(false)
   const [aliases,         setAliases]         = useState({})
   const [sourceHash,      setSourceHash]      = useState('')
+  const [editingResolutions, setEditingResolutions] = useState(false)
+  const [resolutionAliasKeys, setResolutionAliasKeys] = useState([])
   const toast = useToast()
 
   // Merge resolver output into filledRows:
@@ -250,19 +252,19 @@ export default function AutoDeduct() {
   }, [getToken, isMock])
 
   const handleFile = useCallback((file) => {
-    setSrcFile(file); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([]); setSourceHash('')
+    setSrcFile(file); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([]); setSourceHash(''); setEditingResolutions(false); setResolutionAliasKeys([])
   }, [])
 
   const handleRun = useCallback(async () => {
     if (isMock) {
       setResult(MOCK_RESULT)
       setTemplateRows(MOCK_TEMPLATE)
-      setApplied(false); setResolvedExtras(null); setSkippedRows([])
+      setApplied(false); setResolvedExtras(null); setSkippedRows([]); setEditingResolutions(false); setResolutionAliasKeys([])
       toast.info('3 rows need review', 'Mock Run Complete')
       return
     }
     if (!srcFile || processing) return
-    setProcessing(true); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([])
+    setProcessing(true); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([]); setEditingResolutions(false); setResolutionAliasKeys([])
     try {
       // 1. Fetch template from inventory balance (canonical SKU list)
       const tRes  = await fetch(`${BASE}/inventory-balance?action=list`, { headers: authHeaders(getToken()) })
@@ -329,6 +331,7 @@ export default function AutoDeduct() {
   const handleResolve = useCallback((items, skipped = []) => {
     setResolvedExtras(items)
     setSkippedRows(skipped)
+    setEditingResolutions(false)
     const learned = {}
     for (const item of items) {
       if (!item._learnAlias || !item._source) continue
@@ -350,11 +353,19 @@ export default function AutoDeduct() {
       learned[aliasKey(item._source.style, item._source.color, item._source.size)] = aliasValue
     }
     const learnedCount = items.filter((item) => item._learnAlias && item._source).length
-    if (learnedCount) {
-      const nextAliases = { ...aliases, ...learned }
+    if (learnedCount || resolutionAliasKeys.length) {
+      const nextAliases = { ...aliases }
+      for (const key of resolutionAliasKeys) delete nextAliases[key]
+      Object.assign(nextAliases, learned)
       setAliases(nextAliases)
+      setResolutionAliasKeys(Object.keys(learned))
       saveAliases(nextAliases)
-        .then(() => toast.success(`${learnedCount} match${learnedCount !== 1 ? 'es' : ''} remembered for next time`, 'Matches Saved'))
+        .then(() => toast.success(
+          learnedCount
+            ? `${learnedCount} match${learnedCount !== 1 ? 'es' : ''} remembered for next time`
+            : 'Previous draft matches removed',
+          'Matches Saved'
+        ))
         .catch((err) => toast.error(err.message, 'Could Not Save Matches'))
     }
     if (items.length > 0 || skipped.length > 0) {
@@ -363,7 +374,7 @@ export default function AutoDeduct() {
       if (skipped.length) parts.push(`${skipped.length} skipped (kept on Unmatched sheet)`)
       toast.success(parts.join(' · '), 'Ready to Download')
     }
-  }, [aliases, saveAliases, toast])
+  }, [aliases, resolutionAliasKeys, saveAliases, toast])
 
   const handleDownload = useCallback(async () => {
     if (!result) return
@@ -408,6 +419,8 @@ export default function AutoDeduct() {
 
   const stats            = result?.stats
   const hasUnresolved    = result?.unmatchedRows?.length > 0 && resolvedExtras === null
+  const hasReviewRows    = result?.unmatchedRows?.length > 0
+  const showResolver     = hasReviewRows && (hasUnresolved || editingResolutions)
 
   return (
     <div className="space-y-6 max-w-4xl">
@@ -533,16 +546,18 @@ export default function AutoDeduct() {
           )}
 
           {/* Resolver — shown when there are unmatched rows and user hasn't resolved yet */}
-          {hasUnresolved && (
-            <UnmatchedResolver
-              unmatchedRows={result.unmatchedRows}
-              templateRows={templateRows}
-              onDone={handleResolve}
-            />
+          {hasReviewRows && (
+            <div className={showResolver ? '' : 'hidden'}>
+              <UnmatchedResolver
+                unmatchedRows={result.unmatchedRows}
+                templateRows={templateRows}
+                onDone={handleResolve}
+              />
+            </div>
           )}
 
           {/* Actions — shown after resolver is done (or if no unmatched rows) */}
-          {(!hasUnresolved) && (
+          {(!hasUnresolved && !editingResolutions) && (
           <div className="card p-5 space-y-3">
             <h3 className="font-medium text-slate-700 text-sm">Actions</h3>
 
@@ -550,6 +565,12 @@ export default function AutoDeduct() {
               Inventory units to {txnType === 'sales' ? 'deduct' : 'add back'}: <strong className="text-slate-800">{mergedFilledRows.reduce((sum, row) => sum + (Number(row.QTY) || 0), 0).toLocaleString()}</strong>
               {skippedRows.length > 0 && <span className="ml-2 text-amber-600">· {skippedRows.length} skipped row(s) will not be applied</span>}
             </div>
+
+            {hasReviewRows && !applied && (
+              <button onClick={() => setEditingResolutions(true)} className="btn-secondary w-full justify-center py-2.5">
+                Review / Edit Resolutions
+              </button>
+            )}
 
             <button onClick={handleDownload} className="btn-primary w-full justify-center py-2.5">
               <FileDown className="w-4 h-4" />
