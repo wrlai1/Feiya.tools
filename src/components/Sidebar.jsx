@@ -102,7 +102,7 @@ export default function Sidebar({ open, collapsed, onClose }) {
       {open && <div className="fixed inset-0 z-30 bg-slate-950/20 backdrop-blur-[2px] lg:hidden" onClick={onClose} />}
 
       <aside className={`
-        fixed top-0 left-0 z-40 flex h-full w-72 flex-col border-r border-slate-200/70 bg-white
+        fixed top-0 left-0 z-40 flex h-full w-72 flex-col border-r border-slate-200/80 bg-[#fcfcfd]
         sidebar-transition lg:static lg:z-auto
         ${collapsed ? 'lg:w-20' : 'lg:w-72'}
         ${open ? 'translate-x-0' : '-translate-x-full'}
@@ -129,11 +129,14 @@ export default function Sidebar({ open, collapsed, onClose }) {
             const theme = SECTION_THEMES[group.theme]
             const activeGroup = group.items.some((item) => itemMatchesPath(item, location.pathname))
             return (
-              <div key={group.label} className={`mb-2 rounded-2xl px-1 pb-1 transition-colors duration-300 ${
+              <div key={group.label} className={`relative mb-1 rounded-xl px-1 pb-1 transition-colors duration-300 ${
                 activeGroup
                   ? `${theme.sidebarActive} lg:-mr-3 lg:rounded-r-none lg:pr-4`
                   : theme.sidebar
               }`}>
+                {activeGroup && (
+                  <span aria-hidden="true" className={`absolute bottom-3 right-0 top-3 hidden w-[3px] rounded-l-full lg:block ${theme.connector}`} />
+                )}
                 <SectionLabel label={group.label} collapsed={collapsed} theme={theme} />
                 <div className="space-y-1">
                   {group.items.map((item) => (

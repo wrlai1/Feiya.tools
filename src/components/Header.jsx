@@ -56,9 +56,11 @@ export default function Header({ onMenuClick, onSidebarToggle, sidebarCollapsed,
 
       <div className="flex-1 min-w-0">
         <div className="flex min-w-0 items-center gap-2">
-          <span className={`hidden rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.08em] sm:inline-flex ${sectionTheme.pill}`}>
+          <span className={`hidden h-1.5 w-1.5 flex-shrink-0 rounded-full sm:inline-flex ${sectionTheme.dot}`} />
+          <span className={`hidden text-[10px] font-semibold uppercase tracking-[0.1em] sm:inline-flex ${sectionTheme.labelColor}`}>
             {sectionTheme.label}
           </span>
+          <span className="hidden h-3 w-px bg-slate-300 sm:inline-flex" />
           <h1 className="truncate text-[17px] font-semibold tracking-[-0.01em] text-slate-950">{title}</h1>
         </div>
         <p className="hidden truncate text-xs text-slate-400 sm:block">{description}</p>
