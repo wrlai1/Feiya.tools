@@ -1,6 +1,6 @@
 import React from 'react'
 import { useLocation } from 'react-router-dom'
-import { Menu, PanelLeftClose, PanelLeftOpen, ShieldCheck, User } from 'lucide-react'
+import { Menu, PanelLeftClose, PanelLeftOpen, Search, ShieldCheck, User } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 
 const PAGE_TITLES = {
@@ -68,6 +68,16 @@ export default function Header({ onMenuClick, onSidebarToggle, sidebarCollapsed,
 
       {/* User badge */}
       <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={() => window.dispatchEvent(new Event('feiya:open-command-palette'))}
+          aria-label="Open quick navigation"
+          className="inline-flex h-9 w-9 items-center justify-center gap-2 rounded-xl border border-slate-200/80 bg-white/70 text-xs text-slate-500 transition hover:border-slate-300 hover:bg-white hover:text-slate-800 md:w-auto md:px-3"
+        >
+          <Search className="h-3.5 w-3.5" strokeWidth={1.8} />
+          <span className="hidden xl:inline">Quick navigation</span>
+          <kbd className="hidden rounded-md border border-slate-200 bg-slate-50 px-1.5 py-0.5 font-sans text-[10px] text-slate-400 md:inline">⌘K</kbd>
+        </button>
         <div className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-slate-200/80 bg-slate-50/80">
           {isAdmin
             ? <ShieldCheck className="w-3.5 h-3.5 text-blue-600" />

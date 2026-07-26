@@ -2,6 +2,7 @@ import React, { useState } from 'react'
 import { Outlet, useLocation } from 'react-router-dom'
 import Sidebar from './Sidebar.jsx'
 import Header from './Header.jsx'
+import CommandPalette from './CommandPalette.jsx'
 import { sectionThemeForPath } from '../utils/sectionTheme.js'
 
 export default function Layout() {
@@ -32,6 +33,7 @@ export default function Layout() {
           <Outlet />
         </main>
       </div>
+      <CommandPalette />
     </div>
   )
 }

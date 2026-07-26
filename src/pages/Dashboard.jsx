@@ -14,6 +14,7 @@ import {
   ArrowDownRight,
   ArrowRight,
   ArrowUpRight,
+  CheckCircle2,
   BarChart3,
   CalendarDays,
   ClipboardCheck,
@@ -21,6 +22,7 @@ import {
   Palette,
   Rocket,
   TrendingUp,
+  UploadCloud,
 } from 'lucide-react'
 import KPICard from '../components/KPICard.jsx'
 import { useAuth } from '../context/AuthContext.jsx'
@@ -106,23 +108,40 @@ function QuickAction({ to, icon: Icon, label, detail, color = 'blue' }) {
   )
 }
 
-function FocusRow({ label, value, detail, tone = 'blue' }) {
-  const dots = {
-    blue: 'bg-[#0071e3]',
-    green: 'bg-emerald-500',
-    amber: 'bg-amber-500',
+function ActionRow({ to, icon: Icon, title, detail, badge, tone = 'blue' }) {
+  const styles = {
+    blue: {
+      icon: 'bg-blue-50 text-[#0071e3]',
+      badge: 'bg-blue-50 text-[#0071e3]',
+    },
+    green: {
+      icon: 'bg-emerald-50 text-emerald-600',
+      badge: 'bg-emerald-50 text-emerald-700',
+    },
+    amber: {
+      icon: 'bg-amber-50 text-amber-600',
+      badge: 'bg-amber-50 text-amber-700',
+    },
+    purple: {
+      icon: 'bg-purple-50 text-purple-600',
+      badge: 'bg-purple-50 text-purple-700',
+    },
   }
+  const style = styles[tone]
   return (
-    <div className="flex items-start gap-3 border-t border-slate-100 py-4 first:border-0 first:pt-0 last:pb-0">
-      <span className={`mt-1.5 h-2 w-2 flex-shrink-0 rounded-full ${dots[tone]}`} />
+    <Link to={to} className="group flex items-center gap-3 rounded-xl border border-transparent px-2 py-3 transition-colors hover:border-slate-200 hover:bg-slate-50">
+      <span className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full ${style.icon}`}>
+        <Icon className="h-4 w-4" strokeWidth={1.8} />
+      </span>
       <div className="min-w-0 flex-1">
-        <div className="flex items-start justify-between gap-3">
-          <p className="text-sm text-slate-500">{label}</p>
-          <p className="text-right text-sm font-semibold text-slate-900">{value}</p>
+        <div className="flex items-start justify-between gap-2">
+          <p className="text-sm font-semibold text-slate-800">{title}</p>
+          <span className={`flex-shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold ${style.badge}`}>{badge}</span>
         </div>
-        <p className="mt-1 text-xs leading-5 text-slate-400">{detail}</p>
+        <p className="mt-0.5 line-clamp-2 text-xs leading-5 text-slate-400">{detail}</p>
       </div>
-    </div>
+      <ArrowRight className="h-4 w-4 flex-shrink-0 text-slate-300 transition-transform group-hover:translate-x-0.5 group-hover:text-slate-500" />
+    </Link>
   )
 }
 
@@ -232,6 +251,10 @@ export default function Dashboard() {
   }).format(new Date())
   const coverageComplete = summary.storeCount > 0 && summary.latestStoreCount === summary.storeCount
   const leadingStyle = summary.topProducts[0]
+  const missingStores = Math.max(summary.storeCount - summary.latestStoreCount, 0)
+  const leadingStylePath = leadingStyle
+    ? `/analytics?store=${encodeURIComponent(leadingStyle.topStore)}&spu=${encodeURIComponent(leadingStyle.spu)}`
+    : '/analytics'
 
   return (
     <div className="mx-auto max-w-[1500px] space-y-6">
@@ -325,37 +348,54 @@ export default function Dashboard() {
           )}
         </div>
 
-        <aside className="card p-5 sm:p-6">
+        <aside className="card p-4 sm:p-5">
           <div className="mb-5 flex items-center gap-3">
             <div className="flex h-10 w-10 items-center justify-center rounded-full bg-blue-50 text-[#0071e3]">
               <Activity className="h-[18px] w-[18px]" strokeWidth={1.8} />
             </div>
             <div>
-              <h3 className="font-semibold text-slate-950">Today’s Focus</h3>
-              <p className="text-xs text-slate-400">A quick operational pulse</p>
+              <h3 className="font-semibold text-slate-950">Today’s Actions</h3>
+              <p className="text-xs text-slate-400">Open the next task directly</p>
             </div>
           </div>
-          <FocusRow
-            label="Latest sales report"
-            value={summary.latestDay ? formatISODate(summary.latestDay) : 'No data'}
-            detail={summary.latestDay ? `${units(summary.latestUnits)} Units reported on the latest available day.` : 'Upload daily Analytics data to begin.'}
-            tone="blue"
-          />
-          <FocusRow
-            label="Store reporting"
-            value={summary.storeCount ? `${summary.latestStoreCount} / ${summary.storeCount}` : 'No stores'}
-            detail={coverageComplete ? 'All active stores are included in the latest report.' : 'Some stores may not have uploaded the latest day yet.'}
-            tone={coverageComplete ? 'green' : 'amber'}
-          />
-          <FocusRow
-            label="Leading style"
-            value={leadingStyle ? (leadingStyle.sku || leadingStyle.spu) : 'No ranking'}
-            detail={leadingStyle ? `${units(leadingStyle.units)} Units during the last 7 days.` : 'Recent sales will appear here automatically.'}
-            tone="green"
-          />
-          <Link to="/analytics" className="mt-5 flex items-center justify-center gap-2 rounded-xl bg-[#f5f5f7] px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:bg-slate-100">
-            Review full performance <ArrowRight className="h-4 w-4" />
-          </Link>
+          <div className="space-y-1">
+            <ActionRow
+              to="/analytics"
+              icon={summary.latestDay ? BarChart3 : UploadCloud}
+              title={summary.latestDay ? 'Review latest sales' : 'Upload Analytics data'}
+              detail={summary.latestDay ? `${units(summary.latestUnits)} Units reported on ${formatISODate(summary.latestDay)}.` : 'No sales dates are available yet. Start with the daily upload.'}
+              badge={summary.latestDay ? 'Latest' : 'Required'}
+              tone={summary.latestDay ? 'blue' : 'amber'}
+            />
+            <ActionRow
+              to="/analytics"
+              icon={coverageComplete ? CheckCircle2 : UploadCloud}
+              title={coverageComplete ? 'Store reporting complete' : 'Complete store reporting'}
+              detail={coverageComplete
+                ? `All ${summary.storeCount} stores are included in the latest report.`
+                : summary.storeCount
+                  ? `${missingStores} of ${summary.storeCount} stores may still need the latest upload.`
+                  : 'Create a store in Analytics to begin reporting.'}
+              badge={coverageComplete ? 'Complete' : summary.storeCount ? `${missingStores} missing` : 'Set up'}
+              tone={coverageComplete ? 'green' : 'amber'}
+            />
+            <ActionRow
+              to={leadingStylePath}
+              icon={TrendingUp}
+              title={leadingStyle ? `Review ${leadingStyle.sku || leadingStyle.spu}` : 'Review product rankings'}
+              detail={leadingStyle ? `${units(leadingStyle.units)} Units during the last 7 days.` : 'Product rankings will appear after recent sales are uploaded.'}
+              badge={leadingStyle ? 'Top style' : 'Open'}
+              tone={leadingStyle ? 'green' : 'blue'}
+            />
+            <ActionRow
+              to="/new-products"
+              icon={Rocket}
+              title="Review new product launches"
+              detail="Check countdowns, Units trends, and recent ROAS changes."
+              badge="14-day"
+              tone="purple"
+            />
+          </div>
         </aside>
       </section>
 

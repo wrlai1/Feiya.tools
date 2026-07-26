@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   AlertTriangle, ArrowDown, ArrowUp, BarChart3, CalendarDays, ChevronDown,
   ChevronUp, Clock3, Gauge, Loader2, PackagePlus, Pencil, RefreshCw,
-  Rocket, Sparkles, Trash2, TrendingUp, X,
+  Rocket, Search, Sparkles, Trash2, TrendingUp, X,
 } from 'lucide-react'
 import {
   Bar, CartesianGrid, ComposedChart, Legend, Line, ResponsiveContainer, Tooltip, XAxis, YAxis,
@@ -420,6 +420,9 @@ export default function NewProductTracker() {
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [trendDays, setTrendDays] = useState(2)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [statusFilter, setStatusFilter] = useState('all')
+  const [sortBy, setSortBy] = useState('attention')
   const [expanded, setExpanded] = useState(null)
   const [showCreate, setShowCreate] = useState(false)
   const [roasTracker, setRoasTracker] = useState(null)
@@ -490,6 +493,43 @@ export default function NewProductTracker() {
     attention: cards.filter((card) => ['warning', 'danger'].includes(card.analysis.level)).length,
     ended: cards.filter((card) => card.state.phase === 'ended').length,
   }), [cards])
+
+  const visibleCards = useMemo(() => {
+    const needle = normalizeId(searchQuery)
+    const filtered = cards.filter((card) => {
+      const matchesSearch = !needle || [
+        card.tracker.spu,
+        card.displayName,
+        card.tracker.store,
+      ].some((value) => normalizeId(value).includes(needle))
+      if (!matchesSearch) return false
+      if (statusFilter === 'active') return card.state.phase === 'active'
+      if (statusFilter === 'attention') return ['warning', 'danger'].includes(card.analysis.level)
+      if (statusFilter === 'ended') return card.state.phase === 'ended'
+      return true
+    })
+
+    const newestFirst = (a, b) => b.tracker.launchDate.localeCompare(a.tracker.launchDate)
+    return [...filtered].sort((a, b) => {
+      if (sortBy === 'remaining') {
+        if (a.state.phase === 'ended' !== (b.state.phase === 'ended')) {
+          return a.state.phase === 'ended' ? 1 : -1
+        }
+        return a.state.remaining - b.state.remaining || newestFirst(a, b)
+      }
+      if (sortBy === 'newest') return newestFirst(a, b)
+      if (sortBy === 'units') return number(b.latest?.units) - number(a.latest?.units) || newestFirst(a, b)
+
+      const attentionRank = (card) => {
+        if (card.analysis.level === 'danger') return 0
+        if (card.analysis.level === 'warning') return 1
+        return 2
+      }
+      return attentionRank(a) - attentionRank(b)
+        || a.state.remaining - b.state.remaining
+        || newestFirst(a, b)
+    })
+  }, [cards, searchQuery, sortBy, statusFilter])
 
   async function submitCreate(event) {
     event.preventDefault()
@@ -603,6 +643,47 @@ export default function NewProductTracker() {
         </div>
       </div>
 
+      <div className="card p-4">
+        <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
+          <div className="grid flex-1 gap-3 sm:grid-cols-2 lg:grid-cols-[minmax(240px,1fr)_180px_200px]">
+            <label className="block">
+              <span className="mb-1.5 block text-xs font-medium text-slate-500">搜索新品</span>
+              <span className="relative block">
+                <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="search"
+                  value={searchQuery}
+                  onChange={(event) => setSearchQuery(event.target.value)}
+                  className="input-base pl-9"
+                  placeholder="搜索 SPU、款名或店铺"
+                />
+              </span>
+            </label>
+            <label className="block">
+              <span className="mb-1.5 block text-xs font-medium text-slate-500">状态</span>
+              <select className="input-base" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
+                <option value="all">全部</option>
+                <option value="active">追踪中</option>
+                <option value="attention">需关注</option>
+                <option value="ended">已结束</option>
+              </select>
+            </label>
+            <label className="block sm:col-span-2 lg:col-span-1">
+              <span className="mb-1.5 block text-xs font-medium text-slate-500">排序</span>
+              <select className="input-base" value={sortBy} onChange={(event) => setSortBy(event.target.value)}>
+                <option value="attention">需关注优先</option>
+                <option value="remaining">剩余时间少 → 多</option>
+                <option value="newest">最新上架</option>
+                <option value="units">Units 最高</option>
+              </select>
+            </label>
+          </div>
+          <p className="whitespace-nowrap text-sm text-slate-500">
+            显示 <span className="font-semibold text-slate-900">{visibleCards.length}</span> / {cards.length} 个新品
+          </p>
+        </div>
+      </div>
+
       {!cards.length ? (
         <div className="card flex flex-col items-center px-6 py-16 text-center">
           <div className="rounded-2xl bg-blue-50 p-4 text-blue-600"><Rocket className="h-9 w-9" /></div>
@@ -610,9 +691,26 @@ export default function NewProductTracker() {
           <p className="mt-2 max-w-md text-sm leading-6 text-slate-500">加入 SPU、选择对应的 Analytics 店铺并填写上架日期和初始目标 ROAS，即可开始 14 天追踪。</p>
           <button onClick={openCreate} className="btn-primary mt-5"><PackagePlus className="h-4 w-4" /> 加入第一个新品</button>
         </div>
+      ) : !visibleCards.length ? (
+        <div className="card flex flex-col items-center px-6 py-14 text-center">
+          <div className="rounded-2xl bg-slate-100 p-4 text-slate-500"><Search className="h-8 w-8" /></div>
+          <h3 className="mt-4 text-lg font-semibold text-slate-900">没有符合条件的新品</h3>
+          <p className="mt-2 text-sm text-slate-500">尝试更换关键词或状态筛选。</p>
+          <button
+            type="button"
+            onClick={() => {
+              setSearchQuery('')
+              setStatusFilter('all')
+              setSortBy('attention')
+            }}
+            className="btn-secondary mt-5"
+          >
+            清空筛选
+          </button>
+        </div>
       ) : (
         <div className="space-y-4">
-          {cards.map(({ tracker, displayName, dailyRows, state, trend, latest, peak, avgUnits, analysis, impact }) => {
+          {visibleCards.map(({ tracker, displayName, dailyRows, state, trend, latest, peak, avgUnits, analysis, impact }) => {
             const expandedNow = expanded === tracker.id
             const analysisStyle = {
               good: 'border-emerald-200 bg-emerald-50 text-emerald-900',

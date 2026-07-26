@@ -1401,7 +1401,7 @@ export default function MetricsAnalytics() {
   }
 
   return (
-    <div className="space-y-6 max-w-7xl">
+    <div className="mx-auto max-w-[1500px] space-y-6">
       <FloatingStoreSwitcher
         stores={stores}
         activeStore={activeStore}
@@ -1410,12 +1410,45 @@ export default function MetricsAnalytics() {
         loading={salesSummaryLoading}
       />
 
-      <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-bold text-slate-800">Product Analytics</h1>
-          <p className="text-slate-500 mt-1">按店铺和 SPU 追踪每天表现，看销量和点击率、转化率、加购、花费、ROAS 的关系。</p>
+      <nav
+        aria-label="Analytics sections"
+        className="sticky top-0 z-30 rounded-2xl border border-slate-200/80 bg-white/95 px-3 py-2.5 shadow-sm backdrop-blur-xl"
+      >
+        <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="min-w-0">
+              <div className="text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-400">Store</div>
+              <div className="max-w-44 truncate text-sm font-semibold text-slate-800">{activeStore || 'Not selected'}</div>
+            </div>
+            <div className="h-8 w-px flex-shrink-0 bg-slate-200" />
+            <div className="min-w-0">
+              <div className="text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-400">Date range</div>
+              <div className="truncate text-sm font-medium text-slate-600">
+                {currentRange.from && currentRange.to
+                  ? `${formatISODate(currentRange.from)} – ${formatISODate(currentRange.to)}`
+                  : 'Choose a range'}
+              </div>
+            </div>
+          </div>
+          <div className="-mx-1 flex items-center gap-1 overflow-x-auto px-1 pb-0.5 lg:mx-0 lg:px-0 lg:pb-0">
+            {[
+              ['analytics-stores', 'Stores'],
+              ['analytics-data-management', 'Manage'],
+              ['analytics-performance', 'Performance'],
+              ['spu-sku-focus', 'SPU Focus'],
+              ['analytics-movement', 'Movement'],
+            ].map(([id, label]) => (
+              <a
+                key={id}
+                href={`#${id}`}
+                className="whitespace-nowrap rounded-lg px-2.5 py-1.5 text-xs font-medium text-slate-500 transition hover:bg-slate-100 hover:text-slate-800"
+              >
+                {label}
+              </a>
+            ))}
+          </div>
         </div>
-      </div>
+      </nav>
 
       <DateRangeControl
         timeframe={timeframe}
@@ -1443,7 +1476,7 @@ export default function MetricsAnalytics() {
         saving={dailyLogSaving}
       />
 
-      <section className="card p-5 space-y-4">
+      <section id="analytics-stores" className="card scroll-mt-28 p-5 space-y-4">
         <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
           <div>
             <h2 className="font-semibold text-slate-800">Stores</h2>
@@ -1576,7 +1609,7 @@ export default function MetricsAnalytics() {
         )}
       </section>
 
-      <section className="card p-5">
+      <section id="analytics-data-management" className="card scroll-mt-28 p-5">
         <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
           <div>
             <h2 className="font-semibold text-slate-800">Analytics Settings</h2>
@@ -1602,7 +1635,7 @@ export default function MetricsAnalytics() {
         )}
       </section>
 
-      <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <section id="analytics-uploads" className="grid scroll-mt-28 grid-cols-1 lg:grid-cols-2 gap-4">
         <div className="card p-4">
           <div className="flex items-center justify-between mb-3">
             <div>
@@ -1694,7 +1727,7 @@ export default function MetricsAnalytics() {
         onDelete={handleDeleteProduct}
       />
 
-      <section id="spu-sku-focus" className="card p-5 space-y-4 scroll-mt-6">
+      <section id="spu-sku-focus" className="card scroll-mt-28 p-5 space-y-4">
         <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-3">
           <div>
             <h2 className="font-semibold text-slate-800">SPU / SKU Focus</h2>
@@ -1741,12 +1774,13 @@ export default function MetricsAnalytics() {
         )}
       </section>
 
-      {!visibleRows.length ? (
-        <div className="card p-8 text-center text-slate-400">
-          {activeStore ? '上传一份表现数据，或选择有数据的时间范围。' : '先创建或选择店铺。'}
-        </div>
-      ) : (
-        <>
+      <section id="analytics-performance" aria-label="Performance analytics" className="scroll-mt-28">
+        {!visibleRows.length ? (
+          <div className="card p-8 text-center text-slate-400">
+            {activeStore ? '上传一份表现数据，或选择有数据的时间范围。' : '先创建或选择店铺。'}
+          </div>
+        ) : (
+          <div className="space-y-6">
           <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
             <KPICard title="Units" value={count(totals.units)} subtitle={`${count(totals.orders)} orders`} icon={Package} color="blue" />
             <KPICard title="Revenue" value={money(totals.revenue)} subtitle={`${ratio(totals.roas)} ROAS`} icon={TrendingUp} color="teal" />
@@ -1808,11 +1842,14 @@ export default function MetricsAnalytics() {
             query={matrixQuery}
             setQuery={setMatrixQuery}
           />
-        </>
-      )}
+          </div>
+        )}
+      </section>
 
       {/* 库存动销 — 来自 Auto Deduct 流水，与店铺数据独立 */}
-      <MovementAnalytics />
+      <section id="analytics-movement" aria-label="Inventory movement" className="scroll-mt-28">
+        <MovementAnalytics />
+      </section>
     </div>
   )
 }
@@ -1822,7 +1859,7 @@ function FloatingStoreSwitcher({ stores, activeStore, setActiveStore, summary, l
   const active = stores.find((s) => s.name === activeStore)
   const trend = summary?.trend?.slice(-14) || []
   return (
-    <div className="fixed bottom-3 right-3 z-40 w-64 max-w-[calc(100vw-1.5rem)] sm:w-72 lg:bottom-5 lg:right-5">
+    <div className="fixed bottom-3 right-3 z-40 w-64 max-w-[calc(100vw-1.5rem)] sm:w-72 lg:hidden">
       {open && (
         <div className="mb-2 rounded-lg border border-slate-200 bg-white shadow-xl overflow-hidden">
           <div className="px-3 py-2 border-b border-slate-100">
@@ -3371,9 +3408,9 @@ function ProductMatrix({ products, filter, setFilter, sort, setSort, query, setQ
           <h2 className="font-semibold text-slate-800">Product Performance Matrix</h2>
           <p className="text-xs text-slate-400 mt-0.5">筛出销量最多、花费最高、转化最好或需要修改的款。</p>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
           <input
-            className="metric-input !py-1.5 w-44"
+            className="metric-input w-full !py-1.5 sm:w-56"
             placeholder="Search SPU / SKU"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
@@ -3393,26 +3430,26 @@ function ProductMatrix({ products, filter, setFilter, sort, setSort, query, setQ
         </div>
         <span className="text-xs text-slate-400">{products.length} products</span>
       </div>
-      <div className="overflow-x-auto">
-        <table className="min-w-full text-sm">
-          <thead>
-            <tr className="text-left text-xs text-slate-400 border-b border-slate-100">
-              <th className="py-2 pr-4">Product</th>
-              <th className="py-2 pr-4">Type</th>
-              <th className="py-2 pr-4 text-right">Units</th>
-              <th className="py-2 pr-4 text-right">Spend</th>
-              <th className="py-2 pr-4 text-right">Revenue</th>
-              <th className="py-2 pr-4 text-right">ROAS</th>
-              <th className="py-2 pr-4 text-right">CTR</th>
-              <th className="py-2 pr-4 text-right">CVR</th>
-              <th className="py-2 pr-4 text-right">Score</th>
-              <th className="py-2 pr-4">Decision</th>
+      <div className="max-h-[70vh] overflow-auto rounded-xl border border-slate-200/80">
+        <table className="min-w-[1040px] w-full text-sm">
+          <thead className="sticky top-0 z-20 bg-slate-50/95 backdrop-blur">
+            <tr className="border-b border-slate-200 text-left text-xs text-slate-500">
+              <th className="sticky left-0 z-30 min-w-64 border-r border-slate-200 bg-slate-50/95 py-2.5 pl-3 pr-4">Product</th>
+              <th className="py-2.5 pr-4">Type</th>
+              <th className="py-2.5 pr-4 text-right tabular-nums">Units</th>
+              <th className="py-2.5 pr-4 text-right tabular-nums">Spend</th>
+              <th className="py-2.5 pr-4 text-right tabular-nums">Revenue</th>
+              <th className="py-2.5 pr-4 text-right tabular-nums">ROAS</th>
+              <th className="py-2.5 pr-4 text-right tabular-nums">CTR</th>
+              <th className="py-2.5 pr-4 text-right tabular-nums">CVR</th>
+              <th className="py-2.5 pr-4 text-right tabular-nums">Score</th>
+              <th className="py-2.5 pr-4">Decision</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
             {products.map((p) => (
-              <tr key={p.spu} className="align-top">
-                <td className="py-3 pr-4 min-w-64">
+              <tr key={p.spu} className="group align-top transition-colors hover:bg-slate-50/80">
+                <td className="sticky left-0 z-10 min-w-64 border-r border-slate-100 bg-white py-3 pl-3 pr-4 transition-colors group-hover:bg-slate-50">
                   <div className="font-medium text-slate-700">{p.sku || p.spu}</div>
                   <div className="text-xs text-slate-400 line-clamp-2">{p.productName}</div>
                   <div className="text-[11px] text-slate-400 mt-0.5">SPU {p.spu} · Unit x{p.unitMultiplier || 1}</div>
@@ -3422,13 +3459,13 @@ function ProductMatrix({ products, filter, setFilter, sort, setSort, query, setQ
                   <div>{p.lifecycle || '-'}</div>
                   <div>{p.skuType || '-'}</div>
                 </td>
-                <td className="py-3 pr-4 text-right font-medium text-slate-700">{count(p.units)}</td>
-                <td className="py-3 pr-4 text-right">{money(p.spend)}</td>
-                <td className="py-3 pr-4 text-right">{money(p.revenue)}</td>
-                <td className="py-3 pr-4 text-right">{ratio(p.roas)}</td>
-                <td className="py-3 pr-4 text-right">{pct(p.ctr)}</td>
-                <td className="py-3 pr-4 text-right">{pct(p.conversionRate)}</td>
-                <td className="py-3 pr-4 text-right">
+                <td className="whitespace-nowrap py-3 pr-4 text-right font-medium tabular-nums text-slate-700">{count(p.units)}</td>
+                <td className="whitespace-nowrap py-3 pr-4 text-right tabular-nums">{money(p.spend)}</td>
+                <td className="whitespace-nowrap py-3 pr-4 text-right tabular-nums">{money(p.revenue)}</td>
+                <td className="whitespace-nowrap py-3 pr-4 text-right tabular-nums">{ratio(p.roas)}</td>
+                <td className="whitespace-nowrap py-3 pr-4 text-right tabular-nums">{pct(p.ctr)}</td>
+                <td className="whitespace-nowrap py-3 pr-4 text-right tabular-nums">{pct(p.conversionRate)}</td>
+                <td className="whitespace-nowrap py-3 pr-4 text-right tabular-nums">
                   <div className="font-semibold text-slate-700">{p.score ?? 0}</div>
                   <div className="text-[11px] text-slate-400">{p.grade || '-'}</div>
                 </td>
