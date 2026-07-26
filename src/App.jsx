@@ -12,6 +12,7 @@ import StockManagement from './pages/StockManagement.jsx'
 import AutoDeduct from './pages/AutoDeduct.jsx'
 import AutoDeductHistory from './pages/AutoDeductHistory.jsx'
 import MetricsAnalytics from './pages/MetricsAnalytics.jsx'
+import NewProductTracker from './pages/NewProductTracker.jsx'
 import AutoGenerate from './pages/AutoGenerate.jsx'
 import AdminUsers from './pages/AdminUsers.jsx'
 import TimeClockPage from './pages/TimeClockPage.jsx'
@@ -79,6 +80,7 @@ function AppRoutes() {
         <Route path="auto-deduct" element={<RequireAdmin><AutoDeduct /></RequireAdmin>} />
         <Route path="auto-deduct/history" element={<RequireAdmin><AutoDeductHistory /></RequireAdmin>} />
         <Route path="analytics" element={<RequireAdmin><MetricsAnalytics /></RequireAdmin>} />
+        <Route path="new-products" element={<RequireAdmin><NewProductTracker /></RequireAdmin>} />
         <Route path="auto-generate" element={<RequireAdmin><AutoGenerate /></RequireAdmin>} />
         <Route path="users" element={<RequireAdmin><AdminUsers /></RequireAdmin>} />
         <Route path="timeclock" element={<TimeClockPage />} />

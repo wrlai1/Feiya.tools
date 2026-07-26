@@ -12,6 +12,7 @@ const PAGE_TITLES = {
   '/auto-deduct':  'Auto Deduct',
   '/auto-deduct/history': 'Auto Deduct History',
   '/analytics':    'Analytics',
+  '/new-products': 'New Product Tracker',
   '/auto-generate':'Auto Generate',
   '/users':        'User Management',
   '/timeclock':    'Time Clock',

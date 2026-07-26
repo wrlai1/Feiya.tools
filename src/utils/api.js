@@ -194,6 +194,32 @@ export function saveAnalyticsSettings(store, settings) {
   })
 }
 
+// ─── 新品 14 天追踪 ────────────────────────────────────────────────────────────
+
+export function fetchNewProductTrackers() {
+  return request(`${BASE}/new-product-tracker?action=list`)
+}
+
+export function createNewProductTracker(data) {
+  return request(`${BASE}/new-product-tracker?action=create`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+}
+
+export function saveNewProductRoas(trackerId, effectiveDate, roas, note = '') {
+  return request(`${BASE}/new-product-tracker?action=save-roas`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ trackerId, effectiveDate, roas, note }),
+  })
+}
+
+export function deleteNewProductTracker(id) {
+  return request(`${BASE}/new-product-tracker?id=${encodeURIComponent(id)}`, { method: 'DELETE' })
+}
+
 // ─── 动销（inventory movements）─────────────────────────────────────────────────
 
 export function fetchMovements(days = 30) {
