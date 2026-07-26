@@ -34,7 +34,7 @@ const PAGE_DESCRIPTIONS = {
   '/time-report': 'Review team attendance and hours',
 }
 
-export default function Header({ onMenuClick, onSidebarToggle, sidebarCollapsed }) {
+export default function Header({ onMenuClick, onSidebarToggle, sidebarCollapsed, sectionTheme }) {
   const { user } = useAuth()
   const location = useLocation()
   const title    = PAGE_TITLES[location.pathname] || 'Feiya ERP'
@@ -43,7 +43,7 @@ export default function Header({ onMenuClick, onSidebarToggle, sidebarCollapsed 
   const initials = user?.username?.[0]?.toUpperCase() ?? 'F'
 
   return (
-    <header className="min-h-[72px] border-b border-slate-200/70 bg-white/85 px-4 backdrop-blur-xl sm:px-6 lg:px-8 flex items-center gap-3 flex-shrink-0 z-20">
+    <header className={`min-h-[72px] border-b px-4 backdrop-blur-xl transition-colors duration-300 sm:px-6 lg:px-8 flex items-center gap-3 flex-shrink-0 z-20 ${sectionTheme.header} ${sectionTheme.border}`}>
       <button onClick={onMenuClick} aria-label="Open navigation"
         className="lg:hidden p-2 rounded-xl text-slate-500 hover:bg-slate-100 hover:text-slate-800 transition-colors">
         <Menu className="w-5 h-5" />
@@ -55,7 +55,12 @@ export default function Header({ onMenuClick, onSidebarToggle, sidebarCollapsed 
       </button>
 
       <div className="flex-1 min-w-0">
-        <h1 className="text-[17px] font-semibold tracking-[-0.01em] text-slate-950 truncate">{title}</h1>
+        <div className="flex min-w-0 items-center gap-2">
+          <span className={`hidden rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.08em] sm:inline-flex ${sectionTheme.pill}`}>
+            {sectionTheme.label}
+          </span>
+          <h1 className="truncate text-[17px] font-semibold tracking-[-0.01em] text-slate-950">{title}</h1>
+        </div>
         <p className="hidden truncate text-xs text-slate-400 sm:block">{description}</p>
       </div>
 

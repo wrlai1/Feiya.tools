@@ -1,20 +1,23 @@
 import React, { useState } from 'react'
-import { NavLink } from 'react-router-dom'
+import { NavLink, useLocation } from 'react-router-dom'
 import {
   LayoutDashboard, Package, Truck, MessageSquare,
-  Boxes, Minus, Sparkles, X, Users, LogOut, KeyRound, ShieldCheck, User, Clock,
+  Boxes, Minus, X, Users, LogOut, KeyRound, ShieldCheck, User, Clock,
   ClipboardList, BarChart3, Rocket,
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import ChangePasswordModal from './ChangePasswordModal.jsx'
+import { SECTION_THEMES } from '../utils/sectionTheme.js'
 
 const ADMIN_GROUPS = [
   {
     label: 'Overview',
+    theme: 'overview',
     items: [{ label: 'Dashboard', to: '/', icon: LayoutDashboard, end: true }],
   },
   {
     label: 'Operations',
+    theme: 'operations',
     items: [
       { label: 'Inventory Check', to: '/inventory', icon: Package },
       { label: 'Tracking', to: '/tracking', icon: Truck },
@@ -25,6 +28,7 @@ const ADMIN_GROUPS = [
   },
   {
     label: 'Insights',
+    theme: 'insights',
     items: [
       { label: 'Analytics', to: '/analytics', icon: BarChart3 },
       { label: 'New Product Tracker', to: '/new-products', icon: Rocket },
@@ -32,6 +36,7 @@ const ADMIN_GROUPS = [
   },
   {
     label: 'Team',
+    theme: 'team',
     items: [
       { label: 'Time Clock', to: '/timeclock', icon: Clock },
       { label: 'User Management', to: '/users', icon: Users },
@@ -42,25 +47,31 @@ const ADMIN_GROUPS = [
 
 const USER_GROUPS = [
   {
-    label: 'Workspace',
+    label: 'Operations',
+    theme: 'operations',
     items: [
       { label: 'Tracking', to: '/tracking', icon: Truck },
       { label: 'Low Inventory Notes', to: '/notes', icon: MessageSquare },
-      { label: 'Time Clock', to: '/timeclock', icon: Clock },
     ],
+  },
+  {
+    label: 'Team',
+    theme: 'team',
+    items: [{ label: 'Time Clock', to: '/timeclock', icon: Clock }],
   },
 ]
 
-const COMING_SOON = [
-  { label: 'Auto Generate', to: '/auto-generate', icon: Sparkles },
-]
+function itemMatchesPath(item, pathname) {
+  if (item.to === '/') return pathname === '/'
+  return pathname === item.to || pathname.startsWith(`${item.to}/`)
+}
 
-function NavItem({ item, onClick, collapsed }) {
+function NavItem({ item, onClick, collapsed, theme }) {
   return (
     <NavLink to={item.to} end={item.end} onClick={onClick} title={collapsed ? item.label : undefined}
       className={({ isActive }) =>
         `group flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition-colors ${
-          isActive ? 'bg-blue-50 text-[#0071e3]' : 'text-slate-600 hover:bg-slate-100 hover:text-slate-950'
+          isActive ? theme.itemActive : `text-slate-600 ${theme.itemHover}`
         }`
       }
     >
@@ -70,33 +81,18 @@ function NavItem({ item, onClick, collapsed }) {
   )
 }
 
-function ComingSoonItem({ item, collapsed }) {
+function SectionLabel({ label, collapsed, theme }) {
   return (
-    <NavLink to={item.to} title={collapsed ? item.label : undefined}
-      className={({ isActive }) =>
-        `flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition-colors ${
-          isActive ? 'bg-blue-50 text-[#0071e3]' : 'text-slate-400 hover:bg-slate-100 hover:text-slate-700'
-        }`
-      }
-    >
-      <item.icon className="w-[18px] h-[18px] flex-shrink-0" strokeWidth={1.8} />
-      <span className={`flex-1 whitespace-nowrap ${collapsed ? 'lg:hidden' : ''}`}>{item.label}</span>
-      <span className={`rounded-full bg-slate-100 px-2 py-0.5 text-[10px] text-slate-400 ${collapsed ? 'lg:hidden' : ''}`}>Soon</span>
-    </NavLink>
-  )
-}
-
-function SectionLabel({ label, collapsed }) {
-  return (
-    <div className="px-3 pb-1 pt-4">
-      <p className={`text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-400 ${collapsed ? 'lg:hidden' : ''}`}>{label}</p>
-      {collapsed && <div className="hidden h-px bg-slate-200 lg:block" />}
+    <div className="flex items-center gap-2 px-3 pb-1 pt-3">
+      <span className={`h-1.5 w-1.5 flex-shrink-0 rounded-full ${theme.dot}`} />
+      <p className={`text-[10px] font-semibold uppercase tracking-[0.12em] ${theme.labelColor} ${collapsed ? 'lg:hidden' : ''}`}>{label}</p>
     </div>
   )
 }
 
 export default function Sidebar({ open, collapsed, onClose }) {
   const { user, logout } = useAuth()
+  const location = useLocation()
   const [showChangePw, setShowChangePw] = useState(false)
   const isAdmin = user?.role === 'admin'
   const groups = isAdmin ? ADMIN_GROUPS : USER_GROUPS
@@ -129,20 +125,24 @@ export default function Sidebar({ open, collapsed, onClose }) {
 
         {/* Navigation */}
         <nav className="flex-1 overflow-y-auto px-3 py-2">
-          {groups.map((group) => (
-            <div key={group.label}>
-              <SectionLabel label={group.label} collapsed={collapsed} />
-              <div className="space-y-1">
-                {group.items.map((item) => <NavItem key={item.to} item={item} onClick={onClose} collapsed={collapsed} />)}
+          {groups.map((group) => {
+            const theme = SECTION_THEMES[group.theme]
+            const activeGroup = group.items.some((item) => itemMatchesPath(item, location.pathname))
+            return (
+              <div key={group.label} className={`mb-2 rounded-2xl px-1 pb-1 transition-colors duration-300 ${
+                activeGroup
+                  ? `${theme.sidebarActive} lg:-mr-3 lg:rounded-r-none lg:pr-4`
+                  : theme.sidebar
+              }`}>
+                <SectionLabel label={group.label} collapsed={collapsed} theme={theme} />
+                <div className="space-y-1">
+                  {group.items.map((item) => (
+                    <NavItem key={item.to} item={item} onClick={onClose} collapsed={collapsed} theme={theme} />
+                  ))}
+                </div>
               </div>
-            </div>
-          ))}
-          {isAdmin && (
-            <div>
-              <SectionLabel label="Coming Soon" collapsed={collapsed} />
-              {COMING_SOON.map((item) => <ComingSoonItem key={item.to} item={item} collapsed={collapsed} />)}
-            </div>
-          )}
+            )
+          })}
         </nav>
 
         {/* User footer */}
