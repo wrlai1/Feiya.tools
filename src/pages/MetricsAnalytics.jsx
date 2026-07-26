@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { useLocation, useSearchParams } from 'react-router-dom'
 import {
   BarChart, Bar, ComposedChart, Legend, LineChart, Line, ScatterChart, Scatter,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -69,6 +69,23 @@ const TREND_METRICS = [
   { key: 'carts', label: 'Carts', type: 'count', axis: 'left', color: '#f59e0b' },
 ]
 const DEFAULT_TREND_METRICS = ['dailyUnits', 'revenue', 'spend', 'ctr', 'conversionRate']
+const ANALYTICS_SAVED_VIEWS_KEY = 'feiya.analytics.saved-views.v1'
+const MATRIX_FILTERS = [
+  ['all', 'All'],
+  ['good', '机会'],
+  ['warn', '观察'],
+  ['bad', '需要修改'],
+]
+const MATRIX_SORTS = [
+  ['units_desc', 'Units 最多'],
+  ['revenue_desc', 'Revenue 最高'],
+  ['roas_desc', 'ROAS 最高'],
+  ['score_desc', 'Score 最高'],
+  ['ctr_desc', 'CTR 最高'],
+  ['conversionRate_desc', 'CVR 最高'],
+  ['spend_desc', 'Spend 最高'],
+  ['spend_asc', 'Spend 最低'],
+]
 const DAILY_LOG_TAGS = ['上新', '广告', '价格', '库存', '素材']
 const PRODUCT_TEXT_FIELDS = ['sku', 'productName', 'notes', 'category', 'sizeLine', 'lifecycle', 'skuType']
 const PRODUCT_NUMBER_FIELDS = ['unitMultiplier', 'cost', 'declaredPrice', 'frontPrice', 'couponPrice', 'grossProfit']
@@ -709,8 +726,21 @@ function missingDaysInRange(range, savedDays) {
   return days.filter((day) => !saved.has(day))
 }
 
+function loadSavedAnalyticsViews() {
+  try {
+    if (typeof window === 'undefined') return []
+    const parsed = JSON.parse(window.localStorage.getItem(ANALYTICS_SAVED_VIEWS_KEY) || '[]')
+    return Array.isArray(parsed)
+      ? parsed.filter((view) => view && typeof view.id === 'string' && typeof view.name === 'string').slice(0, 20)
+      : []
+  } catch {
+    return []
+  }
+}
+
 export default function MetricsAnalytics() {
   const toast = useToast()
+  const location = useLocation()
   const [searchParams] = useSearchParams()
   const initialStore = searchParams.get('store') || ''
   const initialProduct = normalizeId(searchParams.get('spu'))
@@ -741,6 +771,7 @@ export default function MetricsAnalytics() {
   const [comparisonLoading, setComparisonLoading] = useState(false)
   const [targets, setTargets] = useState(DEFAULT_TARGETS)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [dataManagementOpen, setDataManagementOpen] = useState(false)
   const [storeSettingsOpen, setStoreSettingsOpen] = useState(false)
   const [deleteFrom, setDeleteFrom] = useState('')
   const [deleteTo, setDeleteTo] = useState('')
@@ -753,6 +784,7 @@ export default function MetricsAnalytics() {
   const [crossStoreProducts, setCrossStoreProducts] = useState([])
   const [salesSummary, setSalesSummary] = useState(null)
   const [salesSummaryLoading, setSalesSummaryLoading] = useState(false)
+  const [savedViews, setSavedViews] = useState(loadSavedAnalyticsViews)
 
   const activeDataDay = useMemo(() => {
     const value = stores.find((store) => store.name === activeStore)?.last_day
@@ -1011,6 +1043,35 @@ export default function MetricsAnalytics() {
     })
     return sorted
   }, [productRows, tableFilter, matrixSort, matrixQuery])
+  const rangeDays = useMemo(
+    () => dateSpan(currentRange.from, currentRange.to, 62),
+    [currentRange],
+  )
+  const savedDaysInRange = useMemo(
+    () => new Set(storeDays.map((day) => day.day)),
+    [storeDays],
+  )
+  const missingDaysCount = rangeDays.filter((day) => !savedDaysInRange.has(day)).length
+  const activeStoreRecord = stores.find((store) => store.name === activeStore)
+  const latestSavedDay = String(activeStoreRecord?.last_day || '').slice(0, 10)
+  const latestRangeUpload = storeDays[storeDays.length - 1]
+  const rawDataAgeDays = latestSavedDay
+    ? Math.floor((Date.parse(todayISO()) - Date.parse(latestSavedDay)) / 86400000)
+    : null
+  const dataAgeDays = Number.isFinite(rawDataAgeDays) ? Math.max(0, rawDataAgeDays) : null
+  const showDataManagement = dataManagementOpen || !activeStore || !visibleRows.length || Boolean(draftReport)
+
+  useEffect(() => {
+    if (location.hash === '#analytics-uploads') setDataManagementOpen(true)
+  }, [location.hash])
+
+  useEffect(() => {
+    if (location.hash !== '#analytics-uploads' || !showDataManagement) return undefined
+    const frame = window.requestAnimationFrame(() => {
+      document.getElementById('analytics-uploads')?.scrollIntoView({ block: 'start' })
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [location.hash, showDataManagement])
 
   useEffect(() => {
     const isInitialDeepLink = initialProduct
@@ -1400,8 +1461,69 @@ export default function MetricsAnalytics() {
     }
   }
 
+  const persistSavedViews = (next) => {
+    try {
+      window.localStorage.setItem(ANALYTICS_SAVED_VIEWS_KEY, JSON.stringify(next))
+      setSavedViews(next)
+      return true
+    } catch {
+      toast.error('浏览器无法保存这个视图，请检查本地存储设置。', 'Saved View 未保存')
+      return false
+    }
+  }
+
+  const saveCurrentView = (name) => {
+    const trimmed = String(name || '').trim().slice(0, 48)
+    if (!trimmed) return false
+    const existing = savedViews.find((view) => String(view.name || '').toLowerCase() === trimmed.toLowerCase())
+    const snapshot = {
+      id: existing?.id || `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      name: trimmed,
+      store: activeStore || '',
+      timeframe,
+      customFrom: timeframe === 'custom' ? customFrom : '',
+      customTo: timeframe === 'custom' ? customTo : '',
+      query: matrixQuery.slice(0, 200),
+      filter: tableFilter,
+      sort: matrixSort,
+      metricX,
+      savedAt: new Date().toISOString(),
+    }
+    const next = existing
+      ? savedViews.map((view) => view.id === existing.id ? snapshot : view)
+      : [snapshot, ...savedViews].slice(0, 20)
+    if (!persistSavedViews(next)) return false
+    toast.success(existing ? `${trimmed} 已更新` : `${trimmed} 已保存`, 'Saved View')
+    return true
+  }
+
+  const applySavedView = (view) => {
+    if (!view) return
+    if (view.store && stores.some((store) => store.name === view.store)) setActiveStore(view.store)
+    else if (view.store && view.store !== activeStore) toast.info(`${view.store} 已不存在，保留当前店铺。`, 'Saved View')
+    const nextTimeframe = ['7d', '14d', '30d', 'today', 'yesterday', 'custom'].includes(view.timeframe)
+      ? view.timeframe
+      : '7d'
+    const validDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || '')) ? String(value) : ''
+    setTimeframe(nextTimeframe)
+    setCustomFrom(nextTimeframe === 'custom' ? validDate(view.customFrom) : '')
+    setCustomTo(nextTimeframe === 'custom' ? validDate(view.customTo) : '')
+    setMatrixQuery(String(view.query || '').slice(0, 200))
+    setTableFilter(MATRIX_FILTERS.some(([key]) => key === view.filter) ? view.filter : 'all')
+    setMatrixSort(MATRIX_SORTS.some(([key]) => key === view.sort) ? view.sort : 'units_desc')
+    if (TREND_METRICS.some((metric) => metric.key === view.metricX)) setMetricX(view.metricX)
+    toast.success(`${view.name} 已应用`, 'Saved View')
+  }
+
+  const deleteSavedView = (id) => {
+    const target = savedViews.find((view) => view.id === id)
+    if (!target) return
+    const next = savedViews.filter((view) => view.id !== id)
+    if (persistSavedViews(next)) toast.success(`${target.name} 已删除`, 'Saved View')
+  }
+
   return (
-    <div className="mx-auto max-w-[1500px] space-y-6">
+    <div className="mx-auto flex max-w-[1500px] flex-col gap-6">
       <FloatingStoreSwitcher
         stores={stores}
         activeStore={activeStore}
@@ -1413,6 +1535,7 @@ export default function MetricsAnalytics() {
       <nav
         aria-label="Analytics sections"
         className="sticky top-0 z-30 rounded-2xl border border-slate-200/80 bg-white/95 px-3 py-2.5 shadow-sm backdrop-blur-xl"
+        style={{ order: 0 }}
       >
         <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
           <div className="flex min-w-0 items-center gap-3">
@@ -1432,11 +1555,11 @@ export default function MetricsAnalytics() {
           </div>
           <div className="-mx-1 flex items-center gap-1 overflow-x-auto px-1 pb-0.5 lg:mx-0 lg:px-0 lg:pb-0">
             {[
-              ['analytics-stores', 'Stores'],
-              ['analytics-data-management', 'Manage'],
               ['analytics-performance', 'Performance'],
               ['spu-sku-focus', 'SPU Focus'],
               ['analytics-movement', 'Movement'],
+              ['analytics-stores', 'Stores'],
+              ['analytics-data-management', 'Manage'],
             ].map(([id, label]) => (
               <a
                 key={id}
@@ -1450,33 +1573,66 @@ export default function MetricsAnalytics() {
         </div>
       </nav>
 
-      <DateRangeControl
-        timeframe={timeframe}
-        setTimeframe={setTimeframe}
-        customFrom={customFrom}
-        customTo={customTo}
-        setCustomFrom={setCustomFrom}
-        setCustomTo={setCustomTo}
-        loadWindow={loadWindow}
-        activeStore={activeStore}
-        loading={loading}
-        storeDays={storeDays}
-        anchorDay={activeDataDay}
-        dailyLogs={dailyLogs}
-        dailyStats={dailyStats}
-        onSaveLog={handleSaveDailyLog}
-        logSaving={dailyLogSaving}
-      />
+      <div className="space-y-3" style={{ order: 1 }}>
+        <DataStatusBanner
+          activeStore={activeStore}
+          latestSavedDay={latestSavedDay}
+          latestSource={latestRangeUpload?.fileName || ''}
+          dataAgeDays={dataAgeDays}
+          savedDays={savedDaysInRange.size}
+          expectedDays={rangeDays.length}
+          missingDays={missingDaysCount}
+          draftReport={draftReport}
+        />
+        <SavedViewsBar
+          views={savedViews}
+          timeframe={timeframe}
+          customFrom={customFrom}
+          customTo={customTo}
+          filter={tableFilter}
+          sort={matrixSort}
+          query={matrixQuery}
+          onSave={saveCurrentView}
+          onApply={applySavedView}
+          onDelete={deleteSavedView}
+        />
+      </div>
 
-      <StoreDailyLogCard
-        stores={stores}
-        activeStore={activeStore}
-        setActiveStore={setActiveStore}
-        onSaveLog={handleSaveDailyLog}
-        saving={dailyLogSaving}
-      />
+      <div style={{ order: activeStore ? 2 : 4 }}>
+        <DateRangeControl
+          timeframe={timeframe}
+          setTimeframe={setTimeframe}
+          customFrom={customFrom}
+          customTo={customTo}
+          setCustomFrom={setCustomFrom}
+          setCustomTo={setCustomTo}
+          loadWindow={loadWindow}
+          activeStore={activeStore}
+          loading={loading}
+          storeDays={storeDays}
+          anchorDay={activeDataDay}
+          dailyLogs={dailyLogs}
+          dailyStats={dailyStats}
+          onSaveLog={handleSaveDailyLog}
+          logSaving={dailyLogSaving}
+        />
+      </div>
 
-      <section id="analytics-stores" className="card scroll-mt-28 p-5 space-y-4">
+      <div style={{ order: visibleRows.length ? 7 : 8 }}>
+        <StoreDailyLogCard
+          stores={stores}
+          activeStore={activeStore}
+          setActiveStore={setActiveStore}
+          onSaveLog={handleSaveDailyLog}
+          saving={dailyLogSaving}
+        />
+      </div>
+
+      <section
+        id="analytics-stores"
+        className="card scroll-mt-28 p-5 space-y-4"
+        style={{ order: activeStore ? 8 : 2 }}
+      >
         <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
           <div>
             <h2 className="font-semibold text-slate-800">Stores</h2>
@@ -1609,7 +1765,37 @@ export default function MetricsAnalytics() {
         )}
       </section>
 
-      <section id="analytics-data-management" className="card scroll-mt-28 p-5">
+      <section
+        id="analytics-data-management"
+        className="card scroll-mt-28 p-5"
+        style={{ order: activeStore && visibleRows.length && !draftReport ? 9 : 3 }}
+      >
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+          <div>
+            <h2 className="font-semibold text-slate-800">Data Management</h2>
+            <p className="mt-0.5 text-xs text-slate-400">
+              上传数据、调整分析目标或维护 SPU 档案。核心结果保持在上方，这些低频工具按需展开。
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs text-slate-400">{products.length} SPU · {storeDays.length} saved days</span>
+            <button
+              type="button"
+              onClick={() => setDataManagementOpen((open) => !open)}
+              disabled={!activeStore || !visibleRows.length || Boolean(draftReport)}
+              className="btn-secondary text-xs disabled:opacity-60"
+            >
+              {!activeStore || !visibleRows.length || draftReport
+                ? 'Required tools shown'
+                : dataManagementOpen ? 'Collapse tools' : 'Open tools'}
+            </button>
+          </div>
+        </div>
+      </section>
+
+      {showDataManagement && (
+        <>
+      <section className="card scroll-mt-28 p-5" style={{ order: 11 }}>
         <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
           <div>
             <h2 className="font-semibold text-slate-800">Analytics Settings</h2>
@@ -1635,7 +1821,11 @@ export default function MetricsAnalytics() {
         )}
       </section>
 
-      <section id="analytics-uploads" className="grid scroll-mt-28 grid-cols-1 lg:grid-cols-2 gap-4">
+      <section
+        id="analytics-uploads"
+        className="grid scroll-mt-28 grid-cols-1 gap-4 lg:grid-cols-2"
+        style={{ order: activeStore && visibleRows.length && !draftReport ? 10 : 3 }}
+      >
         <div className="card p-4">
           <div className="flex items-center justify-between mb-3">
             <div>
@@ -1720,14 +1910,22 @@ export default function MetricsAnalytics() {
         </div>
       </section>
 
-      <ProductCatalogEditor
-        activeStore={activeStore}
-        products={products}
-        onSave={handleSaveProduct}
-        onDelete={handleDeleteProduct}
-      />
+      <div style={{ order: 12 }}>
+        <ProductCatalogEditor
+          activeStore={activeStore}
+          products={products}
+          onSave={handleSaveProduct}
+          onDelete={handleDeleteProduct}
+        />
+      </div>
+        </>
+      )}
 
-      <section id="spu-sku-focus" className="card scroll-mt-28 p-5 space-y-4">
+      <section
+        id="spu-sku-focus"
+        className="card scroll-mt-28 p-5 space-y-4"
+        style={{ order: visibleRows.length ? 4 : 6 }}
+      >
         <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-3">
           <div>
             <h2 className="font-semibold text-slate-800">SPU / SKU Focus</h2>
@@ -1774,7 +1972,12 @@ export default function MetricsAnalytics() {
         )}
       </section>
 
-      <section id="analytics-performance" aria-label="Performance analytics" className="scroll-mt-28">
+      <section
+        id="analytics-performance"
+        aria-label="Performance analytics"
+        className="scroll-mt-28"
+        style={{ order: visibleRows.length ? 3 : activeStore ? 4 : 5 }}
+      >
         {!visibleRows.length ? (
           <div className="card p-8 text-center text-slate-400">
             {activeStore ? '上传一份表现数据，或选择有数据的时间范围。' : '先创建或选择店铺。'}
@@ -1841,16 +2044,192 @@ export default function MetricsAnalytics() {
             setSort={setMatrixSort}
             query={matrixQuery}
             setQuery={setMatrixQuery}
+            onViewDetails={focusProduct}
+            activeStore={activeStore}
+            range={currentRange}
           />
           </div>
         )}
       </section>
 
       {/* 库存动销 — 来自 Auto Deduct 流水，与店铺数据独立 */}
-      <section id="analytics-movement" aria-label="Inventory movement" className="scroll-mt-28">
+      <section id="analytics-movement" aria-label="Inventory movement" className="scroll-mt-28" style={{ order: 6 }}>
         <MovementAnalytics />
       </section>
     </div>
+  )
+}
+
+function DataStatusBanner({
+  activeStore,
+  latestSavedDay,
+  latestSource,
+  dataAgeDays,
+  savedDays,
+  expectedDays,
+  missingDays,
+  draftReport,
+}) {
+  const isPreview = Boolean(draftReport)
+  const hasSavedData = Boolean(latestSavedDay)
+  const isComplete = expectedDays > 0 && missingDays === 0
+  const isFresh = dataAgeDays != null && dataAgeDays <= 1
+  const tone = isPreview
+    ? 'border-blue-200 bg-blue-50/70'
+    : activeStore && hasSavedData && isComplete && isFresh
+      ? 'border-emerald-200 bg-emerald-50/70'
+      : 'border-amber-200 bg-amber-50/70'
+  const iconClass = isPreview
+    ? 'bg-blue-100 text-blue-700'
+    : activeStore && hasSavedData && isComplete && isFresh
+      ? 'bg-emerald-100 text-emerald-700'
+      : 'bg-amber-100 text-amber-700'
+  const title = isPreview
+    ? 'Upload preview — 尚未保存'
+    : !activeStore
+      ? '先创建或选择店铺'
+      : !hasSavedData
+        ? '这个店铺还没有已保存的表现数据'
+        : savedDays === 0
+          ? '所选时间范围没有已保存数据'
+          : isComplete && isFresh
+            ? '数据已更新且范围完整'
+            : '数据需要检查'
+  const description = isPreview
+    ? `${draftReport.fileName || 'Uploaded file'} · ${draftReport.rows?.length || 0} rows · 当前所有分析均来自这份预览，保存前不会写入店铺数据。`
+    : !activeStore
+      ? '创建店铺后即可上传 SPU 档案和每日表现数据。'
+      : !hasSavedData
+        ? '先上传每日表现数据；上传后会先预览并检查 SPU，再由你确认保存。'
+        : savedDays === 0
+          ? `最近保存日期是 ${formatISODate(latestSavedDay)}。请调整时间范围，或上传缺少的日期。`
+          : `${savedDays}/${expectedDays || 0} 天有数据${missingDays ? `，缺少 ${missingDays} 天` : ''}。`
+
+  return (
+    <section className={`rounded-xl border px-4 py-3 ${tone}`}>
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div className="flex min-w-0 items-start gap-3">
+          <span className={`mt-0.5 rounded-lg p-2 ${iconClass}`}>
+            {isPreview ? <Upload className="h-4 w-4" /> : activeStore && hasSavedData && isComplete && isFresh ? <CheckCircle className="h-4 w-4" /> : <AlertTriangle className="h-4 w-4" />}
+          </span>
+          <div className="min-w-0">
+            <h2 className="text-sm font-semibold text-slate-800">{title}</h2>
+            <p className="mt-0.5 text-xs leading-5 text-slate-600">{description}</p>
+          </div>
+        </div>
+        <div className="grid shrink-0 grid-cols-1 gap-2 sm:grid-cols-3">
+          <StatusMini
+            label="Freshness"
+            value={latestSavedDay ? formatISODate(latestSavedDay) : 'No saved data'}
+            note={dataAgeDays == null ? '—' : dataAgeDays === 0 ? 'Today' : `${dataAgeDays} day${dataAgeDays === 1 ? '' : 's'} ago`}
+          />
+          <StatusMini
+            label="Completeness"
+            value={expectedDays ? `${savedDays}/${expectedDays} days` : 'Choose range'}
+            note={expectedDays ? missingDays ? `${missingDays} missing` : 'Complete' : '—'}
+          />
+          <StatusMini
+            label={isPreview ? 'Preview source' : 'Latest source in range'}
+            value={isPreview ? draftReport.fileName || 'Uploaded file' : latestSource || 'Not available'}
+            note={isPreview ? 'Not saved' : latestSource ? 'Saved upload' : '—'}
+          />
+        </div>
+      </div>
+      {(!activeStore || (!isPreview && (!hasSavedData || savedDays === 0))) && (
+        <div className="mt-3 flex flex-wrap gap-2 border-t border-black/5 pt-3">
+          {!activeStore && <a href="#analytics-stores" className="btn-primary text-xs">Create or select store</a>}
+          {activeStore && <a href="#analytics-uploads" className="btn-primary text-xs">Upload performance data</a>}
+          {activeStore && hasSavedData && savedDays === 0 && <a href="#analytics-performance" className="btn-secondary text-xs">Review selected range</a>}
+        </div>
+      )}
+    </section>
+  )
+}
+
+function StatusMini({ label, value, note }) {
+  return (
+    <div className="min-w-0 rounded-lg border border-white/80 bg-white/75 px-3 py-2">
+      <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">{label}</div>
+      <div className="mt-0.5 max-w-40 truncate text-xs font-semibold text-slate-700" title={value}>{value}</div>
+      <div className="mt-0.5 text-[10px] text-slate-400">{note}</div>
+    </div>
+  )
+}
+
+function SavedViewsBar({
+  views,
+  timeframe,
+  customFrom,
+  customTo,
+  filter,
+  sort,
+  query,
+  onSave,
+  onApply,
+  onDelete,
+}) {
+  const [name, setName] = useState('')
+  const rangeLabel = timeframe === 'custom'
+    ? `${customFrom || 'Start'} – ${customTo || 'End'}`
+    : ({ '7d': '7 days', '14d': '14 days', '30d': '30 days', today: 'Today', yesterday: 'Yesterday' }[timeframe] || timeframe)
+  const filterLabel = MATRIX_FILTERS.find(([key]) => key === filter)?.[1] || 'All'
+  const sortLabel = MATRIX_SORTS.find(([key]) => key === sort)?.[1] || sort
+
+  const submit = (event) => {
+    event.preventDefault()
+    if (onSave(name)) setName('')
+  }
+
+  return (
+    <section className="card px-4 py-3">
+      <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+        <div className="min-w-0">
+          <h2 className="text-sm font-semibold text-slate-800">Saved Views</h2>
+          <p className="mt-0.5 truncate text-xs text-slate-400">
+            Current: {rangeLabel} · {filterLabel} · {sortLabel}{query ? ` · “${query}”` : ''}
+          </p>
+        </div>
+        <form className="flex w-full max-w-md gap-2 xl:w-auto" onSubmit={submit}>
+          <input
+            className="metric-input min-w-0 flex-1 !py-1.5 xl:w-48"
+            maxLength={48}
+            placeholder="View name"
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+          />
+          <button type="submit" disabled={!name.trim()} className="btn-secondary shrink-0 text-xs disabled:opacity-40">
+            <Save className="h-3.5 w-3.5" /> Save view
+          </button>
+        </form>
+      </div>
+      {views.length > 0 ? (
+        <div className="mt-3 flex gap-2 overflow-x-auto pb-1">
+          {views.map((view) => (
+            <div key={view.id} className="flex shrink-0 items-center rounded-lg border border-slate-200 bg-slate-50">
+              <button type="button" onClick={() => onApply(view)} className="px-3 py-2 text-left hover:bg-white">
+                <div className="max-w-44 truncate text-xs font-semibold text-slate-700">{view.name || 'Untitled'}</div>
+                <div className="max-w-56 truncate text-[10px] text-slate-400">
+                  {view.store || 'Current store'} · {view.timeframe === 'custom' ? `${view.customFrom || '?'} – ${view.customTo || '?'}` : view.timeframe || '7d'}
+                </div>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (window.confirm(`Delete saved view "${view.name || 'Untitled'}"?`)) onDelete(view.id)
+                }}
+                className="mr-1 rounded-md p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-600"
+                aria-label={`Delete ${view.name || 'saved view'}`}
+                title="Delete view"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="mt-3 text-xs text-slate-400">保存常用的店铺、时间范围和 Product Matrix 条件，下次一键恢复。</p>
+      )}
+    </section>
   )
 }
 
@@ -3384,23 +3763,68 @@ function TopProductsChart({ products }) {
   )
 }
 
-function ProductMatrix({ products, filter, setFilter, sort, setSort, query, setQuery }) {
-  const filters = [
-    ['all', 'All'],
-    ['good', '机会'],
-    ['warn', '观察'],
-    ['bad', '需要修改'],
+function ProductMatrix({
+  products,
+  filter,
+  setFilter,
+  sort,
+  setSort,
+  query,
+  setQuery,
+  onViewDetails,
+  activeStore,
+  range,
+}) {
+  const columns = [
+    ['type', 'Type'],
+    ['units', 'Units'],
+    ['spend', 'Spend'],
+    ['revenue', 'Revenue'],
+    ['roas', 'ROAS'],
+    ['ctr', 'CTR'],
+    ['conversionRate', 'CVR'],
+    ['score', 'Score'],
+    ['decision', 'Decision'],
   ]
-  const sorts = [
-    ['units_desc', 'Units 最多'],
-    ['revenue_desc', 'Revenue 最高'],
-    ['roas_desc', 'ROAS 最高'],
-    ['score_desc', 'Score 最高'],
-    ['ctr_desc', 'CTR 最高'],
-    ['conversionRate_desc', 'CVR 最高'],
-    ['spend_desc', 'Spend 最高'],
-    ['spend_asc', 'Spend 最低'],
-  ]
+  const [visibleColumns, setVisibleColumns] = useState(() => columns.map(([key]) => key))
+  const isVisible = (key) => visibleColumns.includes(key)
+  const toggleColumn = (key) => {
+    setVisibleColumns((current) => current.includes(key)
+      ? current.filter((column) => column !== key)
+      : [...current, key])
+  }
+  const exportCurrentResults = () => {
+    const csvCell = (value) => {
+      const text = String(value ?? '')
+      const safe = /^[=+\-@]/.test(text) ? `'${text}` : text
+      return `"${safe.replace(/"/g, '""')}"`
+    }
+    const exportColumns = columns.filter(([key]) => isVisible(key))
+    const headers = ['Product', ...exportColumns.map(([, label]) => label)]
+    const valueFor = (product, key) => ({
+      type: [product.category, product.lifecycle, product.skuType].filter(Boolean).join(' / '),
+      units: product.units,
+      spend: Number(product.spend || 0).toFixed(2),
+      revenue: Number(product.revenue || 0).toFixed(2),
+      roas: Number(product.roas || 0).toFixed(2),
+      ctr: pct(product.ctr),
+      conversionRate: pct(product.conversionRate),
+      score: `${product.score ?? 0} ${product.grade || ''}`.trim(),
+      decision: [product.decision, product.reason].filter(Boolean).join(' — '),
+    })[key]
+    const rows = products.map((product) => [
+      [product.sku || product.spu, product.productName, `SPU ${product.spu}`, `Unit x${product.unitMultiplier || 1}`].filter(Boolean).join(' · '),
+      ...exportColumns.map(([key]) => valueFor(product, key)),
+    ])
+    const csv = `\ufeff${headers.map(csvCell).join(',')}\n${rows.map((row) => row.map(csvCell).join(',')).join('\n')}`
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }))
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${activeStore || 'store'}-product-matrix-${range?.from || todayISO()}-${range?.to || todayISO()}.csv`
+    link.click()
+    URL.revokeObjectURL(url)
+  }
+
   return (
     <section className="card p-5">
       <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
@@ -3416,34 +3840,54 @@ function ProductMatrix({ products, filter, setFilter, sort, setSort, query, setQ
             onChange={(e) => setQuery(e.target.value)}
           />
           <select className="metric-input !py-1.5" value={sort} onChange={(e) => setSort(e.target.value)}>
-            {sorts.map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+            {MATRIX_SORTS.map(([key, label]) => <option key={key} value={key}>{label}</option>)}
           </select>
+          <details className="relative">
+            <summary className="btn-secondary cursor-pointer list-none text-xs">
+              Columns {visibleColumns.length}/{columns.length}
+            </summary>
+            <div className="absolute right-0 z-40 mt-2 w-52 rounded-xl border border-slate-200 bg-white p-2 shadow-xl">
+              <div className="px-2 pb-2 text-[10px] font-semibold uppercase tracking-wide text-slate-400">Visible columns</div>
+              {columns.map(([key, label]) => (
+                <label key={key} className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-xs text-slate-600 hover:bg-slate-50">
+                  <input type="checkbox" checked={isVisible(key)} onChange={() => toggleColumn(key)} />
+                  {label}
+                </label>
+              ))}
+              <button type="button" onClick={() => setVisibleColumns(columns.map(([key]) => key))} className="mt-1 w-full rounded-lg px-2 py-1.5 text-left text-xs font-medium text-blue-600 hover:bg-blue-50">
+                Show all columns
+              </button>
+            </div>
+          </details>
+          <button type="button" onClick={exportCurrentResults} disabled={!products.length} className="btn-secondary text-xs disabled:opacity-40">
+            <Download className="h-3.5 w-3.5" /> Export current
+          </button>
         </div>
       </div>
       <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
         <div className="flex flex-wrap gap-1">
-          {filters.map(([key, label]) => (
+          {MATRIX_FILTERS.map(([key, label]) => (
             <button key={key} onClick={() => setFilter(key)} className={`text-xs px-3 py-1.5 rounded-lg border ${filter === key ? 'bg-blue-50 border-blue-300 text-blue-700' : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'}`}>
               {label}
             </button>
           ))}
         </div>
-        <span className="text-xs text-slate-400">{products.length} products</span>
+        <span className="text-xs text-slate-400">{products.length} products · export uses current rows and visible columns</span>
       </div>
       <div className="max-h-[70vh] overflow-auto rounded-xl border border-slate-200/80">
-        <table className="min-w-[1040px] w-full text-sm">
+        <table className="min-w-[760px] w-full text-sm">
           <thead className="sticky top-0 z-20 bg-slate-50/95 backdrop-blur">
             <tr className="border-b border-slate-200 text-left text-xs text-slate-500">
               <th className="sticky left-0 z-30 min-w-64 border-r border-slate-200 bg-slate-50/95 py-2.5 pl-3 pr-4">Product</th>
-              <th className="py-2.5 pr-4">Type</th>
-              <th className="py-2.5 pr-4 text-right tabular-nums">Units</th>
-              <th className="py-2.5 pr-4 text-right tabular-nums">Spend</th>
-              <th className="py-2.5 pr-4 text-right tabular-nums">Revenue</th>
-              <th className="py-2.5 pr-4 text-right tabular-nums">ROAS</th>
-              <th className="py-2.5 pr-4 text-right tabular-nums">CTR</th>
-              <th className="py-2.5 pr-4 text-right tabular-nums">CVR</th>
-              <th className="py-2.5 pr-4 text-right tabular-nums">Score</th>
-              <th className="py-2.5 pr-4">Decision</th>
+              {isVisible('type') && <th className="py-2.5 pr-4">Type</th>}
+              {isVisible('units') && <th className="py-2.5 pr-4 text-right tabular-nums">Units</th>}
+              {isVisible('spend') && <th className="py-2.5 pr-4 text-right tabular-nums">Spend</th>}
+              {isVisible('revenue') && <th className="py-2.5 pr-4 text-right tabular-nums">Revenue</th>}
+              {isVisible('roas') && <th className="py-2.5 pr-4 text-right tabular-nums">ROAS</th>}
+              {isVisible('ctr') && <th className="py-2.5 pr-4 text-right tabular-nums">CTR</th>}
+              {isVisible('conversionRate') && <th className="py-2.5 pr-4 text-right tabular-nums">CVR</th>}
+              {isVisible('score') && <th className="py-2.5 pr-4 text-right tabular-nums">Score</th>}
+              {isVisible('decision') && <th className="py-2.5 pr-4">Decision</th>}
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
@@ -3453,33 +3897,36 @@ function ProductMatrix({ products, filter, setFilter, sort, setSort, query, setQ
                   <div className="font-medium text-slate-700">{p.sku || p.spu}</div>
                   <div className="text-xs text-slate-400 line-clamp-2">{p.productName}</div>
                   <div className="text-[11px] text-slate-400 mt-0.5">SPU {p.spu} · Unit x{p.unitMultiplier || 1}</div>
+                  <button type="button" onClick={() => onViewDetails?.(p)} className="mt-1.5 text-xs font-semibold text-blue-600 hover:text-blue-800">
+                    View details
+                  </button>
                 </td>
-                <td className="py-3 pr-4 text-xs text-slate-500">
+                {isVisible('type') && <td className="py-3 pr-4 text-xs text-slate-500">
                   <div>{p.category || '-'}</div>
                   <div>{p.lifecycle || '-'}</div>
                   <div>{p.skuType || '-'}</div>
-                </td>
-                <td className="whitespace-nowrap py-3 pr-4 text-right font-medium tabular-nums text-slate-700">{count(p.units)}</td>
-                <td className="whitespace-nowrap py-3 pr-4 text-right tabular-nums">{money(p.spend)}</td>
-                <td className="whitespace-nowrap py-3 pr-4 text-right tabular-nums">{money(p.revenue)}</td>
-                <td className="whitespace-nowrap py-3 pr-4 text-right tabular-nums">{ratio(p.roas)}</td>
-                <td className="whitespace-nowrap py-3 pr-4 text-right tabular-nums">{pct(p.ctr)}</td>
-                <td className="whitespace-nowrap py-3 pr-4 text-right tabular-nums">{pct(p.conversionRate)}</td>
-                <td className="whitespace-nowrap py-3 pr-4 text-right tabular-nums">
+                </td>}
+                {isVisible('units') && <td className="whitespace-nowrap py-3 pr-4 text-right font-medium tabular-nums text-slate-700">{count(p.units)}</td>}
+                {isVisible('spend') && <td className="whitespace-nowrap py-3 pr-4 text-right tabular-nums">{money(p.spend)}</td>}
+                {isVisible('revenue') && <td className="whitespace-nowrap py-3 pr-4 text-right tabular-nums">{money(p.revenue)}</td>}
+                {isVisible('roas') && <td className="whitespace-nowrap py-3 pr-4 text-right tabular-nums">{ratio(p.roas)}</td>}
+                {isVisible('ctr') && <td className="whitespace-nowrap py-3 pr-4 text-right tabular-nums">{pct(p.ctr)}</td>}
+                {isVisible('conversionRate') && <td className="whitespace-nowrap py-3 pr-4 text-right tabular-nums">{pct(p.conversionRate)}</td>}
+                {isVisible('score') && <td className="whitespace-nowrap py-3 pr-4 text-right tabular-nums">
                   <div className="font-semibold text-slate-700">{p.score ?? 0}</div>
                   <div className="text-[11px] text-slate-400">{p.grade || '-'}</div>
-                </td>
-                <td className="py-3 pr-4 min-w-52">
+                </td>}
+                {isVisible('decision') && <td className="py-3 pr-4 min-w-52">
                   <span className={`inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-xs font-medium ${statusClass(p.status)}`}>
                     {p.status === 'good' ? <CheckCircle className="w-3 h-3" /> : <AlertTriangle className="w-3 h-3" />}
                     {p.decision}
                   </span>
                   <div className="text-xs text-slate-400 mt-1">{p.reason}</div>
-                </td>
+                </td>}
               </tr>
             ))}
             {!products.length && (
-              <tr><td colSpan="10" className="py-8 text-center text-slate-400">这个筛选下没有产品。</td></tr>
+              <tr><td colSpan={visibleColumns.length + 1} className="py-8 text-center text-slate-400">这个筛选下没有产品。</td></tr>
             )}
           </tbody>
         </table>

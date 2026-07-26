@@ -2,6 +2,7 @@ import React from 'react'
 import { useLocation } from 'react-router-dom'
 import { Menu, PanelLeftClose, PanelLeftOpen, Search, ShieldCheck, User } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
+import ActionCenter from './ActionCenter.jsx'
 
 const PAGE_TITLES = {
   '/':             'Dashboard',
@@ -67,7 +68,8 @@ export default function Header({ onMenuClick, onSidebarToggle, sidebarCollapsed,
       </div>
 
       {/* User badge */}
-      <div className="flex items-center gap-2">
+      <div className="flex shrink-0 items-center gap-2">
+        <ActionCenter />
         <button
           type="button"
           onClick={() => window.dispatchEvent(new Event('feiya:open-command-palette'))}
