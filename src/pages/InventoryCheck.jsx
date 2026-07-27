@@ -2,7 +2,8 @@ import React, { useCallback, useEffect, useMemo, useState, useTransition } from 
 import {
   Archive, Boxes, CalendarClock, CheckCircle2, ChevronRight,
   AlertCircle, Download, FileSpreadsheet, Layers3, Link2, MapPin,
-  PackageCheck, RefreshCw, Search, Upload, Warehouse, X,
+  Minus, PackageCheck, Pencil, Plus, RefreshCw, Search, Trash2,
+  Upload, Warehouse, X,
 } from 'lucide-react'
 import FileUploadZone from '../components/FileUploadZone.jsx'
 import DataTable from '../components/DataTable.jsx'
@@ -26,10 +27,32 @@ const SHEET_LABELS = {
 const norm = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '')
 const linkKey = (row) => `${norm(row.style)}|${norm(row.color)}`
 const num = (value) => Number(value || 0).toLocaleString()
+const isValidInventoryNumber = (value) => /^\d+$/.test(String(value)) && Number.isSafeInteger(Number(value))
+const clearSheetTotals = (rows, sheet) => rows.map((row) => {
+  if (row.sheet !== sheet) return row
+  const { sheetBoxTotal, sheetQtyTotal, ...current } = row
+  return current
+})
+
+const INVENTORY_FIELDS = [
+  ['rack', 'Location'], ['style', 'Style'], ['color', 'Color'],
+  ['box', 'Boxes', 'number'], ['qty', 'Quantity', 'number'],
+  ['fabric', 'Fabric'], ['label', 'Label'], ['sizes', 'Size Breakdown'],
+  ['ratio', 'Ratio / Breakdown'], ['company', 'Company'],
+  ['customer', 'Customer'], ['remark', 'Remark', 'textarea'],
+]
+
+const PENDING_FIELDS = [
+  ['po', 'PO #'], ['style', 'Style / Description'], ['pallet', 'Pallet'],
+  ['box', 'Boxes', 'number'], ['qty', 'Pcs', 'number'],
+  ['startDate', 'Start Date'], ['cancelDate', 'Cancel Date'],
+  ['customer', 'Customer'], ['remark', 'Remark', 'textarea'],
+  ['notes', 'Notes', 'textarea'],
+]
 
 function InfoPill({ icon: Icon, children }) {
   return (
-    <span className="inline-flex items-center gap-1.5 rounded-full border border-white/20 bg-white/10 px-3 py-1.5 text-xs font-medium text-white/90 backdrop-blur-sm">
+    <span className="inline-flex max-w-full items-center gap-1.5 overflow-hidden text-ellipsis whitespace-nowrap rounded-full border border-white/20 bg-white/10 px-3 py-1.5 text-xs font-medium text-white/90 backdrop-blur-sm">
       <Icon className="h-3.5 w-3.5" /> {children}
     </span>
   )
@@ -67,6 +90,178 @@ function DetailField({ label, value, wide = false }) {
   )
 }
 
+function QuantityCell({ row, field, disabled, onAdjust, large = false }) {
+  return (
+    <div className={`flex items-center ${large ? 'gap-2' : 'gap-1'}`} onClick={(event) => event.stopPropagation()}>
+      <button
+        type="button"
+        disabled={disabled || Number(row[field] || 0) <= 0}
+        onClick={() => onAdjust(row, field, -1)}
+        className={`${large ? 'flex h-11 w-11 items-center justify-center rounded-xl' : 'rounded-md p-1'} border border-slate-200 text-slate-500 transition hover:border-indigo-300 hover:bg-indigo-50 hover:text-indigo-600 disabled:cursor-not-allowed disabled:opacity-30`}
+        aria-label={`Decrease ${field}`}
+      >
+        <Minus className={large ? 'h-4 w-4' : 'h-3 w-3'} />
+      </button>
+      <span className={`${large ? 'min-w-12 text-lg' : 'min-w-10'} text-center font-bold tabular-nums`}>{num(row[field])}</span>
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => onAdjust(row, field, 1)}
+        className={`${large ? 'flex h-11 w-11 items-center justify-center rounded-xl' : 'rounded-md p-1'} border border-slate-200 text-slate-500 transition hover:border-indigo-300 hover:bg-indigo-50 hover:text-indigo-600 disabled:cursor-not-allowed disabled:opacity-30`}
+        aria-label={`Increase ${field}`}
+      >
+        <Plus className={large ? 'h-4 w-4' : 'h-3 w-3'} />
+      </button>
+    </div>
+  )
+}
+
+function MobileInventoryCards({ rows, pending, disabled, resetKey, onAdjust, onEdit, onDelete, onSelect }) {
+  const [visibleCount, setVisibleCount] = useState(25)
+
+  useEffect(() => setVisibleCount(25), [resetKey])
+
+  if (!rows.length) {
+    return <div className="py-12 text-center text-sm text-slate-400">No inventory records found.</div>
+  }
+
+  const visibleRows = rows.slice(0, visibleCount)
+  return (
+    <div className="space-y-3 sm:hidden">
+      {visibleRows.map((row) => (
+        <article key={row.id} onClick={() => onSelect(row)} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm active:bg-slate-50">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <p className="truncate text-base font-black text-slate-900">{row.style || row.po || 'Inventory Record'}</p>
+              <p className="mt-1 truncate text-sm text-slate-500">
+                {[pending ? row.po : row.rack, row.color || row.customer].filter(Boolean).join(' · ') || 'No additional details'}
+              </p>
+            </div>
+            <div className="flex shrink-0 gap-1" onClick={(event) => event.stopPropagation()}>
+              <button type="button" disabled={disabled} onClick={() => onEdit(row)} className="flex h-11 w-11 items-center justify-center rounded-xl bg-indigo-50 text-indigo-600 disabled:opacity-40" aria-label="Edit record"><Pencil className="h-4 w-4" /></button>
+              <button type="button" disabled={disabled} onClick={() => onDelete(row)} className="flex h-11 w-11 items-center justify-center rounded-xl bg-red-50 text-red-600 disabled:opacity-40" aria-label="Delete record"><Trash2 className="h-4 w-4" /></button>
+            </div>
+          </div>
+
+          <div className="mt-4 flex flex-wrap gap-3 border-t border-slate-100 pt-4" onClick={(event) => event.stopPropagation()}>
+            <div className="w-full">
+              <p className="mb-2 text-[11px] font-bold uppercase tracking-wider text-slate-400">Boxes</p>
+              <QuantityCell row={row} field="box" disabled={disabled} onAdjust={onAdjust} large />
+            </div>
+            <div className="w-full">
+              <p className="mb-2 text-[11px] font-bold uppercase tracking-wider text-slate-400">{pending ? 'Pcs' : 'Quantity'}</p>
+              <QuantityCell row={row} field="qty" disabled={disabled} onAdjust={onAdjust} large />
+            </div>
+          </div>
+
+          {row.remark && <p className="mt-4 line-clamp-2 rounded-xl bg-amber-50 px-3 py-2 text-sm leading-5 text-amber-900"><span className="font-bold">Remark:</span> {row.remark}</p>}
+          <p className="mt-3 text-xs font-semibold text-indigo-600">Tap card for full details</p>
+        </article>
+      ))}
+      {visibleRows.length < rows.length && (
+        <button type="button" onClick={() => setVisibleCount((count) => count + 25)} className="min-h-12 w-full rounded-2xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm font-bold text-indigo-700">
+          Load more · {num(rows.length - visibleRows.length)} remaining
+        </button>
+      )}
+    </div>
+  )
+}
+
+function InventoryEditor({ row, isNew, saving, onClose, onSave }) {
+  const [draft, setDraft] = useState(row)
+  const [errors, setErrors] = useState({})
+  const fields = row.kind === 'pending' ? PENDING_FIELDS : INVENTORY_FIELDS
+
+  const update = (key, value) => setDraft((current) => ({ ...current, [key]: value }))
+  const updateNumber = (key, value) => {
+    update(key, value)
+    setErrors((current) => ({
+      ...current,
+      [key]: isValidInventoryNumber(value) ? '' : 'Enter a whole number (0 or more).',
+    }))
+  }
+
+  const adjustNumber = (key, delta) => {
+    const current = isValidInventoryNumber(draft[key]) ? Number(draft[key]) : 0
+    updateNumber(key, String(Math.max(0, current + delta)))
+  }
+
+  const submit = (event) => {
+    event.preventDefault()
+    const numberErrors = Object.fromEntries(
+      fields
+        .filter(([, , type]) => type === 'number')
+        .map(([key]) => [key, isValidInventoryNumber(draft[key]) ? '' : 'Enter a whole number (0 or more).']),
+    )
+    setErrors(numberErrors)
+    if (Object.values(numberErrors).some(Boolean)) return
+    onSave(draft)
+  }
+
+  return (
+    <div className="fixed inset-0 z-[60] flex justify-end bg-slate-950/35 backdrop-blur-sm" onClick={onClose}>
+      <aside className="h-[100dvh] w-full max-w-xl overflow-y-auto bg-white shadow-2xl" onClick={(event) => event.stopPropagation()}>
+        <div className="sticky top-0 z-10 border-b border-slate-100 bg-white/95 px-4 py-4 backdrop-blur sm:px-6 sm:py-5">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <p className="text-xs font-bold uppercase tracking-widest text-indigo-500">{SHEET_LABELS[row.sheet] || row.sheet}</p>
+              <h2 className="mt-1 text-2xl font-black text-slate-900">{isNew ? 'Add New Record' : 'Edit Record'}</h2>
+              <p className="mt-1 text-sm text-slate-500">Changes are saved directly to Inventory Check.</p>
+            </div>
+            <button type="button" onClick={onClose} disabled={saving} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-slate-500 hover:bg-slate-200 disabled:opacity-50"><X className="h-5 w-5" /></button>
+          </div>
+        </div>
+        <form
+          className="space-y-5 p-4 pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:p-6"
+          onSubmit={submit}
+        >
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            {fields.map(([key, label, type]) => (
+              <label key={key} className={type === 'textarea' ? 'sm:col-span-2' : ''}>
+                <span className="text-xs font-bold uppercase tracking-wider text-slate-500">{label}</span>
+                {type === 'textarea' ? (
+                  <textarea
+                    value={draft[key] ?? ''}
+                    onChange={(event) => update(key, event.target.value)}
+                    rows={3}
+                    className="mt-1.5 w-full rounded-xl border border-slate-200 px-3 py-2.5 text-base outline-none transition focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100 sm:text-sm"
+                  />
+                ) : (
+                  <div className={type === 'number' ? 'mt-1.5 flex items-center gap-2' : ''}>
+                    {type === 'number' && (
+                      <button type="button" onClick={() => adjustNumber(key, -1)} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-slate-200 text-slate-500 hover:bg-slate-50"><Minus className="h-4 w-4" /></button>
+                    )}
+                    <input
+                      type="text"
+                      inputMode={type === 'number' ? 'numeric' : undefined}
+                      value={draft[key] ?? ''}
+                      onChange={(event) => type === 'number' ? updateNumber(key, event.target.value) : update(key, event.target.value)}
+                      aria-invalid={type === 'number' ? Boolean(errors[key]) : undefined}
+                      aria-describedby={errors[key] ? `${key}-error` : undefined}
+                      className={`${type === 'number' ? 'min-w-0 flex-1 text-center font-bold tabular-nums' : 'mt-1.5 w-full'} rounded-xl border px-3 py-2.5 text-base outline-none transition sm:text-sm ${errors[key] ? 'border-red-400 bg-red-50 focus:border-red-500 focus:ring-4 focus:ring-red-100' : 'border-slate-200 focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100'}`}
+                    />
+                    {type === 'number' && (
+                      <button type="button" onClick={() => adjustNumber(key, 1)} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-slate-200 text-slate-500 hover:bg-slate-50"><Plus className="h-4 w-4" /></button>
+                    )}
+                  </div>
+                )}
+                {errors[key] && <p id={`${key}-error`} className="mt-1.5 flex items-center gap-1 text-xs font-semibold text-red-600"><AlertCircle className="h-3.5 w-3.5" />{errors[key]}</p>}
+              </label>
+            ))}
+          </div>
+          <div className="flex justify-end gap-2 border-t border-slate-100 pt-5">
+            <button type="button" onClick={onClose} disabled={saving} className="rounded-xl px-4 py-2.5 text-sm font-semibold text-slate-600 hover:bg-slate-100 disabled:opacity-50">Cancel</button>
+            <button type="submit" disabled={saving} className="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-indigo-700 disabled:cursor-wait disabled:opacity-60">
+              {saving && <RefreshCw className="h-4 w-4 animate-spin" />}
+              {saving ? 'Saving…' : isNew ? 'Add Record' : 'Save Changes'}
+            </button>
+          </div>
+        </form>
+      </aside>
+    </div>
+  )
+}
+
 export default function InventoryCheck() {
   const [rows, setRows] = useState([])
   const [lastUpdated, setLastUpdated] = useState(null)
@@ -75,9 +270,12 @@ export default function InventoryCheck() {
   const [inputValue, setInputValue] = useState('')
   const [searchQuery, setSearchQuery] = useState('')
   const [selected, setSelected] = useState(null)
+  const [editingRow, setEditingRow] = useState(null)
+  const [isAdding, setIsAdding] = useState(false)
   const [showUpload, setShowUpload] = useState(false)
   const [isFetching, setIsFetching] = useState(true)
   const [isUploading, setIsUploading] = useState(false)
+  const [isSaving, setIsSaving] = useState(false)
   const [apiError, setApiError] = useState(null)
   const [isPending, startTransition] = useTransition()
   const toast = useToast()
@@ -142,6 +340,81 @@ export default function InventoryCheck() {
     locations: new Set(activeRows.map((row) => row.rack).filter(Boolean)).size,
   }), [activeRows])
 
+  const persistRows = useCallback(async (nextRows, message) => {
+    setIsSaving(true)
+    try {
+      await saveInventory(nextRows, fileName)
+      setRows(nextRows)
+      setLastUpdated(new Date().toISOString())
+      toast.success(message, 'Inventory Updated')
+      return true
+    } catch (error) {
+      toast.error(error.message, 'Could Not Save')
+      return false
+    } finally {
+      setIsSaving(false)
+    }
+  }, [fileName, toast])
+
+  const handleAdjust = useCallback(async (row, field, delta) => {
+    if (isSaving) return
+    const nextValue = Math.max(0, Number(row[field] || 0) + delta)
+    if (nextValue === Number(row[field] || 0)) return
+    const nextRows = clearSheetTotals(
+      rows.map((item) => item.id === row.id ? { ...item, [field]: nextValue } : item),
+      row.sheet,
+    )
+    const saved = await persistRows(nextRows, `${field === 'box' ? 'Boxes' : 'Quantity'} changed to ${num(nextValue)}.`)
+    if (saved) setSelected((current) => current?.id === row.id ? { ...current, [field]: nextValue } : current)
+  }, [isSaving, persistRows, rows])
+
+  const openAdd = useCallback(() => {
+    const pending = activeSheet === 'Pending Shipment'
+    setSelected(null)
+    setIsAdding(true)
+    setEditingRow({
+      id: `manual-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      sheet: activeSheet,
+      rowNumber: 'Manual',
+      kind: pending ? 'pending' : 'inventory',
+      box: 0,
+      qty: 0,
+    })
+  }, [activeSheet])
+
+  const handleSaveRow = useCallback(async (draft) => {
+    if (!isValidInventoryNumber(draft.box) || !isValidInventoryNumber(draft.qty)) {
+      toast.error('Boxes and Quantity must be whole numbers of 0 or more.', 'Check the Numbers')
+      return
+    }
+    const clean = {
+      ...draft,
+      box: Number(draft.box),
+      qty: Number(draft.qty),
+    }
+    const nextRows = clearSheetTotals(isAdding
+      ? [...rows, clean]
+      : rows.map((row) => row.id === clean.id ? clean : row),
+    clean.sheet)
+    const saved = await persistRows(nextRows, isAdding ? 'New inventory record added.' : 'Inventory record saved.')
+    if (saved) {
+      setSelected(isAdding ? null : clean)
+      setEditingRow(null)
+      setIsAdding(false)
+    }
+  }, [isAdding, persistRows, rows, toast])
+
+  const handleDelete = useCallback(async (row) => {
+    if (isSaving || !window.confirm(`Delete ${row.style || row.po || 'this inventory record'}? This cannot be undone.`)) return
+    const nextRows = clearSheetTotals(rows.filter((item) => item.id !== row.id), row.sheet)
+    const saved = await persistRows(nextRows, 'Inventory record deleted.')
+    if (saved) {
+      setSelected(null)
+      setEditingRow(null)
+      setIsAdding(false)
+    }
+  }, [isSaving, persistRows, rows])
+
   const handleFile = useCallback(async (file) => {
     setIsUploading(true)
     try {
@@ -173,8 +446,8 @@ export default function InventoryCheck() {
     { key: 'rack', label: 'Location', sortable: true, render: (value) => value ? <span className="inline-flex items-center gap-1.5 whitespace-nowrap font-bold text-violet-700"><MapPin className="h-3.5 w-3.5" />{value}</span> : '—' },
     { key: 'style', label: 'Style', sortable: true, cellClassName: 'font-semibold whitespace-nowrap' },
     { key: 'color', label: 'Color', sortable: true },
-    { key: 'box', label: 'Boxes', sortable: true, cellClassName: 'tabular-nums' },
-    { key: 'qty', label: 'Qty', sortable: true, cellClassName: 'font-bold tabular-nums' },
+    { key: 'box', label: 'Boxes', sortable: true, render: (_, row) => <QuantityCell row={row} field="box" disabled={isSaving} onAdjust={handleAdjust} /> },
+    { key: 'qty', label: 'Qty', sortable: true, render: (_, row) => <QuantityCell row={row} field="qty" disabled={isSaving} onAdjust={handleAdjust} /> },
     { key: 'sizes', label: 'Size Breakdown', render: (value, row) => <div className="min-w-[150px]"><p className="font-medium">{value || '—'}</p>{row.ratio && <p className="mt-0.5 text-xs text-slate-400">{row.ratio}</p>}</div> },
     { key: 'company', label: 'Company' },
     { key: 'customer', label: 'Customer' },
@@ -182,18 +455,20 @@ export default function InventoryCheck() {
       const links = getLinks(row)
       return links.length ? <span className="inline-flex items-center gap-1 whitespace-nowrap rounded-full bg-emerald-50 px-2 py-1 text-xs font-semibold text-emerald-700"><Link2 className="h-3 w-3" />{links.length === 1 ? links[0].rack || 'Linked' : `${links.length} locations`}</span> : <span className="inline-flex items-center gap-1 whitespace-nowrap rounded-full bg-amber-50 px-2 py-1 text-xs font-semibold text-amber-700"><AlertCircle className="h-3 w-3" />Review</span>
     } }] : []),
+    { key: 'actions', label: 'Actions', sortable: false, render: (_, row) => <div className="flex items-center gap-1" onClick={(event) => event.stopPropagation()}><button type="button" disabled={isSaving} onClick={() => { setIsAdding(false); setEditingRow(row) }} className="rounded-lg p-1.5 text-slate-400 hover:bg-indigo-50 hover:text-indigo-600 disabled:opacity-40" aria-label="Edit record"><Pencil className="h-4 w-4" /></button><button type="button" disabled={isSaving} onClick={() => handleDelete(row)} className="rounded-lg p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-600 disabled:opacity-40" aria-label="Delete record"><Trash2 className="h-4 w-4" /></button></div> },
   ]
 
   const pendingColumns = [
     { key: 'po', label: 'PO #', sortable: true, cellClassName: 'font-semibold whitespace-nowrap' },
     { key: 'style', label: 'Style / Description', sortable: true },
     { key: 'pallet', label: 'Pallet', sortable: true },
-    { key: 'box', label: 'Boxes', sortable: true },
-    { key: 'qty', label: 'Pcs', sortable: true, cellClassName: 'font-bold tabular-nums' },
+    { key: 'box', label: 'Boxes', sortable: true, render: (_, row) => <QuantityCell row={row} field="box" disabled={isSaving} onAdjust={handleAdjust} /> },
+    { key: 'qty', label: 'Pcs', sortable: true, render: (_, row) => <QuantityCell row={row} field="qty" disabled={isSaving} onAdjust={handleAdjust} /> },
     { key: 'startDate', label: 'Start Date', sortable: true, cellClassName: 'whitespace-nowrap' },
     { key: 'cancelDate', label: 'Cancel Date', sortable: true, cellClassName: 'whitespace-nowrap' },
     { key: 'customer', label: 'Customer' },
     { key: 'remark', label: 'Remark' },
+    { key: 'actions', label: 'Actions', sortable: false, render: (_, row) => <div className="flex items-center gap-1" onClick={(event) => event.stopPropagation()}><button type="button" disabled={isSaving} onClick={() => { setIsAdding(false); setEditingRow(row) }} className="rounded-lg p-1.5 text-slate-400 hover:bg-indigo-50 hover:text-indigo-600 disabled:opacity-40" aria-label="Edit record"><Pencil className="h-4 w-4" /></button><button type="button" disabled={isSaving} onClick={() => handleDelete(row)} className="rounded-lg p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-600 disabled:opacity-40" aria-label="Delete record"><Trash2 className="h-4 w-4" /></button></div> },
   ]
 
   const selectedLinks = selected ? getLinks(selected) : []
@@ -248,7 +523,7 @@ export default function InventoryCheck() {
             </div>
           </section>
 
-          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+          <div className="grid grid-cols-1 gap-3 min-[360px]:grid-cols-2 lg:grid-cols-4">
             <MetricCard icon={Archive} label="Records" value={num(stats.rows)} tone="violet" />
             <MetricCard icon={Boxes} label="Boxes" value={num(stats.boxes)} tone="blue" />
             <MetricCard icon={PackageCheck} label={pendingSheet ? 'Pending Pcs' : 'Total Qty'} value={num(stats.qty)} tone="emerald" />
@@ -260,11 +535,12 @@ export default function InventoryCheck() {
               <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
                 <div className="relative flex-1">
                   <Search className="absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
-                  <input value={inputValue} onChange={(event) => { const value = event.target.value; setInputValue(value); startTransition(() => setSearchQuery(value)) }} className="w-full rounded-2xl border border-slate-200 bg-slate-50 py-3 pl-11 pr-4 text-sm outline-none transition focus:border-indigo-400 focus:bg-white focus:ring-4 focus:ring-indigo-100" placeholder="Search location, style, color, fabric, label, company, remark or customer…" />
+                  <input value={inputValue} onChange={(event) => { const value = event.target.value; setInputValue(value); startTransition(() => setSearchQuery(value)) }} className="w-full rounded-2xl border border-slate-200 bg-slate-50 py-3 pl-11 pr-4 text-base outline-none transition focus:border-indigo-400 focus:bg-white focus:ring-4 focus:ring-indigo-100 sm:text-sm" placeholder="Search location, style, color, fabric, label, company, remark or customer…" />
                 </div>
-                <div className="flex items-center gap-2 text-xs text-slate-500">
+                <div className="flex w-full items-center justify-between gap-2 text-xs text-slate-500 lg:w-auto lg:justify-start">
                   {isPending ? 'Searching…' : `${num(filteredRows.length)} results`}
                   {inputValue && <button onClick={() => { setInputValue(''); startTransition(() => setSearchQuery('')) }} className="rounded-lg px-2 py-1 font-semibold text-indigo-600 hover:bg-indigo-50">Clear</button>}
+                  <button type="button" onClick={openAdd} disabled={isSaving} className="ml-auto inline-flex min-h-11 items-center gap-1.5 rounded-xl bg-indigo-600 px-4 py-2 text-sm font-bold text-white shadow-sm hover:bg-indigo-700 disabled:opacity-50 lg:ml-2 lg:min-h-0 lg:px-3 lg:text-xs"><Plus className="h-4 w-4 lg:h-3.5 lg:w-3.5" />Add New</button>
                 </div>
               </div>
               <div className="mt-3 flex items-center gap-2 text-xs text-slate-500">
@@ -272,7 +548,19 @@ export default function InventoryCheck() {
               </div>
             </div>
             <div className="p-3 sm:p-5">
-              <DataTable data={filteredRows} columns={pendingSheet ? pendingColumns : inventoryColumns} pageSize={50} onRowClick={setSelected} getRowKey={(row) => row.id} emptyMessage={searchQuery ? `No results for “${searchQuery}”` : 'No inventory rows in this sheet'} />
+              <MobileInventoryCards
+                rows={filteredRows}
+                pending={pendingSheet}
+                disabled={isSaving}
+                resetKey={`${activeSheet}|${searchQuery}`}
+                onAdjust={handleAdjust}
+                onEdit={(row) => { setIsAdding(false); setEditingRow(row) }}
+                onDelete={handleDelete}
+                onSelect={setSelected}
+              />
+              <div className="hidden sm:block">
+                <DataTable data={filteredRows} columns={pendingSheet ? pendingColumns : inventoryColumns} pageSize={50} onRowClick={setSelected} getRowKey={(row) => row.id} emptyMessage={searchQuery ? `No results for “${searchQuery}”` : 'No inventory rows in this sheet'} />
+              </div>
             </div>
           </section>
         </>
@@ -286,13 +574,17 @@ export default function InventoryCheck() {
 
       {selected && (
         <div className="fixed inset-0 z-50 flex justify-end bg-slate-950/35 backdrop-blur-sm" onClick={() => setSelected(null)}>
-          <aside className="h-full w-full max-w-xl overflow-y-auto bg-white shadow-2xl" onClick={(event) => event.stopPropagation()}>
-            <div className="sticky top-0 z-10 border-b border-slate-100 bg-white/95 px-6 py-5 backdrop-blur">
-              <div className="flex items-start justify-between gap-4"><div><p className="text-xs font-bold uppercase tracking-widest text-indigo-500">{SHEET_LABELS[selected.sheet] || selected.sheet}</p><h2 className="mt-1 text-2xl font-black text-slate-900">{selected.style || selected.po || 'Inventory Detail'}</h2><p className="mt-1 text-sm text-slate-500">{selected.color || selected.customer || `Excel row ${selected.rowNumber}`}</p></div><button onClick={() => setSelected(null)} className="rounded-xl bg-slate-100 p-2 text-slate-500 hover:bg-slate-200"><X className="h-5 w-5" /></button></div>
+          <aside className="h-[100dvh] w-full max-w-xl overflow-y-auto bg-white shadow-2xl" onClick={(event) => event.stopPropagation()}>
+            <div className="sticky top-0 z-10 border-b border-slate-100 bg-white/95 px-4 py-4 backdrop-blur sm:px-6 sm:py-5">
+              <div className="flex items-start justify-between gap-4"><div className="min-w-0"><p className="text-xs font-bold uppercase tracking-widest text-indigo-500">{SHEET_LABELS[selected.sheet] || selected.sheet}</p><h2 className="mt-1 truncate text-2xl font-black text-slate-900">{selected.style || selected.po || 'Inventory Detail'}</h2><p className="mt-1 truncate text-sm text-slate-500">{selected.color || selected.customer || `Excel row ${selected.rowNumber}`}</p></div><button onClick={() => setSelected(null)} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-slate-500 hover:bg-slate-200"><X className="h-5 w-5" /></button></div>
+              <div className="mt-4 flex gap-2">
+                <button type="button" disabled={isSaving} onClick={() => { setIsAdding(false); setEditingRow(selected) }} className="inline-flex min-h-11 flex-1 items-center justify-center gap-1.5 rounded-xl bg-indigo-600 px-3 py-2 text-sm font-bold text-white hover:bg-indigo-700 disabled:opacity-50 sm:min-h-0 sm:flex-none sm:text-xs"><Pencil className="h-4 w-4 sm:h-3.5 sm:w-3.5" />Edit</button>
+                <button type="button" disabled={isSaving} onClick={() => handleDelete(selected)} className="inline-flex min-h-11 flex-1 items-center justify-center gap-1.5 rounded-xl border border-red-200 px-3 py-2 text-sm font-bold text-red-600 hover:bg-red-50 disabled:opacity-50 sm:min-h-0 sm:flex-none sm:text-xs"><Trash2 className="h-4 w-4 sm:h-3.5 sm:w-3.5" />Delete</button>
+              </div>
             </div>
-            <div className="space-y-6 p-6">
+            <div className="space-y-6 p-4 pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:p-6">
               {selected.rack && <div className="rounded-2xl bg-gradient-to-br from-indigo-600 to-violet-700 p-5 text-white"><p className="text-xs font-bold uppercase tracking-widest text-indigo-200">Warehouse Location</p><p className="mt-2 flex items-center gap-2 text-2xl font-black"><MapPin className="h-6 w-6" />{selected.rack}</p></div>}
-              <div className="grid grid-cols-2 gap-x-5 gap-y-5 rounded-2xl border border-slate-200 p-5">
+              <div className="grid grid-cols-1 gap-x-5 gap-y-5 rounded-2xl border border-slate-200 p-5 sm:grid-cols-2">
                 <DetailField label="PO #" value={selected.po} /><DetailField label="Style" value={selected.style} />
                 <DetailField label="Color" value={selected.color} /><DetailField label="Pallet" value={selected.pallet} />
                 <DetailField label="Boxes" value={selected.box || ''} /><DetailField label={selected.kind === 'pending' ? 'Pcs' : 'Quantity'} value={selected.qty || ''} />
@@ -307,6 +599,16 @@ export default function InventoryCheck() {
             </div>
           </aside>
         </div>
+      )}
+
+      {editingRow && (
+        <InventoryEditor
+          row={editingRow}
+          isNew={isAdding}
+          saving={isSaving}
+          onClose={() => { if (!isSaving) { setEditingRow(null); setIsAdding(false) } }}
+          onSave={handleSaveRow}
+        />
       )}
     </div>
   )
