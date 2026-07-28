@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { ArrowLeft, CheckCircle, History, Minus, RefreshCw, TrendingUp } from 'lucide-react'
+import { AlertTriangle, ArrowLeft, CheckCircle, History, Minus, RefreshCw, RotateCcw, TrendingUp } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
+import { useToast } from '../hooks/useToast.js'
 
 function formatDate(value) {
   if (!value) return '—'
@@ -11,20 +12,32 @@ function formatDate(value) {
 
 export default function AutoDeductHistory() {
   const { getToken } = useAuth()
+  const toast = useToast()
   const [transactions, setTransactions] = useState([])
+  const [snapshots, setSnapshots] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [restoring, setRestoring] = useState(null)
 
   const loadHistory = useCallback(async () => {
     setLoading(true)
     setError('')
     try {
-      const res = await fetch('/api/inventory-balance?action=transactions', {
-        headers: { Authorization: `Bearer ${getToken()}` },
-      })
-      const data = await res.json().catch(() => ({}))
-      if (!res.ok) throw new Error(data.error || 'Could not load history')
-      setTransactions(data.transactions || [])
+      const headers = { Authorization: `Bearer ${getToken()}` }
+      const [transactionsRes, snapshotsRes] = await Promise.all([
+        fetch('/api/inventory-balance?action=transactions', { headers }),
+        fetch('/api/inventory-balance?action=history', { headers }),
+      ])
+      const [transactionsData, snapshotsData] = await Promise.all([
+        transactionsRes.json().catch(() => ({})),
+        snapshotsRes.json().catch(() => ({})),
+      ])
+      if (!transactionsRes.ok) throw new Error(transactionsData.error || 'Could not load transaction history')
+      if (!snapshotsRes.ok) throw new Error(snapshotsData.error || 'Could not load rollback points')
+      setTransactions(transactionsData.transactions || [])
+      setSnapshots((snapshotsData.snapshots || []).filter((snapshot) =>
+        ['sales', 'return', 'pre_restore'].includes(snapshot.label)
+      ))
     } catch (err) {
       setError(err.message)
     } finally {
@@ -34,13 +47,49 @@ export default function AutoDeductHistory() {
 
   useEffect(() => { loadHistory() }, [loadHistory])
 
+  const handleRollback = async (snapshot) => {
+    const action = snapshot.label === 'sales'
+      ? 'the deduction'
+      : snapshot.label === 'return'
+        ? 'the add-back'
+        : 'the previous rollback'
+    const confirmed = window.confirm(
+      `Restore the entire inventory balance to ${formatDate(snapshot.created_at || snapshot.timestamp)}?\n\n` +
+      `This returns inventory to the state before ${action}${snapshot.source_name ? ` for ${snapshot.source_name}` : ''}.\n` +
+      `Every inventory change made after that point will also be removed from the current balance.\n\n` +
+      `The current balance will be saved as a new backup first.`
+    )
+    if (!confirmed) return
+
+    setRestoring(snapshot.id)
+    setError('')
+    try {
+      const res = await fetch(`/api/inventory-balance?action=restore&id=${snapshot.id}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${getToken()}` },
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not restore inventory')
+      toast.success(
+        `${Number(data.total_units || 0).toLocaleString()} units across ${Number(data.total_rows || 0).toLocaleString()} SKU rows restored`,
+        'Rollback Complete'
+      )
+      await loadHistory()
+    } catch (err) {
+      setError(err.message)
+      toast.error(err.message, 'Rollback Failed')
+    } finally {
+      setRestoring(null)
+    }
+  }
+
   return (
     <div className="space-y-6 max-w-6xl">
       <div className="flex items-start justify-between gap-4">
         <div>
           <h2 className="text-xl font-bold text-slate-800">Auto Deduct History</h2>
           <p className="text-sm text-slate-500 mt-0.5">
-            Only successfully completed inventory updates appear here
+            Review completed updates and restore inventory to a saved point
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -60,6 +109,71 @@ export default function AutoDeductHistory() {
           {error}
         </div>
       )}
+
+      <div className="card overflow-hidden">
+        <div className="border-b border-slate-100 px-5 py-4">
+          <div className="flex items-center gap-2">
+            <RotateCcw className="h-4 w-4 text-blue-600" />
+            <h3 className="font-semibold text-slate-800">Rollback Auto Deduct</h3>
+          </div>
+          <div className="mt-3 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+            <p>
+              Rollback restores the entire inventory balance to that saved point. Later deductions, returns, and manual edits will also be reverted. Your current balance is backed up automatically first.
+            </p>
+          </div>
+        </div>
+
+        {loading ? (
+          <div className="flex items-center justify-center gap-2 py-10 text-sm text-slate-500">
+            <RefreshCw className="h-4 w-4 animate-spin" /> Loading rollback points…
+          </div>
+        ) : snapshots.length === 0 ? (
+          <div className="px-5 py-10 text-center text-sm text-slate-500">
+            No Auto Deduct rollback points are available yet.
+          </div>
+        ) : (
+          <div className="divide-y divide-slate-100">
+            {snapshots.map((snapshot) => {
+              const isSale = snapshot.label === 'sales'
+              const isBackup = snapshot.label === 'pre_restore'
+              return (
+                <div key={snapshot.id} className="flex flex-col gap-3 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${
+                        isBackup
+                          ? 'bg-purple-100 text-purple-700'
+                          : isSale
+                            ? 'bg-orange-100 text-orange-700'
+                            : 'bg-green-100 text-green-700'
+                      }`}>
+                        {isBackup ? 'Before rollback' : isSale ? 'Before deduction' : 'Before add-back'}
+                      </span>
+                      <span className="text-sm font-medium text-slate-700">
+                        {formatDate(snapshot.created_at || snapshot.timestamp)}
+                      </span>
+                    </div>
+                    <p className="mt-1 truncate text-xs text-slate-500" title={snapshot.source_name || ''}>
+                      {snapshot.source_name || 'No source file'} · {Number(snapshot.total_units || 0).toLocaleString()} units · {Number(snapshot.total_rows || 0).toLocaleString()} SKU rows
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => handleRollback(snapshot)}
+                    disabled={restoring !== null}
+                    className="btn-secondary w-full justify-center text-sm text-blue-700 sm:w-auto"
+                  >
+                    {restoring === snapshot.id
+                      ? <RefreshCw className="h-4 w-4 animate-spin" />
+                      : <RotateCcw className="h-4 w-4" />}
+                    {restoring === snapshot.id ? 'Restoring…' : 'Rollback'}
+                  </button>
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </div>
 
       <div className="card overflow-hidden">
         {loading ? (
@@ -109,7 +223,7 @@ export default function AutoDeductHistory() {
                       <td className="px-4 py-3 text-slate-600">{item.applied_by || '—'}</td>
                       <td className="px-4 py-3">
                         <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-full bg-green-50 text-green-700 text-xs font-medium">
-                          <CheckCircle className="w-3.5 h-3.5" /> Successful
+                          <CheckCircle className="w-3.5 h-3.5" /> Applied
                         </span>
                       </td>
                     </tr>

@@ -11,7 +11,7 @@ import { useAuth } from '../context/AuthContext.jsx'
 import { parseCSV } from '../utils/autoDeductEngine.js'
 
 const BASE = '/api'
-const MAX_SNAPSHOTS = 5
+const MAX_SNAPSHOTS = 20
 
 function authHeaders(token, json = false) {
   const h = { Authorization: `Bearer ${token}` }

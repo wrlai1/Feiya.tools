@@ -19,7 +19,7 @@
 import { neon } from '@neondatabase/serverless'
 import jwt from 'jsonwebtoken'
 
-const MAX_SNAPSHOTS = 5
+const MAX_SNAPSHOTS = 20
 
 function getDB() {
   const url = process.env.DATABASE_URL
@@ -116,7 +116,7 @@ async function ensureTables(sql) {
 }
 
 async function saveSnapshot(sql, label, sourceName = '') {
-  const rows = await sql`SELECT style, color, size, quantity FROM inventory_balance ORDER BY style, color, size`
+  const rows = await sql`SELECT style, color, size, quantity, sort_order FROM inventory_balance ORDER BY sort_order NULLS LAST, id`
   const totalUnits = rows.reduce((s, r) => s + (r.quantity || 0), 0)
   await sql`
     INSERT INTO inventory_snapshots (label, source_name, data, total_rows, total_units)
@@ -343,8 +343,9 @@ export default async function handler(req, res) {
             ${txnType},
             ${sourceName},
             COALESCE(jsonb_agg(jsonb_build_object(
-              'style', style, 'color', color, 'size', size, 'quantity', quantity
-            ) ORDER BY style, color, size), '[]'::jsonb),
+              'style', style, 'color', color, 'size', size, 'quantity', quantity,
+              'sort_order', sort_order
+            ) ORDER BY sort_order NULLS LAST, id), '[]'::jsonb),
             COUNT(*)::int,
             COALESCE(SUM(quantity), 0)::int
           FROM inventory_balance
@@ -426,6 +427,7 @@ export default async function handler(req, res) {
           source_name: r.source_name,
           total_rows:  r.total_rows,
           total_units: r.total_units,
+          created_at:  r.created_at,
           timestamp:   new Date(r.created_at).toLocaleString(),
         })),
       })
@@ -440,20 +442,53 @@ export default async function handler(req, res) {
       const [snap] = await sql`SELECT data FROM inventory_snapshots WHERE id = ${snapId}`
       if (!snap) return res.status(404).json({ error: 'Snapshot not found' })
 
-      await saveSnapshot(sql, 'pre_restore')
-      await sql`DELETE FROM inventory_balance`
+      const restoreRows = (Array.isArray(snap.data) ? snap.data : []).map((row, index) => ({
+        style: String(row.style || '').trim(),
+        color: String(row.color || '').trim(),
+        size: String(row.size || '').trim(),
+        quantity: Number(row.quantity),
+        sort_order: Number.isSafeInteger(Number(row.sort_order)) ? Number(row.sort_order) : index,
+      }))
+      const invalidRow = restoreRows.find((row) =>
+        !row.style || !row.color || !row.size || !Number.isSafeInteger(row.quantity)
+      )
+      if (invalidRow) return res.status(409).json({ error: 'This rollback point contains invalid inventory data and cannot be restored safely.' })
 
-      for (const r of snap.data) {
-        await sql`
-          INSERT INTO inventory_balance (style, color, size, quantity)
-          VALUES (${r.style}, ${r.color}, ${r.size}, ${r.quantity})
-          ON CONFLICT (style, color, size)
-          DO UPDATE SET quantity = EXCLUDED.quantity, updated_at = NOW()
-        `
-      }
+      const totalUnits = restoreRows.reduce((sum, row) => sum + row.quantity, 0)
+      await sql.transaction((txn) => [
+        txn`
+          INSERT INTO inventory_snapshots (label, source_name, data, total_rows, total_units)
+          SELECT
+            'pre_restore',
+            ${`Rollback point ${snapId}`},
+            COALESCE(jsonb_agg(jsonb_build_object(
+              'style', style, 'color', color, 'size', size, 'quantity', quantity,
+              'sort_order', sort_order
+            ) ORDER BY sort_order NULLS LAST, id), '[]'::jsonb),
+            COUNT(*)::int,
+            COALESCE(SUM(quantity), 0)::int
+          FROM inventory_balance
+        `,
+        txn`DELETE FROM inventory_balance`,
+        txn`
+          INSERT INTO inventory_balance (style, color, size, quantity, sort_order)
+          SELECT restored.style, restored.color, restored.size, restored.quantity, restored.sort_order
+          FROM jsonb_to_recordset(${JSON.stringify(restoreRows)}::jsonb)
+            AS restored(style TEXT, color TEXT, size TEXT, quantity INTEGER, sort_order INTEGER)
+        `,
+        txn`
+          DELETE FROM inventory_snapshots
+          WHERE id NOT IN (
+            SELECT id FROM inventory_snapshots ORDER BY created_at DESC LIMIT ${MAX_SNAPSHOTS}
+          )
+        `,
+      ], { isolationLevel: 'Serializable' })
 
-      const [stat] = await sql`SELECT COALESCE(SUM(quantity),0)::int AS u FROM inventory_balance`
-      return res.json({ ok: true, total_units: stat.u })
+      return res.json({
+        ok: true,
+        total_units: totalUnits,
+        total_rows: restoreRows.length,
+      })
     }
 
     return res.status(400).json({ error: `Unknown action: ${action}` })
