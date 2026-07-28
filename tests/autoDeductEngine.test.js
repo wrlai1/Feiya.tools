@@ -7,7 +7,14 @@ import {
 } from '../src/utils/autoDeductEngine.js'
 import { consolidateRows } from '../src/utils/consolidateEngine.js'
 import { findAdditionalComboSizeMappings, findAdditionalSizeMappings } from '../src/utils/autoDeductRules.js'
-import { parseReturnManifestRows, resolveReturnManifestPackages } from '../src/utils/returnImportEngine.js'
+import {
+  expandConfirmedProductSku,
+  parseProductCatalogRows,
+  parseReturnManifestRows,
+  parseSkuReturnManifestRows,
+  resolveProductCatalogRows,
+  resolveReturnManifestPackages,
+} from '../src/utils/returnImportEngine.js'
 import inventoryTargetResolution from '../lib/inventoryTargetResolution.cjs'
 
 const { resolveInventoryTargets } = inventoryTargetResolution
@@ -552,6 +559,88 @@ test('return manifests require tracking on every row', () => {
       { Tracking: '', SKU: 'A100BlackS', Quantity: 1 },
     ]),
     /missing a tracking number/,
+  )
+})
+
+test('confirmed shorthand product SKUs expand into their physical pieces', () => {
+  assert.equal(
+    expandConfirmedProductSku('0015DenimDustyWhiteXL'),
+    '0015Denim&Dusty Blue&WhiteXL',
+  )
+  assert.equal(
+    expandConfirmedProductSku('0015WhtKhakiBkL'),
+    '0015White&Khaki&BlackL',
+  )
+  assert.equal(expandConfirmedProductSku('0066Nile3XL'), '0066Nile3XL')
+})
+
+test('store product catalogs preserve SKU IDs and resolve physical components', () => {
+  const catalog = parseProductCatalogRows([
+    { 'SKU ID': 57081504942, SKU货号: '0015DenimDustyWhiteXL' },
+  ])
+  const resolved = resolveProductCatalogRows(catalog, [
+    { STYLE: '0015', COLOR: 'Denim', SIZE: 'XL' },
+    { STYLE: '0015', COLOR: 'Dusty Blue', SIZE: 'XL' },
+    { STYLE: '0015', COLOR: 'White', SIZE: 'XL' },
+  ])
+
+  assert.equal(resolved[0].skuId, '57081504942')
+  assert.equal(resolved[0].status, 'ready')
+  assert.deepEqual(resolved[0].components, [
+    { style: '0015', color: 'Denim', size: 'XL', qty: 1 },
+    { style: '0015', color: 'Dusty Blue', size: 'XL', qty: 1 },
+    { style: '0015', color: 'White', size: 'XL', qty: 1 },
+  ])
+})
+
+test('SKU return manifests group tracking and retain store-facing return details', () => {
+  const result = parseSkuReturnManifestRows([
+    {
+      '订单号 PO': 'PO-1',
+      'SKU ID': 57081504942,
+      退货原因: '太大',
+      买家备注: '需要小一码',
+      '运单号 Tracking Number': ' 1z-store-return ',
+      物流商: 'UPS',
+    },
+  ], [{
+    sku_id: '57081504942',
+    sku_code: '0015DenimDustyWhiteXL',
+    status: 'ready',
+    components: [
+      { style: '0015', color: 'Denim', size: 'XL', qty: 1 },
+      { style: '0015', color: 'Dusty Blue', size: 'XL', qty: 1 },
+      { style: '0015', color: 'White', size: 'XL', qty: 1 },
+    ],
+  }])
+
+  assert.equal(result.needsReview.length, 0)
+  assert.equal(result.packages[0].tracking, '1Z-STORE-RETURN')
+  assert.equal(result.packages[0].expectedUnits, 3)
+  assert.deepEqual(result.packages[0].orders, ['PO-1'])
+  assert.deepEqual(result.packages[0].reasons, ['太大'])
+  assert.deepEqual(result.packages[0].buyerRemarks, ['需要小一码'])
+  assert.equal(result.packages[0].carrier, 'UPS')
+})
+
+test('SKU return manifests isolate missing catalog data without blocking ready packages', () => {
+  const result = parseSkuReturnManifestRows([
+    { 'SKU ID': 'KNOWN', '运单号 Tracking Number': 'READY-1' },
+    { 'SKU ID': '', '运单号 Tracking Number': 'REVIEW-1' },
+    { 'SKU ID': 'KNOWN', '运单号 Tracking Number': '' },
+  ], [{
+    sku_id: 'KNOWN',
+    sku_code: 'A100BlackS',
+    status: 'ready',
+    components: [{ style: 'A100', color: 'Black', size: 'S', qty: 1 }],
+  }])
+
+  assert.equal(result.packages.length, 1)
+  assert.equal(result.packages[0].tracking, 'READY-1')
+  assert.equal(result.needsReview.length, 2)
+  assert.deepEqual(
+    result.needsReview.map((row) => row.parse_issue).sort(),
+    ['sku_id_missing', 'tracking_missing'],
   )
 })
 

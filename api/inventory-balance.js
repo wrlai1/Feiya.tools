@@ -591,7 +591,8 @@ export default async function handler(req, res) {
           ? [
               txn`
                 UPDATE return_package_items items
-                SET actual_qty = NULL
+                SET actual_qty = NULL,
+                    restock_qty = NULL
                 FROM return_packages packages
                 WHERE items.package_id = packages.id
                   AND packages.tracking_key = ${returnTrackingKey}
@@ -600,6 +601,7 @@ export default async function handler(req, res) {
                 UPDATE return_packages
                 SET status = 'pending',
                     actual_units = 0,
+                    restock_units = 0,
                     remark = NULL,
                     confirmed_by = NULL,
                     confirmed_at = NULL

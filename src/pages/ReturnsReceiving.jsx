@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   BarChart3,
   CheckCircle2,
+  Database,
   FileSpreadsheet,
   Minus,
   PackageOpen,
@@ -14,21 +15,32 @@ import {
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import { useToast } from '../hooks/useToast.js'
-import { parseReturnManifestRows, resolveReturnManifestPackages } from '../utils/returnImportEngine.js'
+import {
+  parseProductCatalogRows,
+  parseReturnManifestRows,
+  parseSkuReturnManifestRows,
+  resolveProductCatalogRows,
+  resolveReturnManifestPackages,
+} from '../utils/returnImportEngine.js'
 
 const BASE = '/api'
 
 const DEMO_PACKAGE = {
   id: 'demo-return',
   tracking_number: '1Z-RETURN-DEMO',
+  store_name: 'Demo Store',
+  order_numbers: ['PO-DEMO-1'],
+  return_reasons: ['Too large'],
+  buyer_remarks: ['Demo four-piece return'],
+  carrier: 'UPS',
   status: 'pending',
   expected_units: 4,
   actual_units: 0,
   items: [
-    { id: 'demo-black', style: '62300SET', color: 'BLACK', size: 'M', expected_qty: 1 },
-    { id: 'demo-denim', style: '62300SET', color: 'DENIM', size: 'M', expected_qty: 1 },
-    { id: 'demo-khaki', style: '62300SET', color: 'KHAKI', size: 'M', expected_qty: 1 },
-    { id: 'demo-white', style: '62300SET', color: 'WHITE', size: 'M', expected_qty: 1 },
+    { id: 'demo-black', sku_id: 'DEMO-SKU', sku_code: '62300SETM', style: '62300SET', color: 'BLACK', size: 'M', expected_qty: 1 },
+    { id: 'demo-denim', sku_id: 'DEMO-SKU', sku_code: '62300SETM', style: '62300SET', color: 'DENIM', size: 'M', expected_qty: 1 },
+    { id: 'demo-khaki', sku_id: 'DEMO-SKU', sku_code: '62300SETM', style: '62300SET', color: 'KHAKI', size: 'M', expected_qty: 1 },
+    { id: 'demo-white', sku_id: 'DEMO-SKU', sku_code: '62300SETM', style: '62300SET', color: 'WHITE', size: 'M', expected_qty: 1 },
   ],
 }
 
@@ -51,13 +63,13 @@ function statusLabel(status) {
   return 'Pending'
 }
 
-function CountControl({ value, onChange, disabled }) {
+function CountControl({ value, onChange, disabled, max = 9999, label = 'Actual quantity' }) {
   const [error, setError] = useState('')
 
   const setValue = (next) => {
     const number = Number(next)
-    if (!Number.isSafeInteger(number) || number < 0 || number > 9999) {
-      setError('Whole numbers only (0–9999)')
+    if (!Number.isSafeInteger(number) || number < 0 || number > max) {
+      setError(`Whole numbers only (0–${max})`)
       return
     }
     setError('')
@@ -84,13 +96,13 @@ function CountControl({ value, onChange, disabled }) {
           disabled={disabled}
           value={value}
           aria-invalid={Boolean(error)}
-          aria-label="Actual quantity"
+          aria-label={label}
           onChange={(event) => setValue(event.target.value)}
           className="h-11 w-16 border-x border-slate-200 text-center text-base font-semibold outline-none disabled:bg-slate-50"
         />
         <button
           type="button"
-          disabled={disabled}
+          disabled={disabled || value >= max}
           onClick={() => setValue(value + 1)}
           className="flex h-11 w-11 items-center justify-center text-slate-600 hover:bg-slate-50 disabled:opacity-30"
           aria-label="Increase actual quantity"
@@ -106,9 +118,9 @@ function CountControl({ value, onChange, disabled }) {
 export default function ReturnsReceiving() {
   const { user, getToken } = useAuth()
   const toast = useToast()
-  const isAdmin = user?.role === 'admin'
   const demoMode = import.meta.env.DEV
     && new URLSearchParams(window.location.search).get('mock') === '1'
+  const isAdmin = user?.role === 'admin' || demoMode
   const scannerRef = useRef(null)
   const [tab, setTab] = useState('receive')
   const [tracking, setTracking] = useState('')
@@ -121,6 +133,11 @@ export default function ReturnsReceiving() {
   const [file, setFile] = useState(null)
   const [parsed, setParsed] = useState(null)
   const [uploading, setUploading] = useState(false)
+  const [stores, setStores] = useState([])
+  const [storeName, setStoreName] = useState('')
+  const [catalogFile, setCatalogFile] = useState(null)
+  const [catalogParsed, setCatalogParsed] = useState(null)
+  const [catalogUploading, setCatalogUploading] = useState(false)
   const [analytics, setAnalytics] = useState(null)
   const [analyticsDays, setAnalyticsDays] = useState(30)
 
@@ -134,16 +151,30 @@ export default function ReturnsReceiving() {
     if (res.ok) setRecent(data.packages || [])
   }, [demoMode, getToken])
 
+  const loadStores = useCallback(async () => {
+    if (!isAdmin || demoMode) return
+    const res = await fetch(`${BASE}/returns?action=stores`, { headers: headers(getToken) })
+    const data = await res.json().catch(() => ({}))
+    if (res.ok) {
+      setStores(data.stores || [])
+      setStoreName((current) => current || data.stores?.[0]?.store_name || '')
+    }
+  }, [demoMode, getToken, isAdmin])
+
   useEffect(() => {
     loadRecent()
+    loadStores()
     if (demoMode) {
       setPkg(DEMO_PACKAGE)
       setTracking(DEMO_PACKAGE.tracking_number)
-      setCounts(Object.fromEntries(DEMO_PACKAGE.items.map((item) => [item.id, 0])))
+      setCounts(Object.fromEntries(DEMO_PACKAGE.items.map((item) => [
+        item.id,
+        { actual: 0, restock: 0 },
+      ])))
     }
     const frame = requestAnimationFrame(() => scannerRef.current?.focus())
     return () => cancelAnimationFrame(frame)
-  }, [demoMode, loadRecent])
+  }, [demoMode, loadRecent, loadStores])
 
   const lookup = useCallback(async (value = tracking) => {
     const query = String(value || '').trim()
@@ -151,7 +182,10 @@ export default function ReturnsReceiving() {
     if (demoMode) {
       setPkg(DEMO_PACKAGE)
       setTracking(DEMO_PACKAGE.tracking_number)
-      setCounts(Object.fromEntries(DEMO_PACKAGE.items.map((item) => [item.id, 0])))
+      setCounts(Object.fromEntries(DEMO_PACKAGE.items.map((item) => [
+        item.id,
+        { actual: 0, restock: 0 },
+      ])))
       setCounted(false)
       setRemark('')
       return
@@ -172,7 +206,12 @@ export default function ReturnsReceiving() {
       setCounts(Object.fromEntries(
         (next.items || []).map((item) => [
           item.id,
-          next.status === 'pending' ? 0 : Number(item.actual_qty || 0),
+          next.status === 'pending'
+            ? { actual: 0, restock: 0 }
+            : {
+                actual: Number(item.actual_qty || 0),
+                restock: Number(item.restock_qty || 0),
+              },
         ]),
       ))
       setRemark(next.remark || '')
@@ -187,19 +226,24 @@ export default function ReturnsReceiving() {
 
   const expectedUnits = Number(pkg?.expected_units || 0)
   const actualUnits = useMemo(
-    () => Object.values(counts).reduce((sum, value) => sum + (Number(value) || 0), 0),
+    () => Object.values(counts).reduce((sum, value) => sum + (Number(value.actual) || 0), 0),
+    [counts],
+  )
+  const restockUnits = useMemo(
+    () => Object.values(counts).reduce((sum, value) => sum + (Number(value.restock) || 0), 0),
     [counts],
   )
   const discrepancy = Boolean(pkg?.items?.some((item) =>
-    Number(counts[item.id] || 0) !== Number(item.expected_qty)
+    Number(counts[item.id]?.actual || 0) !== Number(item.expected_qty)
+    || Number(counts[item.id]?.restock || 0) !== Number(counts[item.id]?.actual || 0)
   ))
 
   const confirmPackage = async () => {
     if (!pkg || pkg.status !== 'pending' || !counted || loading) return
     if (discrepancy) {
       const proceed = window.confirm(
-        `Expected ${expectedUnits} units but counted ${actualUnits}.\n\n` +
-        'Only the counted units will be added to inventory. Save this package as a discrepancy?'
+        `Expected ${expectedUnits}, received ${actualUnits}, and ${restockUnits} are resellable.\n\n` +
+        'Only resellable units will be added to inventory. Save this package as a discrepancy?'
       )
       if (!proceed) return
     }
@@ -212,7 +256,8 @@ export default function ReturnsReceiving() {
           tracking: pkg.tracking_number,
           items: pkg.items.map((item) => ({
             id: item.id,
-            actualQty: Number(counts[item.id] || 0),
+            actualQty: Number(counts[item.id]?.actual || 0),
+            restockQty: Number(counts[item.id]?.restock || 0),
           })),
           remark,
         }),
@@ -220,7 +265,7 @@ export default function ReturnsReceiving() {
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || 'Could not receive return package')
       toast.success(
-        `${Number(data.added_units || 0).toLocaleString()} actual units added to inventory`,
+        `${Number(data.added_units || 0).toLocaleString()} resellable units added to inventory`,
         data.status === 'discrepancy' ? 'Discrepancy Recorded' : 'Return Received',
       )
       await lookup(pkg.tracking_number)
@@ -236,36 +281,54 @@ export default function ReturnsReceiving() {
     setFile(nextFile)
     setParsed(null)
     if (!nextFile) return
+    if (!storeName.trim()) {
+      toast.error('Choose or enter a store before reading the return file', 'Store Required')
+      return
+    }
     try {
       const XLSX = await import('xlsx')
       const workbook = XLSX.read(await nextFile.arrayBuffer(), { type: 'array' })
       const sheetName = workbook.SheetNames.find((name) => name.trim().toUpperCase() === 'TEMU-STYLES')
         || workbook.SheetNames[0]
       const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { raw: false, defval: '' })
-      const parsedRows = parseReturnManifestRows(rows)
-      const [inventoryRes, aliasesRes] = await Promise.all([
-        fetch(`${BASE}/inventory-balance?action=list`, { headers: headers(getToken) }),
-        fetch(`${BASE}/auto-deduct?action=aliases`, { headers: headers(getToken) }),
-      ])
-      const [inventoryData, aliasesData] = await Promise.all([
-        inventoryRes.json().catch(() => ({})),
-        aliasesRes.json().catch(() => ({})),
-      ])
-      if (!inventoryRes.ok) throw new Error(inventoryData.error || 'Could not load inventory targets')
-      if (!aliasesRes.ok) throw new Error(aliasesData.error || 'Could not load confirmed SKU mappings')
-      const result = resolveReturnManifestPackages(
-        parsedRows,
-        (inventoryData.rows || []).map((row) => ({
-          STYLE: row.Style,
-          COLOR: row.Color,
-          SIZE: row.Size,
-        })),
-        aliasesData.aliases || {},
+      const hasSkuId = Object.keys(rows[0] || {}).some((key) =>
+        ['sku id', 'skuid', 'sku_id'].includes(key.trim().toLowerCase())
       )
+      let result
+      if (hasSkuId) {
+        const catalogRes = await fetch(
+          `${BASE}/returns?action=catalog&store=${encodeURIComponent(storeName.trim())}`,
+          { headers: headers(getToken) },
+        )
+        const catalogData = await catalogRes.json().catch(() => ({}))
+        if (!catalogRes.ok) throw new Error(catalogData.error || 'Could not load this store’s product catalog')
+        result = parseSkuReturnManifestRows(rows, catalogData.rows || [])
+      } else {
+        const parsedRows = parseReturnManifestRows(rows)
+        const [inventoryRes, aliasesRes] = await Promise.all([
+          fetch(`${BASE}/inventory-balance?action=list`, { headers: headers(getToken) }),
+          fetch(`${BASE}/auto-deduct?action=aliases`, { headers: headers(getToken) }),
+        ])
+        const [inventoryData, aliasesData] = await Promise.all([
+          inventoryRes.json().catch(() => ({})),
+          aliasesRes.json().catch(() => ({})),
+        ])
+        if (!inventoryRes.ok) throw new Error(inventoryData.error || 'Could not load inventory targets')
+        if (!aliasesRes.ok) throw new Error(aliasesData.error || 'Could not load confirmed SKU mappings')
+        result = resolveReturnManifestPackages(
+          parsedRows,
+          (inventoryData.rows || []).map((row) => ({
+            STYLE: row.Style,
+            COLOR: row.Color,
+            SIZE: row.Size,
+          })),
+          aliasesData.aliases || {},
+        )
+      }
       setParsed(result)
       if (result.needsReview.length) {
-        toast.error(
-          `${result.stats.reviewPackages} packages contain a combo that cannot be safely split`,
+        toast.warning(
+          `${result.stats.reviewPackages} packages need review and will be skipped; ready packages can still upload`,
           'Review Required',
         )
       }
@@ -275,7 +338,7 @@ export default function ReturnsReceiving() {
   }
 
   const uploadManifest = async () => {
-    if (!parsed?.packages?.length || parsed.needsReview.length || uploading) return
+    if (!parsed?.packages?.length || !storeName.trim() || uploading) return
     setUploading(true)
     try {
       const res = await fetch(`${BASE}/returns?action=import`, {
@@ -283,6 +346,7 @@ export default function ReturnsReceiving() {
         headers: headers(getToken, true),
         body: JSON.stringify({
           packages: parsed.packages,
+          storeName: storeName.trim(),
           sourceFile: file?.name || '',
         }),
       })
@@ -301,6 +365,78 @@ export default function ReturnsReceiving() {
       toast.error(error.message, 'Upload Failed')
     } finally {
       setUploading(false)
+    }
+  }
+
+  const parseCatalogFile = async (nextFile) => {
+    setCatalogFile(nextFile)
+    setCatalogParsed(null)
+    if (!nextFile) return
+    if (!storeName.trim()) {
+      toast.error('Enter the store name before reading its product file', 'Store Required')
+      return
+    }
+    try {
+      const XLSX = await import('xlsx')
+      const workbook = XLSX.read(await nextFile.arrayBuffer(), { type: 'array' })
+      const sheet = workbook.Sheets[workbook.SheetNames[0]]
+      const rows = XLSX.utils.sheet_to_json(sheet, { raw: false, defval: '' })
+      const catalogRows = parseProductCatalogRows(rows)
+      const [inventoryRes, aliasesRes] = await Promise.all([
+        fetch(`${BASE}/inventory-balance?action=list`, { headers: headers(getToken) }),
+        fetch(`${BASE}/auto-deduct?action=aliases`, { headers: headers(getToken) }),
+      ])
+      const [inventoryData, aliasesData] = await Promise.all([
+        inventoryRes.json().catch(() => ({})),
+        aliasesRes.json().catch(() => ({})),
+      ])
+      if (!inventoryRes.ok) throw new Error(inventoryData.error || 'Could not load inventory targets')
+      if (!aliasesRes.ok) throw new Error(aliasesData.error || 'Could not load confirmed SKU mappings')
+      const resolved = resolveProductCatalogRows(
+        catalogRows,
+        (inventoryData.rows || []).map((row) => ({
+          STYLE: row.Style,
+          COLOR: row.Color,
+          SIZE: row.Size,
+        })),
+        aliasesData.aliases || {},
+      )
+      setCatalogParsed({
+        rows: resolved,
+        ready: resolved.filter((row) => row.status === 'ready').length,
+        review: resolved.filter((row) => row.status !== 'ready').length,
+      })
+    } catch (error) {
+      toast.error(error.message, 'Could Not Read Product File')
+    }
+  }
+
+  const uploadCatalog = async () => {
+    if (!catalogParsed?.rows?.length || !storeName.trim() || catalogUploading) return
+    setCatalogUploading(true)
+    try {
+      const res = await fetch(`${BASE}/returns?action=catalog-import`, {
+        method: 'POST',
+        headers: headers(getToken, true),
+        body: JSON.stringify({
+          storeName: storeName.trim(),
+          sourceFile: catalogFile?.name || '',
+          rows: catalogParsed.rows,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not upload product catalog')
+      toast.success(
+        `${data.ready_rows} ready · ${data.review_rows} need mapping review`,
+        `${data.store_name} Product Catalog Updated`,
+      )
+      setCatalogFile(null)
+      setCatalogParsed(null)
+      await loadStores()
+    } catch (error) {
+      toast.error(error.message, 'Product Upload Failed')
+    } finally {
+      setCatalogUploading(false)
     }
   }
 
@@ -326,10 +462,11 @@ export default function ReturnsReceiving() {
   }, [loadAnalytics, tab])
 
   const tabs = [
-    { id: 'receive', label: 'Scan & Receive', icon: ScanLine },
+    { id: 'receive', label: 'Scan & Receive', shortLabel: 'Scan', icon: ScanLine },
     ...(isAdmin ? [
-      { id: 'upload', label: 'Upload Manifest', icon: Upload },
-      { id: 'analytics', label: 'Return Analytics', icon: BarChart3 },
+      { id: 'upload', label: 'Upload Manifest', shortLabel: 'Returns', icon: Upload },
+      { id: 'catalog', label: 'Product Catalogs', shortLabel: 'Products', icon: Database },
+      { id: 'analytics', label: 'Return Analytics', shortLabel: 'Stats', icon: BarChart3 },
     ] : []),
   ]
 
@@ -347,12 +484,14 @@ export default function ReturnsReceiving() {
             <button
               key={item.id}
               type="button"
+              aria-label={item.label}
               onClick={() => setTab(item.id)}
-              className={`flex flex-1 items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium sm:flex-none ${
+              className={`flex flex-1 flex-col items-center justify-center gap-1 rounded-lg px-2 py-2 text-[10px] font-medium sm:flex-none sm:flex-row sm:gap-2 sm:px-3 sm:text-sm ${
                 tab === item.id ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-50'
               }`}
             >
               <item.icon className="h-4 w-4" />
+              <span className="sm:hidden">{item.shortLabel}</span>
               <span className="hidden sm:inline">{item.label}</span>
             </button>
           ))}
@@ -407,46 +546,109 @@ export default function ReturnsReceiving() {
                   <p className="mt-1 text-xs text-slate-500">
                     Expected {expectedUnits} units · {pkg.items.length} SKU lines
                   </p>
+                  <div className="mt-2 flex flex-wrap gap-2 text-xs text-slate-500">
+                    {pkg.store_name && <span className="rounded-md bg-slate-100 px-2 py-1">Store: {pkg.store_name}</span>}
+                    {pkg.carrier && <span className="rounded-md bg-slate-100 px-2 py-1">Carrier: {pkg.carrier}</span>}
+                    {(pkg.order_numbers || []).map((order) => (
+                      <span key={order} className="rounded-md bg-slate-100 px-2 py-1">PO: {order}</span>
+                    ))}
+                  </div>
+                  {(pkg.return_reasons?.length > 0 || pkg.buyer_remarks?.length > 0) && (
+                    <div className="mt-2 space-y-1 text-xs text-slate-500">
+                      {pkg.return_reasons?.length > 0 && <p><strong>Reason:</strong> {pkg.return_reasons.join(' · ')}</p>}
+                      {pkg.buyer_remarks?.length > 0 && <p><strong>Buyer note:</strong> {pkg.buyer_remarks.join(' · ')}</p>}
+                    </div>
+                  )}
                 </div>
                 {pkg.status === 'pending' && (
                   <button
                     type="button"
                     onClick={() => setCounts(Object.fromEntries(
-                      pkg.items.map((item) => [item.id, Number(item.expected_qty)]),
+                      pkg.items.map((item) => [
+                        item.id,
+                        {
+                          actual: Number(item.expected_qty),
+                          restock: Number(item.expected_qty),
+                        },
+                      ]),
                     ))}
                     className="btn-secondary w-full justify-center text-sm sm:w-auto"
                   >
-                    <CheckCircle2 className="h-4 w-4" /> All expected items present
+                    <CheckCircle2 className="h-4 w-4" /> All present & resellable
                   </button>
                 )}
               </div>
 
               <div className="divide-y divide-slate-100">
                 {pkg.items.map((item) => {
-                  const actual = Number(counts[item.id] || 0)
+                  const actual = Number(counts[item.id]?.actual || 0)
+                  const restock = Number(counts[item.id]?.restock || 0)
                   const differs = actual !== Number(item.expected_qty)
+                  const notResellable = actual !== restock
                   return (
                     <div key={item.id} className="flex flex-col gap-3 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-5">
                       <div className="min-w-0">
                         <p className="truncate text-sm font-semibold text-slate-800">
                           {item.style} / {item.color} / {item.size}
                         </p>
+                        {(item.sku_id || item.sku_code) && (
+                          <p className="mt-1 truncate text-xs text-slate-400">
+                            SKU ID {item.sku_id || '—'} · {item.sku_code || '—'}
+                          </p>
+                        )}
                         <p className="mt-1 text-xs text-slate-500">
                           Expected: <strong>{item.expected_qty}</strong>
-                          {pkg.status !== 'pending' && <> · Received: <strong>{item.actual_qty ?? 0}</strong></>}
+                          {pkg.status !== 'pending' && (
+                            <>
+                              {' '}· Received: <strong>{item.actual_qty ?? 0}</strong>
+                              {' '}· Restocked: <strong>{item.restock_qty ?? 0}</strong>
+                            </>
+                          )}
                         </p>
                       </div>
-                      <div className="flex items-center justify-between gap-3 sm:justify-end">
+                      <div className="flex flex-col gap-2 sm:items-end">
                         {pkg.status === 'pending' && (
-                          <span className={`text-xs font-semibold ${differs ? 'text-amber-700' : 'text-emerald-700'}`}>
-                            {differs ? `Difference ${actual - Number(item.expected_qty)}` : 'Matches'}
+                          <span className={`text-xs font-semibold ${differs || notResellable ? 'text-amber-700' : 'text-emerald-700'}`}>
+                            {differs
+                              ? `Difference ${actual - Number(item.expected_qty)}`
+                              : notResellable
+                                ? `${actual - restock} not resellable`
+                                : 'Matches'}
                           </span>
                         )}
-                        <CountControl
-                          value={actual}
-                          disabled={pkg.status !== 'pending'}
-                          onChange={(value) => setCounts((current) => ({ ...current, [item.id]: value }))}
-                        />
+                        <div className="flex flex-wrap items-start justify-between gap-3 sm:justify-end">
+                          <div>
+                            <p className="mb-1 text-[11px] font-medium text-slate-500">Physically received</p>
+                            <CountControl
+                              label="Physically received quantity"
+                              value={actual}
+                              disabled={pkg.status !== 'pending'}
+                              onChange={(value) => setCounts((current) => ({
+                                ...current,
+                                [item.id]: {
+                                  actual: value,
+                                  restock: Math.min(Number(current[item.id]?.restock || 0), value),
+                                },
+                              }))}
+                            />
+                          </div>
+                          <div>
+                            <p className="mb-1 text-[11px] font-medium text-slate-500">Resellable</p>
+                            <CountControl
+                              label="Resellable quantity"
+                              value={restock}
+                              max={actual}
+                              disabled={pkg.status !== 'pending'}
+                              onChange={(value) => setCounts((current) => ({
+                                ...current,
+                                [item.id]: {
+                                  actual: Number(current[item.id]?.actual || 0),
+                                  restock: value,
+                                },
+                              }))}
+                            />
+                          </div>
+                        </div>
                       </div>
                     </div>
                   )
@@ -464,8 +666,9 @@ export default function ReturnsReceiving() {
                       ? <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
                       : <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />}
                     <span>
-                      Counted <strong>{actualUnits}</strong> of <strong>{expectedUnits}</strong> expected units.
-                      {discrepancy && ' Only actual counted units will be restocked.'}
+                      Received <strong>{actualUnits}</strong> of <strong>{expectedUnits}</strong> expected;
+                      {' '}<strong>{restockUnits}</strong> are resellable.
+                      {discrepancy && ' Only resellable units will be added to inventory.'}
                     </span>
                   </div>
                   <textarea
@@ -492,7 +695,7 @@ export default function ReturnsReceiving() {
                     className="btn-primary mt-4 w-full justify-center py-3 text-sm disabled:opacity-50 sm:w-auto sm:min-w-52"
                   >
                     {loading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <PackageOpen className="h-4 w-4" />}
-                    Add {actualUnits} Actual Units to Inventory
+                    Add {restockUnits} Resellable Units to Inventory
                   </button>
                 </div>
               )}
@@ -523,7 +726,8 @@ export default function ReturnsReceiving() {
                     <div className="min-w-0">
                       <p className="truncate text-sm font-medium text-slate-700">{item.tracking_number}</p>
                       <p className="mt-0.5 text-xs text-slate-400">
-                        {item.actual_units || 0} received / {item.expected_units} expected
+                        {item.store_name ? `${item.store_name} · ` : ''}
+                        {item.actual_units || 0} received · {item.restock_units || 0} restocked / {item.expected_units} expected
                       </p>
                     </div>
                     <span className={`shrink-0 rounded-full px-2 py-0.5 text-xs font-semibold ${statusBadge(item.status)}`}>
@@ -546,10 +750,26 @@ export default function ReturnsReceiving() {
             <div>
               <h3 className="font-semibold text-slate-900">Upload daily return manifest</h3>
               <p className="mt-1 text-sm text-slate-500">
-                Accepts Excel or CSV with Tracking/运单号, SKU/款号, Quantity/数量, and optional Product Attribute/商品属性.
+                Select the store, then upload Tracking Number, SKU ID, PO, reason, buyer note, and carrier.
               </p>
             </div>
           </div>
+          <label className="mt-5 block text-sm font-semibold text-slate-700">
+            Store
+            <input
+              list="return-store-options"
+              value={storeName}
+              onChange={(event) => {
+                setStoreName(event.target.value)
+                setParsed(null)
+              }}
+              placeholder="Enter or choose store name"
+              className="mt-2 h-11 w-full rounded-xl border border-slate-300 bg-white px-3 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 sm:max-w-sm"
+            />
+            <datalist id="return-store-options">
+              {stores.map((store) => <option key={store.store_key} value={store.store_name} />)}
+            </datalist>
+          </label>
           <input
             type="file"
             accept=".xlsx,.xls,.csv"
@@ -578,14 +798,14 @@ export default function ReturnsReceiving() {
 
               {parsed.needsReview.length > 0 && (
                 <div className="rounded-xl border border-amber-200 bg-amber-50 p-3">
-                  <p className="text-sm font-semibold text-amber-800">Upload stopped for safety</p>
+                  <p className="text-sm font-semibold text-amber-800">Review required for these packages</p>
                   <p className="mt-1 text-xs text-amber-700">
-                    These packages contain a set/combo without a trusted “&” color breakdown:
+                    These packages will be skipped. Ready packages can still upload:
                   </p>
                   <ul className="mt-2 space-y-1 text-xs text-amber-800">
                     {parsed.needsReview.slice(0, 10).map((row, index) => (
                       <li key={`${row.tracking}-${index}`}>
-                        {row.tracking}: {row.raw_style} ({row.parse_issue})
+                        {row.tracking || `Excel row ${row.excelRow}`}: {row.skuId || row.raw_style || 'Missing SKU'} ({row.parse_issue})
                       </li>
                     ))}
                   </ul>
@@ -595,12 +815,102 @@ export default function ReturnsReceiving() {
               <button
                 type="button"
                 onClick={uploadManifest}
-                disabled={uploading || !parsed.packages.length || parsed.needsReview.length > 0}
+                disabled={uploading || !parsed.packages.length || !storeName.trim()}
                 className="btn-primary w-full justify-center py-3 disabled:opacity-50 sm:w-auto"
               >
                 {uploading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
                 Upload Return Manifest
               </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab === 'catalog' && isAdmin && (
+        <div className="space-y-4">
+          <div className="card p-5">
+            <div className="flex items-start gap-3">
+              <div className="rounded-xl bg-violet-50 p-2 text-violet-600">
+                <Database className="h-5 w-5" />
+              </div>
+              <div>
+                <h3 className="font-semibold text-slate-900">Store product catalog</h3>
+                <p className="mt-1 text-sm text-slate-500">
+                  Upload SKU ID and SKU货号 for one store. Existing SKU IDs update; new products are added immediately.
+                </p>
+              </div>
+            </div>
+            <label className="mt-5 block text-sm font-semibold text-slate-700">
+              Store
+              <input
+                list="catalog-store-options"
+                value={storeName}
+                onChange={(event) => {
+                  setStoreName(event.target.value)
+                  setCatalogParsed(null)
+                }}
+                placeholder="Enter or choose store name"
+                className="mt-2 h-11 w-full rounded-xl border border-slate-300 bg-white px-3 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 sm:max-w-sm"
+              />
+              <datalist id="catalog-store-options">
+                {stores.map((store) => <option key={store.store_key} value={store.store_name} />)}
+              </datalist>
+            </label>
+            <input
+              type="file"
+              accept=".xlsx,.xls,.csv"
+              onChange={(event) => parseCatalogFile(event.target.files?.[0] || null)}
+              className="mt-5 block w-full rounded-xl border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-sm text-slate-600 file:mr-4 file:rounded-lg file:border-0 file:bg-violet-600 file:px-4 file:py-2 file:text-sm file:font-semibold file:text-white"
+            />
+            {catalogParsed && (
+              <div className="mt-5 space-y-4">
+                <div className="grid grid-cols-3 gap-3">
+                  {[
+                    ['File Rows', catalogParsed.rows.length],
+                    ['Ready', catalogParsed.ready],
+                    ['Need Review', catalogParsed.review],
+                  ].map(([label, value]) => (
+                    <div key={label} className="rounded-xl bg-slate-50 p-3">
+                      <p className="text-xl font-bold text-slate-900">{value}</p>
+                      <p className="text-xs text-slate-500">{label}</p>
+                    </div>
+                  ))}
+                </div>
+                {catalogParsed.review > 0 && (
+                  <div className="rounded-xl border border-amber-200 bg-amber-50 p-3">
+                    <p className="text-sm font-semibold text-amber-800">
+                      Unresolved SKUs will be saved for review but cannot receive inventory yet.
+                    </p>
+                    <ul className="mt-2 space-y-1 text-xs text-amber-700">
+                      {catalogParsed.rows.filter((row) => row.status !== 'ready').slice(0, 10).map((row) => (
+                        <li key={row.skuId}>{row.skuId}: {row.skuCode} ({row.issue})</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                <button
+                  type="button"
+                  onClick={uploadCatalog}
+                  disabled={catalogUploading || !storeName.trim()}
+                  className="btn-primary w-full justify-center py-3 disabled:opacity-50 sm:w-auto"
+                >
+                  {catalogUploading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+                  Update {storeName.trim() || 'Store'} Catalog
+                </button>
+              </div>
+            )}
+          </div>
+
+          {stores.length > 0 && (
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+              {stores.map((store) => (
+                <div key={store.store_key} className="card p-4">
+                  <p className="font-semibold text-slate-800">{store.store_name}</p>
+                  <p className="mt-1 text-sm text-slate-500">
+                    {Number(store.ready_count || 0).toLocaleString()} ready / {Number(store.product_count || 0).toLocaleString()} products
+                  </p>
+                </div>
+              ))}
             </div>
           )}
         </div>
@@ -625,18 +935,56 @@ export default function ReturnsReceiving() {
 
           {analytics && (
             <>
-              <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+              <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
                 {[
                   ['Received Packages', analytics.summary.received_packages],
                   ['Discrepancy Packages', analytics.summary.discrepancy_packages],
-                  ['Expected Units', analytics.summary.expected_units],
                   ['Actual Returned Units', analytics.summary.returned_units],
+                  ['Restocked Units', analytics.summary.restocked_units],
+                  ['Sold Units', analytics.summary.sold_units],
+                  ['Total Return Rate', analytics.summary.total_return_rate == null
+                    ? '—'
+                    : `${Number(analytics.summary.total_return_rate).toFixed(2)}%`],
                 ].map(([label, value]) => (
                   <div key={label} className="card p-4">
-                    <p className="text-2xl font-bold text-slate-900">{Number(value || 0).toLocaleString()}</p>
+                    <p className="text-2xl font-bold text-slate-900">
+                      {typeof value === 'number' ? value.toLocaleString() : value}
+                    </p>
                     <p className="mt-1 text-xs text-slate-500">{label}</p>
                   </div>
                 ))}
+              </div>
+              <div className="card overflow-hidden">
+                <div className="border-b border-slate-200 px-4 py-3 sm:px-5">
+                  <h3 className="text-sm font-semibold text-slate-800">Returns by store</h3>
+                  <p className="mt-1 text-xs text-slate-400">
+                    Store counts are shown separately; the total return rate above combines every store.
+                  </p>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full min-w-[620px] text-sm">
+                    <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
+                      <tr>
+                        <th className="px-4 py-3">Store</th>
+                        <th className="px-4 py-3 text-right">Packages</th>
+                        <th className="px-4 py-3 text-right">Discrepancies</th>
+                        <th className="px-4 py-3 text-right">Returned</th>
+                        <th className="px-4 py-3 text-right">Restocked</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {(analytics.stores || []).map((store) => (
+                        <tr key={store.store_name}>
+                          <td className="px-4 py-3 font-medium text-slate-800">{store.store_name}</td>
+                          <td className="px-4 py-3 text-right">{store.received_packages}</td>
+                          <td className="px-4 py-3 text-right">{store.discrepancy_packages}</td>
+                          <td className="px-4 py-3 text-right font-semibold text-blue-700">{store.returned_units}</td>
+                          <td className="px-4 py-3 text-right font-semibold text-emerald-700">{store.restocked_units}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               </div>
               <div className="card overflow-hidden">
                 <div className="border-b border-slate-200 px-4 py-3 sm:px-5">

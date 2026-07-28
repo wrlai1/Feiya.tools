@@ -1799,7 +1799,8 @@ app.all('/api/inventory-balance', async (req, res) => {
           ? [
               txn`
                 UPDATE return_package_items items
-                SET actual_qty = NULL
+                SET actual_qty = NULL,
+                    restock_qty = NULL
                 FROM return_packages packages
                 WHERE items.package_id = packages.id
                   AND packages.tracking_key = ${returnTrackingKey}
@@ -1808,6 +1809,7 @@ app.all('/api/inventory-balance', async (req, res) => {
                 UPDATE return_packages
                 SET status = 'pending',
                     actual_units = 0,
+                    restock_units = 0,
                     remark = NULL,
                     confirmed_by = NULL,
                     confirmed_at = NULL

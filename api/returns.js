@@ -5,6 +5,7 @@ import inventoryTargetResolution from '../lib/inventoryTargetResolution.cjs'
 const { resolveInventoryTargets } = inventoryTargetResolution
 const MAX_PACKAGES_PER_IMPORT = 5000
 const MAX_ITEMS_PER_IMPORT = 50000
+const MAX_CATALOG_ROWS_PER_IMPORT = 20000
 
 function getDB() {
   const url = process.env.DATABASE_URL
@@ -21,13 +22,19 @@ function normalizeTracking(value) {
   return String(value || '').trim().replace(/\s+/g, '').toUpperCase()
 }
 
+function normalizeStore(value) {
+  const name = String(value || '').trim().replace(/\s+/g, ' ').slice(0, 100)
+  if (!name) throw new Error('Store name is required')
+  return { name, key: name.toLowerCase() }
+}
+
 function itemIdentity(item) {
-  return [item.style, item.color, item.size]
+  return [item.sku_id, item.style, item.color, item.size]
     .map((value) => String(value || '').trim().toLowerCase())
     .join('\u0000')
 }
 
-function normalizePackages(rawPackages) {
+function normalizePackages(rawPackages, store) {
   if (!Array.isArray(rawPackages) || !rawPackages.length) throw new Error('packages array required')
   if (rawPackages.length > MAX_PACKAGES_PER_IMPORT) throw new Error(`Import is limited to ${MAX_PACKAGES_PER_IMPORT} packages`)
 
@@ -43,12 +50,23 @@ function normalizePackages(rawPackages) {
     const pkg = packages.get(trackingKey) || {
       tracking_key: trackingKey,
       tracking_number: trackingNumber || trackingKey,
+      store_name: store.name,
+      store_key: store.key,
+      order_numbers: new Set(),
+      return_reasons: new Set(),
+      buyer_remarks: new Set(),
+      carrier: String(rawPackage.carrier || '').trim(),
       items: new Map(),
     }
+    for (const value of rawPackage.orders || []) if (String(value || '').trim()) pkg.order_numbers.add(String(value).trim())
+    for (const value of rawPackage.reasons || []) if (String(value || '').trim()) pkg.return_reasons.add(String(value).trim())
+    for (const value of rawPackage.buyerRemarks || []) if (String(value || '').trim()) pkg.buyer_remarks.add(String(value).trim())
     for (const rawItem of rawPackage.items) {
       itemCount += 1
       if (itemCount > MAX_ITEMS_PER_IMPORT) throw new Error(`Import is limited to ${MAX_ITEMS_PER_IMPORT} item rows`)
       const item = {
+        sku_id: String(rawItem.skuId || rawItem.sku_id || '').trim(),
+        sku_code: String(rawItem.skuCode || rawItem.sku_code || '').trim(),
         style: String(rawItem.style || rawItem.STYLE || '').trim(),
         color: String(rawItem.color || rawItem.COLOR || '').trim(),
         size: String(rawItem.size || rawItem.SIZE || '').trim(),
@@ -70,9 +88,42 @@ function normalizePackages(rawPackages) {
     return {
       tracking_key: pkg.tracking_key,
       tracking_number: pkg.tracking_number,
+      store_name: pkg.store_name,
+      store_key: pkg.store_key,
+      order_numbers: [...pkg.order_numbers],
+      return_reasons: [...pkg.return_reasons],
+      buyer_remarks: [...pkg.buyer_remarks],
+      carrier: pkg.carrier,
       expected_units: items.reduce((sum, item) => sum + item.expected_qty, 0),
       items,
     }
+  })
+}
+
+function normalizeCatalogRows(rawRows) {
+  if (!Array.isArray(rawRows) || !rawRows.length) throw new Error('Product rows are required')
+  if (rawRows.length > MAX_CATALOG_ROWS_PER_IMPORT) {
+    throw new Error(`Product import is limited to ${MAX_CATALOG_ROWS_PER_IMPORT} rows`)
+  }
+  const seen = new Set()
+  return rawRows.map((rawRow) => {
+    const skuId = String(rawRow.skuId || rawRow.sku_id || '').trim()
+    const skuCode = String(rawRow.skuCode || rawRow.sku_code || '').trim()
+    const status = rawRow.status === 'ready' ? 'ready' : 'review'
+    const issue = String(rawRow.issue || '').trim().slice(0, 200)
+    if (!skuId || !skuCode || seen.has(skuId)) throw new Error(`Invalid or duplicate SKU ID: ${skuId || '(blank)'}`)
+    seen.add(skuId)
+    const components = Array.isArray(rawRow.components) ? rawRow.components.map((component) => ({
+      style: String(component.style || '').trim(),
+      color: String(component.color || '').trim(),
+      size: String(component.size || '').trim(),
+      qty: Number(component.qty || 1),
+    })) : []
+    if (status === 'ready' && (!components.length || components.some((component) =>
+      !component.style || !component.color || !component.size
+      || !Number.isSafeInteger(component.qty) || component.qty <= 0
+    ))) throw new Error(`Resolved SKU ${skuId} has invalid physical components`)
+    return { sku_id: skuId, sku_code: skuCode, status, issue, components }
   })
 }
 
@@ -154,6 +205,13 @@ async function ensureTables(sql) {
       confirmed_at TIMESTAMPTZ
     )
   `
+  await sql`ALTER TABLE return_packages ADD COLUMN IF NOT EXISTS store_name TEXT`
+  await sql`ALTER TABLE return_packages ADD COLUMN IF NOT EXISTS store_key TEXT`
+  await sql`ALTER TABLE return_packages ADD COLUMN IF NOT EXISTS order_numbers JSONB NOT NULL DEFAULT '[]'::jsonb`
+  await sql`ALTER TABLE return_packages ADD COLUMN IF NOT EXISTS return_reasons JSONB NOT NULL DEFAULT '[]'::jsonb`
+  await sql`ALTER TABLE return_packages ADD COLUMN IF NOT EXISTS buyer_remarks JSONB NOT NULL DEFAULT '[]'::jsonb`
+  await sql`ALTER TABLE return_packages ADD COLUMN IF NOT EXISTS carrier TEXT`
+  await sql`ALTER TABLE return_packages ADD COLUMN IF NOT EXISTS restock_units INTEGER NOT NULL DEFAULT 0`
   await sql`
     CREATE TABLE IF NOT EXISTS return_package_items (
       id BIGSERIAL PRIMARY KEY,
@@ -166,20 +224,46 @@ async function ensureTables(sql) {
       UNIQUE(package_id, style, color, size)
     )
   `
+  await sql`ALTER TABLE return_package_items ADD COLUMN IF NOT EXISTS sku_id TEXT NOT NULL DEFAULT ''`
+  await sql`ALTER TABLE return_package_items ADD COLUMN IF NOT EXISTS sku_code TEXT NOT NULL DEFAULT ''`
+  await sql`ALTER TABLE return_package_items ADD COLUMN IF NOT EXISTS restock_qty INTEGER`
+  await sql`ALTER TABLE return_package_items DROP CONSTRAINT IF EXISTS return_package_items_package_id_style_color_size_key`
+  await sql`
+    CREATE UNIQUE INDEX IF NOT EXISTS return_package_items_source_sku_uq
+    ON return_package_items (package_id, sku_id, style, color, size)
+  `
+  await sql`
+    CREATE TABLE IF NOT EXISTS return_product_catalog (
+      id BIGSERIAL PRIMARY KEY,
+      store_name TEXT NOT NULL,
+      store_key TEXT NOT NULL,
+      sku_id TEXT NOT NULL,
+      sku_code TEXT NOT NULL,
+      components JSONB NOT NULL DEFAULT '[]'::jsonb,
+      status TEXT NOT NULL DEFAULT 'review',
+      issue TEXT,
+      source_file TEXT,
+      updated_by TEXT,
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(store_key, sku_id)
+    )
+  `
   await sql`CREATE INDEX IF NOT EXISTS return_packages_status_idx ON return_packages (status, uploaded_at DESC)`
   await sql`CREATE INDEX IF NOT EXISTS return_packages_confirmed_idx ON return_packages (confirmed_at DESC)`
+  await sql`CREATE INDEX IF NOT EXISTS return_packages_store_idx ON return_packages (store_key, uploaded_at DESC)`
 }
 
 async function loadPackage(sql, trackingKey) {
   const [pkg] = await sql`
-    SELECT id, tracking_number, tracking_key, source_file, status, expected_units,
-           actual_units, remark, uploaded_by, uploaded_at, confirmed_by, confirmed_at
+    SELECT id, tracking_number, tracking_key, source_file, status, store_name, store_key,
+           order_numbers, return_reasons, buyer_remarks, carrier, expected_units,
+           actual_units, restock_units, remark, uploaded_by, uploaded_at, confirmed_by, confirmed_at
     FROM return_packages
     WHERE tracking_key = ${trackingKey}
   `
   if (!pkg) return null
   const items = await sql`
-    SELECT id, style, color, size, expected_qty, actual_qty
+    SELECT id, sku_id, sku_code, style, color, size, expected_qty, actual_qty, restock_qty
     FROM return_package_items
     WHERE package_id = ${pkg.id}
     ORDER BY style, color, size
@@ -234,9 +318,78 @@ export default async function handler(req, res) {
     const action = String(req.query.action || '')
     await ensureTables(sql)
 
+    if (req.method === 'POST' && action === 'catalog-import') {
+      if (payload.role !== 'admin') return res.status(403).json({ error: 'Admin access required' })
+      const store = normalizeStore(req.body?.storeName)
+      const rows = normalizeCatalogRows(req.body?.rows)
+      const sourceFile = String(req.body?.sourceFile || '').trim()
+      const data = JSON.stringify(rows)
+      await sql`
+        WITH incoming AS (
+          SELECT *
+          FROM jsonb_to_recordset(${data}::jsonb)
+            AS item(
+              sku_id TEXT, sku_code TEXT, status TEXT, issue TEXT, components JSONB
+            )
+        )
+        INSERT INTO return_product_catalog (
+          store_name, store_key, sku_id, sku_code, components, status, issue,
+          source_file, updated_by, updated_at
+        )
+        SELECT
+          ${store.name}, ${store.key}, sku_id, sku_code, components, status, issue,
+          ${sourceFile}, ${payload.username}, NOW()
+        FROM incoming
+        ON CONFLICT (store_key, sku_id) DO UPDATE SET
+          store_name = EXCLUDED.store_name,
+          sku_code = EXCLUDED.sku_code,
+          components = EXCLUDED.components,
+          status = EXCLUDED.status,
+          issue = EXCLUDED.issue,
+          source_file = EXCLUDED.source_file,
+          updated_by = EXCLUDED.updated_by,
+          updated_at = NOW()
+      `
+      return res.json({
+        ok: true,
+        store_name: store.name,
+        imported_rows: rows.length,
+        ready_rows: rows.filter((row) => row.status === 'ready').length,
+        review_rows: rows.filter((row) => row.status !== 'ready').length,
+      })
+    }
+
+    if (req.method === 'GET' && action === 'catalog') {
+      if (payload.role !== 'admin') return res.status(403).json({ error: 'Admin access required' })
+      const store = normalizeStore(req.query.store)
+      const rows = await sql`
+        SELECT sku_id, sku_code, components, status, issue, source_file, updated_at
+        FROM return_product_catalog
+        WHERE store_key = ${store.key}
+        ORDER BY sku_id
+      `
+      return res.json({ store_name: store.name, rows })
+    }
+
+    if (req.method === 'GET' && action === 'stores') {
+      const rows = await sql`
+        SELECT
+          store_key,
+          MIN(store_name) AS store_name,
+          COUNT(*)::int AS product_count,
+          COUNT(*) FILTER (WHERE status = 'ready')::int AS ready_count,
+          MAX(updated_at) AS updated_at
+        FROM return_product_catalog
+        GROUP BY store_key
+        ORDER BY store_name
+      `
+      return res.json({ stores: rows })
+    }
+
     if (req.method === 'POST' && action === 'import') {
       if (payload.role !== 'admin') return res.status(403).json({ error: 'Admin access required' })
-      const packages = normalizePackages(req.body?.packages)
+      const store = normalizeStore(req.body?.storeName)
+      const packages = normalizePackages(req.body?.packages, store)
       const sourceFile = String(req.body?.sourceFile || '').trim()
       const trackingKeys = packages.map((pkg) => pkg.tracking_key)
       const finalPackages = await sql`
@@ -259,22 +412,33 @@ export default async function handler(req, res) {
             WITH incoming AS (
               SELECT * FROM jsonb_to_recordset(${manifest}::jsonb)
                 AS item(
-                  tracking_key TEXT, tracking_number TEXT, expected_units INTEGER, items JSONB
+                  tracking_key TEXT, tracking_number TEXT, store_name TEXT, store_key TEXT,
+                  order_numbers JSONB, return_reasons JSONB, buyer_remarks JSONB, carrier TEXT,
+                  expected_units INTEGER, items JSONB
                 )
             )
             INSERT INTO return_packages (
-              tracking_key, tracking_number, source_file, status, expected_units,
-              actual_units, uploaded_by, uploaded_at, confirmed_by, confirmed_at, remark
+              tracking_key, tracking_number, store_name, store_key, order_numbers,
+              return_reasons, buyer_remarks, carrier, source_file, status, expected_units,
+              actual_units, restock_units, uploaded_by, uploaded_at, confirmed_by, confirmed_at, remark
             )
             SELECT
-              tracking_key, tracking_number, ${sourceFile}, 'pending', expected_units,
-              0, ${payload.username}, NOW(), NULL, NULL, NULL
+              tracking_key, tracking_number, store_name, store_key, order_numbers,
+              return_reasons, buyer_remarks, carrier, ${sourceFile}, 'pending', expected_units,
+              0, 0, ${payload.username}, NOW(), NULL, NULL, NULL
             FROM incoming
             ON CONFLICT (tracking_key) DO UPDATE SET
               tracking_number = EXCLUDED.tracking_number,
+              store_name = EXCLUDED.store_name,
+              store_key = EXCLUDED.store_key,
+              order_numbers = EXCLUDED.order_numbers,
+              return_reasons = EXCLUDED.return_reasons,
+              buyer_remarks = EXCLUDED.buyer_remarks,
+              carrier = EXCLUDED.carrier,
               source_file = EXCLUDED.source_file,
               expected_units = EXCLUDED.expected_units,
               actual_units = 0,
+              restock_units = 0,
               uploaded_by = EXCLUDED.uploaded_by,
               uploaded_at = NOW(),
               confirmed_by = NULL,
@@ -307,19 +471,24 @@ export default async function handler(req, res) {
             incoming_items AS (
               SELECT
                 packages.tracking_key,
+                item.sku_id,
+                item.sku_code,
                 item.style,
                 item.color,
                 item.size,
                 item.expected_qty
               FROM incoming_packages packages
               CROSS JOIN LATERAL jsonb_to_recordset(packages.items)
-                AS item(style TEXT, color TEXT, size TEXT, expected_qty INTEGER)
+                AS item(
+                  sku_id TEXT, sku_code TEXT, style TEXT, color TEXT, size TEXT, expected_qty INTEGER
+                )
             )
             INSERT INTO return_package_items (
-              package_id, style, color, size, expected_qty, actual_qty
+              package_id, sku_id, sku_code, style, color, size, expected_qty, actual_qty, restock_qty
             )
             SELECT
-              packages.id, items.style, items.color, items.size, items.expected_qty, NULL
+              packages.id, items.sku_id, items.sku_code, items.style, items.color,
+              items.size, items.expected_qty, NULL, NULL
             FROM incoming_items items
             JOIN return_packages packages ON packages.tracking_key = items.tracking_key
             WHERE packages.status = 'pending'
@@ -346,7 +515,7 @@ export default async function handler(req, res) {
       const status = String(req.query.status || '')
       const rows = status
         ? await sql`
-            SELECT id, tracking_number, status, expected_units, actual_units,
+            SELECT id, tracking_number, store_name, status, expected_units, actual_units, restock_units,
                    uploaded_at, confirmed_at
             FROM return_packages
             WHERE status = ${status}
@@ -354,7 +523,7 @@ export default async function handler(req, res) {
             LIMIT 200
           `
         : await sql`
-            SELECT id, tracking_number, status, expected_units, actual_units,
+            SELECT id, tracking_number, store_name, status, expected_units, actual_units, restock_units,
                    uploaded_at, confirmed_at
             FROM return_packages
             ORDER BY CASE WHEN status = 'pending' THEN 0 ELSE 1 END, uploaded_at DESC
@@ -371,16 +540,28 @@ export default async function handler(req, res) {
       if (pkg.status !== 'pending') return res.status(409).json({ error: 'This return package has already been received' })
 
       const actualItems = Array.isArray(req.body?.items) ? req.body.items : []
-      const actualById = new Map()
+      const countsById = new Map()
       for (const item of actualItems) {
         const id = Number(item.id)
         const actualQty = Number(item.actualQty)
-        if (!Number.isSafeInteger(id) || !Number.isSafeInteger(actualQty) || actualQty < 0 || actualQty > 9999 || actualById.has(id)) {
-          return res.status(400).json({ error: 'Every item requires one valid non-negative actual quantity' })
+        const restockQty = Number(item.restockQty)
+        if (
+          !Number.isSafeInteger(id)
+          || !Number.isSafeInteger(actualQty)
+          || !Number.isSafeInteger(restockQty)
+          || actualQty < 0
+          || actualQty > 9999
+          || restockQty < 0
+          || restockQty > actualQty
+          || countsById.has(id)
+        ) {
+          return res.status(400).json({
+            error: 'Every item requires valid received and restockable quantities; restockable cannot exceed received',
+          })
         }
-        actualById.set(id, actualQty)
+        countsById.set(id, { actualQty, restockQty })
       }
-      if (actualById.size !== pkg.items.length || pkg.items.some((item) => !actualById.has(Number(item.id)))) {
+      if (countsById.size !== pkg.items.length || pkg.items.some((item) => !countsById.has(Number(item.id)))) {
         return res.status(400).json({ error: 'Count every expected item before confirming the package' })
       }
 
@@ -389,7 +570,7 @@ export default async function handler(req, res) {
           style: item.style,
           color: item.color,
           size: item.size,
-          qty: actualById.get(Number(item.id)),
+          qty: countsById.get(Number(item.id)).restockQty,
           allowCreate: false,
         }))
         .filter((item) => item.qty > 0)
@@ -404,9 +585,11 @@ export default async function handler(req, res) {
       }
 
       const receivedRows = resolved.rows
-      const actualUnits = [...actualById.values()].reduce((sum, qty) => sum + qty, 0)
+      const actualUnits = [...countsById.values()].reduce((sum, counts) => sum + counts.actualQty, 0)
+      const restockUnits = [...countsById.values()].reduce((sum, counts) => sum + counts.restockQty, 0)
       const hasDiscrepancy = pkg.items.some((item) =>
-        actualById.get(Number(item.id)) !== Number(item.expected_qty)
+        countsById.get(Number(item.id)).actualQty !== Number(item.expected_qty)
+        || countsById.get(Number(item.id)).restockQty !== countsById.get(Number(item.id)).actualQty
       )
       const finalStatus = hasDiscrepancy ? 'discrepancy' : 'received'
       const sourceName = `Return ${pkg.tracking_number}`
@@ -444,7 +627,7 @@ export default async function handler(req, res) {
             applied_by, rollback_snapshot_id
           )
           SELECT
-            'return', ${sourceName}, ${sourceHash}, ${actualUnits},
+            'return', ${sourceName}, ${sourceHash}, ${restockUnits},
             ${receivedRows.length}, ${payload.username}, saved_snapshot.id
           FROM saved_snapshot
         `,
@@ -466,13 +649,15 @@ export default async function handler(req, res) {
         ]),
         ...pkg.items.map((item) => txn`
           UPDATE return_package_items
-          SET actual_qty = ${actualById.get(Number(item.id))}
+          SET actual_qty = ${countsById.get(Number(item.id)).actualQty},
+              restock_qty = ${countsById.get(Number(item.id)).restockQty}
           WHERE id = ${item.id} AND package_id = ${pkg.id}
         `),
         txn`
           UPDATE return_packages
           SET status = ${finalStatus},
               actual_units = ${actualUnits},
+              restock_units = ${restockUnits},
               remark = ${remark},
               confirmed_by = ${payload.username},
               confirmed_at = NOW()
@@ -491,7 +676,8 @@ export default async function handler(req, res) {
         status: finalStatus,
         expected_units: Number(pkg.expected_units),
         actual_units: actualUnits,
-        added_units: actualUnits,
+        restock_units: restockUnits,
+        added_units: restockUnits,
       })
     }
 
@@ -504,10 +690,44 @@ export default async function handler(req, res) {
           COUNT(*)::int AS received_packages,
           COUNT(*) FILTER (WHERE status = 'discrepancy')::int AS discrepancy_packages,
           COALESCE(SUM(expected_units), 0)::int AS expected_units,
-          COALESCE(SUM(actual_units), 0)::int AS returned_units
+          COALESCE(SUM(actual_units), 0)::int AS returned_units,
+          COALESCE(SUM(restock_units), 0)::int AS restocked_units
         FROM return_packages
         WHERE status IN ('received', 'discrepancy')
           AND confirmed_at >= ${from}
+      `
+      const [salesSummary] = await sql`
+        SELECT COALESCE(SUM(rows.qty), 0)::int AS sold_units
+        FROM inventory_txn_rows rows
+        WHERE rows.txn_type = 'sales'
+          AND rows.applied_at >= ${from}
+          AND NOT EXISTS (
+            SELECT 1
+            FROM inventory_transactions transactions
+            WHERE transactions.rolled_back_at IS NOT NULL
+              AND transactions.transaction_type = rows.txn_type
+              AND transactions.source_file IS NOT DISTINCT FROM rows.source_file
+              AND transactions.applied_by IS NOT DISTINCT FROM rows.applied_by
+              AND transactions.applied_at = rows.applied_at
+          )
+      `
+      summary.sold_units = Number(salesSummary?.sold_units || 0)
+      summary.total_return_rate = summary.sold_units > 0
+        ? Number(summary.returned_units || 0) * 100 / summary.sold_units
+        : null
+      const stores = await sql`
+        SELECT
+          COALESCE(NULLIF(store_name, ''), 'Unassigned') AS store_name,
+          COUNT(*)::int AS received_packages,
+          COUNT(*) FILTER (WHERE status = 'discrepancy')::int AS discrepancy_packages,
+          COALESCE(SUM(expected_units), 0)::int AS expected_units,
+          COALESCE(SUM(actual_units), 0)::int AS returned_units,
+          COALESCE(SUM(restock_units), 0)::int AS restocked_units
+        FROM return_packages
+        WHERE status IN ('received', 'discrepancy')
+          AND confirmed_at >= ${from}
+        GROUP BY COALESCE(NULLIF(store_name, ''), 'Unassigned')
+        ORDER BY returned_units DESC, store_name
       `
       const rows = await sql`
         WITH sales AS (
@@ -571,7 +791,7 @@ export default async function handler(req, res) {
         ORDER BY returned_qty DESC, style, color, size
         LIMIT 500
       `
-      return res.json({ days, summary, rows })
+      return res.json({ days, summary, stores, rows })
     }
 
     return res.status(400).json({ error: `Unknown action: ${action}` })
