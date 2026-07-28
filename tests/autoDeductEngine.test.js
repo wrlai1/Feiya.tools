@@ -7,6 +7,9 @@ import {
 } from '../src/utils/autoDeductEngine.js'
 import { consolidateRows } from '../src/utils/consolidateEngine.js'
 import { findAdditionalComboSizeMappings, findAdditionalSizeMappings } from '../src/utils/autoDeductRules.js'
+import inventoryTargetResolution from '../lib/inventoryTargetResolution.cjs'
+
+const { resolveInventoryTargets } = inventoryTargetResolution
 
 test('petite sales sizes are shifted exactly once', () => {
   const salesRows = consolidateRows([
@@ -406,6 +409,62 @@ test('invalid source quantities stop the run instead of being partially parsed',
     () => consolidateRows([{ SKU: 'A100BlackS', Quantity: 'one' }]),
     /数量无效/,
   )
+})
+
+test('apply resolves inventory capitalization without changing SKU identity', () => {
+  const result = resolveInventoryTargets([
+    { style: '543924', color: 'brown', size: 'L', qty: 2, allowCreate: false },
+  ], [
+    {
+      target_index: 0,
+      match_count: 1,
+      matched_style: '543924',
+      matched_color: 'Brown',
+      matched_size: 'L',
+    },
+  ])
+
+  assert.deepEqual(result.rows, [
+    { style: '543924', color: 'Brown', size: 'L', qty: 2, allowCreate: false },
+  ])
+  assert.equal(result.missing.length, 0)
+  assert.equal(result.ambiguous.length, 0)
+})
+
+test('apply fails closed when capitalization resolves to multiple inventory rows', () => {
+  const result = resolveInventoryTargets([
+    { style: '543924', color: 'brown', size: 'L', qty: 1, allowCreate: false },
+  ], [
+    { target_index: 0, match_count: 2 },
+  ])
+
+  assert.equal(result.ambiguous.length, 1)
+})
+
+test('manual create reuses an existing capitalization match and merges quantities', () => {
+  const result = resolveInventoryTargets([
+    { style: '543924', color: 'brown', size: 'L', qty: 1, allowCreate: true },
+    { style: '543924', color: 'Brown', size: 'L', qty: 2, allowCreate: false },
+  ], [
+    {
+      target_index: 0,
+      match_count: 1,
+      matched_style: '543924',
+      matched_color: 'Brown',
+      matched_size: 'L',
+    },
+    {
+      target_index: 1,
+      match_count: 1,
+      matched_style: '543924',
+      matched_color: 'Brown',
+      matched_size: 'L',
+    },
+  ])
+
+  assert.deepEqual(result.rows, [
+    { style: '543924', color: 'Brown', size: 'L', qty: 3, allowCreate: false },
+  ])
 })
 
 test('a confirmed style and color safely carries to sibling sizes during review', () => {

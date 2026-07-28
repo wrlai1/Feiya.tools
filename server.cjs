@@ -9,6 +9,7 @@ const cors    = require('cors');
 const { neon }  = require('@neondatabase/serverless');
 const bcrypt    = require('bcryptjs');
 const jwt       = require('jsonwebtoken');
+const { resolveInventoryTargets } = require('./lib/inventoryTargetResolution.cjs');
 
 const app  = express();
 const PORT = 3001;
@@ -1531,7 +1532,7 @@ app.all('/api/inventory-balance', async (req, res) => {
         if (duplicate.length) return res.status(409).json({ error: 'This exact file has already been applied. Inventory was not changed.' });
       }
 
-      const applyRows = filledRows.flatMap((r) => {
+      let applyRows = filledRows.flatMap((r) => {
         const style = String(r.STYLE || '').trim();
         const color = String(r.COLOR || '').trim();
         const size = String(r.SIZE || '').trim();
@@ -1546,26 +1547,43 @@ app.all('/api/inventory-balance', async (req, res) => {
       if (invalidRow) return res.status(400).json({ error: 'Invalid style, color, size, or quantity in deduction preview' });
       if (!applyRows.length) return res.status(400).json({ error: 'No inventory quantities to apply' });
 
-      const existingTargets = applyRows.filter((row) => !row.allowCreate);
-      if (existingTargets.length) {
-        const missing = await sql`
-          WITH targets AS (
-            SELECT * FROM jsonb_to_recordset(${JSON.stringify(existingTargets)}::jsonb)
-              AS target(style TEXT, color TEXT, size TEXT)
-          )
-          SELECT target.style, target.color, target.size
-          FROM targets target
-          LEFT JOIN inventory_balance inventory
-            ON inventory.style = target.style
-           AND inventory.color = target.color
-           AND inventory.size = target.size
-          WHERE inventory.id IS NULL
-        `;
-        if (missing.length) {
-          const target = missing[0];
-          return res.status(409).json({ error: `Inventory target no longer exists: ${target.style} / ${target.color} / ${target.size}. Run Auto-Fill again.` });
-        }
+      const targetResolutions = await sql`
+        WITH targets AS (
+          SELECT
+            (target.ordinality - 1)::int AS target_index,
+            target.value->>'style' AS style,
+            target.value->>'color' AS color,
+            target.value->>'size' AS size
+          FROM jsonb_array_elements(${JSON.stringify(applyRows)}::jsonb)
+            WITH ORDINALITY AS target(value, ordinality)
+        )
+        SELECT
+          target.target_index,
+          COUNT(inventory.id)::int AS match_count,
+          MIN(inventory.style) AS matched_style,
+          MIN(inventory.color) AS matched_color,
+          MIN(inventory.size) AS matched_size
+        FROM targets target
+        LEFT JOIN inventory_balance inventory
+          ON LOWER(BTRIM(inventory.style)) = LOWER(BTRIM(target.style))
+         AND LOWER(BTRIM(inventory.color)) = LOWER(BTRIM(target.color))
+         AND LOWER(BTRIM(inventory.size)) = LOWER(BTRIM(target.size))
+        GROUP BY target.target_index
+        ORDER BY target.target_index
+      `;
+      const resolvedTargets = resolveInventoryTargets(applyRows, targetResolutions);
+      if (resolvedTargets.ambiguous.length) {
+        const target = resolvedTargets.ambiguous[0];
+        return res.status(409).json({
+          error: `More than one inventory target matches capitalization-insensitively: ${target.style} / ${target.color} / ${target.size}. Merge the duplicate inventory rows before applying.`,
+        });
       }
+      if (resolvedTargets.missing.length) {
+        const target = resolvedTargets.missing[0];
+        return res.status(409).json({ error: `Inventory target no longer exists: ${target.style} / ${target.color} / ${target.size}. Run Auto-Fill again.` });
+      }
+      applyRows = resolvedTargets.rows;
+      const existingTargets = applyRows.filter((row) => !row.allowCreate);
 
       const appliedUnits = applyRows.reduce((sum, row) => sum + row.qty, 0);
       await sql.transaction((txn) => [
