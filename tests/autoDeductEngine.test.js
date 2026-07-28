@@ -7,6 +7,7 @@ import {
 } from '../src/utils/autoDeductEngine.js'
 import { consolidateRows } from '../src/utils/consolidateEngine.js'
 import { findAdditionalComboSizeMappings, findAdditionalSizeMappings } from '../src/utils/autoDeductRules.js'
+import { parseReturnManifestRows, resolveReturnManifestPackages } from '../src/utils/returnImportEngine.js'
 import inventoryTargetResolution from '../lib/inventoryTargetResolution.cjs'
 
 const { resolveInventoryTargets } = inventoryTargetResolution
@@ -465,6 +466,93 @@ test('manual create reuses an existing capitalization match and merges quantitie
   assert.deepEqual(result.rows, [
     { style: '543924', color: 'Brown', size: 'L', qty: 3, allowCreate: false },
   ])
+})
+
+test('return manifests group tracking numbers and expand ampersand sets', () => {
+  const result = parseReturnManifestRows([
+    {
+      运单号: ' 1z-return-01 ',
+      SKU货号: 'M022Black&Denim&Khaki&WhiteM',
+      商品属性: 'Black&Denim&Khaki&White / M',
+      应履约件数: 1,
+    },
+    {
+      运单号: '1Z-RETURN-01',
+      SKU货号: 'M022WhiteM',
+      商品属性: 'White / M',
+      应履约件数: 1,
+    },
+  ])
+
+  assert.equal(result.packages.length, 1)
+  assert.equal(result.packages[0].tracking, '1Z-RETURN-01')
+  assert.equal(result.packages[0].expectedUnits, 5)
+  const resolved = resolveReturnManifestPackages(result, [
+    { STYLE: 'M022 Missy', COLOR: 'BLACK', SIZE: 'M' },
+    { STYLE: 'M022 Missy', COLOR: 'DENIM', SIZE: 'M' },
+    { STYLE: 'M022 Missy', COLOR: 'KHAKI', SIZE: 'M' },
+    { STYLE: 'M022 Missy', COLOR: 'WHITE', SIZE: 'M' },
+  ])
+  assert.deepEqual(resolved.packages[0].items, [
+    { style: 'M022 Missy', color: 'BLACK', size: 'M', expectedQty: 1 },
+    { style: 'M022 Missy', color: 'DENIM', size: 'M', expectedQty: 1 },
+    { style: 'M022 Missy', color: 'KHAKI', size: 'M', expectedQty: 1 },
+    { style: 'M022 Missy', color: 'WHITE', size: 'M', expectedQty: 2 },
+  ])
+})
+
+test('return manifests stop unknown non-ampersand sets for review', () => {
+  const result = parseReturnManifestRows([
+    { Tracking: 'RETURN-2', SKU: '53058setM', Quantity: 1 },
+  ])
+
+  assert.equal(result.packages.length, 1)
+  assert.equal(result.stats.reviewPackages, 1)
+  assert.equal(result.needsReview[0].parse_issue, 'set_components_unknown')
+  const resolved = resolveReturnManifestPackages(result, [])
+  assert.equal(resolved.packages.length, 0)
+  assert.equal(resolved.stats.reviewPackages, 1)
+})
+
+test('return manifests reuse a human-confirmed combo and its corresponding size', () => {
+  const parsed = parseReturnManifestRows([
+    { Tracking: 'RETURN-3', SKU: '62300setM', Quantity: 1 },
+  ])
+  const aliases = {
+    [aliasKey('62300', 'set', 'S')]: {
+      components: [
+        { STYLE: '62300SET', COLOR: 'BLACK', SIZE: 'S' },
+        { STYLE: '62300SET', COLOR: 'DENIM', SIZE: 'S' },
+        { STYLE: '62300SET', COLOR: 'KHAKI', SIZE: 'S' },
+        { STYLE: '62300SET', COLOR: 'WHITE', SIZE: 'S' },
+      ],
+      _confirmed: true,
+    },
+  }
+  const resolved = resolveReturnManifestPackages(parsed, [
+    { STYLE: '62300SET', COLOR: 'BLACK', SIZE: 'M' },
+    { STYLE: '62300SET', COLOR: 'DENIM', SIZE: 'M' },
+    { STYLE: '62300SET', COLOR: 'KHAKI', SIZE: 'M' },
+    { STYLE: '62300SET', COLOR: 'WHITE', SIZE: 'M' },
+  ], aliases)
+
+  assert.equal(resolved.needsReview.length, 0)
+  assert.equal(resolved.packages[0].expectedUnits, 4)
+  assert.deepEqual(resolved.packages[0].items, [
+    { style: '62300SET', color: 'BLACK', size: 'M', expectedQty: 1 },
+    { style: '62300SET', color: 'DENIM', size: 'M', expectedQty: 1 },
+    { style: '62300SET', color: 'KHAKI', size: 'M', expectedQty: 1 },
+    { style: '62300SET', color: 'WHITE', size: 'M', expectedQty: 1 },
+  ])
+})
+
+test('return manifests require tracking on every row', () => {
+  assert.throws(
+    () => parseReturnManifestRows([
+      { Tracking: '', SKU: 'A100BlackS', Quantity: 1 },
+    ]),
+    /missing a tracking number/,
+  )
 })
 
 test('a confirmed style and color safely carries to sibling sizes during review', () => {

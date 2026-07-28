@@ -79,7 +79,7 @@ export function normalizeSize(s) {
 const M022_MISSY_SIZES = new Set(['S', 'M', 'L', 'XL'])
 const M022_PLUS_SIZES = new Set(['1X', '2X', '3X'])
 
-function m022InventoryStyle(style, normalizedSize) {
+export function m022InventoryStyle(style, normalizedSize) {
   if (normalizeStyleIdentity(style) !== 'm022') return ''
   if (M022_MISSY_SIZES.has(normalizedSize)) return 'M022 Missy'
   if (M022_PLUS_SIZES.has(normalizedSize)) return 'M022 PLUS'

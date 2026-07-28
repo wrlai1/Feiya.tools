@@ -4,6 +4,7 @@ import {
   LayoutDashboard, Package, Truck, MessageSquare,
   Boxes, Minus, X, Users, LogOut, KeyRound, ShieldCheck, User, Clock,
   ClipboardList, BarChart3, Rocket,
+  ScanLine,
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import ChangePasswordModal from './ChangePasswordModal.jsx'
@@ -24,6 +25,7 @@ const ADMIN_GROUPS = [
       { label: 'Low Inventory Notes', to: '/notes', icon: MessageSquare },
       { label: 'Stock Management', to: '/stock', icon: Boxes },
       { label: 'Auto Deduct', to: '/auto-deduct', icon: Minus, end: true },
+      { label: 'Returns Receiving', to: '/returns', icon: ScanLine },
     ],
   },
   {
@@ -51,6 +53,7 @@ const USER_GROUPS = [
     theme: 'operations',
     items: [
       { label: 'Tracking', to: '/tracking', icon: Truck },
+      { label: 'Returns Receiving', to: '/returns', icon: ScanLine },
       { label: 'Low Inventory Notes', to: '/notes', icon: MessageSquare },
     ],
   },

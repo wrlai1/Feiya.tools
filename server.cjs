@@ -17,6 +17,12 @@ const PORT = 3001;
 app.use(cors());
 app.use(express.json());
 
+let returnsHandlerPromise;
+app.all('/api/returns', async (req, res) => {
+  returnsHandlerPromise ||= import('./api/returns.js').then((module) => module.default);
+  return (await returnsHandlerPromise)(req, res);
+});
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function getDB() {
@@ -1670,10 +1676,19 @@ app.all('/api/inventory-balance', async (req, res) => {
       const days = Math.min(Math.max(parseInt(req.query.days, 10) || 30, 1), 365);
       const from = new Date(Date.now() - days * 86400000).toISOString();
       const rows = await sql`
-        SELECT txn_type, style, color, size, qty, applied_at::date AS day
-        FROM inventory_txn_rows
-        WHERE applied_at >= ${from}
-        ORDER BY applied_at
+        SELECT rows.txn_type, rows.style, rows.color, rows.size, rows.qty, rows.applied_at::date AS day
+        FROM inventory_txn_rows rows
+        WHERE rows.applied_at >= ${from}
+          AND NOT EXISTS (
+            SELECT 1
+            FROM inventory_transactions transactions
+            WHERE transactions.rolled_back_at IS NOT NULL
+              AND transactions.transaction_type = rows.txn_type
+              AND transactions.source_file IS NOT DISTINCT FROM rows.source_file
+              AND transactions.applied_by IS NOT DISTINCT FROM rows.applied_by
+              AND transactions.applied_at = rows.applied_at
+          )
+        ORDER BY rows.applied_at
       `;
       return res.json({ days, rows });
     }
@@ -1722,6 +1737,29 @@ app.all('/api/inventory-balance', async (req, res) => {
         WHERE id = ${snapId}
       `;
       if (!snap) return res.status(404).json({ error: 'Snapshot not found' });
+      const [rollbackTransaction] = ['sales', 'return'].includes(snap.label)
+        ? await sql`
+            SELECT candidate.id, candidate.source_hash
+            FROM inventory_transactions candidate
+            WHERE candidate.rolled_back_at IS NULL
+              AND (
+                candidate.rollback_snapshot_id = ${snapId}
+                OR (
+                  candidate.rollback_snapshot_id IS NULL
+                  AND candidate.transaction_type = ${snap.label}
+                  AND candidate.source_file IS NOT DISTINCT FROM ${snap.source_name}
+                  AND candidate.applied_at >= ${snap.created_at}
+                )
+              )
+            ORDER BY
+              CASE WHEN candidate.rollback_snapshot_id = ${snapId} THEN 0 ELSE 1 END,
+              candidate.applied_at
+            LIMIT 1
+          `
+        : [];
+      const returnTrackingKey = String(rollbackTransaction?.source_hash || '').startsWith('return-package:')
+        ? String(rollbackTransaction.source_hash).slice('return-package:'.length)
+        : '';
 
       const restoreRows = (Array.isArray(snap.data) ? snap.data : []).map((row, index) => ({
         style: String(row.style || '').trim(),
@@ -1750,29 +1788,32 @@ app.all('/api/inventory-balance', async (req, res) => {
             COALESCE(SUM(quantity), 0)::int
           FROM inventory_balance
         `,
-        ...(['sales', 'return'].includes(snap.label)
+        ...(rollbackTransaction
           ? [txn`
               UPDATE inventory_transactions
               SET rolled_back_at = NOW()
-              WHERE id = (
-                SELECT candidate.id
-                FROM inventory_transactions candidate
-                WHERE candidate.rolled_back_at IS NULL
-                  AND (
-                    candidate.rollback_snapshot_id = ${snapId}
-                    OR (
-                      candidate.rollback_snapshot_id IS NULL
-                      AND candidate.transaction_type = ${snap.label}
-                      AND candidate.source_file IS NOT DISTINCT FROM ${snap.source_name}
-                      AND candidate.applied_at >= ${snap.created_at}
-                    )
-                  )
-                ORDER BY
-                  CASE WHEN candidate.rollback_snapshot_id = ${snapId} THEN 0 ELSE 1 END,
-                  candidate.applied_at
-                LIMIT 1
-              )
+              WHERE id = ${rollbackTransaction.id} AND rolled_back_at IS NULL
             `]
+          : []),
+        ...(returnTrackingKey
+          ? [
+              txn`
+                UPDATE return_package_items items
+                SET actual_qty = NULL
+                FROM return_packages packages
+                WHERE items.package_id = packages.id
+                  AND packages.tracking_key = ${returnTrackingKey}
+              `,
+              txn`
+                UPDATE return_packages
+                SET status = 'pending',
+                    actual_units = 0,
+                    remark = NULL,
+                    confirmed_by = NULL,
+                    confirmed_at = NULL
+                WHERE tracking_key = ${returnTrackingKey}
+              `,
+            ]
           : []),
         ...(quantityOnly
           ? [txn`
