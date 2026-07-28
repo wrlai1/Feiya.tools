@@ -203,6 +203,7 @@ export default function AutoDeductHistory() {
               <tbody className="divide-y divide-slate-100">
                 {transactions.map((item) => {
                   const isSale = item.transaction_type === 'sales'
+                  const isRolledBack = Boolean(item.rolled_back_at)
                   const ActionIcon = isSale ? Minus : TrendingUp
                   return (
                     <tr key={item.id} className="hover:bg-slate-50/70">
@@ -222,8 +223,15 @@ export default function AutoDeductHistory() {
                       </td>
                       <td className="px-4 py-3 text-slate-600">{item.applied_by || '—'}</td>
                       <td className="px-4 py-3">
-                        <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-full bg-green-50 text-green-700 text-xs font-medium">
-                          <CheckCircle className="w-3.5 h-3.5" /> Applied
+                        <span className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-medium ${
+                          isRolledBack
+                            ? 'bg-slate-100 text-slate-600'
+                            : 'bg-green-50 text-green-700'
+                        }`}>
+                          {isRolledBack
+                            ? <RotateCcw className="w-3.5 h-3.5" />
+                            : <CheckCircle className="w-3.5 h-3.5" />}
+                          {isRolledBack ? 'Rolled Back' : 'Applied'}
                         </span>
                       </td>
                     </tr>

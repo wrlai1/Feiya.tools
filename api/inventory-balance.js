@@ -81,7 +81,8 @@ async function ensureTables(sql) {
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS applied_at TIMESTAMPTZ DEFAULT NOW()`
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS row_count INTEGER`
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS source_hash TEXT`
-  await sql`CREATE UNIQUE INDEX IF NOT EXISTS inventory_transactions_source_hash_uq ON inventory_transactions (transaction_type, source_hash) WHERE source_hash IS NOT NULL AND source_hash <> ''`
+  await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS rollback_snapshot_id INTEGER`
+  await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS rolled_back_at TIMESTAMPTZ`
   // sort_order preserves the original SalesTEMPLATE.csv row sequence so the
   // filled-template Excel download comes out in the same order as the template.
   await sql`ALTER TABLE inventory_balance ADD COLUMN IF NOT EXISTS sort_order INTEGER`
@@ -112,6 +113,47 @@ async function ensureTables(sql) {
       total_units INTEGER DEFAULT 0,
       created_at  TIMESTAMPTZ DEFAULT NOW()
     )
+  `
+  await sql`
+    WITH restored_snapshots AS (
+      SELECT
+        substring(source_name FROM 'point ([0-9]+)$')::integer AS snapshot_id,
+        created_at AS restored_at
+      FROM inventory_snapshots
+      WHERE label = 'pre_restore' AND source_name ~ 'point [0-9]+$'
+    ),
+    restored_transactions AS (
+      SELECT
+        restored.restored_at,
+        (
+          SELECT candidate.id
+          FROM inventory_transactions candidate
+          JOIN inventory_snapshots original ON original.id = restored.snapshot_id
+          WHERE candidate.rollback_snapshot_id = original.id
+             OR (
+               candidate.rollback_snapshot_id IS NULL
+               AND candidate.transaction_type = original.label
+               AND candidate.source_file IS NOT DISTINCT FROM original.source_name
+               AND candidate.applied_at >= original.created_at
+             )
+          ORDER BY
+            CASE WHEN candidate.rollback_snapshot_id = original.id THEN 0 ELSE 1 END,
+            candidate.applied_at
+          LIMIT 1
+        ) AS transaction_id
+      FROM restored_snapshots restored
+    )
+    UPDATE inventory_transactions target
+    SET rolled_back_at = restored.restored_at
+    FROM restored_transactions restored
+    WHERE target.id = restored.transaction_id
+      AND target.rolled_back_at IS NULL
+  `
+  await sql`DROP INDEX IF EXISTS inventory_transactions_source_hash_uq`
+  await sql`
+    CREATE UNIQUE INDEX IF NOT EXISTS inventory_transactions_active_source_hash_uq
+    ON inventory_transactions (transaction_type, source_hash)
+    WHERE source_hash IS NOT NULL AND source_hash <> '' AND rolled_back_at IS NULL
   `
 }
 
@@ -273,7 +315,13 @@ export default async function handler(req, res) {
       if (!['sales', 'return'].includes(txnType)) return res.status(400).json({ error: 'Invalid transaction type' })
 
       if (sourceHash) {
-        const duplicate = await sql`SELECT id FROM inventory_transactions WHERE transaction_type = ${txnType} AND source_hash = ${sourceHash} LIMIT 1`
+        const duplicate = await sql`
+          SELECT id FROM inventory_transactions
+          WHERE transaction_type = ${txnType}
+            AND source_hash = ${sourceHash}
+            AND rolled_back_at IS NULL
+          LIMIT 1
+        `
         if (duplicate.length) return res.status(409).json({ error: 'This exact file has already been applied. Inventory was not changed.' })
       }
 
@@ -338,17 +386,28 @@ export default async function handler(req, res) {
           FROM target_counts
         `] : []),
         txn`
-          INSERT INTO inventory_snapshots (label, source_name, data, total_rows, total_units)
+          WITH saved_snapshot AS (
+            INSERT INTO inventory_snapshots (label, source_name, data, total_rows, total_units)
+            SELECT
+              ${txnType},
+              ${sourceName},
+              COALESCE(jsonb_agg(jsonb_build_object(
+                'style', style, 'color', color, 'size', size, 'quantity', quantity,
+                'sort_order', sort_order
+              ) ORDER BY sort_order NULLS LAST, id), '[]'::jsonb),
+              COUNT(*)::int,
+              COALESCE(SUM(quantity), 0)::int
+            FROM inventory_balance
+            RETURNING id
+          )
+          INSERT INTO inventory_transactions (
+            transaction_type, source_file, source_hash, applied_units, row_count,
+            applied_by, rollback_snapshot_id
+          )
           SELECT
-            ${txnType},
-            ${sourceName},
-            COALESCE(jsonb_agg(jsonb_build_object(
-              'style', style, 'color', color, 'size', size, 'quantity', quantity,
-              'sort_order', sort_order
-            ) ORDER BY sort_order NULLS LAST, id), '[]'::jsonb),
-            COUNT(*)::int,
-            COALESCE(SUM(quantity), 0)::int
-          FROM inventory_balance
+            ${txnType}, ${sourceName}, ${sourceHash}, ${appliedUnits},
+            ${applyRows.length}, ${payload.username}, saved_snapshot.id
+          FROM saved_snapshot
         `,
         ...applyRows.flatMap((row) => {
           const delta = txnType === 'sales' ? -row.qty : row.qty
@@ -372,10 +431,6 @@ export default async function handler(req, res) {
             `,
           ]
         }),
-        txn`
-          INSERT INTO inventory_transactions (transaction_type, source_file, source_hash, applied_units, row_count, applied_by)
-          VALUES (${txnType}, ${sourceName}, ${sourceHash}, ${appliedUnits}, ${applyRows.length}, ${payload.username})
-        `,
         txn`
           DELETE FROM inventory_snapshots
           WHERE id NOT IN (
@@ -402,7 +457,7 @@ export default async function handler(req, res) {
     // ── GET transactions ──────────────────────────────────────────────────────
     if (req.method === 'GET' && action === 'transactions') {
       const rows = await sql`
-        SELECT id, transaction_type, source_file, applied_units, row_count, applied_by, applied_at
+        SELECT id, transaction_type, source_file, applied_units, row_count, applied_by, applied_at, rolled_back_at
         FROM inventory_transactions
         ORDER BY applied_at DESC LIMIT 200
       `
@@ -440,7 +495,11 @@ export default async function handler(req, res) {
       if (!snapId) return res.status(400).json({ error: 'id required' })
       const quantityOnly = req.query.mode === 'quantities'
 
-      const [snap] = await sql`SELECT data FROM inventory_snapshots WHERE id = ${snapId}`
+      const [snap] = await sql`
+        SELECT data, label, source_name, created_at
+        FROM inventory_snapshots
+        WHERE id = ${snapId}
+      `
       if (!snap) return res.status(404).json({ error: 'Snapshot not found' })
 
       const restoreRows = (Array.isArray(snap.data) ? snap.data : []).map((row, index) => ({
@@ -470,6 +529,30 @@ export default async function handler(req, res) {
             COALESCE(SUM(quantity), 0)::int
           FROM inventory_balance
         `,
+        ...(['sales', 'return'].includes(snap.label)
+          ? [txn`
+              UPDATE inventory_transactions
+              SET rolled_back_at = NOW()
+              WHERE id = (
+                SELECT candidate.id
+                FROM inventory_transactions candidate
+                WHERE candidate.rolled_back_at IS NULL
+                  AND (
+                    candidate.rollback_snapshot_id = ${snapId}
+                    OR (
+                      candidate.rollback_snapshot_id IS NULL
+                      AND candidate.transaction_type = ${snap.label}
+                      AND candidate.source_file IS NOT DISTINCT FROM ${snap.source_name}
+                      AND candidate.applied_at >= ${snap.created_at}
+                    )
+                  )
+                ORDER BY
+                  CASE WHEN candidate.rollback_snapshot_id = ${snapId} THEN 0 ELSE 1 END,
+                  candidate.applied_at
+                LIMIT 1
+              )
+            `]
+          : []),
         ...(quantityOnly
           ? [txn`
               INSERT INTO inventory_balance (style, color, size, quantity, sort_order)
