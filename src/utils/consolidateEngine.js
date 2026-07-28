@@ -57,11 +57,6 @@ const STYLE_ALIAS_WITH_COLOR_PREFIX = {
   N95401: ['95401', 'Capri'],
 }
 
-// set 行展开：一行套装 → 每个颜色一行（同尺码同数量）
-const SET_EXPANSIONS = {
-  53058: { set: ['white', 'mid denim', 'light denim'] },
-}
-
 function expandStyleBySize(style, size) {
   // 只扩展**前导零**的 4 位款号（0055/0066/0069…）。1542、8766 这类真实
   // 4 位款号不能碰 —— 无条件扩展是老版本的 bug。
@@ -218,14 +213,18 @@ export function consolidateRows(rows) {
     p.style = resolveStyle(p.style, p.size)
   }
 
-  // Explicit multi-color attributes are safe to split as source data, but the
-  // resulting rows still require an exact database match later. Cross-style SKU
-  // strings are never guessed from the attribute text.
+  // Explicit "&" color lists are safe to split as source data, but the resulting
+  // rows still require an exact database match later. Other combo formats review.
   const expanded = []
   for (const p of parsed) {
-    if (p.style === '62300' && p.color.replace(/[^a-z0-9]/gi, '').toLowerCase() === 'navyx2denim') {
-      expanded.push({ ...p, color: 'navy', qty: p.qty * 2, issue: '', packCount: 1 })
-      expanded.push({ ...p, color: 'denim', issue: '', packCount: 1 })
+    if (p.attr.colors.length > 1) {
+      for (const color of p.attr.colors) expanded.push({ ...p, color, issue: p.issue, packCount: 1 })
+      continue
+    }
+
+    const ampersandColors = p.color.split('&').map(x => x.trim()).filter(Boolean)
+    if (ampersandColors.length > 1) {
+      for (const color of ampersandColors) expanded.push({ ...p, color, issue: p.issue, packCount: 1 })
       continue
     }
 
@@ -235,31 +234,24 @@ export function consolidateRows(rows) {
       continue
     }
 
-    if (p.attr.colors.length > 1) {
-      for (const color of p.attr.colors) expanded.push({ ...p, color, issue: p.issue, packCount: 1 })
-      continue
-    }
-
     if (p.color.includes('+')) {
       const colors = p.color.split('+').map(x => x.trim()).filter(Boolean)
       if (colors.length > 1) {
-        for (const color of colors) expanded.push({ ...p, color, issue: p.issue, packCount: 1 })
+        expanded.push({
+          ...p,
+          packCount: colors.length,
+          issue: appendIssue(p.issue, 'set_components_unknown'),
+        })
         continue
       }
     }
 
-    const map = SET_EXPANSIONS[p.style]
-    const colors = map && map[p.color.trim().toLowerCase()]
-    if (colors) {
-      for (const color of colors) expanded.push({ ...p, color, issue: '', packCount: 1 })
-    } else {
-      const unknownSet = p.attr.packCount > 1 || p.attr.mentionsSet || /set/i.test(p.color)
-      expanded.push({
-        ...p,
-        packCount: p.attr.packCount || 1,
-        issue: unknownSet ? appendIssue(p.issue, 'set_components_unknown') : p.issue,
-      })
-    }
+    const unknownSet = p.attr.packCount > 1 || p.attr.mentionsSet || /set/i.test(p.color)
+    expanded.push({
+      ...p,
+      packCount: p.attr.packCount || 1,
+      issue: unknownSet ? appendIssue(p.issue, 'set_components_unknown') : p.issue,
+    })
   }
   parsed = expanded
 

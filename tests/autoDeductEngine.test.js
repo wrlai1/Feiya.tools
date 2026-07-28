@@ -26,6 +26,119 @@ test('petite sales sizes are shifted exactly once', () => {
   )
 })
 
+test('explicit ampersand color combinations split for any style', () => {
+  const withAttribute = consolidateRows([
+    {
+      SKU: 'A100Black&Denim&WhiteM',
+      'Product Attribute': 'Black&Denim&White / M',
+      Quantity: 2,
+    },
+  ])
+  const fromSkuOnly = consolidateRows([
+    { SKU: 'B200Navy&KhakiL', Quantity: 1 },
+  ])
+
+  assert.deepEqual(
+    withAttribute.consolidated.map(({ style, color, size, QTY }) => ({ style, color, size, QTY })),
+    [
+      { style: 'A100', color: 'black', size: 'M', QTY: 2 },
+      { style: 'A100', color: 'denim', size: 'M', QTY: 2 },
+      { style: 'A100', color: 'white', size: 'M', QTY: 2 },
+    ],
+  )
+  assert.deepEqual(
+    fromSkuOnly.consolidated.map(({ style, color, size, QTY }) => ({ style, color, size, QTY })),
+    [
+      { style: 'B200', color: 'khaki', size: 'L', QTY: 1 },
+      { style: 'B200', color: 'navy', size: 'L', QTY: 1 },
+    ],
+  )
+})
+
+test('non-ampersand color combinations require confirmation', () => {
+  const result = consolidateRows([
+    { SKU: 'A100Black+WhiteS', Quantity: 2 },
+    { SKU: '53058setM', Quantity: 1 },
+  ])
+
+  assert.equal(result.consolidated.length, 2)
+  const plusCombo = result.consolidated.find((row) => row.style === 'A100')
+  const namedSet = result.consolidated.find((row) => row.style === '53058')
+  assert.equal(plusCombo.parse_issue, 'set_components_unknown')
+  assert.equal(plusCombo.pack_count, 2)
+  assert.equal(namedSet.parse_issue, 'set_components_unknown')
+  assert.equal(result.needsReview.length, 2)
+})
+
+test('M022 routes missy and plus sizes before inventory matching', () => {
+  const salesRows = consolidateRows([
+    {
+      SKU: 'M022Black&DenimS',
+      'Product Attribute': 'Black&Denim / S',
+      Quantity: 1,
+    },
+    {
+      SKU: 'M022Black&Denim1XL',
+      'Product Attribute': 'Black&Denim / 1XL',
+      Quantity: 2,
+    },
+  ]).consolidated
+  const result = fillTemplate([
+    { STYLE: 'M022 Missy', COLOR: 'BLACK', SIZE: 'S' },
+    { STYLE: 'M022 Missy', COLOR: 'DENIM', SIZE: 'S' },
+    { STYLE: 'M022 PLUS', COLOR: 'BLACK', SIZE: '1X' },
+    { STYLE: 'M022 PLUS', COLOR: 'DENIM', SIZE: '1X' },
+  ], salesRows)
+
+  assert.deepEqual(
+    result.filledRows.filter((row) => row.QTY),
+    [
+      { STYLE: 'M022 Missy', COLOR: 'BLACK', SIZE: 'S', QTY: 1 },
+      { STYLE: 'M022 Missy', COLOR: 'DENIM', SIZE: 'S', QTY: 1 },
+      { STYLE: 'M022 PLUS', COLOR: 'BLACK', SIZE: '1X', QTY: 2 },
+      { STYLE: 'M022 PLUS', COLOR: 'DENIM', SIZE: '1X', QTY: 2 },
+    ],
+  )
+  assert.equal(result.unmatchedRows.length, 0)
+})
+
+test('M022 unknown sizes require confirmation', () => {
+  const result = fillTemplate([
+    { STYLE: 'M022', COLOR: 'BLACK', SIZE: 'XXL' },
+  ], [
+    { style: 'M022', color: 'black', size: 'XXL', QTY: 1 },
+  ])
+
+  assert.equal(result.filledRows.reduce((sum, row) => sum + row.QTY, 0), 0)
+  assert.equal(result.unmatchedRows[0].parseIssue, 'm022_size_unknown')
+})
+
+test('existing M022 color confirmations remain valid across missy and plus', () => {
+  const aliases = {
+    [aliasKey('M022', 'melon')]: {
+      STYLE: 'M022 Missy',
+      COLOR: 'CANYON ROSE',
+      _confirmed: true,
+    },
+  }
+  const result = fillTemplate([
+    { STYLE: 'M022 Missy', COLOR: 'CANYON ROSE', SIZE: 'M' },
+    { STYLE: 'M022 PLUS', COLOR: 'CANYON ROSE', SIZE: '2X' },
+  ], [
+    { style: 'M022', color: 'melon', size: 'M', QTY: 1 },
+    { style: 'M022', color: 'melon', size: '2XL', QTY: 2 },
+  ], aliases)
+
+  assert.deepEqual(
+    result.filledRows.filter((row) => row.QTY),
+    [
+      { STYLE: 'M022 Missy', COLOR: 'CANYON ROSE', SIZE: 'M', QTY: 1 },
+      { STYLE: 'M022 PLUS', COLOR: 'CANYON ROSE', SIZE: '2X', QTY: 2 },
+    ],
+  )
+  assert.equal(result.unmatchedRows.length, 0)
+})
+
 test('numeric color codes remain distinct inventory identities', () => {
   const templateRows = [
     { STYLE: '5010149', COLOR: 'Ponte Print 32#', SIZE: 'S' },

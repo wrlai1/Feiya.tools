@@ -8,6 +8,7 @@ const REVIEW_REASONS = {
   ambiguous_inventory_color: 'More than one inventory color has the same cleaned identity.',
   confirmed_mapping_requires_review: 'This saved mapping changes style or uses a combo and must be confirmed again.',
   confirmed_mapping_size_missing: 'The previously confirmed target does not contain this exact size.',
+  m022_size_unknown: 'M022 must use S–XL for Missy or 1X–3X for Plus.',
 }
 
 function DeferredSearchInput({ value, onCommit, onFocus }) {

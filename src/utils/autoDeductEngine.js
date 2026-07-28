@@ -76,6 +76,16 @@ export function normalizeSize(s) {
     .replace(/^([123])XL$/, '$1X')   // 1XL→1X, 2XL→2X, 3XL→3X
 }
 
+const M022_MISSY_SIZES = new Set(['S', 'M', 'L', 'XL'])
+const M022_PLUS_SIZES = new Set(['1X', '2X', '3X'])
+
+function m022InventoryStyle(style, normalizedSize) {
+  if (normalizeStyleIdentity(style) !== 'm022') return ''
+  if (M022_MISSY_SIZES.has(normalizedSize)) return 'M022 Missy'
+  if (M022_PLUS_SIZES.has(normalizedSize)) return 'M022 PLUS'
+  return null
+}
+
 // ── Fuzzy helpers ─────────────────────────────────────────────────────────────
 
 /**
@@ -317,26 +327,34 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
     }
     if (!qty) return
     const packCount = Math.max(1, parseInt(row.pack_count || row.packCount, 10) || 1)
-    const parseIssue = String(row.parse_issue || row.parseIssue || '')
+    let parseIssue = String(row.parse_issue || row.parseIssue || '')
     if (!style) {
       srcTotal += qty * packCount
       unmatchedRows.push({ style, color, size: normalizeSize(rawSize), qty, packCount, parseIssue: parseIssue || 'missing_style' })
       return
     }
-    const normStyle = normalizeStyle(style)
     // Consolidated rows already contain warehouse sizes. Petite conversion must
     // happen exactly once in consolidateRows, never again during matching.
     const normSize  = normalizeSize(rawSize)
+    const routedM022Style = m022InventoryStyle(style, normSize)
+    if (routedM022Style === null) {
+      parseIssue = [...new Set([...parseIssue.split(';'), 'm022_size_unknown'].filter(Boolean))].join(';')
+    }
+    const matchStyle = routedM022Style || style
+    const normStyle = normalizeStyle(matchStyle)
     const key       = `${normStyle}||${normSize}`
     let candidates = buckets.get(key) || []
     const baseAliasKey = aliasKey(style, color)
     const savedSizeAlias = aliases[aliasKey(style, color, normSize)]
     const savedGeneralAlias = aliases[baseAliasKey]
-    const aliasTarget = asConfirmedAlias(savedSizeAlias, true)
+    let aliasTarget = asConfirmedAlias(savedSizeAlias, true)
       || savedSizeAlias
       || asConfirmedAlias(savedGeneralAlias)
       || savedGeneralAlias
       || inferConfirmedStyleColorAlias(aliases, baseAliasKey)
+    if (routedM022Style && aliasTarget?._confirmed && !Array.isArray(aliasTarget.components)) {
+      aliasTarget = { ...aliasTarget, STYLE: routedM022Style }
+    }
 
     const confirmedStyleColorRule = aliasTarget?._confirmed === true
     const confirmedComboRule = confirmedStyleColorRule && Array.isArray(aliasTarget?.components)
@@ -465,7 +483,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
 
     const hadLooseStyleCandidates = candidates.length > 0
     candidates = candidates.filter((candidate) =>
-      normalizeStyleIdentity(candidate.style) === normalizeStyleIdentity(style)
+      normalizeStyleIdentity(candidate.style) === normalizeStyleIdentity(matchStyle)
     )
 
     if (!candidates?.length && target) {
