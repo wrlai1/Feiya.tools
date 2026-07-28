@@ -2,6 +2,17 @@ import { normalizeColor, normalizeSize, normalizeStyleIdentity } from './autoDed
 
 const sourceColorKey = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '')
 
+const REUSABLE_REVIEW_ISSUES = new Set([
+  'style_identity_mismatch',
+  'ambiguous_inventory_style',
+  'ambiguous_inventory_color',
+  'confirmed_mapping_size_missing',
+])
+
+function canReuseAcrossSizes(issue) {
+  return !issue || REUSABLE_REVIEW_ISSUES.has(issue)
+}
+
 /**
  * Find unresolved sibling rows that can safely reuse a confirmed link.
  * The source style/color must be identical after basic cleanup, only the size may
@@ -15,7 +26,7 @@ export function findAdditionalSizeMappings({
   targetEntry,
 }) {
   const source = unmatchedRows[sourceIndex]
-  if (!source || source.packCount > 1 || source.parseIssue) return []
+  if (!source || source.packCount > 1 || !canReuseAcrossSizes(source.parseIssue)) return []
 
   const sourceStyle = normalizeStyleIdentity(source.style)
   const sourceColor = sourceColorKey(source.color)
@@ -24,7 +35,13 @@ export function findAdditionalSizeMappings({
   if (normalizeSize(targetEntry.SIZE) !== normalizeSize(source.size)) return []
 
   return unmatchedRows.flatMap((row, index) => {
-    if (index === sourceIndex || resolved[index] || row.packCount > 1 || row.parseIssue) return []
+    if (
+      index === sourceIndex
+      || resolved[index]
+      || row.packCount > 1
+      || row.parseIssue !== source.parseIssue
+      || !canReuseAcrossSizes(row.parseIssue)
+    ) return []
     if (normalizeStyleIdentity(row.style) !== sourceStyle || sourceColorKey(row.color) !== sourceColor) return []
 
     const targetSize = normalizeSize(row.size)

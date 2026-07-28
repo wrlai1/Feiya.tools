@@ -382,24 +382,34 @@ export default function AutoDeduct() {
     const learned = {}
     for (const item of items) {
       if (!item._learnAlias || !item._source) continue
-      // Combo and cross-style links remain manual review items. Only remember an
-      // exact source style/color/size → same-style inventory target.
+      // A simple human-confirmed link is stable at style+color level. Future
+      // sizes reuse it only when the exact target size exists in inventory.
       if (item._isCombo) continue
-      const sourceStyle = normalizeStyleIdentity(item._source.style)
-      const targetStyle = normalizeStyleIdentity(item.STYLE)
-      if (sourceStyle !== targetStyle) continue
       const aliasValue = {
           STYLE: item.STYLE,
           COLOR: item.COLOR,
-          SIZE: item.SIZE,
           _isNew: !!item._isNew,
+          _confirmed: true,
         }
-      learned[aliasKey(item._source.style, item._source.color, item._source.size)] = aliasValue
+      if (item._isNew) {
+        learned[aliasKey(item._source.style, item._source.color, item._source.size)] = {
+          ...aliasValue,
+          SIZE: item.SIZE,
+        }
+      } else {
+        learned[aliasKey(item._source.style, item._source.color)] = aliasValue
+      }
     }
     const learnedCount = Object.keys(learned).length
     if (learnedCount || resolutionAliasKeys.length) {
       const nextAliases = { ...aliases }
       for (const key of resolutionAliasKeys) delete nextAliases[key]
+      for (const [key, value] of Object.entries(learned)) {
+        if (value._isNew || value.SIZE) continue
+        for (const existingKey of Object.keys(nextAliases)) {
+          if (existingKey.startsWith(`${key}::`)) delete nextAliases[existingKey]
+        }
+      }
       Object.assign(nextAliases, learned)
       setAliases(nextAliases)
       setResolutionAliasKeys(Object.keys(learned))

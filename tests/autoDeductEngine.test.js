@@ -6,6 +6,7 @@ import {
   fillTemplate,
 } from '../src/utils/autoDeductEngine.js'
 import { consolidateRows } from '../src/utils/consolidateEngine.js'
+import { findAdditionalSizeMappings } from '../src/utils/autoDeductRules.js'
 
 test('petite sales sizes are shifted exactly once', () => {
   const salesRows = consolidateRows([
@@ -98,7 +99,7 @@ test('learned colors do not collide through semantic aliases', () => {
   assert.equal(fuschia.filledRows.find((row) => row.QTY)?.COLOR, 'FUSCHIA')
 })
 
-test('cross-style learned mappings always return to manual review', () => {
+test('existing human-confirmed cross-style mappings remain trusted', () => {
   const aliases = {
     [aliasKey('STYLE-A', 'black', 'S')]: {
       STYLE: 'STYLE-B',
@@ -112,11 +113,14 @@ test('cross-style learned mappings always return to manual review', () => {
     aliases,
   )
 
-  assert.equal(result.filledRows.reduce((sum, row) => sum + row.QTY, 0), 0)
-  assert.equal(result.unmatchedRows[0].parseIssue, 'confirmed_mapping_requires_review')
+  assert.deepEqual(
+    result.filledRows.filter((row) => row.QTY),
+    [{ STYLE: 'STYLE-B', COLOR: 'BLACK', SIZE: 'S', QTY: 2 }],
+  )
+  assert.equal(result.unmatchedRows.length, 0)
 })
 
-test('learned mappings apply only to the confirmed size', () => {
+test('existing confirmed size mappings safely extend to other available sizes', () => {
   const templateRows = [
     { STYLE: '50073', COLOR: 'DARK DENIM', SIZE: 'S' },
     { STYLE: '50073', COLOR: 'DARK DENIM', SIZE: 'M' },
@@ -132,8 +136,92 @@ test('learned mappings apply only to the confirmed size', () => {
     { style: '50073', color: 'dark', size: 'M', QTY: 1 },
   ], aliases)
 
+  assert.deepEqual(
+    result.filledRows.filter((row) => row.QTY),
+    [{ STYLE: '50073', COLOR: 'DARK DENIM', SIZE: 'M', QTY: 1 }],
+  )
+  assert.equal(result.unmatchedRows.length, 0)
+})
+
+test('human-confirmed cross-style color rule reuses exact target sizes', () => {
+  const aliases = {
+    [aliasKey('SOURCE-1', 'Black')]: {
+      STYLE: 'TARGET-9',
+      COLOR: 'JET BLACK',
+      _confirmed: true,
+    },
+  }
+  const result = fillTemplate([
+    { STYLE: 'TARGET-9', COLOR: 'JET BLACK', SIZE: 'S' },
+    { STYLE: 'TARGET-9', COLOR: 'JET BLACK', SIZE: 'M' },
+  ], [
+    { style: 'SOURCE-1', color: 'Black', size: 'M', QTY: 2 },
+  ], aliases)
+
+  assert.deepEqual(
+    result.filledRows.filter((row) => row.QTY),
+    [{ STYLE: 'TARGET-9', COLOR: 'JET BLACK', SIZE: 'M', QTY: 2 }],
+  )
+  assert.equal(result.unmatchedRows.length, 0)
+})
+
+test('confirmed style and color rule supports the equivalent 1X and 1XL labels', () => {
+  const aliases = {
+    [aliasKey('SOURCE-1', 'Black')]: {
+      STYLE: 'TARGET-9',
+      COLOR: 'JET BLACK',
+      _confirmed: true,
+    },
+  }
+  const result = fillTemplate([
+    { STYLE: 'TARGET-9', COLOR: 'JET BLACK', SIZE: '1XL' },
+  ], [
+    { style: 'SOURCE-1', color: 'Black', size: '1X', QTY: 1 },
+  ], aliases)
+
+  assert.deepEqual(
+    result.filledRows.filter((row) => row.QTY),
+    [{ STYLE: 'TARGET-9', COLOR: 'JET BLACK', SIZE: '1XL', QTY: 1 }],
+  )
+})
+
+test('confirmed style and color rule stops when target size does not exist', () => {
+  const aliases = {
+    [aliasKey('SOURCE-1', 'Black')]: {
+      STYLE: 'TARGET-9',
+      COLOR: 'JET BLACK',
+      _confirmed: true,
+    },
+  }
+  const result = fillTemplate([
+    { STYLE: 'TARGET-9', COLOR: 'JET BLACK', SIZE: 'S' },
+  ], [
+    { style: 'SOURCE-1', color: 'Black', size: 'M', QTY: 2 },
+  ], aliases)
+
   assert.equal(result.filledRows.reduce((sum, row) => sum + row.QTY, 0), 0)
-  assert.equal(result.unmatchedRows.length, 1)
+  assert.equal(result.unmatchedRows[0].parseIssue, 'confirmed_mapping_size_missing')
+})
+
+test('combo mappings still require review for every source row', () => {
+  const aliases = {
+    [aliasKey('SET-1', 'Black Navy')]: {
+      components: [
+        { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S' },
+        { STYLE: 'B200', COLOR: 'NAVY', SIZE: 'S' },
+      ],
+      _confirmed: true,
+    },
+  }
+  const result = fillTemplate([
+    { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S' },
+    { STYLE: 'B200', COLOR: 'NAVY', SIZE: 'S' },
+  ], [
+    { style: 'SET-1', color: 'Black Navy', size: 'S', QTY: 1 },
+  ], aliases)
+
+  assert.equal(result.filledRows.reduce((sum, row) => sum + row.QTY, 0), 0)
+  assert.equal(result.unmatchedRows[0].parseIssue, 'confirmed_mapping_requires_review')
 })
 
 test('learned mapping cannot bypass a source parsing warning', () => {
@@ -174,4 +262,45 @@ test('invalid source quantities stop the run instead of being partially parsed',
     () => consolidateRows([{ SKU: 'A100BlackS', Quantity: 'one' }]),
     /数量无效/,
   )
+})
+
+test('a confirmed style and color safely carries to sibling sizes during review', () => {
+  const mappings = findAdditionalSizeMappings({
+    unmatchedRows: [
+      { style: 'A-100', color: 'Black', size: 'S', packCount: 1, parseIssue: 'style_identity_mismatch' },
+      { style: 'A-100', color: 'Black', size: 'M', packCount: 1, parseIssue: 'style_identity_mismatch' },
+      { style: 'A-100', color: 'Navy', size: 'M', packCount: 1, parseIssue: 'style_identity_mismatch' },
+    ],
+    templateRows: [
+      { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S' },
+      { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'M' },
+      { STYLE: 'A100', COLOR: 'NAVY', SIZE: 'M' },
+    ],
+    resolved: [null, null, null],
+    sourceIndex: 0,
+    targetEntry: { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S' },
+  })
+
+  assert.deepEqual(mappings, [{
+    index: 1,
+    entry: { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'M' },
+  }])
+})
+
+test('set and cross-style combo review rows never carry across sizes', () => {
+  const mappings = findAdditionalSizeMappings({
+    unmatchedRows: [
+      { style: 'A100', color: 'Black+Navy', size: 'S', packCount: 1, parseIssue: 'cross_style_combo' },
+      { style: 'A100', color: 'Black+Navy', size: 'M', packCount: 1, parseIssue: 'cross_style_combo' },
+    ],
+    templateRows: [
+      { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S' },
+      { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'M' },
+    ],
+    resolved: [null, null],
+    sourceIndex: 0,
+    targetEntry: { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S' },
+  })
+
+  assert.deepEqual(mappings, [])
 })

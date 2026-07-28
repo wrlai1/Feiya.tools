@@ -228,13 +228,33 @@ export function aliasKey(style, salesColor, size = '') {
   return normSize ? `${base}::${normSize}` : base
 }
 
+function asConfirmedSimpleAlias(value, keepSize = false) {
+  if (!value || Array.isArray(value.components) || value._isNew) return null
+  if (typeof value === 'string') return { COLOR: value, _confirmed: true }
+  return { ...value, SIZE: keepSize ? value.SIZE : undefined, _confirmed: true }
+}
+
+function inferConfirmedStyleColorAlias(aliases, baseKey) {
+  const targets = Object.entries(aliases)
+    .filter(([key]) => key.startsWith(`${baseKey}::`))
+    .map(([, value]) => asConfirmedSimpleAlias(value))
+    .filter(Boolean)
+  if (!targets.length) return null
+
+  const fingerprints = new Set(targets.map((target) =>
+    `${String(target.STYLE || '')}\u0000${String(target.COLOR || '')}`
+  ))
+  return fingerprints.size === 1 ? targets[0] : null
+}
+
 /**
  * Match sales rows against the template and accumulate quantities.
  *
  * @param {Array}  templateRows  - parsed template CSV rows {STYLE, COLOR, SIZE}
  * @param {Array}  salesRows     - parsed sales CSV rows {style, color, size, QTY}
- * @param {Object} aliases       - confirmed same-style, size-specific overrides,
- *                                 keyed by aliasKey(style, color, size).
+ * @param {Object} aliases       - human-confirmed overrides. A style+color rule
+ *                                 reuses the current source size only when that
+ *                                 exact target size exists in inventory.
  * @returns {{ filledRows, unmatchedRows, stats }}
  */
 export function fillTemplate(templateRows, salesRows, aliases = {}) {
@@ -287,40 +307,60 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
     const normSize  = normalizeSize(rawSize)
     const key       = `${normStyle}||${normSize}`
     let candidates = buckets.get(key) || []
-    const aliasTarget = aliases[aliasKey(style, color, normSize)]
+    const baseAliasKey = aliasKey(style, color)
+    const savedSizeAlias = aliases[aliasKey(style, color, normSize)]
+    const savedGeneralAlias = aliases[baseAliasKey]
+    const aliasTarget = asConfirmedSimpleAlias(savedSizeAlias, true)
+      || savedSizeAlias
+      || asConfirmedSimpleAlias(savedGeneralAlias)
+      || savedGeneralAlias
+      || inferConfirmedStyleColorAlias(aliases, baseAliasKey)
     srcTotal += qty * packCount
 
-    // Cross-style and combo mappings always require a fresh human review. They
-    // are valid business cases, but are too risky to reuse silently.
+    // Combo mappings always require fresh review. A cross-style mapping can only
+    // auto-apply when it came from an explicit human-confirmed style+color rule.
+    const confirmedStyleColorRule = aliasTarget?._confirmed === true
     const aliasNeedsReview = Array.isArray(aliasTarget?.components)
-      || (aliasTarget?.STYLE && normalizeStyleIdentity(aliasTarget.STYLE) !== normalizeStyleIdentity(style))
+      || (
+        aliasTarget?.STYLE
+        && normalizeStyleIdentity(aliasTarget.STYLE) !== normalizeStyleIdentity(style)
+        && !confirmedStyleColorRule
+      )
     if (aliasNeedsReview) {
       unmatchedRows.push({ style, color, size: normSize, qty, packCount, parseIssue: parseIssue || 'confirmed_mapping_requires_review' })
       return
     }
 
     // ── Learned alias ──────────────────────────────────────────────────────────
-    // Only a previously confirmed same-style, same-size Link can auto-match.
-    // Combo and cross-style mappings always return to review.
+    // A confirmed style+color rule reuses the current source size. Target style,
+    // color, and size still have to exist exactly in the current inventory.
     const target = typeof aliasTarget === 'string' ? { COLOR: aliasTarget } : aliasTarget
     const applyAliasTarget = (pool = []) => {
       const matchTarget = (wanted, items) => {
         const wantStyle = String(wanted.STYLE || '').trim()
         const wantColor = String(wanted.COLOR || '').trim()
-        const wantSize = String(wanted.SIZE || normSize).trim()
-        return items.find(c => {
+        const wantSize = normalizeSize(wanted.SIZE || normSize)
+        const matches = items.filter(c => {
           const styleOk = !wantStyle || c.style === wantStyle
           const colorOk = !wantColor || c.color === wantColor
-          const sizeOk = !wantSize || c.size === wantSize
+          const sizeOk = !wantSize || normalizeSize(c.size) === wantSize
           return styleOk && colorOk && sizeOk
         })
+        return matches.length === 1 ? matches[0] : null
       }
 
-      const matched = matchTarget({
+      let matched = matchTarget({
         STYLE: target.STYLE,
         COLOR: target.COLOR,
         SIZE: target.SIZE || normSize,
       }, pool)
+      if (!matched && confirmedStyleColorRule && target.STYLE) {
+        matched = matchTarget({
+          STYLE: target.STYLE,
+          COLOR: target.COLOR,
+          SIZE: target.SIZE || normSize,
+        }, entries)
+      }
       if (matched) {
         matched.qty += qty
         filledTotal += qty

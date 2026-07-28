@@ -438,6 +438,7 @@ export default async function handler(req, res) {
       if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
       const snapId = parseInt(req.query.id, 10)
       if (!snapId) return res.status(400).json({ error: 'id required' })
+      const quantityOnly = req.query.mode === 'quantities'
 
       const [snap] = await sql`SELECT data FROM inventory_snapshots WHERE id = ${snapId}`
       if (!snap) return res.status(404).json({ error: 'Snapshot not found' })
@@ -455,12 +456,12 @@ export default async function handler(req, res) {
       if (invalidRow) return res.status(409).json({ error: 'This rollback point contains invalid inventory data and cannot be restored safely.' })
 
       const totalUnits = restoreRows.reduce((sum, row) => sum + row.quantity, 0)
-      await sql.transaction((txn) => [
+      const transactionResults = await sql.transaction((txn) => [
         txn`
           INSERT INTO inventory_snapshots (label, source_name, data, total_rows, total_units)
           SELECT
             'pre_restore',
-            ${`Rollback point ${snapId}`},
+            ${`${quantityOnly ? 'Quantity rollback' : 'Rollback'} point ${snapId}`},
             COALESCE(jsonb_agg(jsonb_build_object(
               'style', style, 'color', color, 'size', size, 'quantity', quantity,
               'sort_order', sort_order
@@ -469,25 +470,41 @@ export default async function handler(req, res) {
             COALESCE(SUM(quantity), 0)::int
           FROM inventory_balance
         `,
-        txn`DELETE FROM inventory_balance`,
-        txn`
-          INSERT INTO inventory_balance (style, color, size, quantity, sort_order)
-          SELECT restored.style, restored.color, restored.size, restored.quantity, restored.sort_order
-          FROM jsonb_to_recordset(${JSON.stringify(restoreRows)}::jsonb)
-            AS restored(style TEXT, color TEXT, size TEXT, quantity INTEGER, sort_order INTEGER)
-        `,
+        ...(quantityOnly
+          ? [txn`
+              INSERT INTO inventory_balance (style, color, size, quantity, sort_order)
+              SELECT restored.style, restored.color, restored.size, restored.quantity, restored.sort_order
+              FROM jsonb_to_recordset(${JSON.stringify(restoreRows)}::jsonb)
+                AS restored(style TEXT, color TEXT, size TEXT, quantity INTEGER, sort_order INTEGER)
+              ON CONFLICT (style, color, size)
+              DO UPDATE SET quantity = EXCLUDED.quantity, updated_at = NOW()
+            `]
+          : [
+              txn`DELETE FROM inventory_balance`,
+              txn`
+                INSERT INTO inventory_balance (style, color, size, quantity, sort_order)
+                SELECT restored.style, restored.color, restored.size, restored.quantity, restored.sort_order
+                FROM jsonb_to_recordset(${JSON.stringify(restoreRows)}::jsonb)
+                  AS restored(style TEXT, color TEXT, size TEXT, quantity INTEGER, sort_order INTEGER)
+              `,
+            ]),
         txn`
           DELETE FROM inventory_snapshots
           WHERE id NOT IN (
             SELECT id FROM inventory_snapshots ORDER BY created_at DESC LIMIT ${MAX_SNAPSHOTS}
           )
         `,
+        txn`
+          SELECT COUNT(*)::int AS total_rows, COALESCE(SUM(quantity), 0)::int AS total_units
+          FROM inventory_balance
+        `,
       ], { isolationLevel: 'Serializable' })
 
+      const [restoredStats] = transactionResults[transactionResults.length - 1]
       return res.json({
         ok: true,
-        total_units: totalUnits,
-        total_rows: restoreRows.length,
+        total_units: restoredStats?.total_units ?? totalUnits,
+        total_rows: restoredStats?.total_rows ?? restoreRows.length,
       })
     }
 

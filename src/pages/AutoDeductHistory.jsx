@@ -54,9 +54,9 @@ export default function AutoDeductHistory() {
         ? 'the add-back'
         : 'the previous rollback'
     const confirmed = window.confirm(
-      `Restore the entire inventory balance to ${formatDate(snapshot.created_at || snapshot.timestamp)}?\n\n` +
-      `This returns inventory to the state before ${action}${snapshot.source_name ? ` for ${snapshot.source_name}` : ''}.\n` +
-      `Every inventory change made after that point will also be removed from the current balance.\n\n` +
+      `Restore saved inventory quantities from ${formatDate(snapshot.created_at || snapshot.timestamp)}?\n\n` +
+      `This restores quantities from before ${action}${snapshot.source_name ? ` for ${snapshot.source_name}` : ''}.\n` +
+      `Styles, colors, and sizes added after that point will be kept.\n\n` +
       `The current balance will be saved as a new backup first.`
     )
     if (!confirmed) return
@@ -64,7 +64,7 @@ export default function AutoDeductHistory() {
     setRestoring(snapshot.id)
     setError('')
     try {
-      const res = await fetch(`/api/inventory-balance?action=restore&id=${snapshot.id}`, {
+      const res = await fetch(`/api/inventory-balance?action=restore&id=${snapshot.id}&mode=quantities`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${getToken()}` },
       })
@@ -119,7 +119,7 @@ export default function AutoDeductHistory() {
           <div className="mt-3 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
             <p>
-              Rollback restores the entire inventory balance to that saved point. Later deductions, returns, and manual edits will also be reverted. Your current balance is backed up automatically first.
+              Rollback restores saved quantities but keeps styles, colors, and sizes added later. Quantity changes made after that point to the saved SKUs will be reverted. Your current balance is backed up automatically first.
             </p>
           </div>
         </div>
