@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   BarChart3,
   CheckCircle2,
+  ClipboardList,
   Database,
   FileSpreadsheet,
   Minus,
@@ -22,6 +23,7 @@ import {
   resolveProductCatalogRows,
   resolveReturnManifestPackages,
 } from '../utils/returnImportEngine.js'
+import { parseOrderHistoryRows } from '../utils/orderImportEngine.js'
 
 const BASE = '/api'
 
@@ -42,6 +44,27 @@ const DEMO_PACKAGE = {
     { id: 'demo-khaki', sku_id: 'DEMO-SKU', sku_code: '62300SETM', style: '62300SET', color: 'KHAKI', size: 'M', expected_qty: 1 },
     { id: 'demo-white', sku_id: 'DEMO-SKU', sku_code: '62300SETM', style: '62300SET', color: 'WHITE', size: 'M', expected_qty: 1 },
   ],
+  related_orders: [{
+    order_key: 'PO-DEMO-1',
+    order_number: 'PO-DEMO-1',
+    store_key: 'demo store',
+    store_name: 'Demo Store',
+    status: 'Delivered',
+    items: [{
+      id: 'demo-order-item',
+      sku_id: 'DEMO-SKU',
+      sku_code: '62300SETM',
+      attributes: 'Black & Denim & Khaki & White / M',
+      quantity: 1,
+      outbound_trackings: ['1Z-OUTBOUND-DEMO'],
+      catalog_components: [
+        { style: '62300SET', color: 'BLACK', size: 'M', qty: 1 },
+        { style: '62300SET', color: 'DENIM', size: 'M', qty: 1 },
+        { style: '62300SET', color: 'KHAKI', size: 'M', qty: 1 },
+        { style: '62300SET', color: 'WHITE', size: 'M', qty: 1 },
+      ],
+    }],
+  }],
 }
 
 function headers(getToken, json = false) {
@@ -115,6 +138,60 @@ function CountControl({ value, onChange, disabled, max = 9999, label = 'Actual q
   )
 }
 
+function OrderDetails({ order, compact = false }) {
+  if (!order) return null
+  return (
+    <div className={`rounded-xl border border-indigo-100 bg-indigo-50/60 ${compact ? 'p-3' : 'p-4 sm:p-5'}`}>
+      <div className="flex flex-wrap items-center gap-2">
+        <ClipboardList className="h-4 w-4 text-indigo-600" />
+        <p className="font-semibold text-slate-900">{order.order_number}</p>
+        {order.store_name && (
+          <span className="rounded-full bg-white px-2 py-0.5 text-xs font-medium text-indigo-700">
+            {order.store_name}
+          </span>
+        )}
+        {order.status && (
+          <span className="rounded-full bg-white px-2 py-0.5 text-xs text-slate-600">{order.status}</span>
+        )}
+      </div>
+      <div className="mt-3 space-y-2">
+        {(order.items || []).map((item) => (
+          <div key={item.id || `${item.sku_code}-${item.attributes}`} className="rounded-lg bg-white p-3">
+            <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
+              <div className="min-w-0">
+                <p className="break-words text-sm font-semibold text-slate-800">{item.sku_code}</p>
+                <p className="mt-0.5 text-xs text-slate-500">{item.attributes}</p>
+                {item.sku_id && <p className="mt-1 text-[11px] text-slate-400">SKU ID {item.sku_id}</p>}
+              </div>
+              <span className="mt-1 shrink-0 text-sm font-bold text-indigo-700 sm:mt-0">
+                Qty {Number(item.quantity || 0)}
+              </span>
+            </div>
+            {Array.isArray(item.catalog_components) && item.catalog_components.length > 0 && (
+              <div className="mt-2 flex flex-wrap gap-1">
+                {item.catalog_components.map((component, index) => (
+                  <span
+                    key={`${component.style}-${component.color}-${component.size}-${index}`}
+                    className="rounded-md bg-slate-100 px-2 py-1 text-[11px] text-slate-600"
+                  >
+                    {component.style} / {component.color} / {component.size}
+                    {Number(component.qty || 1) > 1 ? ` ×${component.qty}` : ''}
+                  </span>
+                ))}
+              </div>
+            )}
+            {item.outbound_trackings?.length > 0 && (
+              <p className="mt-2 break-all text-[11px] text-slate-400">
+                Original shipment: {item.outbound_trackings.join(' · ')}
+              </p>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 export default function ReturnsReceiving() {
   const { user, getToken } = useAuth()
   const toast = useToast()
@@ -140,6 +217,12 @@ export default function ReturnsReceiving() {
   const [catalogUploading, setCatalogUploading] = useState(false)
   const [analytics, setAnalytics] = useState(null)
   const [analyticsDays, setAnalyticsDays] = useState(30)
+  const [orderOnly, setOrderOnly] = useState(null)
+  const [orderChoices, setOrderChoices] = useState([])
+  const [orderFile, setOrderFile] = useState(null)
+  const [orderParsed, setOrderParsed] = useState(null)
+  const [orderUploading, setOrderUploading] = useState(false)
+  const [orderStats, setOrderStats] = useState([])
 
   const loadRecent = useCallback(async () => {
     if (demoMode) {
@@ -176,7 +259,7 @@ export default function ReturnsReceiving() {
     return () => cancelAnimationFrame(frame)
   }, [demoMode, loadRecent, loadStores])
 
-  const lookup = useCallback(async (value = tracking) => {
+  const lookup = useCallback(async (value = tracking, orderStore = '') => {
     const query = String(value || '').trim()
     if (!query) return
     if (demoMode) {
@@ -192,6 +275,8 @@ export default function ReturnsReceiving() {
     }
     setLoading(true)
     setPkg(null)
+    setOrderOnly(null)
+    setOrderChoices([])
     setCounted(false)
     setRemark('')
     try {
@@ -199,7 +284,24 @@ export default function ReturnsReceiving() {
         headers: headers(getToken),
       })
       const data = await res.json().catch(() => ({}))
-      if (!res.ok) throw new Error(data.error || 'Return package not found')
+      if (!res.ok) {
+        const orderRes = await fetch(
+          `${BASE}/returns?action=order-lookup&order=${encodeURIComponent(query)}${
+            orderStore ? `&store=${encodeURIComponent(orderStore)}` : ''
+          }`,
+          { headers: headers(getToken) },
+        )
+        const orderData = await orderRes.json().catch(() => ({}))
+        if (orderRes.status === 409 && Array.isArray(orderData.stores)) {
+          setOrderChoices(orderData.stores)
+          setTracking(query)
+          return
+        }
+        if (!orderRes.ok) throw new Error(orderData.error || data.error || 'Return package or order not found')
+        setOrderOnly(orderData.order)
+        setTracking(orderData.order.order_number)
+        return
+      }
       const next = data.package
       setPkg(next)
       setTracking(next.tracking_number)
@@ -216,7 +318,7 @@ export default function ReturnsReceiving() {
       ))
       setRemark(next.remark || '')
     } catch (error) {
-      toast.error(error.message, 'Tracking Not Found')
+      toast.error(error.message, 'Tracking or Order Not Found')
       setTracking('')
       requestAnimationFrame(() => scannerRef.current?.focus())
     } finally {
@@ -440,6 +542,106 @@ export default function ReturnsReceiving() {
     }
   }
 
+  const loadOrderStats = useCallback(async () => {
+    if (!isAdmin || demoMode) return
+    const res = await fetch(`${BASE}/returns?action=order-stats`, { headers: headers(getToken) })
+    const data = await res.json().catch(() => ({}))
+    if (res.ok) setOrderStats(data.stores || [])
+  }, [demoMode, getToken, isAdmin])
+
+  const parseOrderFile = async (nextFile) => {
+    setOrderFile(nextFile)
+    setOrderParsed(null)
+    if (!nextFile) return
+    if (!storeName.trim()) {
+      toast.error('Enter the store name before reading its order history', 'Store Required')
+      return
+    }
+    try {
+      const bytes = await nextFile.arrayBuffer()
+      const digest = await crypto.subtle.digest('SHA-256', bytes)
+      const sourceHash = [...new Uint8Array(digest)]
+        .map((byte) => byte.toString(16).padStart(2, '0'))
+        .join('')
+      const XLSX = await import('xlsx')
+      const workbook = XLSX.read(bytes, { type: 'array' })
+      const sheetName = workbook.SheetNames.find((name) => name.trim().toUpperCase() === 'TEMU-STYLES')
+        || workbook.SheetNames[0]
+      const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { raw: false, defval: '' })
+      const result = parseOrderHistoryRows(rows)
+      setOrderParsed({ ...result, sourceHash })
+      if (result.conflicts.length) {
+        toast.warning(
+          `${result.conflicts.length} shared SKU货号 mappings will remain separate by platform SKU ID`,
+          'SKU IDs Kept Separate',
+        )
+      } else if (result.skippedRows.length) {
+        toast.warning(
+          `${result.skippedRows.length} incomplete rows will be skipped`,
+          'Incomplete Order Rows',
+        )
+      }
+    } catch (error) {
+      toast.error(error.message, 'Could Not Read Order File')
+    }
+  }
+
+  const uploadOrders = async () => {
+    if (!orderParsed?.orders?.length || !storeName.trim() || orderUploading) return
+    setOrderUploading(true)
+    try {
+      const batches = []
+      for (let index = 0; index < orderParsed.orders.length; index += 500) {
+        batches.push(orderParsed.orders.slice(index, index + 500))
+      }
+      const totals = {
+        newOrders: 0,
+        existingOrders: 0,
+        newItems: 0,
+        existingItems: 0,
+        conflicts: [],
+      }
+      for (let index = 0; index < batches.length; index += 1) {
+        const res = await fetch(`${BASE}/returns?action=orders-import`, {
+          method: 'POST',
+          headers: headers(getToken, true),
+          body: JSON.stringify({
+            storeName: storeName.trim(),
+            sourceFile: orderFile?.name || '',
+            sourceHash: orderParsed.sourceHash,
+            batchIndex: index,
+            orders: batches[index],
+          }),
+        })
+        const data = await res.json().catch(() => ({}))
+        if (!res.ok) throw new Error(data.error || `Could not upload order batch ${index + 1}`)
+        totals.newOrders += Number(data.new_orders || 0)
+        totals.existingOrders += Number(data.existing_orders || 0)
+        totals.newItems += Number(data.new_items || 0)
+        totals.existingItems += Number(data.existing_items || 0)
+        totals.conflicts.push(...(data.conflicts || []))
+      }
+      if (totals.conflicts.length) {
+        toast.warning(
+          `${totals.conflicts.length} existing order items were different and were not overwritten`,
+          'Order Conflicts Protected',
+        )
+      } else {
+        toast.success(
+          `${totals.newOrders.toLocaleString()} new · ${totals.existingOrders.toLocaleString()} already known`,
+          `${storeName.trim()} Orders Imported`,
+        )
+      }
+      setOrderFile(null)
+      setOrderParsed(null)
+      await Promise.all([loadOrderStats(), loadStores()])
+    } catch (error) {
+      toast.error(error.message, 'Order Upload Failed')
+    } finally {
+      setOrderUploading(false)
+    }
+  }
+
   const loadAnalytics = useCallback(async () => {
     if (!isAdmin) return
     setLoading(true)
@@ -459,13 +661,15 @@ export default function ReturnsReceiving() {
 
   useEffect(() => {
     if (tab === 'analytics') loadAnalytics()
-  }, [loadAnalytics, tab])
+    if (tab === 'orders') loadOrderStats()
+  }, [loadAnalytics, loadOrderStats, tab])
 
   const tabs = [
     { id: 'receive', label: 'Scan & Receive', shortLabel: 'Scan', icon: ScanLine },
     ...(isAdmin ? [
       { id: 'upload', label: 'Upload Manifest', shortLabel: 'Returns', icon: Upload },
       { id: 'catalog', label: 'Product Catalogs', shortLabel: 'Products', icon: Database },
+      { id: 'orders', label: 'Order History', shortLabel: 'Orders', icon: ClipboardList },
       { id: 'analytics', label: 'Return Analytics', shortLabel: 'Stats', icon: BarChart3 },
     ] : []),
   ]
@@ -508,7 +712,7 @@ export default function ReturnsReceiving() {
             className="card p-4 sm:p-5"
           >
             <label className="text-sm font-semibold text-slate-800" htmlFor="return-tracking">
-              Scan return package
+              Scan return package or find an order
             </label>
             <div className="mt-2 flex gap-2">
               <div className="relative min-w-0 flex-1">
@@ -520,7 +724,7 @@ export default function ReturnsReceiving() {
                   onChange={(event) => setTracking(event.target.value)}
                   autoComplete="off"
                   spellCheck="false"
-                  placeholder="Scan or enter tracking number"
+                  placeholder="Scan tracking or enter order number"
                   className="h-12 w-full rounded-xl border border-slate-300 bg-white pl-11 pr-3 text-base outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
                 />
               </div>
@@ -529,8 +733,39 @@ export default function ReturnsReceiving() {
                 <span className="hidden sm:inline">Find</span>
               </button>
             </div>
-            <p className="mt-2 text-xs text-slate-400">USB and Bluetooth barcode scanners work as keyboard input. Scan ends with Enter.</p>
+            <p className="mt-2 text-xs text-slate-400">
+              USB and Bluetooth scanners work as keyboard input. An exact order number can also show the original SKUs.
+            </p>
           </form>
+
+          {orderChoices.length > 0 && (
+            <div className="card p-4 sm:p-5">
+              <p className="text-sm font-semibold text-slate-800">
+                This order number exists in more than one store. Choose the store:
+              </p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                {orderChoices.map((store) => (
+                  <button
+                    key={store}
+                    type="button"
+                    onClick={() => lookup(tracking, store)}
+                    className="btn-secondary min-h-11 text-sm"
+                  >
+                    {store}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {orderOnly && (
+            <div className="card p-4 sm:p-5">
+              <OrderDetails order={orderOnly} />
+              <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                This finds the original order only. Scan or upload the return Tracking before receiving inventory.
+              </div>
+            </div>
+          )}
 
           {pkg && (
             <div className="card overflow-hidden">
@@ -578,6 +813,17 @@ export default function ReturnsReceiving() {
                   </button>
                 )}
               </div>
+
+              {pkg.related_orders?.length > 0 && (
+                <div className="space-y-3 border-b border-slate-200 bg-white px-4 py-4 sm:px-5">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                    Original order contents
+                  </p>
+                  {pkg.related_orders.map((order) => (
+                    <OrderDetails key={`${order.store_key}-${order.order_key}`} order={order} compact />
+                  ))}
+                </div>
+              )}
 
               <div className="divide-y divide-slate-100">
                 {pkg.items.map((item) => {
@@ -908,6 +1154,131 @@ export default function ReturnsReceiving() {
                   <p className="font-semibold text-slate-800">{store.store_name}</p>
                   <p className="mt-1 text-sm text-slate-500">
                     {Number(store.ready_count || 0).toLocaleString()} ready / {Number(store.product_count || 0).toLocaleString()} products
+                  </p>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab === 'orders' && isAdmin && (
+        <div className="space-y-4">
+          <div className="card p-5">
+            <div className="flex items-start gap-3">
+              <div className="rounded-xl bg-indigo-50 p-2 text-indigo-600">
+                <ClipboardList className="h-5 w-5" />
+              </div>
+              <div>
+                <h3 className="font-semibold text-slate-900">Historical order data</h3>
+                <p className="mt-1 text-sm text-slate-500">
+                  Choose one store, then upload its TEMU CSV or daily order workbook. Buyer names, phones, emails, and addresses are discarded before upload.
+                </p>
+              </div>
+            </div>
+            <label className="mt-5 block text-sm font-semibold text-slate-700">
+              Store
+              <input
+                list="order-store-options"
+                value={storeName}
+                onChange={(event) => {
+                  setStoreName(event.target.value)
+                  setOrderParsed(null)
+                }}
+                placeholder="House, Garden, Medley…"
+                className="mt-2 h-11 w-full rounded-xl border border-slate-300 bg-white px-3 outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100 sm:max-w-sm"
+              />
+              <datalist id="order-store-options">
+                {stores.map((store) => <option key={store.store_key} value={store.store_name} />)}
+              </datalist>
+            </label>
+            <input
+              type="file"
+              accept=".xlsx,.xls,.csv"
+              onChange={(event) => parseOrderFile(event.target.files?.[0] || null)}
+              className="mt-5 block w-full rounded-xl border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-sm text-slate-600 file:mr-4 file:rounded-lg file:border-0 file:bg-indigo-600 file:px-4 file:py-2 file:text-sm file:font-semibold file:text-white"
+            />
+
+            {orderParsed && (
+              <div className="mt-5 space-y-4">
+                <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+                  {[
+                    ['Orders', orderParsed.stats.orderCount],
+                    ['SKU Lines', orderParsed.stats.itemCount],
+                    ['Units', orderParsed.stats.unitCount],
+                    ['Conflicts', orderParsed.stats.conflicts],
+                  ].map(([label, value]) => (
+                    <div key={label} className={`rounded-xl p-3 ${
+                      label === 'Conflicts' && Number(value) > 0 ? 'bg-red-50' : 'bg-slate-50'
+                    }`}>
+                      <p className="text-xl font-bold text-slate-900">{Number(value).toLocaleString()}</p>
+                      <p className="text-xs text-slate-500">{label}</p>
+                    </div>
+                  ))}
+                </div>
+                {(orderParsed.stats.earliestOrder || orderParsed.stats.latestOrder) && (
+                  <p className="text-xs text-slate-500">
+                    File range:{' '}
+                    {orderParsed.stats.earliestOrder
+                      ? new Date(orderParsed.stats.earliestOrder).toLocaleDateString()
+                      : 'Unknown'}
+                    {' '}–{' '}
+                    {orderParsed.stats.latestOrder
+                      ? new Date(orderParsed.stats.latestOrder).toLocaleDateString()
+                      : 'Unknown'}
+                  </p>
+                )}
+                {orderParsed.skippedRows.length > 0 && (
+                  <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+                    {orderParsed.skippedRows.length} incomplete rows will be skipped. No buyer PII is retained.
+                  </div>
+                )}
+                {orderParsed.conflicts.length > 0 && (
+                  <div className="rounded-xl border border-amber-200 bg-amber-50 p-3">
+                    <p className="text-sm font-semibold text-amber-800">
+                      These rows share a SKU货号 but have different platform SKU IDs. They will remain separate.
+                    </p>
+                    <ul className="mt-2 space-y-1 text-xs text-amber-700">
+                      {orderParsed.conflicts.slice(0, 10).map((item, index) => (
+                        <li key={`${item.orderNumber}-${index}`}>
+                          {item.orderNumber} · {item.skuCode} · {item.existingSkuId} / {item.incomingSkuId}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                <button
+                  type="button"
+                  onClick={uploadOrders}
+                  disabled={orderUploading || !storeName.trim()}
+                  className="btn-primary w-full justify-center py-3 disabled:opacity-50 sm:w-auto"
+                >
+                  {orderUploading
+                    ? <RefreshCw className="h-4 w-4 animate-spin" />
+                    : <Upload className="h-4 w-4" />}
+                  Import {orderParsed.stats.orderCount.toLocaleString()} {storeName.trim() || 'Store'} Orders
+                </button>
+              </div>
+            )}
+          </div>
+
+          {orderStats.length > 0 && (
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+              {orderStats.map((store) => (
+                <div key={store.store_key} className="card p-4">
+                  <p className="font-semibold text-slate-800">{store.store_name}</p>
+                  <p className="mt-1 text-sm text-slate-500">
+                    {Number(store.order_count || 0).toLocaleString()} orders ·{' '}
+                    {Number(store.unit_count || 0).toLocaleString()} units
+                  </p>
+                  <p className="mt-1 text-xs text-slate-400">
+                    {store.earliest_order
+                      ? new Date(store.earliest_order).toLocaleDateString()
+                      : 'No dated orders'}
+                    {' '}–{' '}
+                    {store.latest_order
+                      ? new Date(store.latest_order).toLocaleDateString()
+                      : 'Now'}
                   </p>
                 </div>
               ))}

@@ -11,6 +11,7 @@ import { useAuth } from '../context/AuthContext.jsx'
 import { parseCSV, fillTemplate, generateExcel, aliasKey, normalizeSize, normalizeStyleIdentity } from '../utils/autoDeductEngine.js'
 import ConsolidateStep from '../components/ConsolidateStep.jsx'
 import { consolidateRows } from '../utils/consolidateEngine.js'
+import { parseOrderHistoryRows } from '../utils/orderImportEngine.js'
 
 const BASE = '/api'
 
@@ -205,6 +206,11 @@ export default function AutoDeduct() {
   const [editingResolutions, setEditingResolutions] = useState(false)
   const [resolutionAliasKeys, setResolutionAliasKeys] = useState([])
   const [previewConfirmed, setPreviewConfirmed] = useState(false)
+  const [orderArchive, setOrderArchive] = useState(null)
+  const [orderStore, setOrderStore] = useState(() =>
+    window.localStorage.getItem('auto-deduct-order-store') || ''
+  )
+  const [orderStores, setOrderStores] = useState([])
   const toast = useToast()
 
   // Merge resolver output into filledRows:
@@ -297,8 +303,16 @@ export default function AutoDeduct() {
       .catch(() => setAliases({}))
   }, [getToken, isMock])
 
+  useEffect(() => {
+    if (isMock) return
+    fetch(`${BASE}/returns?action=stores`, { headers: authHeaders(getToken()) })
+      .then((response) => response.json())
+      .then((data) => setOrderStores(data.stores || []))
+      .catch(() => setOrderStores([]))
+  }, [getToken, isMock])
+
   const handleFile = useCallback((file) => {
-    setSrcFile(file); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([]); setSourceHash(''); setEditingResolutions(false); setResolutionAliasKeys([]); setPreviewConfirmed(false)
+    setSrcFile(file); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([]); setSourceHash(''); setEditingResolutions(false); setResolutionAliasKeys([]); setPreviewConfirmed(false); setOrderArchive(null)
   }, [])
 
   const handleRun = useCallback(async () => {
@@ -327,11 +341,14 @@ export default function AutoDeduct() {
       let salesRows
       if (/\.csv$/i.test(srcFile.name)) {
         salesRows = parseCSV(new TextDecoder().decode(bytes))
+        setOrderArchive(null)
       } else {
         const XLSX = await import('xlsx')
         const wb = XLSX.read(bytes, { type: 'array' })
         const sheetName = wb.SheetNames.find(name => name.trim().toUpperCase() === 'TEMU-STYLES') || wb.SheetNames[0]
         const rawRows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { raw: false, defval: '' })
+        const parsedOrders = parseOrderHistoryRows(rawRows)
+        setOrderArchive(parsedOrders)
         salesRows = consolidateRows(rawRows).consolidated
       }
 
@@ -455,6 +472,29 @@ export default function AutoDeduct() {
     }
   }, [result, resolvedExtras, skippedRows, mergedFilledRows, srcFile, toast])
 
+  const archiveDailyOrders = useCallback(async () => {
+    if (txnType !== 'sales' || !orderArchive?.orders?.length) return { conflicts: [] }
+    if (!orderStore.trim()) throw new Error('Choose the store for these orders before applying')
+    const conflicts = []
+    for (let index = 0; index < orderArchive.orders.length; index += 500) {
+      const res = await fetch(`${BASE}/returns?action=orders-import`, {
+        method: 'POST',
+        headers: authHeaders(getToken(), true),
+        body: JSON.stringify({
+          storeName: orderStore.trim(),
+          sourceFile: srcFile?.name || '',
+          sourceHash,
+          batchIndex: Math.floor(index / 500),
+          orders: orderArchive.orders.slice(index, index + 500),
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not archive daily orders')
+      conflicts.push(...(data.conflicts || []))
+    }
+    return { conflicts }
+  }, [getToken, orderArchive, orderStore, sourceHash, srcFile, txnType])
+
   const handleApply = useCallback(async () => {
     if (!mergedFilledRows.length || applying) return
     if (!previewConfirmed) {
@@ -463,6 +503,7 @@ export default function AutoDeduct() {
     }
     setApplying(true)
     try {
+      const archived = await archiveDailyOrders()
       const res = await fetch(`${BASE}/inventory-balance?action=apply`, {
         method:  'POST',
         headers: authHeaders(getToken(), true),
@@ -476,6 +517,12 @@ export default function AutoDeduct() {
       const data = await res.json()
       if (!res.ok) throw new Error(data.error)
       setApplied(true)
+      if (archived.conflicts.length) {
+        toast.warning(
+          `${archived.conflicts.length} order item conflicts were protected and not overwritten`,
+          'Order History Needs Review'
+        )
+      }
       toast.success(
         `${data.applied_units.toLocaleString()} units ${txnType === 'sales' ? 'deducted from inventory' : 'returned to inventory'}`,
         'Inventory Updated'
@@ -485,7 +532,7 @@ export default function AutoDeduct() {
     } finally {
       setApplying(false)
     }
-  }, [mergedFilledRows, txnType, srcFile, sourceHash, applying, getToken, previewConfirmed, toast])
+  }, [archiveDailyOrders, mergedFilledRows, txnType, srcFile, sourceHash, applying, getToken, previewConfirmed, toast])
 
   const stats            = result?.stats
   const hasUnresolved    = result?.unmatchedRows?.length > 0 && resolvedExtras === null
@@ -564,6 +611,31 @@ export default function AutoDeduct() {
           ))}
         </div>
 
+        {txnType === 'sales' && (
+          <label className="block text-sm font-medium text-slate-700">
+            Store for order history
+            <input
+              list="auto-deduct-store-options"
+              value={orderStore}
+              onChange={(event) => {
+                const value = event.target.value
+                setOrderStore(value)
+                window.localStorage.setItem('auto-deduct-order-store', value)
+              }}
+              placeholder="House, Garden, Medley…"
+              className="mt-1.5 h-11 w-full rounded-xl border border-slate-300 bg-white px-3 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 sm:max-w-sm"
+            />
+            <datalist id="auto-deduct-store-options">
+              {orderStores.map((store) => (
+                <option key={store.store_key} value={store.store_name} />
+              ))}
+            </datalist>
+            <span className="mt-1 block text-xs font-normal text-slate-400">
+              Required for TEMU workbooks so their order numbers and SKUs remain searchable after rollback.
+            </span>
+          </label>
+        )}
+
         {/* File upload */}
         <FileUploadZone
           onFile={handleFile}
@@ -572,7 +644,7 @@ export default function AutoDeduct() {
           label="Drag & drop TEMU order / consolidated file here"
           sublabel="TEMU-STYLES is selected automatically"
           currentFile={srcFile}
-          onClear={() => { setSrcFile(null); setResult(null); setApplied(false); setPreviewConfirmed(false) }}
+          onClear={() => { setSrcFile(null); setResult(null); setApplied(false); setPreviewConfirmed(false); setOrderArchive(null) }}
         />
 
         {/* Run button */}
@@ -635,6 +707,17 @@ export default function AutoDeduct() {
               Inventory units to {txnType === 'sales' ? 'deduct' : 'add back'}: <strong className="text-slate-800">{mergedFilledRows.reduce((sum, row) => sum + (Number(row.QTY) || 0), 0).toLocaleString()}</strong>
               {skippedRows.length > 0 && <span className="ml-2 text-amber-600">· {skippedRows.length} skipped row(s) will not be applied</span>}
             </div>
+            {txnType === 'sales' && orderArchive?.orders?.length > 0 && (
+              <div className={`rounded-xl border px-4 py-3 text-sm ${
+                orderStore.trim()
+                  ? 'border-indigo-200 bg-indigo-50 text-indigo-800'
+                  : 'border-amber-200 bg-amber-50 text-amber-800'
+              }`}>
+                {orderStore.trim()
+                  ? `${orderArchive.stats.orderCount.toLocaleString()} orders will also be saved under ${orderStore.trim()}. Inventory rollback will not delete them.`
+                  : 'Choose the store above before applying so these order numbers and SKUs can be saved.'}
+              </div>
+            )}
 
             <details defaultOpen={hasCrossStylePreview} className="overflow-hidden rounded-xl border border-slate-200">
               <summary className="cursor-pointer bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-700">
@@ -714,7 +797,9 @@ export default function AutoDeduct() {
             ) : (
               <button
                 onClick={handleApply}
-                disabled={applying || !previewConfirmed}
+                disabled={applying || !previewConfirmed || (
+                  txnType === 'sales' && orderArchive?.orders?.length > 0 && !orderStore.trim()
+                )}
                 className={`w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
                   txnType === 'sales'
                     ? 'bg-orange-100 hover:bg-orange-200 text-orange-700'
