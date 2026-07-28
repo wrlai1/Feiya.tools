@@ -22,8 +22,15 @@ const COLOR_ALIASES = {
   pinkarrow:   'fuschia',
 }
 
-/** Normalize a color string for fuzzy comparison */
+/** Stable color identity used by exact matches and learned mappings. */
 export function normalizeColor(s) {
+  return String(s)
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '')
+}
+
+/** Looser color key used only to rank review candidates, never to auto-apply. */
+function normalizeFuzzyColor(s) {
   const base = String(s)
     .toLowerCase()
     .replace(/#\s*\d+/g, '')     // remove numeric codes: #2, #1827, #32, "# 51"
@@ -46,6 +53,17 @@ export function normalizeStyle(s) {
 }
 
 /**
+ * Conservative style identity used before any automatic deduction.
+ * Case and spacing are presentation differences; punctuation remains meaningful.
+ */
+export function normalizeStyleIdentity(s) {
+  return String(s)
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '')
+}
+
+/**
  * Normalize a size string.
  * Also maps plus-size variants: 1XL → 1X, 2XL → 2X, 3XL → 3X
  * so sales and template entries match regardless of which convention is used.
@@ -56,12 +74,6 @@ export function normalizeSize(s) {
     .toUpperCase()
     .replace(/\s+/g, '')
     .replace(/^([123])XL$/, '$1X')   // 1XL→1X, 2XL→2X, 3XL→3X
-}
-
-/** TEMU petite labels are one step larger than the warehouse labels. */
-export function normalizeSalesSize(s) {
-  const normalized = normalizeSize(s)
-  return ({ PS: 'PS', PM: 'PS', PL: 'PM', PXL: 'PL' })[normalized] || normalized
 }
 
 // ── Fuzzy helpers ─────────────────────────────────────────────────────────────
@@ -92,8 +104,7 @@ function lcsLength(a, b) {
 function colorTokens(raw) {
   return String(raw)
     .toLowerCase()
-    .replace(/#\s*\d+/g, ' ')    // remove numeric codes
-    .replace(/[^a-z\s]/g, ' ')  // non-alpha → space
+    .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/)
     .map(t => t.trim())
     .filter(t => t.length >= 2) // keep 2+ char tokens (catches "tr", "nv" etc.)
@@ -132,14 +143,10 @@ const PATTERN_WORDS = new Set([
  *   5. Proportional substring                                   → < threshold
  */
 function colorScore(templateColor, salesColor) {
-  const exact = (value) => String(value)
-    .toLowerCase()
-    .replace(/#\s*\d+/g, '')
-    .replace(/[^a-z]/g, '')
-  const exactTemplate = exact(templateColor)
-  const exactSales = exact(salesColor)
-  const tc = normalizeColor(templateColor)
-  const sc = normalizeColor(salesColor)
+  const exactTemplate = normalizeColor(templateColor)
+  const exactSales = normalizeColor(salesColor)
+  const tc = normalizeFuzzyColor(templateColor)
+  const sc = normalizeFuzzyColor(salesColor)
   if (!tc || !sc) return 0
   if (exactTemplate && exactTemplate === exactSales) return 1.0
 
@@ -216,41 +223,9 @@ export function parseCSV(text) {
 
 /** Build the lookup key for a learned alias: style + sales-color + optional size. */
 export function aliasKey(style, salesColor, size = '') {
-  const base = `${normalizeStyle(style)}::${normalizeColor(salesColor)}`
-  const normSize = normalizeSalesSize(size)
+  const base = `${normalizeStyleIdentity(style)}::${normalizeColor(salesColor)}`
+  const normSize = normalizeSize(size)
   return normSize ? `${base}::${normSize}` : base
-}
-
-// Older saved choices only have a size-specific key. Reuse them across sizes
-// when every saved size agrees on the same target style/color (and combo mix).
-function inferLegacyGeneralAlias(aliases, baseKey) {
-  const sourceStyle = baseKey.split('::')[0]
-  const targets = Object.entries(aliases)
-    .filter(([key, value]) => key.startsWith(`${baseKey}::`) && value && !value._isNew)
-    .map(([, value]) => value)
-
-  if (!targets.length) return null
-
-  const fingerprint = (target) => {
-    if (typeof target === 'string') return `single::${sourceStyle}::${normalizeColor(target)}`
-    if (Array.isArray(target.components) && target.components.length) {
-      return `combo::${target.components.map(component => [
-        normalizeStyle(component.STYLE || ''),
-        normalizeColor(component.COLOR || ''),
-        Math.max(1, parseInt(component.multiplier, 10) || 1),
-      ].join('::')).join('||')}`
-    }
-    return `single::${normalizeStyle(target.STYLE || '')}::${normalizeColor(target.COLOR || '')}`
-  }
-
-  if (new Set(targets.map(fingerprint)).size !== 1) return null
-
-  const target = targets[0]
-  if (typeof target === 'string') return target
-  if (Array.isArray(target.components) && target.components.length) {
-    return { components: target.components.map(component => ({ ...component, SIZE: undefined })) }
-  }
-  return { ...target, SIZE: undefined }
 }
 
 /**
@@ -258,11 +233,8 @@ function inferLegacyGeneralAlias(aliases, baseKey) {
  *
  * @param {Array}  templateRows  - parsed template CSV rows {STYLE, COLOR, SIZE}
  * @param {Array}  salesRows     - parsed sales CSV rows {style, color, size, QTY}
- * @param {Object} aliases       - learned style-scoped overrides, keyed by aliasKey():
- *                                 { "<normStyle>::<normSalesColor>": "<template COLOR>" }.
- *                                 A hit forces the row to that template color, skipping
- *                                 fuzzy scoring entirely. Style-scoped on purpose — "mid"
- *                                 means MID DENIM for one style, MEDIUM for another.
+ * @param {Object} aliases       - confirmed same-style, size-specific overrides,
+ *                                 keyed by aliasKey(style, color, size).
  * @returns {{ filledRows, unmatchedRows, stats }}
  */
 export function fillTemplate(templateRows, salesRows, aliases = {}) {
@@ -295,85 +267,104 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
     const style    = String(row.style || row.STYLE || '').trim()
     const color    = String(row.color || row.COLOR || '').trim()
     const rawSize  = String(row.size  || row.SIZE  || '').trim()
-    const qty      = parseInt(row.QTY || row.qty || 0, 10) || 0
+    const rawQty   = row.QTY ?? row.qty ?? 0
+    const qty      = Number(rawQty)
 
+    if (!Number.isSafeInteger(qty) || qty < 0) {
+      throw new Error(`Invalid quantity "${rawQty}" for ${style || 'unknown style'}. Use a whole number of units.`)
+    }
     if (!qty) return
     const packCount = Math.max(1, parseInt(row.pack_count || row.packCount, 10) || 1)
     const parseIssue = String(row.parse_issue || row.parseIssue || '')
     if (!style) {
       srcTotal += qty * packCount
-      unmatchedRows.push({ style, color, size: normalizeSalesSize(rawSize), qty, packCount, parseIssue: parseIssue || 'missing_style' })
+      unmatchedRows.push({ style, color, size: normalizeSize(rawSize), qty, packCount, parseIssue: parseIssue || 'missing_style' })
       return
     }
     const normStyle = normalizeStyle(style)
-    const normSize  = normalizeSalesSize(rawSize)
+    // Consolidated rows already contain warehouse sizes. Petite conversion must
+    // happen exactly once in consolidateRows, never again during matching.
+    const normSize  = normalizeSize(rawSize)
     const key       = `${normStyle}||${normSize}`
     let candidates = buckets.get(key) || []
-    const baseAliasKey = aliasKey(style, color)
     const aliasTarget = aliases[aliasKey(style, color, normSize)]
-      || aliases[baseAliasKey]
-      || inferLegacyGeneralAlias(aliases, baseAliasKey)
-    const aliasComponentCount = Array.isArray(aliasTarget?.components)
-      ? aliasTarget.components.reduce((sum, component) => sum + Math.max(1, parseInt(component.multiplier, 10) || 1), 0)
-      : 0
-    srcTotal += qty * (aliasComponentCount || packCount)
+    srcTotal += qty * packCount
 
-    // ── Learned alias — a previous human "Link" or "Combo" wins outright ────────
-    // If the user has taught us what this (style, color) means, fill that template
-    // color directly and skip fuzzy scoring. Combo aliases split one source row into
-    // multiple template rows, each receiving the source quantity.
+    // Cross-style and combo mappings always require a fresh human review. They
+    // are valid business cases, but are too risky to reuse silently.
+    const aliasNeedsReview = Array.isArray(aliasTarget?.components)
+      || (aliasTarget?.STYLE && normalizeStyleIdentity(aliasTarget.STYLE) !== normalizeStyleIdentity(style))
+    if (aliasNeedsReview) {
+      unmatchedRows.push({ style, color, size: normSize, qty, packCount, parseIssue: parseIssue || 'confirmed_mapping_requires_review' })
+      return
+    }
+
+    // ── Learned alias ──────────────────────────────────────────────────────────
+    // Only a previously confirmed same-style, same-size Link can auto-match.
+    // Combo and cross-style mappings always return to review.
     const target = typeof aliasTarget === 'string' ? { COLOR: aliasTarget } : aliasTarget
     const applyAliasTarget = (pool = []) => {
       const matchTarget = (wanted, items) => {
-        const wantStyle = normalizeStyle(wanted.STYLE || '')
-        const wantColor = normalizeColor(wanted.COLOR || '')
-        const wantSize = normalizeSize(wanted.SIZE || normSize)
+        const wantStyle = String(wanted.STYLE || '').trim()
+        const wantColor = String(wanted.COLOR || '').trim()
+        const wantSize = String(wanted.SIZE || normSize).trim()
         return items.find(c => {
-          const styleOk = !wantStyle || normalizeStyle(c.style) === wantStyle
-          const colorOk = !wantColor || normalizeColor(c.color) === wantColor
-          const sizeOk = !wantSize || normalizeSize(c.size) === wantSize
+          const styleOk = !wantStyle || c.style === wantStyle
+          const colorOk = !wantColor || c.color === wantColor
+          const sizeOk = !wantSize || c.size === wantSize
           return styleOk && colorOk && sizeOk
         })
       }
 
-      if (Array.isArray(target?.components) && target.components.length) {
-        const matches = target.components.map(component => matchTarget(component, entries))
-        if (matches.some(match => !match)) return false
-        for (const [i, matched] of matches.entries()) {
-          const multiplier = Math.max(1, parseInt(target.components[i].multiplier, 10) || 1)
-          matched.qty += qty * multiplier
-        }
-        filledTotal += qty * target.components.reduce((sum, component) => sum + Math.max(1, parseInt(component.multiplier, 10) || 1), 0)
+      const matched = matchTarget({
+        STYLE: target.STYLE,
+        COLOR: target.COLOR,
+        SIZE: target.SIZE || normSize,
+      }, pool)
+      if (matched) {
+        matched.qty += qty
+        filledTotal += qty
         matchLog.push({
           style,
           salesColor: color,
           size: normSize,
           qty,
-          matchedTo: target.components.map(c => `${c.STYLE}/${c.COLOR}/${c.SIZE}`).join(' + '),
-          via: 'alias combo',
+          targetStyle: matched.style,
+          targetColor: matched.color,
+          targetSize: matched.size,
+          via: 'confirmed',
         })
-        return true
-      }
-
-      const wantStyle = normalizeStyle(target.STYLE || '')
-      const wantColor = normalizeColor(target.COLOR || '')
-      const wantSize = normalizeSize(target.SIZE || normSize)
-      const matchIn = (items) => matchTarget({ STYLE: wantStyle, COLOR: wantColor, SIZE: wantSize }, items)
-      const matched = matchIn(pool) || (wantStyle ? matchIn(entries) : null)
-      if (matched) {
-        matched.qty += qty
-        filledTotal += qty
-        matchLog.push({ style, salesColor: color, size: normSize, qty, matchedTo: matched.color, via: 'alias' })
         return true
       }
       if (target._isNew && target.STYLE && target.COLOR) {
         entries.push({ style: target.STYLE, color: target.COLOR, size: target.SIZE || normSize, qty })
         filledTotal += qty
-        matchLog.push({ style, salesColor: color, size: normSize, qty, matchedTo: target.COLOR, via: 'alias new' })
+        matchLog.push({
+          style,
+          salesColor: color,
+          size: normSize,
+          qty,
+          targetStyle: target.STYLE,
+          targetColor: target.COLOR,
+          targetSize: target.SIZE || normSize,
+          via: 'confirmed new',
+        })
         return true
       }
       return false
     }
+
+    // Parsing uncertainty always requires a fresh human decision. A learned
+    // mapping must never hide a malformed or ambiguous source description.
+    if (parseIssue) {
+      unmatchedRows.push({ style, color, size: normSize, qty, packCount, parseIssue })
+      return
+    }
+
+    const hadLooseStyleCandidates = candidates.length > 0
+    candidates = candidates.filter((candidate) =>
+      normalizeStyleIdentity(candidate.style) === normalizeStyleIdentity(style)
+    )
 
     if (!candidates?.length && target) {
       if (applyAliasTarget([])) return
@@ -381,19 +372,42 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
       return
     }
 
-    if (parseIssue && !aliasTarget) {
-      unmatchedRows.push({ style, color, size: normSize, qty, packCount, parseIssue })
+    if (!candidates?.length) {
+      unmatchedRows.push({
+        style,
+        color,
+        size: normSize,
+        qty,
+        packCount,
+        parseIssue: hadLooseStyleCandidates ? 'style_identity_mismatch' : parseIssue,
+      })
       return
     }
 
-    if (!candidates?.length) {
-      unmatchedRows.push({ style, color, size: normSize, qty, packCount, parseIssue })
+    if (!aliasTarget && new Set(candidates.map((candidate) => candidate.style)).size > 1) {
+      unmatchedRows.push({ style, color, size: normSize, qty, packCount, parseIssue: 'ambiguous_inventory_style' })
       return
     }
 
     if (aliasTarget) {
       if (applyAliasTarget(candidates)) return
       unmatchedRows.push({ style, color, size: normSize, qty, packCount, parseIssue: parseIssue || 'confirmed_mapping_size_missing' })
+      return
+    }
+
+    // Fail closed if destructive cleanup would make two differently named
+    // inventory colors share one exact identity.
+    const exactIdentity = normalizeColor(color)
+    const exactTargets = new Map(
+      candidates
+        .filter((candidate) => normalizeColor(candidate.color) === exactIdentity)
+        .map((candidate) => [
+          `${candidate.style}\u0000${candidate.color}\u0000${candidate.size}`,
+          candidate,
+        ]),
+    )
+    if (exactTargets.size > 1) {
+      unmatchedRows.push({ style, color, size: normSize, qty, packCount, parseIssue: 'ambiguous_inventory_color' })
       return
     }
 
@@ -420,12 +434,20 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
     if (passing.length === 1) chosen = passing[0].idx
 
     if (chosen >= 0) {
-      candidates[chosen].qty += qty
+      const matched = candidates[chosen]
+      matched.qty += qty
       filledTotal += qty
       const chosenScore = passing.find(p => p.idx === chosen)?.score ?? 0
-      if (chosenScore < 0.999) {
-        matchLog.push({ style, salesColor: color, size: normSize, qty, matchedTo: candidates[chosen].color, via: `fuzzy ${chosenScore.toFixed(2)}` })
-      }
+      matchLog.push({
+        style,
+        salesColor: color,
+        size: normSize,
+        qty,
+        targetStyle: matched.style,
+        targetColor: matched.color,
+        targetSize: matched.size,
+        via: chosenScore >= 0.999 ? 'exact' : `fuzzy ${chosenScore.toFixed(2)}`,
+      })
     } else {
       unmatchedRows.push({ style, color, size: normSize, qty, packCount, parseIssue })
     }

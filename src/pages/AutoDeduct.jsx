@@ -8,7 +8,7 @@ import FileUploadZone from '../components/FileUploadZone.jsx'
 import UnmatchedResolver from '../components/UnmatchedResolver.jsx'
 import { useToast } from '../hooks/useToast.js'
 import { useAuth } from '../context/AuthContext.jsx'
-import { parseCSV, fillTemplate, generateExcel, aliasKey } from '../utils/autoDeductEngine.js'
+import { parseCSV, fillTemplate, generateExcel, aliasKey, normalizeStyleIdentity } from '../utils/autoDeductEngine.js'
 import ConsolidateStep from '../components/ConsolidateStep.jsx'
 import { consolidateRows } from '../utils/consolidateEngine.js'
 
@@ -204,6 +204,7 @@ export default function AutoDeduct() {
   const [sourceHash,      setSourceHash]      = useState('')
   const [editingResolutions, setEditingResolutions] = useState(false)
   const [resolutionAliasKeys, setResolutionAliasKeys] = useState([])
+  const [previewConfirmed, setPreviewConfirmed] = useState(false)
   const toast = useToast()
 
   // Merge resolver output into filledRows:
@@ -225,7 +226,7 @@ export default function AutoDeduct() {
         continue
       }
       if (extra._isNew) {
-        rows.push({ STYLE: extra.STYLE, COLOR: extra.COLOR, SIZE: extra.SIZE, QTY: extra.QTY })
+        rows.push({ STYLE: extra.STYLE, COLOR: extra.COLOR, SIZE: extra.SIZE, QTY: extra.QTY, allowCreate: true })
       } else {
         const found = rows.find(r => r.STYLE === extra.STYLE && r.COLOR === extra.COLOR && r.SIZE === extra.SIZE)
         if (found) found.QTY = (found.QTY || 0) + extra.QTY
@@ -234,6 +235,51 @@ export default function AutoDeduct() {
     }
     return rows
   }, [result, resolvedExtras])
+
+  const deductionPreview = useMemo(() => {
+    const preview = (result?.matchLog || []).map((match) => ({
+      sourceStyle: match.style,
+      sourceColor: match.salesColor,
+      sourceSize: match.size,
+      targetStyle: match.targetStyle,
+      targetColor: match.targetColor,
+      targetSize: match.targetSize,
+      qty: match.qty,
+      via: match.via,
+    }))
+    for (const extra of resolvedExtras || []) {
+      if (extra._isCombo && Array.isArray(extra.components)) {
+        for (const component of extra.components) {
+          preview.push({
+            sourceStyle: extra._source?.style,
+            sourceColor: extra._source?.color,
+            sourceSize: extra._source?.size,
+            targetStyle: component.STYLE,
+            targetColor: component.COLOR,
+            targetSize: component.SIZE,
+            qty: extra.QTY * Math.max(1, parseInt(component.multiplier, 10) || 1),
+            via: 'manual combo',
+          })
+        }
+      } else {
+        preview.push({
+          sourceStyle: extra._source?.style,
+          sourceColor: extra._source?.color,
+          sourceSize: extra._source?.size,
+          targetStyle: extra.STYLE,
+          targetColor: extra.COLOR,
+          targetSize: extra.SIZE,
+          qty: extra.QTY,
+          via: extra._isNew ? 'manual new' : 'manual',
+        })
+      }
+    }
+    return preview
+  }, [result, resolvedExtras])
+
+  const hasCrossStylePreview = deductionPreview.some((item) =>
+    normalizeStyleIdentity(item.sourceStyle) !== normalizeStyleIdentity(item.targetStyle)
+  )
 
   useEffect(() => {
     if (isMock) { setTemplateRows(MOCK_TEMPLATE); return }
@@ -252,19 +298,19 @@ export default function AutoDeduct() {
   }, [getToken, isMock])
 
   const handleFile = useCallback((file) => {
-    setSrcFile(file); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([]); setSourceHash(''); setEditingResolutions(false); setResolutionAliasKeys([])
+    setSrcFile(file); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([]); setSourceHash(''); setEditingResolutions(false); setResolutionAliasKeys([]); setPreviewConfirmed(false)
   }, [])
 
   const handleRun = useCallback(async () => {
     if (isMock) {
       setResult(MOCK_RESULT)
       setTemplateRows(MOCK_TEMPLATE)
-      setApplied(false); setResolvedExtras(null); setSkippedRows([]); setEditingResolutions(false); setResolutionAliasKeys([])
+      setApplied(false); setResolvedExtras(null); setSkippedRows([]); setEditingResolutions(false); setResolutionAliasKeys([]); setPreviewConfirmed(false)
       toast.info('3 rows need review', 'Mock Run Complete')
       return
     }
     if (!srcFile || processing) return
-    setProcessing(true); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([]); setEditingResolutions(false); setResolutionAliasKeys([])
+    setProcessing(true); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([]); setEditingResolutions(false); setResolutionAliasKeys([]); setPreviewConfirmed(false)
     try {
       // 1. Fetch template from inventory balance (canonical SKU list)
       const tRes  = await fetch(`${BASE}/inventory-balance?action=list`, { headers: authHeaders(getToken()) })
@@ -332,27 +378,25 @@ export default function AutoDeduct() {
     setResolvedExtras(items)
     setSkippedRows(skipped)
     setEditingResolutions(false)
+    setPreviewConfirmed(false)
     const learned = {}
     for (const item of items) {
       if (!item._learnAlias || !item._source) continue
-      const aliasValue = item._isCombo
-        ? { components: item.components || [] }
-        : {
+      // Combo and cross-style links remain manual review items. Only remember an
+      // exact source style/color/size → same-style inventory target.
+      if (item._isCombo) continue
+      const sourceStyle = normalizeStyleIdentity(item._source.style)
+      const targetStyle = normalizeStyleIdentity(item.STYLE)
+      if (sourceStyle !== targetStyle) continue
+      const aliasValue = {
           STYLE: item.STYLE,
           COLOR: item.COLOR,
           SIZE: item.SIZE,
           _isNew: !!item._isNew,
         }
-      // Also remember a style+color rule that can reuse the source size next time.
-      // Never generalise a newly-created SKU: another size must be confirmed first.
-      if (!item._isNew) {
-        learned[aliasKey(item._source.style, item._source.color)] = item._isCombo
-          ? { components: (item.components || []).map(component => ({ ...component, SIZE: undefined })) }
-          : { ...aliasValue, SIZE: undefined }
-      }
       learned[aliasKey(item._source.style, item._source.color, item._source.size)] = aliasValue
     }
-    const learnedCount = items.filter((item) => item._learnAlias && item._source).length
+    const learnedCount = Object.keys(learned).length
     if (learnedCount || resolutionAliasKeys.length) {
       const nextAliases = { ...aliases }
       for (const key of resolutionAliasKeys) delete nextAliases[key]
@@ -391,6 +435,10 @@ export default function AutoDeduct() {
 
   const handleApply = useCallback(async () => {
     if (!mergedFilledRows.length || applying) return
+    if (!previewConfirmed) {
+      toast.error('Review the source-to-inventory preview and confirm it before applying.', 'Review Required')
+      return
+    }
     setApplying(true)
     try {
       const res = await fetch(`${BASE}/inventory-balance?action=apply`, {
@@ -415,7 +463,7 @@ export default function AutoDeduct() {
     } finally {
       setApplying(false)
     }
-  }, [mergedFilledRows, txnType, srcFile, sourceHash, applying, getToken, toast])
+  }, [mergedFilledRows, txnType, srcFile, sourceHash, applying, getToken, previewConfirmed, toast])
 
   const stats            = result?.stats
   const hasUnresolved    = result?.unmatchedRows?.length > 0 && resolvedExtras === null
@@ -484,7 +532,7 @@ export default function AutoDeduct() {
             { id: 'sales',  label: 'Sales — Deduct',    icon: Minus,       active: 'text-orange-600' },
             { id: 'return', label: 'Return — Add Back', icon: TrendingUp,  active: 'text-green-600'  },
           ].map(({ id, label, icon: Icon, active }) => (
-            <button key={id} onClick={() => setTxnType(id)}
+            <button key={id} onClick={() => { setTxnType(id); setPreviewConfirmed(false) }}
               className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${
                 txnType === id ? `bg-white shadow-sm ${active}` : 'text-slate-500 hover:text-slate-700'
               }`}>
@@ -502,7 +550,7 @@ export default function AutoDeduct() {
           label="Drag & drop TEMU order / consolidated file here"
           sublabel="TEMU-STYLES is selected automatically"
           currentFile={srcFile}
-          onClear={() => { setSrcFile(null); setResult(null); setApplied(false) }}
+          onClear={() => { setSrcFile(null); setResult(null); setApplied(false); setPreviewConfirmed(false) }}
         />
 
         {/* Run button */}
@@ -566,8 +614,67 @@ export default function AutoDeduct() {
               {skippedRows.length > 0 && <span className="ml-2 text-amber-600">· {skippedRows.length} skipped row(s) will not be applied</span>}
             </div>
 
+            <details defaultOpen={hasCrossStylePreview} className="overflow-hidden rounded-xl border border-slate-200">
+              <summary className="cursor-pointer bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-700">
+                Review source → inventory targets ({deductionPreview.length.toLocaleString()} mappings)
+              </summary>
+              <div className="max-h-80 overflow-auto">
+                <table className="w-full min-w-[760px] text-left text-xs">
+                  <thead className="sticky top-0 bg-white text-slate-400">
+                    <tr className="border-b border-slate-100">
+                      <th className="px-3 py-2 font-semibold">Source</th>
+                      <th className="px-3 py-2 font-semibold">Inventory target</th>
+                      <th className="px-3 py-2 text-right font-semibold">Qty</th>
+                      <th className="px-3 py-2 font-semibold">Method</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {deductionPreview.map((item, index) => {
+                      const sourceStyle = normalizeStyleIdentity(item.sourceStyle)
+                      const targetStyle = normalizeStyleIdentity(item.targetStyle)
+                      const crossStyle = sourceStyle !== targetStyle
+                      return (
+                        <tr key={`${index}-${item.sourceStyle}-${item.sourceColor}-${item.sourceSize}`} className={crossStyle ? 'bg-red-50' : ''}>
+                          <td className="px-3 py-2 text-slate-600">
+                            <span className="font-mono font-semibold text-slate-800">{item.sourceStyle || '—'}</span>
+                            <span className="mx-1 text-slate-300">/</span>{item.sourceColor || '—'}
+                            <span className="mx-1 text-slate-300">/</span>{item.sourceSize || '—'}
+                          </td>
+                          <td className="px-3 py-2 text-slate-600">
+                            <span className="font-mono font-semibold text-slate-800">{item.targetStyle || '—'}</span>
+                            <span className="mx-1 text-slate-300">/</span>{item.targetColor || '—'}
+                            <span className="mx-1 text-slate-300">/</span>{item.targetSize || '—'}
+                            {crossStyle && <span className="ml-2 rounded-full bg-red-100 px-2 py-0.5 font-bold text-red-700">Cross-style</span>}
+                          </td>
+                          <td className="px-3 py-2 text-right font-bold tabular-nums text-slate-800">{Number(item.qty || 0).toLocaleString()}</td>
+                          <td className="px-3 py-2 text-slate-500">{item.via}</td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </details>
+
+            {hasCrossStylePreview && (
+              <div className="flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                Cross-style manual links are highlighted above. Confirm that every target style is intentional before applying.
+              </div>
+            )}
+
+            <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm text-indigo-900">
+              <input
+                type="checkbox"
+                checked={previewConfirmed}
+                onChange={(event) => setPreviewConfirmed(event.target.checked)}
+                className="mt-0.5 h-4 w-4 rounded border-indigo-300 text-indigo-600"
+              />
+              <span>I reviewed the target style, color, size, and quantity for these mappings.</span>
+            </label>
+
             {hasReviewRows && !applied && (
-              <button onClick={() => setEditingResolutions(true)} className="btn-secondary w-full justify-center py-2.5">
+              <button onClick={() => { setEditingResolutions(true); setPreviewConfirmed(false) }} className="btn-secondary w-full justify-center py-2.5">
                 Review / Edit Resolutions
               </button>
             )}
@@ -585,7 +692,7 @@ export default function AutoDeduct() {
             ) : (
               <button
                 onClick={handleApply}
-                disabled={applying}
+                disabled={applying || !previewConfirmed}
                 className={`w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
                   txnType === 'sales'
                     ? 'bg-orange-100 hover:bg-orange-200 text-orange-700'

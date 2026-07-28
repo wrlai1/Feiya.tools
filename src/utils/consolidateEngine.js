@@ -160,6 +160,15 @@ export function consolidateRows(rows) {
   if (!styleKey) throw new Error('找不到 Style/SKU 列')
   if (!qtyKey) throw new Error('找不到 Quantity/Qty/数量 列')
 
+  const invalidQtyIndex = rows.findIndex((row) => {
+    const raw = row[qtyKey]
+    const qty = Number(raw)
+    return String(raw ?? '').trim() === '' || !Number.isSafeInteger(qty) || qty < 0
+  })
+  if (invalidQtyIndex >= 0) {
+    throw new Error(`第 ${invalidQtyIndex + 2} 行数量无效；Quantity 必须是 0 或正整数`)
+  }
+
   const origTotal = rows.reduce((s, r) => s + (Number(r[qtyKey]) || 0), 0)
 
   // 解析每一行

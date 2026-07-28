@@ -2,6 +2,14 @@ import React, { useEffect, useState, useMemo } from 'react'
 import { Search, Plus, SkipForward, CheckCircle, X, Link2, ChevronDown, RotateCcw } from 'lucide-react'
 import { findAdditionalSizeMappings } from '../utils/autoDeductRules.js'
 
+const REVIEW_REASONS = {
+  style_identity_mismatch: 'The style punctuation differs from inventory, so it was not matched automatically.',
+  ambiguous_inventory_style: 'More than one inventory style could match this source style.',
+  ambiguous_inventory_color: 'More than one inventory color has the same cleaned identity.',
+  confirmed_mapping_requires_review: 'This saved mapping changes style or uses a combo and must be confirmed again.',
+  confirmed_mapping_size_missing: 'The previously confirmed target does not contain this exact size.',
+}
+
 function DeferredSearchInput({ value, onCommit, onFocus }) {
   const [draft, setDraft] = useState(value)
 
@@ -447,6 +455,12 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
                   {row.packCount > 1 ? `${row.qty} order(s) × ${row.packCount} units` : `QTY ${row.qty}`}
                 </span>
               </div>
+
+              {row.parseIssue && !r && (
+                <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                  {REVIEW_REASONS[row.parseIssue] || `Source needs review: ${row.parseIssue.replaceAll('_', ' ')}`}
+                </div>
+              )}
 
               {setReview && !r && (
                 <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">

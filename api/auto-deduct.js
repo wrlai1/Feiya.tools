@@ -119,6 +119,7 @@ export default async function handler(req, res) {
     }
 
     if (req.method === 'POST' && action === 'save-aliases') {
+      if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
       const { aliases } = req.body || {}
       if (!aliases || typeof aliases !== 'object' || Array.isArray(aliases)) {
         return res.status(400).json({ error: 'aliases object required' })

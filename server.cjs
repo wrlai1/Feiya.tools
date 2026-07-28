@@ -1094,6 +1094,7 @@ app.all('/api/auto-deduct', async (req, res) => {
     }
 
     if (req.method === 'POST' && action === 'save-aliases') {
+      if (!isAdmin) return res.status(403).json({ error: 'Admin access required' });
       const { aliases } = req.body || {};
       if (!aliases || typeof aliases !== 'object' || Array.isArray(aliases)) return res.status(400).json({ error: 'aliases object required' });
       const value = JSON.stringify({ aliases, updatedAt: new Date().toISOString(), updatedBy: payload.username });
@@ -1327,6 +1328,7 @@ async function ensureInventoryTables(sql) {
     )
   `;
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS source_hash TEXT`;
+  await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS row_count INTEGER`;
   await sql`CREATE UNIQUE INDEX IF NOT EXISTS inventory_transactions_source_hash_uq ON inventory_transactions (transaction_type, source_hash) WHERE source_hash IS NOT NULL AND source_hash <> ''`;
 }
 
@@ -1472,39 +1474,118 @@ app.all('/api/inventory-balance', async (req, res) => {
     if (req.method === 'POST' && action === 'apply') {
       if (!isAdmin) return res.status(403).json({ error: 'Admin access required' });
       const { filledRows = [], txnType = 'sales', sourceName = '', sourceHash = '' } = req.body || {};
+      if (!['sales', 'return'].includes(txnType)) return res.status(400).json({ error: 'Invalid transaction type' });
 
       if (sourceHash) {
         const duplicate = await sql`SELECT id FROM inventory_transactions WHERE transaction_type = ${txnType} AND source_hash = ${sourceHash} LIMIT 1`;
         if (duplicate.length) return res.status(409).json({ error: 'This exact file has already been applied. Inventory was not changed.' });
       }
 
-      await saveInventorySnapshot(sql, txnType, sourceName);
+      const applyRows = filledRows.flatMap((r) => {
+        const style = String(r.STYLE || '').trim();
+        const color = String(r.COLOR || '').trim();
+        const size = String(r.SIZE || '').trim();
+        const rawQty = r.QTY;
+        const qty = Number(rawQty);
+        if (rawQty === '' || rawQty == null || qty === 0) return [];
+        return [{ style, color, size, qty, allowCreate: r.allowCreate === true }];
+      });
+      const invalidRow = applyRows.find((row) =>
+        !row.style || !row.color || !row.size || !Number.isSafeInteger(row.qty) || row.qty < 0
+      );
+      if (invalidRow) return res.status(400).json({ error: 'Invalid style, color, size, or quantity in deduction preview' });
+      if (!applyRows.length) return res.status(400).json({ error: 'No inventory quantities to apply' });
 
-      let appliedUnits = 0;
-      for (const r of filledRows) {
-        const qty = parseInt(r.QTY, 10) || 0;
-        if (!qty) continue;
-
-        const delta = txnType === 'sales' ? -qty : qty;
-        await sql`
-          INSERT INTO inventory_balance (style, color, size, quantity)
-          VALUES (${String(r.STYLE)}, ${String(r.COLOR)}, ${String(r.SIZE)}, ${delta})
-          ON CONFLICT (style, color, size)
-          DO UPDATE SET quantity = inventory_balance.quantity + ${delta}, updated_at = NOW()
+      const existingTargets = applyRows.filter((row) => !row.allowCreate);
+      if (existingTargets.length) {
+        const missing = await sql`
+          WITH targets AS (
+            SELECT * FROM jsonb_to_recordset(${JSON.stringify(existingTargets)}::jsonb)
+              AS target(style TEXT, color TEXT, size TEXT)
+          )
+          SELECT target.style, target.color, target.size
+          FROM targets target
+          LEFT JOIN inventory_balance inventory
+            ON inventory.style = target.style
+           AND inventory.color = target.color
+           AND inventory.size = target.size
+          WHERE inventory.id IS NULL
         `;
-        appliedUnits += qty;
-
-        // 动销流水：每个 SKU 一行，apply 时间戳即记账日期
-        await sql`
-          INSERT INTO inventory_txn_rows (txn_type, style, color, size, qty, source_file, applied_by)
-          VALUES (${txnType}, ${String(r.STYLE)}, ${String(r.COLOR)}, ${String(r.SIZE)}, ${qty}, ${sourceName}, ${payload.username})
-        `;
+        if (missing.length) {
+          const target = missing[0];
+          return res.status(409).json({ error: `Inventory target no longer exists: ${target.style} / ${target.color} / ${target.size}. Run Auto-Fill again.` });
+        }
       }
 
-      await sql`
-        INSERT INTO inventory_transactions (transaction_type, source_file, source_hash, applied_units, applied_by)
-        VALUES (${txnType}, ${sourceName}, ${sourceHash}, ${appliedUnits}, ${payload.username})
-      `;
+      const appliedUnits = applyRows.reduce((sum, row) => sum + row.qty, 0);
+      await sql.transaction((txn) => [
+        ...(existingTargets.length ? [txn`
+          WITH targets AS (
+            SELECT * FROM jsonb_to_recordset(${JSON.stringify(existingTargets)}::jsonb)
+              AS target(style TEXT, color TEXT, size TEXT)
+          ),
+          locked AS MATERIALIZED (
+            SELECT inventory.id
+            FROM targets target
+            JOIN inventory_balance inventory
+              ON inventory.style = target.style
+             AND inventory.color = target.color
+             AND inventory.size = target.size
+            FOR UPDATE OF inventory
+          ),
+          target_counts AS (
+            SELECT
+              (SELECT COUNT(*) FROM targets) AS expected,
+              (SELECT COUNT(*) FROM locked) AS found
+          )
+          SELECT 1 / CASE WHEN expected = found THEN 1 ELSE 0 END AS targets_valid
+          FROM target_counts
+        `] : []),
+        txn`
+          INSERT INTO inventory_snapshots (label, source_name, data, total_rows, total_units)
+          SELECT
+            ${txnType},
+            ${sourceName},
+            COALESCE(jsonb_agg(jsonb_build_object(
+              'style', style, 'color', color, 'size', size, 'quantity', quantity
+            ) ORDER BY style, color, size), '[]'::jsonb),
+            COUNT(*)::int,
+            COALESCE(SUM(quantity), 0)::int
+          FROM inventory_balance
+        `,
+        ...applyRows.flatMap((row) => {
+          const delta = txnType === 'sales' ? -row.qty : row.qty;
+          const update = row.allowCreate
+            ? txn`
+                INSERT INTO inventory_balance (style, color, size, quantity)
+                VALUES (${row.style}, ${row.color}, ${row.size}, ${delta})
+                ON CONFLICT (style, color, size)
+                DO UPDATE SET quantity = inventory_balance.quantity + ${delta}, updated_at = NOW()
+              `
+            : txn`
+                UPDATE inventory_balance
+                SET quantity = quantity + ${delta}, updated_at = NOW()
+                WHERE style = ${row.style} AND color = ${row.color} AND size = ${row.size}
+              `;
+          return [
+            update,
+            txn`
+              INSERT INTO inventory_txn_rows (txn_type, style, color, size, qty, source_file, applied_by)
+              VALUES (${txnType}, ${row.style}, ${row.color}, ${row.size}, ${row.qty}, ${sourceName}, ${payload.username})
+            `,
+          ];
+        }),
+        txn`
+          INSERT INTO inventory_transactions (transaction_type, source_file, source_hash, applied_units, row_count, applied_by)
+          VALUES (${txnType}, ${sourceName}, ${sourceHash}, ${appliedUnits}, ${applyRows.length}, ${payload.username})
+        `,
+        txn`
+          DELETE FROM inventory_snapshots
+          WHERE id NOT IN (
+            SELECT id FROM inventory_snapshots ORDER BY created_at DESC LIMIT ${MAX_SNAPSHOTS_INV}
+          )
+        `,
+      ]);
       return res.json({ ok: true, applied_units: appliedUnits });
     }
 

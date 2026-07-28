@@ -1,4 +1,4 @@
-import { normalizeColor, normalizeSize, normalizeStyle } from './autoDeductEngine.js'
+import { normalizeColor, normalizeSize, normalizeStyleIdentity } from './autoDeductEngine.js'
 
 const sourceColorKey = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '')
 
@@ -17,19 +17,19 @@ export function findAdditionalSizeMappings({
   const source = unmatchedRows[sourceIndex]
   if (!source || source.packCount > 1 || source.parseIssue) return []
 
-  const sourceStyle = normalizeStyle(source.style)
+  const sourceStyle = normalizeStyleIdentity(source.style)
   const sourceColor = sourceColorKey(source.color)
-  const targetStyle = normalizeStyle(targetEntry.STYLE)
+  const targetStyle = normalizeStyleIdentity(targetEntry.STYLE)
   const targetColor = normalizeColor(targetEntry.COLOR)
   if (normalizeSize(targetEntry.SIZE) !== normalizeSize(source.size)) return []
 
   return unmatchedRows.flatMap((row, index) => {
     if (index === sourceIndex || resolved[index] || row.packCount > 1 || row.parseIssue) return []
-    if (normalizeStyle(row.style) !== sourceStyle || sourceColorKey(row.color) !== sourceColor) return []
+    if (normalizeStyleIdentity(row.style) !== sourceStyle || sourceColorKey(row.color) !== sourceColor) return []
 
     const targetSize = normalizeSize(row.size)
     const entry = templateRows.find((candidate) =>
-      normalizeStyle(candidate.STYLE) === targetStyle &&
+      normalizeStyleIdentity(candidate.STYLE) === targetStyle &&
       normalizeColor(candidate.COLOR) === targetColor &&
       normalizeSize(candidate.SIZE) === targetSize
     )
