@@ -10,6 +10,7 @@ const MAX_CATALOG_ROWS_PER_IMPORT = 20000
 const MAX_ORDERS_PER_IMPORT = 1000
 const MAX_ORDER_ITEMS_PER_IMPORT = 5000
 const MAX_ORDER_LOOKUPS = 1000
+const COMBINED_ORDER_STORE_KEY = 'all stores'
 
 function getDB() {
   const url = process.env.DATABASE_URL
@@ -435,7 +436,7 @@ async function loadPackage(sql, trackingKey) {
     WHERE package_id = ${pkg.id}
     ORDER BY style, color, size
   `
-  const relatedOrders = await loadOrdersByKeys(
+  const relatedOrders = await loadOrdersWithCombinedFallback(
     sql,
     pkg.store_key,
     Array.isArray(pkg.order_numbers) ? pkg.order_numbers : [],
@@ -493,6 +494,18 @@ async function loadOrdersByKeys(sql, storeKey, orderNumbers) {
     ...order,
     items: itemsByOrder.get(String(order.id)) || [],
   }))
+}
+
+async function loadOrdersWithCombinedFallback(sql, storeKey, orderNumbers) {
+  const direct = await loadOrdersByKeys(sql, storeKey, orderNumbers)
+  if (!storeKey || storeKey === COMBINED_ORDER_STORE_KEY) return direct
+  const found = new Set(direct.map((order) => order.order_key))
+  const missing = (orderNumbers || []).filter((orderNumber) =>
+    !found.has(normalizeOrderNumber(orderNumber))
+  )
+  if (!missing.length) return direct
+  const combined = await loadOrdersByKeys(sql, COMBINED_ORDER_STORE_KEY, missing)
+  return [...direct, ...combined]
 }
 
 async function resolveInventoryRows(sql, rows) {
@@ -855,7 +868,9 @@ export default async function handler(req, res) {
       if (!orderKey) return res.status(400).json({ error: 'order required' })
       const storeValue = String(req.query.store || '').trim()
       const storeKey = storeValue ? normalizeStore(storeValue).key : ''
-      const orders = await loadOrdersByKeys(sql, storeKey, [orderNumber])
+      const orders = storeKey
+        ? await loadOrdersWithCombinedFallback(sql, storeKey, [orderNumber])
+        : await loadOrdersByKeys(sql, '', [orderNumber])
       if (!orders.length) return res.status(404).json({ error: 'Order is not in the uploaded history' })
       if (!storeKey && new Set(orders.map((order) => order.store_key)).size > 1) {
         return res.status(409).json({
@@ -876,7 +891,7 @@ export default async function handler(req, res) {
       if (orderNumbers.length > MAX_ORDER_LOOKUPS) {
         return res.status(400).json({ error: `Lookup is limited to ${MAX_ORDER_LOOKUPS} orders per batch` })
       }
-      const orders = await loadOrdersByKeys(sql, store.key, orderNumbers)
+      const orders = await loadOrdersWithCombinedFallback(sql, store.key, orderNumbers)
       return res.json({ orders })
     }
 

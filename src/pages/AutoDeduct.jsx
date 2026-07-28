@@ -207,10 +207,6 @@ export default function AutoDeduct() {
   const [resolutionAliasKeys, setResolutionAliasKeys] = useState([])
   const [previewConfirmed, setPreviewConfirmed] = useState(false)
   const [orderArchive, setOrderArchive] = useState(null)
-  const [orderStore, setOrderStore] = useState(() =>
-    window.localStorage.getItem('auto-deduct-order-store') || ''
-  )
-  const [orderStores, setOrderStores] = useState([])
   const toast = useToast()
 
   // Merge resolver output into filledRows:
@@ -301,14 +297,6 @@ export default function AutoDeduct() {
       .then(r => r.json())
       .then(data => setAliases(data.aliases || {}))
       .catch(() => setAliases({}))
-  }, [getToken, isMock])
-
-  useEffect(() => {
-    if (isMock) return
-    fetch(`${BASE}/returns?action=stores`, { headers: authHeaders(getToken()) })
-      .then((response) => response.json())
-      .then((data) => setOrderStores(data.stores || []))
-      .catch(() => setOrderStores([]))
   }, [getToken, isMock])
 
   const handleFile = useCallback((file) => {
@@ -474,14 +462,13 @@ export default function AutoDeduct() {
 
   const archiveDailyOrders = useCallback(async () => {
     if (txnType !== 'sales' || !orderArchive?.orders?.length) return { conflicts: [] }
-    if (!orderStore.trim()) throw new Error('Choose the store for these orders before applying')
     const conflicts = []
     for (let index = 0; index < orderArchive.orders.length; index += 500) {
       const res = await fetch(`${BASE}/returns?action=orders-import`, {
         method: 'POST',
         headers: authHeaders(getToken(), true),
         body: JSON.stringify({
-          storeName: orderStore.trim(),
+          storeName: 'All Stores',
           sourceFile: srcFile?.name || '',
           sourceHash,
           batchIndex: Math.floor(index / 500),
@@ -493,7 +480,7 @@ export default function AutoDeduct() {
       conflicts.push(...(data.conflicts || []))
     }
     return { conflicts }
-  }, [getToken, orderArchive, orderStore, sourceHash, srcFile, txnType])
+  }, [getToken, orderArchive, sourceHash, srcFile, txnType])
 
   const handleApply = useCallback(async () => {
     if (!mergedFilledRows.length || applying) return
@@ -538,6 +525,9 @@ export default function AutoDeduct() {
   const hasUnresolved    = result?.unmatchedRows?.length > 0 && resolvedExtras === null
   const hasReviewRows    = result?.unmatchedRows?.length > 0
   const showResolver     = hasReviewRows && (hasUnresolved || editingResolutions)
+  const applyBlockReason = !previewConfirmed
+    ? 'Check the review box above before applying.'
+    : ''
 
   return (
     <div className="space-y-6 max-w-4xl">
@@ -611,31 +601,6 @@ export default function AutoDeduct() {
           ))}
         </div>
 
-        {txnType === 'sales' && (
-          <label className="block text-sm font-medium text-slate-700">
-            Store for order history
-            <input
-              list="auto-deduct-store-options"
-              value={orderStore}
-              onChange={(event) => {
-                const value = event.target.value
-                setOrderStore(value)
-                window.localStorage.setItem('auto-deduct-order-store', value)
-              }}
-              placeholder="House, Garden, Medley…"
-              className="mt-1.5 h-11 w-full rounded-xl border border-slate-300 bg-white px-3 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 sm:max-w-sm"
-            />
-            <datalist id="auto-deduct-store-options">
-              {orderStores.map((store) => (
-                <option key={store.store_key} value={store.store_name} />
-              ))}
-            </datalist>
-            <span className="mt-1 block text-xs font-normal text-slate-400">
-              Required for TEMU workbooks so their order numbers and SKUs remain searchable after rollback.
-            </span>
-          </label>
-        )}
-
         {/* File upload */}
         <FileUploadZone
           onFile={handleFile}
@@ -708,14 +673,9 @@ export default function AutoDeduct() {
               {skippedRows.length > 0 && <span className="ml-2 text-amber-600">· {skippedRows.length} skipped row(s) will not be applied</span>}
             </div>
             {txnType === 'sales' && orderArchive?.orders?.length > 0 && (
-              <div className={`rounded-xl border px-4 py-3 text-sm ${
-                orderStore.trim()
-                  ? 'border-indigo-200 bg-indigo-50 text-indigo-800'
-                  : 'border-amber-200 bg-amber-50 text-amber-800'
-              }`}>
-                {orderStore.trim()
-                  ? `${orderArchive.stats.orderCount.toLocaleString()} orders will also be saved under ${orderStore.trim()}. Inventory rollback will not delete them.`
-                  : 'Choose the store above before applying so these order numbers and SKUs can be saved.'}
+              <div className="rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm text-indigo-800">
+                {orderArchive.stats.orderCount.toLocaleString()} orders will also be saved in the combined order history.
+                Inventory rollback will not delete them.
               </div>
             )}
 
@@ -795,26 +755,33 @@ export default function AutoDeduct() {
                 Transaction logged successfully
               </div>
             ) : (
-              <button
-                onClick={handleApply}
-                disabled={applying || !previewConfirmed || (
-                  txnType === 'sales' && orderArchive?.orders?.length > 0 && !orderStore.trim()
+              <>
+                {applyBlockReason && (
+                  <div id="apply-block-reason" className="flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm font-semibold text-red-700">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                    {applyBlockReason}
+                  </div>
                 )}
-                className={`w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
-                  txnType === 'sales'
-                    ? 'bg-orange-100 hover:bg-orange-200 text-orange-700'
-                    : 'bg-green-100 hover:bg-green-200 text-green-700'
-                }`}
-              >
-                {applying
-                  ? <RefreshCw className="w-4 h-4 animate-spin" />
-                  : txnType === 'sales' ? <Minus className="w-4 h-4" /> : <TrendingUp className="w-4 h-4" />}
-                {applying
-                  ? 'Logging…'
-                  : txnType === 'sales'
-                  ? 'Log as Deducted from Inventory'
-                  : 'Log as Returned to Inventory'}
-              </button>
+                <button
+                  onClick={handleApply}
+                  disabled={applying}
+                  aria-describedby={applyBlockReason ? 'apply-block-reason' : undefined}
+                  className={`w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+                    txnType === 'sales'
+                      ? 'bg-orange-100 hover:bg-orange-200 text-orange-700'
+                      : 'bg-green-100 hover:bg-green-200 text-green-700'
+                  }`}
+                >
+                  {applying
+                    ? <RefreshCw className="w-4 h-4 animate-spin" />
+                    : txnType === 'sales' ? <Minus className="w-4 h-4" /> : <TrendingUp className="w-4 h-4" />}
+                  {applying
+                    ? 'Logging…'
+                    : txnType === 'sales'
+                      ? 'Log as Deducted from Inventory'
+                      : 'Log as Returned to Inventory'}
+                </button>
+              </>
             )}
           </div>
           )}
