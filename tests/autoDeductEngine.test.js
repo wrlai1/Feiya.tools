@@ -6,7 +6,7 @@ import {
   fillTemplate,
 } from '../src/utils/autoDeductEngine.js'
 import { consolidateRows } from '../src/utils/consolidateEngine.js'
-import { findAdditionalSizeMappings } from '../src/utils/autoDeductRules.js'
+import { findAdditionalComboSizeMappings, findAdditionalSizeMappings } from '../src/utils/autoDeductRules.js'
 
 test('petite sales sizes are shifted exactly once', () => {
   const salesRows = consolidateRows([
@@ -203,9 +203,9 @@ test('confirmed style and color rule stops when target size does not exist', () 
   assert.equal(result.unmatchedRows[0].parseIssue, 'confirmed_mapping_size_missing')
 })
 
-test('combo mappings still require review for every source row', () => {
+test('existing confirmed combo mappings extend to corresponding target sizes', () => {
   const aliases = {
-    [aliasKey('SET-1', 'Black Navy')]: {
+    [aliasKey('62300', 'set', 'S')]: {
       components: [
         { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S' },
         { STYLE: 'B200', COLOR: 'NAVY', SIZE: 'S' },
@@ -214,14 +214,45 @@ test('combo mappings still require review for every source row', () => {
     },
   }
   const result = fillTemplate([
-    { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S' },
+    { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'M' },
+    { STYLE: 'B200', COLOR: 'NAVY', SIZE: 'M' },
+  ], [
+    { style: '62300', color: 'set', size: 'M', QTY: 2, parse_issue: 'set_components_unknown' },
+  ], aliases)
+
+  assert.deepEqual(
+    result.filledRows.filter((row) => row.QTY),
+    [
+      { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'M', QTY: 2 },
+      { STYLE: 'B200', COLOR: 'NAVY', SIZE: 'M', QTY: 2 },
+    ],
+  )
+  assert.equal(result.unmatchedRows.length, 0)
+  assert.equal(result.stats.src_total, 4)
+  assert.equal(result.stats.reconciled_total, 4)
+})
+
+test('confirmed combo stops the entire set when one target size is missing', () => {
+  const aliases = {
+    [aliasKey('62300', 'set')]: {
+      components: [
+        { STYLE: 'A100', COLOR: 'BLACK', multiplier: 1 },
+        { STYLE: 'B200', COLOR: 'NAVY', multiplier: 1 },
+      ],
+      _confirmed: true,
+    },
+  }
+  const result = fillTemplate([
+    { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'M' },
     { STYLE: 'B200', COLOR: 'NAVY', SIZE: 'S' },
   ], [
-    { style: 'SET-1', color: 'Black Navy', size: 'S', QTY: 1 },
+    { style: '62300', color: 'set', size: 'M', QTY: 1, parse_issue: 'set_components_unknown' },
   ], aliases)
 
   assert.equal(result.filledRows.reduce((sum, row) => sum + row.QTY, 0), 0)
-  assert.equal(result.unmatchedRows[0].parseIssue, 'confirmed_mapping_requires_review')
+  assert.equal(result.unmatchedRows[0].parseIssue, 'confirmed_mapping_size_missing')
+  assert.equal(result.stats.src_total, 2)
+  assert.equal(result.stats.reconciled_total, 2)
 })
 
 test('learned mapping cannot bypass a source parsing warning', () => {
@@ -287,20 +318,31 @@ test('a confirmed style and color safely carries to sibling sizes during review'
   }])
 })
 
-test('set and cross-style combo review rows never carry across sizes', () => {
-  const mappings = findAdditionalSizeMappings({
+test('a confirmed combo selection carries all components to sibling sizes', () => {
+  const mappings = findAdditionalComboSizeMappings({
     unmatchedRows: [
-      { style: 'A100', color: 'Black+Navy', size: 'S', packCount: 1, parseIssue: 'cross_style_combo' },
-      { style: 'A100', color: 'Black+Navy', size: 'M', packCount: 1, parseIssue: 'cross_style_combo' },
+      { style: '62300', color: 'set', size: 'S', packCount: 2, parseIssue: 'set_components_unknown' },
+      { style: '62300', color: 'set', size: 'M', packCount: 2, parseIssue: 'set_components_unknown' },
     ],
     templateRows: [
       { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S' },
       { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'M' },
+      { STYLE: 'B200', COLOR: 'NAVY', SIZE: 'S' },
+      { STYLE: 'B200', COLOR: 'NAVY', SIZE: 'M' },
     ],
     resolved: [null, null],
     sourceIndex: 0,
-    targetEntry: { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S' },
+    components: [
+      { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S', multiplier: 1 },
+      { STYLE: 'B200', COLOR: 'NAVY', SIZE: 'S', multiplier: 1 },
+    ],
   })
 
-  assert.deepEqual(mappings, [])
+  assert.deepEqual(mappings, [{
+    index: 1,
+    components: [
+      { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'M', multiplier: 1 },
+      { STYLE: 'B200', COLOR: 'NAVY', SIZE: 'M', multiplier: 1 },
+    ],
+  }])
 })

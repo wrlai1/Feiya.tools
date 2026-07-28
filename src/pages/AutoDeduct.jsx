@@ -8,7 +8,7 @@ import FileUploadZone from '../components/FileUploadZone.jsx'
 import UnmatchedResolver from '../components/UnmatchedResolver.jsx'
 import { useToast } from '../hooks/useToast.js'
 import { useAuth } from '../context/AuthContext.jsx'
-import { parseCSV, fillTemplate, generateExcel, aliasKey, normalizeStyleIdentity } from '../utils/autoDeductEngine.js'
+import { parseCSV, fillTemplate, generateExcel, aliasKey, normalizeSize, normalizeStyleIdentity } from '../utils/autoDeductEngine.js'
 import ConsolidateStep from '../components/ConsolidateStep.jsx'
 import { consolidateRows } from '../utils/consolidateEngine.js'
 
@@ -382,9 +382,21 @@ export default function AutoDeduct() {
     const learned = {}
     for (const item of items) {
       if (!item._learnAlias || !item._source) continue
-      // A simple human-confirmed link is stable at style+color level. Future
-      // sizes reuse it only when the exact target size exists in inventory.
-      if (item._isCombo) continue
+      // A human-confirmed link is stable at style+color level. Future sizes
+      // reuse it only when every exact target size exists in inventory.
+      if (item._isCombo) {
+        const sourceSize = normalizeSize(item._source.size)
+        if ((item.components || []).some((component) => normalizeSize(component.SIZE) !== sourceSize)) continue
+        learned[aliasKey(item._source.style, item._source.color)] = {
+          components: (item.components || []).map((component) => ({
+            STYLE: component.STYLE,
+            COLOR: component.COLOR,
+            multiplier: Math.max(1, parseInt(component.multiplier, 10) || 1),
+          })),
+          _confirmed: true,
+        }
+        continue
+      }
       const aliasValue = {
           STYLE: item.STYLE,
           COLOR: item.COLOR,

@@ -228,22 +228,44 @@ export function aliasKey(style, salesColor, size = '') {
   return normSize ? `${base}::${normSize}` : base
 }
 
-function asConfirmedSimpleAlias(value, keepSize = false) {
-  if (!value || Array.isArray(value.components) || value._isNew) return null
+function asConfirmedAlias(value, keepSize = false) {
+  if (!value || value._isNew) return null
   if (typeof value === 'string') return { COLOR: value, _confirmed: true }
+  if (Array.isArray(value.components) && value.components.length) {
+    return {
+      ...value,
+      components: value.components.map((component) => ({
+        STYLE: component.STYLE,
+        COLOR: component.COLOR,
+        SIZE: keepSize ? component.SIZE : undefined,
+        multiplier: Math.max(1, parseInt(component.multiplier, 10) || 1),
+      })),
+      _confirmed: true,
+    }
+  }
   return { ...value, SIZE: keepSize ? value.SIZE : undefined, _confirmed: true }
 }
 
 function inferConfirmedStyleColorAlias(aliases, baseKey) {
   const targets = Object.entries(aliases)
     .filter(([key]) => key.startsWith(`${baseKey}::`))
-    .map(([, value]) => asConfirmedSimpleAlias(value))
+    .map(([, value]) => asConfirmedAlias(value))
     .filter(Boolean)
   if (!targets.length) return null
 
-  const fingerprints = new Set(targets.map((target) =>
-    `${String(target.STYLE || '')}\u0000${String(target.COLOR || '')}`
-  ))
+  const fingerprints = new Set(targets.map((target) => {
+    if (Array.isArray(target.components)) {
+      const components = target.components
+        .map((component) => [
+          String(component.STYLE || ''),
+          String(component.COLOR || ''),
+          Math.max(1, parseInt(component.multiplier, 10) || 1),
+        ].join('\u0000'))
+        .sort()
+      return `combo\u0000${components.join('\u0001')}`
+    }
+    return `single\u0000${String(target.STYLE || '')}\u0000${String(target.COLOR || '')}`
+  }))
   return fingerprints.size === 1 ? targets[0] : null
 }
 
@@ -310,24 +332,30 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
     const baseAliasKey = aliasKey(style, color)
     const savedSizeAlias = aliases[aliasKey(style, color, normSize)]
     const savedGeneralAlias = aliases[baseAliasKey]
-    const aliasTarget = asConfirmedSimpleAlias(savedSizeAlias, true)
+    const aliasTarget = asConfirmedAlias(savedSizeAlias, true)
       || savedSizeAlias
-      || asConfirmedSimpleAlias(savedGeneralAlias)
+      || asConfirmedAlias(savedGeneralAlias)
       || savedGeneralAlias
       || inferConfirmedStyleColorAlias(aliases, baseAliasKey)
-    srcTotal += qty * packCount
 
-    // Combo mappings always require fresh review. A cross-style mapping can only
-    // auto-apply when it came from an explicit human-confirmed style+color rule.
     const confirmedStyleColorRule = aliasTarget?._confirmed === true
-    const aliasNeedsReview = Array.isArray(aliasTarget?.components)
+    const confirmedComboRule = confirmedStyleColorRule && Array.isArray(aliasTarget?.components)
+    const effectivePackCount = confirmedComboRule
+      ? aliasTarget.components.reduce((sum, component) =>
+          sum + Math.max(1, parseInt(component.multiplier, 10) || 1), 0)
+      : packCount
+    srcTotal += qty * effectivePackCount
+
+    // Unconfirmed legacy combos require review. A cross-style mapping can only
+    // auto-apply when it came from a human-confirmed style+color rule.
+    const aliasNeedsReview = (Array.isArray(aliasTarget?.components) && !confirmedComboRule)
       || (
         aliasTarget?.STYLE
         && normalizeStyleIdentity(aliasTarget.STYLE) !== normalizeStyleIdentity(style)
         && !confirmedStyleColorRule
-      )
+    )
     if (aliasNeedsReview) {
-      unmatchedRows.push({ style, color, size: normSize, qty, packCount, parseIssue: parseIssue || 'confirmed_mapping_requires_review' })
+      unmatchedRows.push({ style, color, size: normSize, qty, packCount: effectivePackCount, parseIssue: parseIssue || 'confirmed_mapping_requires_review' })
       return
     }
 
@@ -347,6 +375,35 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
           return styleOk && colorOk && sizeOk
         })
         return matches.length === 1 ? matches[0] : null
+      }
+
+      if (confirmedComboRule) {
+        const matches = target.components.map((component) =>
+          matchTarget({
+            STYLE: component.STYLE,
+            COLOR: component.COLOR,
+            SIZE: component.SIZE || normSize,
+          }, entries)
+        )
+        if (matches.some((match) => !match)) return false
+
+        for (const [index, matched] of matches.entries()) {
+          const multiplier = Math.max(1, parseInt(target.components[index].multiplier, 10) || 1)
+          const componentQty = qty * multiplier
+          matched.qty += componentQty
+          filledTotal += componentQty
+          matchLog.push({
+            style,
+            salesColor: color,
+            size: normSize,
+            qty: componentQty,
+            targetStyle: matched.style,
+            targetColor: matched.color,
+            targetSize: matched.size,
+            via: 'confirmed combo',
+          })
+        }
+        return true
       }
 
       let matched = matchTarget({
@@ -394,10 +451,15 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
       return false
     }
 
-    // Parsing uncertainty always requires a fresh human decision. A learned
-    // mapping must never hide a malformed or ambiguous source description.
-    if (parseIssue) {
-      unmatchedRows.push({ style, color, size: normSize, qty, packCount, parseIssue })
+    // A confirmed combo resolves only the known set/combo uncertainty. Other
+    // parsing warnings still require a fresh human decision.
+    const comboResolvedIssue = confirmedComboRule
+      && parseIssue
+        .split(';')
+        .filter(Boolean)
+        .every((issue) => ['set_components_unknown', 'cross_style_combo'].includes(issue))
+    if (parseIssue && !comboResolvedIssue) {
+      unmatchedRows.push({ style, color, size: normSize, qty, packCount: effectivePackCount, parseIssue })
       return
     }
 
@@ -408,7 +470,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
 
     if (!candidates?.length && target) {
       if (applyAliasTarget([])) return
-      unmatchedRows.push({ style, color, size: normSize, qty, packCount, parseIssue: parseIssue || 'confirmed_mapping_size_missing' })
+      unmatchedRows.push({ style, color, size: normSize, qty, packCount: effectivePackCount, parseIssue: 'confirmed_mapping_size_missing' })
       return
     }
 
@@ -418,20 +480,20 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
         color,
         size: normSize,
         qty,
-        packCount,
+        packCount: effectivePackCount,
         parseIssue: hadLooseStyleCandidates ? 'style_identity_mismatch' : parseIssue,
       })
       return
     }
 
     if (!aliasTarget && new Set(candidates.map((candidate) => candidate.style)).size > 1) {
-      unmatchedRows.push({ style, color, size: normSize, qty, packCount, parseIssue: 'ambiguous_inventory_style' })
+      unmatchedRows.push({ style, color, size: normSize, qty, packCount: effectivePackCount, parseIssue: 'ambiguous_inventory_style' })
       return
     }
 
     if (aliasTarget) {
       if (applyAliasTarget(candidates)) return
-      unmatchedRows.push({ style, color, size: normSize, qty, packCount, parseIssue: parseIssue || 'confirmed_mapping_size_missing' })
+      unmatchedRows.push({ style, color, size: normSize, qty, packCount: effectivePackCount, parseIssue: 'confirmed_mapping_size_missing' })
       return
     }
 

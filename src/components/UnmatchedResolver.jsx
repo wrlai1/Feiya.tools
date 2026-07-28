@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useMemo } from 'react'
 import { Search, Plus, SkipForward, CheckCircle, X, Link2, ChevronDown, RotateCcw } from 'lucide-react'
-import { findAdditionalSizeMappings } from '../utils/autoDeductRules.js'
+import { findAdditionalComboSizeMappings, findAdditionalSizeMappings } from '../utils/autoDeductRules.js'
 
 const REVIEW_REASONS = {
   style_identity_mismatch: 'The style punctuation differs from inventory, so it was not matched automatically.',
@@ -220,7 +220,20 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
     if (!components.length) return
     const expected = expectedPackCount(i, row)
     if (isSetReview(row) && (!expected || comboMultiplierTotal(i) !== expected)) return
-    resolve(i, 'combo', { components })
+    const additional = findAdditionalComboSizeMappings({
+      unmatchedRows,
+      templateRows: normTemplate,
+      resolved,
+      sourceIndex: i,
+      components,
+    })
+    const next = [...resolved]
+    next[i] = { type: 'combo', entry: { components } }
+    for (const match of additional) {
+      next[match.index] = { type: 'combo', entry: { components: match.components }, autoApplied: true }
+    }
+    setResolved(next)
+    setCreateForms(prev => { const forms = [...prev]; forms[i] = null; return forms })
   }
 
   function handleApply() {
