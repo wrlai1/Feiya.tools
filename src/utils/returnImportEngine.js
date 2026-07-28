@@ -132,6 +132,26 @@ export function resolveProductCatalogRows(catalogRows, templateRows, aliases = {
   })
 }
 
+export function suggestProductCatalogSelections(sourceComponents, inventoryRows, aliases = {}) {
+  return (sourceComponents || []).map((source) => {
+    const result = fillTemplate(inventoryRows, [{
+      style: source.style,
+      color: source.color,
+      size: source.size,
+      qty: 1,
+    }], aliases)
+    const targets = result.filledRows.filter((row) => Number(row.QTY) > 0)
+    if (result.unmatchedRows.length || targets.length !== 1 || Number(targets[0].QTY) !== 1) {
+      return {}
+    }
+    return {
+      style: targets[0].STYLE,
+      color: targets[0].COLOR,
+      matchedBy: result.matchLog[0]?.via || 'inventory',
+    }
+  })
+}
+
 function normalizedSize(value) {
   const size = String(value || '').trim().toUpperCase()
   if (size === '1XL') return '1X'

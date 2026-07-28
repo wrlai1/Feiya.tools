@@ -27,6 +27,7 @@ import {
   parseSkuReturnManifestRows,
   resolveProductCatalogRows,
   resolveReturnManifestPackages,
+  suggestProductCatalogSelections,
 } from '../utils/returnImportEngine.js'
 import { parseOrderHistoryRows } from '../utils/orderImportEngine.js'
 import { summarizeReturnInspection } from '../utils/returnInspection.js'
@@ -557,18 +558,27 @@ export default function ReturnsReceiving() {
     }
   }
 
+  const catalogSuggestedSelections = useMemo(() => {
+    const suggestions = {}
+    for (const row of catalogParsed?.rows || []) {
+      if (row.status === 'ready' || !row.sourceComponents?.length) continue
+      suggestProductCatalogSelections(
+        row.sourceComponents,
+        catalogInventoryRows,
+        catalogAliases,
+      ).forEach((selection, index) => {
+        if (selection.style && selection.color) {
+          suggestions[`${row.skuId}:${index}`] = selection
+        }
+      })
+    }
+    return suggestions
+  }, [catalogAliases, catalogInventoryRows, catalogParsed])
+
   const catalogSelectionFor = (row, index) => {
     const selectionKey = `${row.skuId}:${index}`
     if (catalogSelections[selectionKey]) return catalogSelections[selectionKey]
-    const source = row.sourceComponents?.[index]
-    const learned = source ? catalogAliases[aliasKey(source.style, source.color)] : null
-    if (!learned || learned.components || learned._isNew) return {}
-    const exists = catalogInventoryRows.some((target) =>
-      target.STYLE === learned.STYLE
-      && target.COLOR === learned.COLOR
-      && sameSize(target.SIZE, source.size)
-    )
-    return exists ? { style: learned.STYLE, color: learned.COLOR } : {}
+    return catalogSuggestedSelections[selectionKey] || {}
   }
 
   const confirmCatalogMapping = async (row) => {
@@ -1424,6 +1434,11 @@ export default function ReturnsReceiving() {
                                   <p className="text-xs font-semibold text-slate-700">
                                     Source: {source.style} / {source.color} / {source.size}
                                   </p>
+                                  {selection.matchedBy && (
+                                    <p className="mt-1 text-xs font-semibold text-emerald-700">
+                                      Auto Deduct match applied
+                                    </p>
+                                  )}
                                   <div className="mt-2 grid gap-2 sm:grid-cols-2">
                                     <label className="text-xs font-medium text-slate-500">
                                       Inventory style

@@ -18,6 +18,7 @@ import {
   parseSkuReturnManifestRows,
   resolveProductCatalogRows,
   resolveReturnManifestPackages,
+  suggestProductCatalogSelections,
 } from '../src/utils/returnImportEngine.js'
 import inventoryTargetResolution from '../lib/inventoryTargetResolution.cjs'
 
@@ -712,6 +713,36 @@ test('unresolved product combos retain their source components for upload-time r
     row.sourceComponents.map((component) => component.color).sort(),
     ['fuchsia', 'khaki', 'navy', 'white'],
   )
+})
+
+test('unresolved product review reuses Auto Deduct matches component by component', () => {
+  const inventoryRows = [
+    { STYLE: 'M017-MISSY', COLOR: 'KHAKI #3455 slub', SIZE: 'S' },
+    { STYLE: 'M017-MISSY', COLOR: 'DEEP BLUE #3455 slub', SIZE: 'S' },
+  ]
+  const aliases = {
+    [aliasKey('M017', 'navy')]: {
+      STYLE: 'M017-MISSY',
+      COLOR: 'DEEP BLUE #3455 slub',
+      _confirmed: true,
+    },
+  }
+
+  const selections = suggestProductCatalogSelections([
+    { style: 'M017-MISSY', color: 'KHAKI #3455 slub', size: 'S' },
+    { style: 'M017', color: 'navy', size: 'S' },
+    { style: 'M017', color: 'silver', size: 'S' },
+  ], inventoryRows, aliases)
+
+  assert.deepEqual(
+    selections.map(({ matchedBy, ...selection }) => selection),
+    [
+      { style: 'M017-MISSY', color: 'KHAKI #3455 slub' },
+      { style: 'M017-MISSY', color: 'DEEP BLUE #3455 slub' },
+      {},
+    ],
+  )
+  assert.equal(selections[1].matchedBy, 'confirmed')
 })
 
 test('SKU return manifests group tracking and retain store-facing return details', () => {
