@@ -8,6 +8,7 @@ const MAX_ITEMS_PER_IMPORT = 50000
 const MAX_CATALOG_ROWS_PER_IMPORT = 20000
 const MAX_ORDERS_PER_IMPORT = 1000
 const MAX_ORDER_ITEMS_PER_IMPORT = 5000
+const MAX_ORDER_LOOKUPS = 1000
 
 function getDB() {
   const url = process.env.DATABASE_URL
@@ -31,7 +32,11 @@ function normalizeStore(value) {
 }
 
 function normalizeOrderNumber(value) {
-  return String(value || '').trim().replace(/\s+/g, '').toUpperCase()
+  return String(value || '')
+    .trim()
+    .replace(/\s+/g, '')
+    .toUpperCase()
+    .replace(/-D\d+$/, '')
 }
 
 function cleanText(value, maxLength = 500) {
@@ -856,6 +861,20 @@ export default async function handler(req, res) {
         })
       }
       return res.json({ order: orders[0], matches: orders.length })
+    }
+
+    if (req.method === 'POST' && action === 'orders-lookup') {
+      if (payload.role !== 'admin') return res.status(403).json({ error: 'Admin access required' })
+      const store = normalizeStore(req.body?.storeName)
+      const orderNumbers = Array.isArray(req.body?.orderNumbers)
+        ? [...new Set(req.body.orderNumbers.map((value) => cleanText(value, 100)).filter(Boolean))]
+        : []
+      if (!orderNumbers.length) return res.status(400).json({ error: 'orderNumbers array required' })
+      if (orderNumbers.length > MAX_ORDER_LOOKUPS) {
+        return res.status(400).json({ error: `Lookup is limited to ${MAX_ORDER_LOOKUPS} orders per batch` })
+      }
+      const orders = await loadOrdersByKeys(sql, store.key, orderNumbers)
+      return res.json({ orders })
     }
 
     if (req.method === 'GET' && action === 'order-stats') {

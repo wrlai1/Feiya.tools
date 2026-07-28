@@ -8,7 +8,9 @@ import {
 import { consolidateRows } from '../src/utils/consolidateEngine.js'
 import { findAdditionalComboSizeMappings, findAdditionalSizeMappings } from '../src/utils/autoDeductRules.js'
 import {
+  applyReturnOrderMatch,
   expandConfirmedProductSku,
+  getReturnManifestOrderNumbers,
   parseProductCatalogRows,
   parseReturnManifestRows,
   parseSkuReturnManifestRows,
@@ -642,6 +644,95 @@ test('SKU return manifests isolate missing catalog data without blocking ready p
     result.needsReview.map((row) => row.parse_issue).sort(),
     ['sku_id_missing', 'tracking_missing'],
   )
+})
+
+test('missing return SKU IDs show every original SKU and require a selection for multi-SKU orders', () => {
+  const rows = [
+    {
+      '订单号 PO': ' PO-RECOVER-1 ',
+      'SKU ID': '',
+      '运单号 Tracking Number': 'RETURN-RECOVER-1',
+    },
+    {
+      '订单号 PO': 'PO-RECOVER-1-D01',
+      'SKU ID': '',
+      '运单号 Tracking Number': 'RETURN-RECOVER-1',
+    },
+  ]
+  const parsed = parseSkuReturnManifestRows(rows, [
+    {
+      sku_id: 'SKU-A',
+      sku_code: 'A100BlackM',
+      status: 'ready',
+      components: [{ style: 'A100', color: 'Black', size: 'M', qty: 1 }],
+    },
+    {
+      sku_id: 'SKU-B',
+      sku_code: 'B200NavyL',
+      status: 'ready',
+      components: [{ style: 'B200', color: 'Navy', size: 'L', qty: 1 }],
+    },
+  ], [{
+    order_number: 'PO-RECOVER-1',
+    items: [
+      { sku_id: 'SKU-A', quantity: 1 },
+      { sku_id: 'SKU-B', quantity: 2 },
+    ],
+  }])
+
+  assert.deepEqual(getReturnManifestOrderNumbers(rows), ['PO-RECOVER-1', 'PO-RECOVER-1-D01'])
+  assert.equal(parsed.packages.length, 0)
+  assert.equal(parsed.pendingOrderMatches.length, 1)
+  assert.equal(parsed.pendingOrderMatches[0].candidateOrders[0].candidates.length, 2)
+  assert.equal(parsed.needsReview[0].parse_issue, 'order_has_multiple_skus')
+
+  const candidates = parsed.pendingOrderMatches[0].candidateOrders[0].candidates
+  const result = applyReturnOrderMatch(parsed, 'RETURN-RECOVER-1', {
+    [candidates[0].candidateKey]: 1,
+    [candidates[1].candidateKey]: 2,
+  })
+
+  assert.equal(result.needsReview.length, 0)
+  assert.equal(result.pendingOrderMatches.length, 0)
+  assert.equal(result.stats.recoveredPackages, 1)
+  assert.equal(result.packages[0].expectedUnits, 3)
+  assert.deepEqual(result.packages[0].items, [
+    { skuId: 'SKU-A', skuCode: 'A100BlackM', style: 'A100', color: 'Black', size: 'M', expectedQty: 1 },
+    { skuId: 'SKU-B', skuCode: 'B200NavyL', style: 'B200', color: 'Navy', size: 'L', expectedQty: 2 },
+  ])
+})
+
+test('a single-SKU order safely fills a missing return SKU without a selection', () => {
+  const result = parseSkuReturnManifestRows([{
+    '订单号 PO': 'PO-SINGLE-D02',
+    'SKU ID': '',
+    '运单号 Tracking Number': 'RETURN-SINGLE',
+  }], [{
+    sku_id: 'SKU-ONLY',
+    sku_code: 'A100BlackM',
+    status: 'ready',
+    components: [{ style: 'A100', color: 'Black', size: 'M', qty: 1 }],
+  }], [{
+    order_number: 'PO-SINGLE',
+    items: [{ sku_id: 'SKU-ONLY', quantity: 1 }],
+  }])
+
+  assert.equal(result.needsReview.length, 0)
+  assert.equal(result.pendingOrderMatches.length, 0)
+  assert.equal(result.stats.recoveredPackages, 1)
+  assert.equal(result.packages[0].items[0].skuId, 'SKU-ONLY')
+})
+
+test('missing return SKU stays in review when its order history is unavailable', () => {
+  const result = parseSkuReturnManifestRows([{
+    '订单号 PO': 'PO-NOT-UPLOADED',
+    'SKU ID': '',
+    '运单号 Tracking Number': 'RETURN-REVIEW-1',
+  }], [], [])
+
+  assert.equal(result.packages.length, 0)
+  assert.equal(result.needsReview[0].orderNumber, 'PO-NOT-UPLOADED')
+  assert.equal(result.needsReview[0].parse_issue, 'order_history_missing')
 })
 
 test('a confirmed style and color safely carries to sibling sizes during review', () => {

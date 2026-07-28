@@ -17,6 +17,8 @@ import {
 import { useAuth } from '../context/AuthContext.jsx'
 import { useToast } from '../hooks/useToast.js'
 import {
+  applyReturnOrderMatch,
+  getReturnManifestOrderNumbers,
   parseProductCatalogRows,
   parseReturnManifestRows,
   parseSkuReturnManifestRows,
@@ -209,6 +211,7 @@ export default function ReturnsReceiving() {
   const [recent, setRecent] = useState([])
   const [file, setFile] = useState(null)
   const [parsed, setParsed] = useState(null)
+  const [orderCandidateQuantities, setOrderCandidateQuantities] = useState({})
   const [uploading, setUploading] = useState(false)
   const [stores, setStores] = useState([])
   const [storeName, setStoreName] = useState('')
@@ -382,6 +385,7 @@ export default function ReturnsReceiving() {
   const parseFile = async (nextFile) => {
     setFile(nextFile)
     setParsed(null)
+    setOrderCandidateQuantities({})
     if (!nextFile) return
     if (!storeName.trim()) {
       toast.error('Choose or enter a store before reading the return file', 'Store Required')
@@ -404,7 +408,22 @@ export default function ReturnsReceiving() {
         )
         const catalogData = await catalogRes.json().catch(() => ({}))
         if (!catalogRes.ok) throw new Error(catalogData.error || 'Could not load this store’s product catalog')
-        result = parseSkuReturnManifestRows(rows, catalogData.rows || [])
+        const historicalOrders = []
+        const orderNumbers = getReturnManifestOrderNumbers(rows)
+        for (let index = 0; index < orderNumbers.length; index += 500) {
+          const orderRes = await fetch(`${BASE}/returns?action=orders-lookup`, {
+            method: 'POST',
+            headers: headers(getToken, true),
+            body: JSON.stringify({
+              storeName: storeName.trim(),
+              orderNumbers: orderNumbers.slice(index, index + 500),
+            }),
+          })
+          const orderData = await orderRes.json().catch(() => ({}))
+          if (!orderRes.ok) throw new Error(orderData.error || 'Could not load matching order history')
+          historicalOrders.push(...(orderData.orders || []))
+        }
+        result = parseSkuReturnManifestRows(rows, catalogData.rows || [], historicalOrders)
       } else {
         const parsedRows = parseReturnManifestRows(rows)
         const [inventoryRes, aliasesRes] = await Promise.all([
@@ -1042,19 +1061,115 @@ export default function ReturnsReceiving() {
                 </div>
               </div>
 
-              {parsed.needsReview.length > 0 && (
+              {(parsed.pendingOrderMatches || []).map((match) => (
+                <div key={match.tracking} className="rounded-xl border border-indigo-200 bg-indigo-50 p-3 sm:p-4">
+                  <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <p className="text-sm font-semibold text-indigo-900">
+                        Choose returned SKUs for {match.trackingNumber}
+                      </p>
+                      <p className="mt-1 text-xs text-indigo-700">
+                        The return file had no SKU ID. Set the quantity only for products included in this return.
+                      </p>
+                    </div>
+                  </div>
+                  <div className="mt-3 space-y-3">
+                    {match.candidateOrders.map((order) => (
+                      <div key={order.orderKey} className="rounded-xl bg-white p-3">
+                        <p className="text-xs font-semibold text-slate-500">
+                          Original order {order.orderKey} · {order.candidates.length} SKU(s)
+                        </p>
+                        <div className="mt-2 divide-y divide-slate-100">
+                          {order.candidates.map((candidate) => (
+                            <div
+                              key={candidate.candidateKey}
+                              className="flex flex-col gap-3 py-3 sm:flex-row sm:items-center sm:justify-between"
+                            >
+                              <div className="min-w-0">
+                                <p className="break-words text-sm font-semibold text-slate-800">
+                                  {candidate.skuCode || candidate.skuId || 'Unknown SKU'}
+                                </p>
+                                {candidate.attributes && (
+                                  <p className="mt-0.5 text-xs text-slate-500">{candidate.attributes}</p>
+                                )}
+                                <p className="mt-1 text-[11px] text-slate-400">
+                                  SKU ID {candidate.skuId || '—'} · Ordered {candidate.maxQuantity}
+                                </p>
+                                {candidate.status !== 'ready' && (
+                                  <p className="mt-1 text-xs font-medium text-amber-700">
+                                    Product mapping required: {candidate.issue}
+                                  </p>
+                                )}
+                              </div>
+                              <div className="flex items-center justify-between gap-3 sm:justify-end">
+                                <span className="text-xs font-medium text-slate-500">Return qty</span>
+                                <CountControl
+                                  label={`Return quantity for ${candidate.skuCode || candidate.skuId}`}
+                                  value={Number(orderCandidateQuantities[candidate.candidateKey] || 0)}
+                                  max={Number.isSafeInteger(candidate.maxQuantity) ? candidate.maxQuantity : 0}
+                                  disabled={candidate.status !== 'ready'}
+                                  onChange={(value) => setOrderCandidateQuantities((current) => ({
+                                    ...current,
+                                    [candidate.candidateKey]: value,
+                                  }))}
+                                />
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      try {
+                        const next = applyReturnOrderMatch(
+                          parsed,
+                          match.tracking,
+                          orderCandidateQuantities,
+                        )
+                        setParsed(next)
+                        toast.success(
+                          `${next.packages.find((pkg) => pkg.tracking === match.tracking)?.expectedUnits || 0} expected units selected`,
+                          'Order SKUs Confirmed',
+                        )
+                      } catch (error) {
+                        toast.error(error.message, 'Choose Return SKUs')
+                      }
+                    }}
+                    className="btn-primary mt-3 w-full justify-center py-3 sm:w-auto"
+                  >
+                    <CheckCircle2 className="h-4 w-4" />
+                    Confirm Selected SKUs
+                  </button>
+                </div>
+              ))}
+
+              {parsed.needsReview.some((row) => row.parse_issue !== 'order_has_multiple_skus') && (
                 <div className="rounded-xl border border-amber-200 bg-amber-50 p-3">
                   <p className="text-sm font-semibold text-amber-800">Review required for these packages</p>
                   <p className="mt-1 text-xs text-amber-700">
                     These packages will be skipped. Ready packages can still upload:
                   </p>
                   <ul className="mt-2 space-y-1 text-xs text-amber-800">
-                    {parsed.needsReview.slice(0, 10).map((row, index) => (
+                    {parsed.needsReview
+                      .filter((row) => row.parse_issue !== 'order_has_multiple_skus')
+                      .slice(0, 10)
+                      .map((row, index) => (
                       <li key={`${row.tracking}-${index}`}>
                         {row.tracking || `Excel row ${row.excelRow}`}: {row.skuId || row.raw_style || 'Missing SKU'} ({row.parse_issue})
+                        {row.orderNumber ? ` · PO ${row.orderNumber}` : ''}
                       </li>
-                    ))}
+                      ))}
                   </ul>
+                </div>
+              )}
+
+              {Number(parsed.stats.recoveredPackages || 0) > 0 && (
+                <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800">
+                  {parsed.stats.recoveredPackages} package(s) had missing SKU IDs and were completed from this store’s order history.
+                  The original order quantities will be shown to the worker for physical verification.
                 </div>
               )}
 
