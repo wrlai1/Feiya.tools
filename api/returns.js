@@ -1,6 +1,7 @@
 import { neon } from '@neondatabase/serverless'
 import jwt from 'jsonwebtoken'
 import inventoryTargetResolution from '../lib/inventoryTargetResolution.cjs'
+import { summarizeReturnInspection } from '../src/utils/returnInspection.js'
 
 const { resolveInventoryTargets } = inventoryTargetResolution
 const MAX_PACKAGES_PER_IMPORT = 5000
@@ -316,6 +317,7 @@ async function ensureTables(sql) {
   await sql`ALTER TABLE return_packages ADD COLUMN IF NOT EXISTS buyer_remarks JSONB NOT NULL DEFAULT '[]'::jsonb`
   await sql`ALTER TABLE return_packages ADD COLUMN IF NOT EXISTS carrier TEXT`
   await sql`ALTER TABLE return_packages ADD COLUMN IF NOT EXISTS restock_units INTEGER NOT NULL DEFAULT 0`
+  await sql`ALTER TABLE return_packages ADD COLUMN IF NOT EXISTS flagged_not_ours BOOLEAN NOT NULL DEFAULT false`
   await sql`
     CREATE TABLE IF NOT EXISTS return_package_items (
       id BIGSERIAL PRIMARY KEY,
@@ -331,6 +333,7 @@ async function ensureTables(sql) {
   await sql`ALTER TABLE return_package_items ADD COLUMN IF NOT EXISTS sku_id TEXT NOT NULL DEFAULT ''`
   await sql`ALTER TABLE return_package_items ADD COLUMN IF NOT EXISTS sku_code TEXT NOT NULL DEFAULT ''`
   await sql`ALTER TABLE return_package_items ADD COLUMN IF NOT EXISTS restock_qty INTEGER`
+  await sql`ALTER TABLE return_package_items ADD COLUMN IF NOT EXISTS not_ours_qty INTEGER`
   await sql`ALTER TABLE return_package_items DROP CONSTRAINT IF EXISTS return_package_items_package_id_style_color_size_key`
   await sql`
     CREATE UNIQUE INDEX IF NOT EXISTS return_package_items_source_sku_uq
@@ -421,13 +424,13 @@ async function loadPackage(sql, trackingKey) {
   const [pkg] = await sql`
     SELECT id, tracking_number, tracking_key, source_file, status, store_name, store_key,
            order_numbers, return_reasons, buyer_remarks, carrier, expected_units,
-           actual_units, restock_units, remark, uploaded_by, uploaded_at, confirmed_by, confirmed_at
+           actual_units, restock_units, flagged_not_ours, remark, uploaded_by, uploaded_at, confirmed_by, confirmed_at
     FROM return_packages
     WHERE tracking_key = ${trackingKey}
   `
   if (!pkg) return null
   const items = await sql`
-    SELECT id, sku_id, sku_code, style, color, size, expected_qty, actual_qty, restock_qty
+    SELECT id, sku_id, sku_code, style, color, size, expected_qty, actual_qty, restock_qty, not_ours_qty
     FROM return_package_items
     WHERE package_id = ${pkg.id}
     ORDER BY style, color, size
@@ -931,12 +934,12 @@ export default async function handler(req, res) {
             INSERT INTO return_packages (
               tracking_key, tracking_number, store_name, store_key, order_numbers,
               return_reasons, buyer_remarks, carrier, source_file, status, expected_units,
-              actual_units, restock_units, uploaded_by, uploaded_at, confirmed_by, confirmed_at, remark
+              actual_units, restock_units, flagged_not_ours, uploaded_by, uploaded_at, confirmed_by, confirmed_at, remark
             )
             SELECT
               tracking_key, tracking_number, store_name, store_key, order_numbers,
               return_reasons, buyer_remarks, carrier, ${sourceFile}, 'pending', expected_units,
-              0, 0, ${payload.username}, NOW(), NULL, NULL, NULL
+              0, 0, false, ${payload.username}, NOW(), NULL, NULL, NULL
             FROM incoming
             ON CONFLICT (tracking_key) DO UPDATE SET
               tracking_number = EXCLUDED.tracking_number,
@@ -950,6 +953,7 @@ export default async function handler(req, res) {
               expected_units = EXCLUDED.expected_units,
               actual_units = 0,
               restock_units = 0,
+              flagged_not_ours = false,
               uploaded_by = EXCLUDED.uploaded_by,
               uploaded_at = NOW(),
               confirmed_by = NULL,
@@ -995,11 +999,11 @@ export default async function handler(req, res) {
                 )
             )
             INSERT INTO return_package_items (
-              package_id, sku_id, sku_code, style, color, size, expected_qty, actual_qty, restock_qty
+              package_id, sku_id, sku_code, style, color, size, expected_qty, actual_qty, restock_qty, not_ours_qty
             )
             SELECT
               packages.id, items.sku_id, items.sku_code, items.style, items.color,
-              items.size, items.expected_qty, NULL, NULL
+              items.size, items.expected_qty, NULL, NULL, NULL
             FROM incoming_items items
             JOIN return_packages packages ON packages.tracking_key = items.tracking_key
             WHERE packages.status = 'pending'
@@ -1026,7 +1030,7 @@ export default async function handler(req, res) {
       const status = String(req.query.status || '')
       const rows = status
         ? await sql`
-            SELECT id, tracking_number, store_name, status, expected_units, actual_units, restock_units,
+            SELECT id, tracking_number, store_name, status, expected_units, actual_units, restock_units, flagged_not_ours,
                    uploaded_at, confirmed_at
             FROM return_packages
             WHERE status = ${status}
@@ -1034,7 +1038,7 @@ export default async function handler(req, res) {
             LIMIT 200
           `
         : await sql`
-            SELECT id, tracking_number, store_name, status, expected_units, actual_units, restock_units,
+            SELECT id, tracking_number, store_name, status, expected_units, actual_units, restock_units, flagged_not_ours,
                    uploaded_at, confirmed_at
             FROM return_packages
             ORDER BY CASE WHEN status = 'pending' THEN 0 ELSE 1 END, uploaded_at DESC
@@ -1056,24 +1060,42 @@ export default async function handler(req, res) {
         const id = Number(item.id)
         const actualQty = Number(item.actualQty)
         const restockQty = Number(item.restockQty)
+        const notOursQty = Number(item.notOursQty || 0)
         if (
           !Number.isSafeInteger(id)
           || !Number.isSafeInteger(actualQty)
           || !Number.isSafeInteger(restockQty)
+          || !Number.isSafeInteger(notOursQty)
           || actualQty < 0
           || actualQty > 9999
           || restockQty < 0
           || restockQty > actualQty
+          || notOursQty < 0
+          || notOursQty > 9999
           || countsById.has(id)
         ) {
           return res.status(400).json({
             error: 'Every item requires valid received and restockable quantities; restockable cannot exceed received',
           })
         }
-        countsById.set(id, { actualQty, restockQty })
+        countsById.set(id, { actualQty, restockQty, notOursQty })
       }
       if (countsById.size !== pkg.items.length || pkg.items.some((item) => !countsById.has(Number(item.id)))) {
         return res.status(400).json({ error: 'Count every expected item before confirming the package' })
+      }
+      let inspection
+      try {
+        inspection = summarizeReturnInspection(pkg.items.map((item) => {
+          const counts = countsById.get(Number(item.id))
+          return {
+            expectedQty: Number(item.expected_qty),
+            goodQty: counts.restockQty,
+            damagedQty: counts.actualQty - counts.restockQty,
+            notOursQty: counts.notOursQty,
+          }
+        }))
+      } catch (error) {
+        return res.status(400).json({ error: error.message })
       }
 
       const inventoryRows = pkg.items
@@ -1096,13 +1118,7 @@ export default async function handler(req, res) {
       }
 
       const receivedRows = resolved.rows
-      const actualUnits = [...countsById.values()].reduce((sum, counts) => sum + counts.actualQty, 0)
-      const restockUnits = [...countsById.values()].reduce((sum, counts) => sum + counts.restockQty, 0)
-      const hasDiscrepancy = pkg.items.some((item) =>
-        countsById.get(Number(item.id)).actualQty !== Number(item.expected_qty)
-        || countsById.get(Number(item.id)).restockQty !== countsById.get(Number(item.id)).actualQty
-      )
-      const finalStatus = hasDiscrepancy ? 'discrepancy' : 'received'
+      const { actualUnits, restockUnits, notOursUnits, status: finalStatus } = inspection
       const sourceName = `Return ${pkg.tracking_number}`
       const sourceHash = `return-package:${pkg.tracking_key}`
       const remark = String(req.body?.remark || '').trim().slice(0, 1000)
@@ -1161,7 +1177,8 @@ export default async function handler(req, res) {
         ...pkg.items.map((item) => txn`
           UPDATE return_package_items
           SET actual_qty = ${countsById.get(Number(item.id)).actualQty},
-              restock_qty = ${countsById.get(Number(item.id)).restockQty}
+              restock_qty = ${countsById.get(Number(item.id)).restockQty},
+              not_ours_qty = ${countsById.get(Number(item.id)).notOursQty}
           WHERE id = ${item.id} AND package_id = ${pkg.id}
         `),
         txn`
@@ -1169,6 +1186,7 @@ export default async function handler(req, res) {
           SET status = ${finalStatus},
               actual_units = ${actualUnits},
               restock_units = ${restockUnits},
+              flagged_not_ours = ${notOursUnits > 0},
               remark = ${remark},
               confirmed_by = ${payload.username},
               confirmed_at = NOW()
@@ -1188,6 +1206,7 @@ export default async function handler(req, res) {
         expected_units: Number(pkg.expected_units),
         actual_units: actualUnits,
         restock_units: restockUnits,
+        not_ours_units: notOursUnits,
         added_units: restockUnits,
       })
     }
@@ -1200,6 +1219,8 @@ export default async function handler(req, res) {
         SELECT
           COUNT(*)::int AS received_packages,
           COUNT(*) FILTER (WHERE status = 'discrepancy')::int AS discrepancy_packages,
+          (SELECT COUNT(*)::int FROM return_packages
+           WHERE status = 'rejected' AND confirmed_at >= ${from}) AS flagged_packages,
           COALESCE(SUM(expected_units), 0)::int AS expected_units,
           COALESCE(SUM(actual_units), 0)::int AS returned_units,
           COALESCE(SUM(restock_units), 0)::int AS restocked_units
@@ -1229,13 +1250,14 @@ export default async function handler(req, res) {
       const stores = await sql`
         SELECT
           COALESCE(NULLIF(store_name, ''), 'Unassigned') AS store_name,
-          COUNT(*)::int AS received_packages,
+          COUNT(*) FILTER (WHERE status IN ('received', 'discrepancy'))::int AS received_packages,
           COUNT(*) FILTER (WHERE status = 'discrepancy')::int AS discrepancy_packages,
-          COALESCE(SUM(expected_units), 0)::int AS expected_units,
+          COUNT(*) FILTER (WHERE status = 'rejected')::int AS flagged_packages,
+          COALESCE(SUM(expected_units) FILTER (WHERE status IN ('received', 'discrepancy')), 0)::int AS expected_units,
           COALESCE(SUM(actual_units), 0)::int AS returned_units,
           COALESCE(SUM(restock_units), 0)::int AS restocked_units
         FROM return_packages
-        WHERE status IN ('received', 'discrepancy')
+        WHERE status IN ('received', 'discrepancy', 'rejected')
           AND confirmed_at >= ${from}
         GROUP BY COALESCE(NULLIF(store_name, ''), 'Unassigned')
         ORDER BY returned_units DESC, store_name

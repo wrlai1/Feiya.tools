@@ -5,6 +5,7 @@ import {
   aliasKey,
   fillTemplate,
 } from '../src/utils/autoDeductEngine.js'
+import { summarizeReturnInspection } from '../src/utils/returnInspection.js'
 import { consolidateRows } from '../src/utils/consolidateEngine.js'
 import { findAdditionalComboSizeMappings, findAdditionalSizeMappings } from '../src/utils/autoDeductRules.js'
 import {
@@ -21,6 +22,54 @@ import {
 import inventoryTargetResolution from '../lib/inventoryTargetResolution.cjs'
 
 const { resolveInventoryTargets } = inventoryTargetResolution
+
+test('return inspection separates inventory, return-rate, and not-ours outcomes', () => {
+  const normal = summarizeReturnInspection([
+    { expectedQty: 1, goodQty: 1, damagedQty: 0, notOursQty: 0 },
+  ])
+  assert.deepEqual(
+    { status: normal.status, actual: normal.actualUnits, restock: normal.restockUnits },
+    { status: 'received', actual: 1, restock: 1 },
+  )
+
+  const damaged = summarizeReturnInspection([
+    { expectedQty: 1, goodQty: 0, damagedQty: 1, notOursQty: 0 },
+  ])
+  assert.deepEqual(
+    { status: damaged.status, actual: damaged.actualUnits, restock: damaged.restockUnits },
+    { status: 'discrepancy', actual: 1, restock: 0 },
+  )
+
+  const swapped = summarizeReturnInspection([
+    { expectedQty: 1, goodQty: 0, damagedQty: 0, notOursQty: 1 },
+  ])
+  assert.deepEqual(
+    { status: swapped.status, actual: swapped.actualUnits, restock: swapped.restockUnits, notOurs: swapped.notOursUnits },
+    { status: 'rejected', actual: 0, restock: 0, notOurs: 1 },
+  )
+})
+
+test('return inspection supports mixed set outcomes and rejects over-counting', () => {
+  const mixed = summarizeReturnInspection([
+    { expectedQty: 4, goodQty: 2, damagedQty: 1, notOursQty: 1 },
+  ])
+  assert.deepEqual(
+    {
+      status: mixed.status,
+      actual: mixed.actualUnits,
+      restock: mixed.restockUnits,
+      damaged: mixed.damagedUnits,
+      notOurs: mixed.notOursUnits,
+    },
+    { status: 'discrepancy', actual: 3, restock: 2, damaged: 1, notOurs: 1 },
+  )
+  assert.throws(
+    () => summarizeReturnInspection([
+      { expectedQty: 1, goodQty: 1, damagedQty: 1, notOursQty: 0 },
+    ]),
+    /cannot exceed/,
+  )
+})
 
 test('petite sales sizes are shifted exactly once', () => {
   const salesRows = consolidateRows([

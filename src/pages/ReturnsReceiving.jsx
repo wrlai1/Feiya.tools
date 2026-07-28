@@ -13,6 +13,7 @@ import {
   ScanLine,
   Search,
   Upload,
+  XCircle,
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import { useToast } from '../hooks/useToast.js'
@@ -28,6 +29,7 @@ import {
   resolveReturnManifestPackages,
 } from '../utils/returnImportEngine.js'
 import { parseOrderHistoryRows } from '../utils/orderImportEngine.js'
+import { summarizeReturnInspection } from '../utils/returnInspection.js'
 
 const BASE = '/api'
 
@@ -81,13 +83,15 @@ function headers(getToken, json = false) {
 function statusBadge(status) {
   if (status === 'received') return 'bg-emerald-100 text-emerald-700'
   if (status === 'discrepancy') return 'bg-amber-100 text-amber-800'
+  if (status === 'rejected') return 'bg-red-100 text-red-700'
   return 'bg-blue-100 text-blue-700'
 }
 
 function statusLabel(status) {
-  if (status === 'received') return 'Received'
-  if (status === 'discrepancy') return 'Discrepancy'
-  return 'Pending'
+  if (status === 'received') return '✅ Received / Recibido'
+  if (status === 'discrepancy') return '⚠️ Review / Revisar'
+  if (status === 'rejected') return '❌ Not ours / No es nuestro'
+  return 'Pending / Pendiente'
 }
 
 function sameSize(left, right) {
@@ -107,7 +111,7 @@ function CountControl({ value, onChange, disabled, max = 9999, label = 'Actual q
   const setValue = (next) => {
     const number = Number(next)
     if (!Number.isSafeInteger(number) || number < 0 || number > max) {
-      setError(`Whole numbers only (0–${max})`)
+      setError(`Whole numbers only / Solo números (0–${max})`)
       return
     }
     setError('')
@@ -271,7 +275,7 @@ export default function ReturnsReceiving() {
       setTracking(DEMO_PACKAGE.tracking_number)
       setCounts(Object.fromEntries(DEMO_PACKAGE.items.map((item) => [
         item.id,
-        { actual: 0, restock: 0 },
+        { good: 0, damaged: 0, notOurs: 0 },
       ])))
     }
     const frame = requestAnimationFrame(() => scannerRef.current?.focus())
@@ -286,7 +290,7 @@ export default function ReturnsReceiving() {
       setTracking(DEMO_PACKAGE.tracking_number)
       setCounts(Object.fromEntries(DEMO_PACKAGE.items.map((item) => [
         item.id,
-        { actual: 0, restock: 0 },
+        { good: 0, damaged: 0, notOurs: 0 },
       ])))
       setCounted(false)
       setRemark('')
@@ -328,10 +332,11 @@ export default function ReturnsReceiving() {
         (next.items || []).map((item) => [
           item.id,
           next.status === 'pending'
-            ? { actual: 0, restock: 0 }
+            ? { good: 0, damaged: 0, notOurs: 0 }
             : {
-                actual: Number(item.actual_qty || 0),
-                restock: Number(item.restock_qty || 0),
+                good: Number(item.restock_qty || 0),
+                damaged: Math.max(Number(item.actual_qty || 0) - Number(item.restock_qty || 0), 0),
+                notOurs: Number(item.not_ours_qty || 0),
               },
         ]),
       ))
@@ -346,25 +351,24 @@ export default function ReturnsReceiving() {
   }, [demoMode, getToken, toast, tracking])
 
   const expectedUnits = Number(pkg?.expected_units || 0)
-  const actualUnits = useMemo(
-    () => Object.values(counts).reduce((sum, value) => sum + (Number(value.actual) || 0), 0),
-    [counts],
-  )
-  const restockUnits = useMemo(
-    () => Object.values(counts).reduce((sum, value) => sum + (Number(value.restock) || 0), 0),
-    [counts],
-  )
-  const discrepancy = Boolean(pkg?.items?.some((item) =>
-    Number(counts[item.id]?.actual || 0) !== Number(item.expected_qty)
-    || Number(counts[item.id]?.restock || 0) !== Number(counts[item.id]?.actual || 0)
-  ))
+  const inspection = useMemo(() => summarizeReturnInspection((pkg?.items || []).map((item) => ({
+    expectedQty: Number(item.expected_qty),
+    goodQty: Number(counts[item.id]?.good || 0),
+    damagedQty: Number(counts[item.id]?.damaged || 0),
+    notOursQty: Number(counts[item.id]?.notOurs || 0),
+  }))), [counts, pkg])
+  const {
+    actualUnits, restockUnits, damagedUnits, notOursUnits, categorizedUnits,
+    hasDiscrepancy: discrepancy,
+  } = inspection
 
   const confirmPackage = async () => {
     if (!pkg || pkg.status !== 'pending' || !counted || loading) return
     if (discrepancy) {
       const proceed = window.confirm(
-        `Expected ${expectedUnits}, received ${actualUnits}, and ${restockUnits} are resellable.\n\n` +
-        'Only resellable units will be added to inventory. Save this package as a discrepancy?'
+        `Expected / Esperado: ${expectedUnits}\n` +
+        `Good / Bueno: ${restockUnits}\nDamaged / Dañado: ${damagedUnits}\nNot ours / No es nuestro: ${notOursUnits}\n\n` +
+        'Confirm these results? / ¿Confirmar estos resultados?'
       )
       if (!proceed) return
     }
@@ -377,18 +381,19 @@ export default function ReturnsReceiving() {
           tracking: pkg.tracking_number,
           items: pkg.items.map((item) => ({
             id: item.id,
-            actualQty: Number(counts[item.id]?.actual || 0),
-            restockQty: Number(counts[item.id]?.restock || 0),
+            actualQty: Number(counts[item.id]?.good || 0) + Number(counts[item.id]?.damaged || 0),
+            restockQty: Number(counts[item.id]?.good || 0),
+            notOursQty: Number(counts[item.id]?.notOurs || 0),
           })),
           remark,
         }),
       })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || 'Could not receive return package')
-      toast.success(
-        `${Number(data.added_units || 0).toLocaleString()} resellable units added to inventory`,
-        data.status === 'discrepancy' ? 'Discrepancy Recorded' : 'Return Received',
-      )
+      const title = data.status === 'rejected'
+        ? 'Not ours / No es nuestro'
+        : data.status === 'discrepancy' ? 'Saved / Guardado' : 'Received / Recibido'
+      toast.success(`${Number(data.added_units || 0)} added to inventory / agregado al inventario`, title)
       await lookup(pkg.tracking_number)
       await loadRecent()
     } catch (error) {
@@ -770,9 +775,9 @@ export default function ReturnsReceiving() {
     <div className="mx-auto max-w-6xl space-y-5">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <h2 className="text-xl font-bold text-slate-900">Returns Receiving</h2>
+          <h2 className="text-xl font-bold text-slate-900">Returns / Devoluciones</h2>
           <p className="mt-1 text-sm text-slate-500">
-            Scan, count, compare, and restock only what is physically returned
+            Scan and check every item / Escanee y revise cada artículo
           </p>
         </div>
         <div className="flex w-full gap-1 rounded-xl border border-slate-200 bg-white p-1 sm:w-auto">
@@ -804,7 +809,7 @@ export default function ReturnsReceiving() {
             className="card p-4 sm:p-5"
           >
             <label className="text-sm font-semibold text-slate-800" htmlFor="return-tracking">
-              Scan return package or find an order
+              Scan return or find order / Escanear devolución o buscar pedido
             </label>
             <div className="mt-2 flex gap-2">
               <div className="relative min-w-0 flex-1">
@@ -816,17 +821,17 @@ export default function ReturnsReceiving() {
                   onChange={(event) => setTracking(event.target.value)}
                   autoComplete="off"
                   spellCheck="false"
-                  placeholder="Scan tracking or enter order number"
+                  placeholder="Tracking or order / Rastreo o pedido"
                   className="h-12 w-full rounded-xl border border-slate-300 bg-white pl-11 pr-3 text-base outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
                 />
               </div>
               <button type="submit" disabled={loading || !tracking.trim()} className="btn-primary h-12 px-4">
                 {loading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
-                <span className="hidden sm:inline">Find</span>
+                <span className="hidden sm:inline">Find / Buscar</span>
               </button>
             </div>
             <p className="mt-2 text-xs text-slate-400">
-              USB and Bluetooth scanners work as keyboard input. An exact order number can also show the original SKUs.
+              Scanner or phone works here / Use escáner o teléfono aquí.
             </p>
           </form>
 
@@ -894,14 +899,15 @@ export default function ReturnsReceiving() {
                       pkg.items.map((item) => [
                         item.id,
                         {
-                          actual: Number(item.expected_qty),
-                          restock: Number(item.expected_qty),
+                          good: Number(item.expected_qty),
+                          damaged: 0,
+                          notOurs: 0,
                         },
                       ]),
                     ))}
-                    className="btn-secondary w-full justify-center text-sm sm:w-auto"
+                    className="flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-emerald-600 px-4 text-sm font-bold text-white hover:bg-emerald-700 sm:w-auto"
                   >
-                    <CheckCircle2 className="h-4 w-4" /> All present & resellable
+                    <CheckCircle2 className="h-5 w-5" /> All Good / Todo bien
                   </button>
                 )}
               </div>
@@ -919,14 +925,32 @@ export default function ReturnsReceiving() {
 
               <div className="divide-y divide-slate-100">
                 {pkg.items.map((item) => {
-                  const actual = Number(counts[item.id]?.actual || 0)
-                  const restock = Number(counts[item.id]?.restock || 0)
-                  const differs = actual !== Number(item.expected_qty)
-                  const notResellable = actual !== restock
+                  const expected = Number(item.expected_qty)
+                  const good = Number(counts[item.id]?.good || 0)
+                  const damaged = Number(counts[item.id]?.damaged || 0)
+                  const notOurs = Number(counts[item.id]?.notOurs || 0)
+                  const selected = good + damaged + notOurs
+                  const setWholeOutcome = (outcome) => setCounts((current) => ({
+                    ...current,
+                    [item.id]: {
+                      good: outcome === 'good' ? expected : 0,
+                      damaged: outcome === 'damaged' ? expected : 0,
+                      notOurs: outcome === 'notOurs' ? expected : 0,
+                    },
+                  }))
+                  const setOutcomeCount = (outcome, value) => setCounts((current) => ({
+                    ...current,
+                    [item.id]: {
+                      good: Number(current[item.id]?.good || 0),
+                      damaged: Number(current[item.id]?.damaged || 0),
+                      notOurs: Number(current[item.id]?.notOurs || 0),
+                      [outcome]: value,
+                    },
+                  }))
                   return (
-                    <div key={item.id} className="flex flex-col gap-3 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-5">
+                    <div key={item.id} className="flex flex-col gap-4 px-4 py-5 sm:px-5">
                       <div className="min-w-0">
-                        <p className="truncate text-sm font-semibold text-slate-800">
+                        <p className="break-words text-base font-bold text-slate-900">
                           {item.style} / {item.color} / {item.size}
                         </p>
                         {(item.sku_id || item.sku_code) && (
@@ -935,59 +959,70 @@ export default function ReturnsReceiving() {
                           </p>
                         )}
                         <p className="mt-1 text-xs text-slate-500">
-                          Expected: <strong>{item.expected_qty}</strong>
+                          Expected / Esperado: <strong>{item.expected_qty}</strong>
                           {pkg.status !== 'pending' && (
                             <>
-                              {' '}· Received: <strong>{item.actual_qty ?? 0}</strong>
-                              {' '}· Restocked: <strong>{item.restock_qty ?? 0}</strong>
+                              {' '}· Good / Bueno: <strong>{item.restock_qty ?? 0}</strong>
+                              {' '}· Damaged / Dañado: <strong>{Math.max(Number(item.actual_qty || 0) - Number(item.restock_qty || 0), 0)}</strong>
+                              {' '}· Not ours / No es nuestro: <strong>{item.not_ours_qty ?? 0}</strong>
                             </>
                           )}
                         </p>
                       </div>
-                      <div className="flex flex-col gap-2 sm:items-end">
-                        {pkg.status === 'pending' && (
-                          <span className={`text-xs font-semibold ${differs || notResellable ? 'text-amber-700' : 'text-emerald-700'}`}>
-                            {differs
-                              ? `Difference ${actual - Number(item.expected_qty)}`
-                              : notResellable
-                                ? `${actual - restock} not resellable`
-                                : 'Matches'}
-                          </span>
-                        )}
-                        <div className="flex flex-wrap items-start justify-between gap-3 sm:justify-end">
-                          <div>
-                            <p className="mb-1 text-[11px] font-medium text-slate-500">Physically received</p>
-                            <CountControl
-                              label="Physically received quantity"
-                              value={actual}
-                              disabled={pkg.status !== 'pending'}
-                              onChange={(value) => setCounts((current) => ({
-                                ...current,
-                                [item.id]: {
-                                  actual: value,
-                                  restock: Math.min(Number(current[item.id]?.restock || 0), value),
-                                },
-                              }))}
-                            />
+                      {pkg.status === 'pending' && (
+                        <>
+                          <div className="grid grid-cols-3 gap-2">
+                            <button type="button" onClick={() => setWholeOutcome('good')}
+                              className={`min-h-20 rounded-xl border-2 px-2 py-3 text-center font-bold ${
+                                good === expected ? 'border-emerald-700 bg-emerald-600 text-white ring-2 ring-emerald-200' : 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                              }`}>
+                              <CheckCircle2 className="mx-auto mb-1 h-7 w-7" />
+                              <span className="block text-sm">GOOD</span>
+                              <span className="block text-xs">BUENO</span>
+                            </button>
+                            <button type="button" onClick={() => setWholeOutcome('damaged')}
+                              className={`min-h-20 rounded-xl border-2 px-2 py-3 text-center font-bold ${
+                                damaged === expected ? 'border-amber-700 bg-amber-500 text-white ring-2 ring-amber-200' : 'border-amber-200 bg-amber-50 text-amber-800'
+                              }`}>
+                              <AlertTriangle className="mx-auto mb-1 h-7 w-7" />
+                              <span className="block text-sm">DAMAGED</span>
+                              <span className="block text-xs">DAÑADO</span>
+                            </button>
+                            <button type="button" onClick={() => setWholeOutcome('notOurs')}
+                              className={`min-h-20 rounded-xl border-2 px-1 py-3 text-center font-bold ${
+                                notOurs === expected ? 'border-red-800 bg-red-600 text-white ring-2 ring-red-200' : 'border-red-200 bg-red-50 text-red-800'
+                              }`}>
+                              <XCircle className="mx-auto mb-1 h-7 w-7" />
+                              <span className="block text-sm">NOT OURS</span>
+                              <span className="block text-xs">NO NUESTRO</span>
+                            </button>
                           </div>
-                          <div>
-                            <p className="mb-1 text-[11px] font-medium text-slate-500">Resellable</p>
-                            <CountControl
-                              label="Resellable quantity"
-                              value={restock}
-                              max={actual}
-                              disabled={pkg.status !== 'pending'}
-                              onChange={(value) => setCounts((current) => ({
-                                ...current,
-                                [item.id]: {
-                                  actual: Number(current[item.id]?.actual || 0),
-                                  restock: value,
-                                },
-                              }))}
-                            />
-                          </div>
-                        </div>
-                      </div>
+                          {expected > 1 && (
+                            <div className="grid gap-3 rounded-xl bg-slate-50 p-3 sm:grid-cols-3">
+                              {[
+                                ['good', 'Good / Bueno', good, expected - damaged - notOurs],
+                                ['damaged', 'Damaged / Dañado', damaged, expected - good - notOurs],
+                                ['notOurs', 'Not ours / No nuestro', notOurs, expected - good - damaged],
+                              ].map(([key, label, value, max]) => (
+                                <div key={key} className="flex items-center justify-between gap-2 sm:flex-col sm:items-start">
+                                  <p className="text-xs font-bold text-slate-600">{label}</p>
+                                  <CountControl
+                                    label={label}
+                                    value={value}
+                                    max={max}
+                                    onChange={(next) => setOutcomeCount(key, next)}
+                                  />
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                          <p className={`text-xs font-semibold ${selected === expected ? 'text-emerald-700' : 'text-red-700'}`}>
+                            {selected === expected
+                              ? '✓ Complete / Completo'
+                              : `${expected - selected} not selected / sin seleccionar`}
+                          </p>
+                        </>
+                      )}
                     </div>
                   )
                 })}
@@ -1003,18 +1038,19 @@ export default function ReturnsReceiving() {
                     {discrepancy
                       ? <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
                       : <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />}
-                    <span>
-                      Received <strong>{actualUnits}</strong> of <strong>{expectedUnits}</strong> expected;
-                      {' '}<strong>{restockUnits}</strong> are resellable.
-                      {discrepancy && ' Only resellable units will be added to inventory.'}
-                    </span>
+                    <div className="grid w-full grid-cols-2 gap-2 sm:grid-cols-4">
+                      <span className="font-semibold text-emerald-700">✅ Good / Bueno: {restockUnits}</span>
+                      <span className="font-semibold text-amber-700">⚠️ Damaged / Dañado: {damagedUnits}</span>
+                      <span className="font-semibold text-red-700">❌ Not ours / No nuestro: {notOursUnits}</span>
+                      <span className="font-semibold text-slate-600">Unselected / Pendiente: {expectedUnits - categorizedUnits}</span>
+                    </div>
                   </div>
                   <textarea
                     value={remark}
                     onChange={(event) => setRemark(event.target.value)}
                     maxLength={1000}
                     rows={2}
-                    placeholder="Optional note: missing item, wrong item, damaged item…"
+                    placeholder="Note / Nota (optional / opcional)"
                     className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
                   />
                   <label className="mt-3 flex cursor-pointer items-start gap-2 text-sm text-slate-700">
@@ -1024,16 +1060,20 @@ export default function ReturnsReceiving() {
                       onChange={(event) => setCounted(event.target.checked)}
                       className="mt-0.5 h-4 w-4 rounded border-slate-300"
                     />
-                    I opened this package and physically counted every listed item.
+                    I opened and checked every item. / Abrí y revisé cada artículo.
                   </label>
                   <button
                     type="button"
                     onClick={confirmPackage}
-                    disabled={!counted || loading}
-                    className="btn-primary mt-4 w-full justify-center py-3 text-sm disabled:opacity-50 sm:w-auto sm:min-w-52"
+                    disabled={!counted || loading || categorizedUnits !== expectedUnits}
+                    className={`mt-4 flex min-h-14 w-full items-center justify-center gap-2 rounded-xl px-5 text-base font-bold text-white disabled:opacity-40 sm:w-auto sm:min-w-64 ${
+                      notOursUnits > 0 && actualUnits === 0 ? 'bg-red-600 hover:bg-red-700' : 'bg-emerald-600 hover:bg-emerald-700'
+                    }`}
                   >
                     {loading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <PackageOpen className="h-4 w-4" />}
-                    Add {restockUnits} Resellable Units to Inventory
+                    {notOursUnits > 0 && actualUnits === 0
+                      ? '❌ Flag Not Ours / Marcar no nuestro'
+                      : `✅ Confirm / Confirmar · ${restockUnits} to inventory`}
                   </button>
                 </div>
               )}
@@ -1616,6 +1656,7 @@ export default function ReturnsReceiving() {
                 {[
                   ['Received Packages', analytics.summary.received_packages],
                   ['Discrepancy Packages', analytics.summary.discrepancy_packages],
+                  ['Not Ours / Flagged', analytics.summary.flagged_packages],
                   ['Actual Returned Units', analytics.summary.returned_units],
                   ['Restocked Units', analytics.summary.restocked_units],
                   ['Sold Units', analytics.summary.sold_units],
@@ -1639,12 +1680,13 @@ export default function ReturnsReceiving() {
                   </p>
                 </div>
                 <div className="overflow-x-auto">
-                  <table className="w-full min-w-[620px] text-sm">
+                  <table className="w-full min-w-[700px] text-sm">
                     <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
                       <tr>
                         <th className="px-4 py-3">Store</th>
                         <th className="px-4 py-3 text-right">Packages</th>
                         <th className="px-4 py-3 text-right">Discrepancies</th>
+                        <th className="px-4 py-3 text-right">Not Ours</th>
                         <th className="px-4 py-3 text-right">Returned</th>
                         <th className="px-4 py-3 text-right">Restocked</th>
                       </tr>
@@ -1655,6 +1697,7 @@ export default function ReturnsReceiving() {
                           <td className="px-4 py-3 font-medium text-slate-800">{store.store_name}</td>
                           <td className="px-4 py-3 text-right">{store.received_packages}</td>
                           <td className="px-4 py-3 text-right">{store.discrepancy_packages}</td>
+                          <td className="px-4 py-3 text-right font-semibold text-red-700">{store.flagged_packages}</td>
                           <td className="px-4 py-3 text-right font-semibold text-blue-700">{store.returned_units}</td>
                           <td className="px-4 py-3 text-right font-semibold text-emerald-700">{store.restocked_units}</td>
                         </tr>
