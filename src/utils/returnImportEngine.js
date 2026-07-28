@@ -142,6 +142,7 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
   }
   const groups = new Map()
   const needsReview = []
+  const waitingForTracking = []
 
   rows.forEach((row, index) => {
     const excelRow = index + 2
@@ -152,7 +153,12 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
     const rawQty = quantityKey ? row[quantityKey] : 1
     const quantity = rawQty === '' || rawQty == null ? 1 : Number(rawQty)
     if (!tracking) {
-      needsReview.push({ tracking: '', excelRow, skuId, parse_issue: 'tracking_missing' })
+      waitingForTracking.push({
+        excelRow,
+        orderNumber,
+        skuId,
+        parse_issue: 'tracking_pending',
+      })
       return
     }
     const group = groups.get(tracking) || {
@@ -347,11 +353,13 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
   return {
     packages,
     needsReview,
+    waitingForTracking,
     pendingOrderMatches,
     stats: {
       packageCount: packages.length,
       expectedUnits: packages.reduce((sum, pkg) => sum + pkg.expectedUnits, 0),
       reviewPackages: new Set(needsReview.map((row) => row.tracking || `row:${row.excelRow}`)).size,
+      waitingForTracking: waitingForTracking.length,
       recoveredPackages: packages.filter((pkg) => pkg.recoveredFromOrders.length > 0).length,
     },
   }

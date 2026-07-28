@@ -639,11 +639,11 @@ test('SKU return manifests isolate missing catalog data without blocking ready p
 
   assert.equal(result.packages.length, 1)
   assert.equal(result.packages[0].tracking, 'READY-1')
-  assert.equal(result.needsReview.length, 2)
-  assert.deepEqual(
-    result.needsReview.map((row) => row.parse_issue).sort(),
-    ['sku_id_missing', 'tracking_missing'],
-  )
+  assert.equal(result.needsReview.length, 1)
+  assert.equal(result.needsReview[0].parse_issue, 'sku_id_missing')
+  assert.equal(result.waitingForTracking.length, 1)
+  assert.equal(result.waitingForTracking[0].parse_issue, 'tracking_pending')
+  assert.equal(result.stats.waitingForTracking, 1)
 })
 
 test('missing return SKU IDs show every original SKU and require a selection for multi-SKU orders', () => {

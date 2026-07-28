@@ -1044,7 +1044,7 @@ export default function ReturnsReceiving() {
 
           {parsed && (
             <div className="mt-5 space-y-4">
-              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
                 <div className="rounded-xl bg-slate-50 p-3">
                   <p className="text-xl font-bold text-slate-900">{parsed.stats.packageCount}</p>
                   <p className="text-xs text-slate-500">Packages ready</p>
@@ -1058,6 +1058,12 @@ export default function ReturnsReceiving() {
                     {parsed.stats.reviewPackages}
                   </p>
                   <p className="text-xs text-slate-500">Packages needing review</p>
+                </div>
+                <div className="rounded-xl bg-blue-50 p-3">
+                  <p className="text-xl font-bold text-blue-800">
+                    {Number(parsed.stats.waitingForTracking || 0)}
+                  </p>
+                  <p className="text-xs text-slate-500">Waiting for Tracking</p>
                 </div>
               </div>
 
@@ -1145,6 +1151,23 @@ export default function ReturnsReceiving() {
                   </button>
                 </div>
               ))}
+
+              {(parsed.waitingForTracking || []).length > 0 && (
+                <div className="rounded-xl border border-blue-200 bg-blue-50 p-3">
+                  <p className="text-sm font-semibold text-blue-800">Waiting for Tracking</p>
+                  <p className="mt-1 text-xs text-blue-700">
+                    These rows are not errors. They will be skipped today and can be uploaded again after Tracking is updated.
+                  </p>
+                  <ul className="mt-2 space-y-1 text-xs text-blue-800">
+                    {parsed.waitingForTracking.slice(0, 10).map((row) => (
+                      <li key={`${row.excelRow}-${row.orderNumber}`}>
+                        Excel row {row.excelRow}: {row.skuId || 'Missing SKU'}
+                        {row.orderNumber ? ` · PO ${row.orderNumber}` : ''}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
 
               {parsed.needsReview.some((row) => row.parse_issue !== 'order_has_multiple_skus') && (
                 <div className="rounded-xl border border-amber-200 bg-amber-50 p-3">
