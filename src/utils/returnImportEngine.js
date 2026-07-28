@@ -82,12 +82,27 @@ export function resolveProductCatalogRows(catalogRows, templateRows, aliases = {
       SKU: expandConfirmedProductSku(catalogRow.skuCode),
       Quantity: 1,
     }])
+    const sourceComponents = [
+      ...consolidated.consolidated.map((row) => ({
+        style: row.style,
+        color: row.color,
+        size: row.size,
+        qty: Number(row.QTY || 1),
+      })),
+      ...consolidated.needsReview.map((row) => ({
+        style: row.style,
+        color: row.color,
+        size: row.size,
+        qty: Number(row.QTY || row.qty || 1),
+      })),
+    ]
     if (consolidated.needsReview.length) {
       return {
         ...catalogRow,
         status: 'review',
         issue: consolidated.needsReview[0].parse_issue || 'sku_parse_failed',
         components: [],
+        sourceComponents,
       }
     }
     const result = fillTemplate(templateRows, consolidated.consolidated, aliases)
@@ -97,12 +112,14 @@ export function resolveProductCatalogRows(catalogRows, templateRows, aliases = {
         status: 'review',
         issue: result.unmatchedRows[0].parseIssue || 'inventory_target_missing',
         components: [],
+        sourceComponents,
       }
     }
     return {
       ...catalogRow,
       status: 'ready',
       issue: '',
+      sourceComponents,
       components: result.filledRows
         .filter((row) => Number(row.QTY) > 0)
         .map((row) => ({
@@ -113,6 +130,74 @@ export function resolveProductCatalogRows(catalogRows, templateRows, aliases = {
         })),
     }
   })
+}
+
+function normalizedSize(value) {
+  const size = String(value || '').trim().toUpperCase()
+  if (size === '1XL') return '1X'
+  if (size === '2XL') return '2X'
+  if (size === '3XL') return '3X'
+  return size
+}
+
+function normalizedIdentity(value) {
+  return String(value || '').trim().toLowerCase()
+}
+
+export function applyProductCatalogMapping(catalogRows, skuId, selections, inventoryRows) {
+  const selectedRow = (catalogRows || []).find((row) => String(row.skuId) === String(skuId))
+  if (!selectedRow) throw new Error('SKU is no longer in this product file')
+  if (!selectedRow.sourceComponents?.length) throw new Error('This SKU could not be split into source components')
+  if (!Array.isArray(selections) || selections.length !== selectedRow.sourceComponents.length) {
+    throw new Error('Choose an inventory style and color for every component')
+  }
+
+  const rules = new Map()
+  selectedRow.sourceComponents.forEach((source, index) => {
+    const selection = selections[index] || {}
+    const matches = (inventoryRows || []).filter((target) =>
+      normalizedIdentity(target.STYLE) === normalizedIdentity(selection.style)
+      && normalizedIdentity(target.COLOR) === normalizedIdentity(selection.color)
+      && normalizedSize(target.SIZE) === normalizedSize(source.size)
+    )
+    if (matches.length !== 1) {
+      throw new Error(
+        `${source.style} / ${source.color} / ${source.size} requires one exact inventory target`,
+      )
+    }
+    rules.set(
+      `${normalizedIdentity(source.style)}\u241f${normalizedIdentity(source.color)}`,
+      { style: matches[0].STYLE, color: matches[0].COLOR },
+    )
+  })
+
+  const updatedSkuIds = []
+  const rows = (catalogRows || []).map((row) => {
+    if (row.status === 'ready' || !row.sourceComponents?.length) return row
+    const components = []
+    for (const source of row.sourceComponents) {
+      const rule = rules.get(
+        `${normalizedIdentity(source.style)}\u241f${normalizedIdentity(source.color)}`,
+      )
+      if (!rule) return row
+      const matches = (inventoryRows || []).filter((target) =>
+        normalizedIdentity(target.STYLE) === normalizedIdentity(rule.style)
+        && normalizedIdentity(target.COLOR) === normalizedIdentity(rule.color)
+        && normalizedSize(target.SIZE) === normalizedSize(source.size)
+      )
+      if (matches.length !== 1) return row
+      components.push({
+        style: matches[0].STYLE,
+        color: matches[0].COLOR,
+        size: matches[0].SIZE,
+        qty: Number(source.qty || 1),
+      })
+    }
+    updatedSkuIds.push(row.skuId)
+    return { ...row, status: 'ready', issue: '', components }
+  })
+
+  return { rows, updatedSkuIds }
 }
 
 export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders = []) {

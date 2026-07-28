@@ -8,6 +8,7 @@ import {
 import { consolidateRows } from '../src/utils/consolidateEngine.js'
 import { findAdditionalComboSizeMappings, findAdditionalSizeMappings } from '../src/utils/autoDeductRules.js'
 import {
+  applyProductCatalogMapping,
   applyReturnOrderMatch,
   expandConfirmedProductSku,
   getReturnManifestOrderNumbers,
@@ -593,6 +594,75 @@ test('store product catalogs preserve SKU IDs and resolve physical components', 
     { style: '0015', color: 'Dusty Blue', size: 'XL', qty: 1 },
     { style: '0015', color: 'White', size: 'XL', qty: 1 },
   ])
+})
+
+test('manual product mapping carries the same confirmed colors to sibling sizes', () => {
+  const catalogRows = [
+    {
+      skuId: 'SKU-S',
+      skuCode: 'M017Navy&KhakiS',
+      status: 'review',
+      issue: 'inventory_target_missing',
+      components: [],
+      sourceComponents: [
+        { style: 'M017', color: 'navy', size: 'S', qty: 1 },
+        { style: 'M017', color: 'khaki', size: 'S', qty: 1 },
+      ],
+    },
+    {
+      skuId: 'SKU-M',
+      skuCode: 'M017Navy&KhakiM',
+      status: 'review',
+      issue: 'inventory_target_missing',
+      components: [],
+      sourceComponents: [
+        { style: 'M017', color: 'navy', size: 'M', qty: 1 },
+        { style: 'M017', color: 'khaki', size: 'M', qty: 1 },
+      ],
+    },
+    {
+      skuId: 'SKU-X',
+      skuCode: 'XM017Navy&KhakiXL',
+      status: 'review',
+      issue: 'inventory_target_missing',
+      components: [],
+      sourceComponents: [
+        { style: 'XM017', color: 'navy', size: 'XL', qty: 1 },
+        { style: 'XM017', color: 'khaki', size: 'XL', qty: 1 },
+      ],
+    },
+  ]
+  const inventoryRows = ['S', 'M', 'XL'].flatMap((size) => [
+    { STYLE: 'M017-MISSY', COLOR: 'DEEP BLUE #3455 slub', SIZE: size },
+    { STYLE: 'M017-MISSY', COLOR: 'KHAKI #3455 slub', SIZE: size },
+  ])
+
+  const result = applyProductCatalogMapping(catalogRows, 'SKU-S', [
+    { style: 'M017-MISSY', color: 'DEEP BLUE #3455 slub' },
+    { style: 'M017-MISSY', color: 'KHAKI #3455 slub' },
+  ], inventoryRows)
+
+  assert.deepEqual(result.updatedSkuIds, ['SKU-S', 'SKU-M'])
+  assert.equal(result.rows[0].status, 'ready')
+  assert.equal(result.rows[1].status, 'ready')
+  assert.equal(result.rows[2].status, 'review')
+  assert.deepEqual(result.rows[1].components, [
+    { style: 'M017-MISSY', color: 'DEEP BLUE #3455 slub', size: 'M', qty: 1 },
+    { style: 'M017-MISSY', color: 'KHAKI #3455 slub', size: 'M', qty: 1 },
+  ])
+})
+
+test('unresolved product combos retain their source components for upload-time review', () => {
+  const [row] = resolveProductCatalogRows([
+    { skuId: 'M017-S', skuCode: 'M017Navy&Fuchsia&Khaki&WhiteS' },
+  ], [])
+
+  assert.equal(row.status, 'review')
+  assert.equal(row.issue, 'inventory_target_missing')
+  assert.deepEqual(
+    row.sourceComponents.map((component) => component.color).sort(),
+    ['fuchsia', 'khaki', 'navy', 'white'],
+  )
 })
 
 test('SKU return manifests group tracking and retain store-facing return details', () => {

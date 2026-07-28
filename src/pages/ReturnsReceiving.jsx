@@ -16,7 +16,9 @@ import {
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import { useToast } from '../hooks/useToast.js'
+import { aliasKey } from '../utils/autoDeductEngine.js'
 import {
+  applyProductCatalogMapping,
   applyReturnOrderMatch,
   getReturnManifestOrderNumbers,
   parseProductCatalogRows,
@@ -86,6 +88,17 @@ function statusLabel(status) {
   if (status === 'received') return 'Received'
   if (status === 'discrepancy') return 'Discrepancy'
   return 'Pending'
+}
+
+function sameSize(left, right) {
+  const normalize = (value) => {
+    const size = String(value || '').trim().toUpperCase()
+    if (size === '1XL') return '1X'
+    if (size === '2XL') return '2X'
+    if (size === '3XL') return '3X'
+    return size
+  }
+  return normalize(left) === normalize(right)
 }
 
 function CountControl({ value, onChange, disabled, max = 9999, label = 'Actual quantity' }) {
@@ -217,6 +230,9 @@ export default function ReturnsReceiving() {
   const [storeName, setStoreName] = useState('')
   const [catalogFile, setCatalogFile] = useState(null)
   const [catalogParsed, setCatalogParsed] = useState(null)
+  const [catalogInventoryRows, setCatalogInventoryRows] = useState([])
+  const [catalogSelections, setCatalogSelections] = useState({})
+  const [catalogAliases, setCatalogAliases] = useState({})
   const [catalogUploading, setCatalogUploading] = useState(false)
   const [analytics, setAnalytics] = useState(null)
   const [analyticsDays, setAnalyticsDays] = useState(30)
@@ -492,6 +508,7 @@ export default function ReturnsReceiving() {
   const parseCatalogFile = async (nextFile) => {
     setCatalogFile(nextFile)
     setCatalogParsed(null)
+    setCatalogSelections({})
     if (!nextFile) return
     if (!storeName.trim()) {
       toast.error('Enter the store name before reading its product file', 'Store Required')
@@ -513,15 +530,18 @@ export default function ReturnsReceiving() {
       ])
       if (!inventoryRes.ok) throw new Error(inventoryData.error || 'Could not load inventory targets')
       if (!aliasesRes.ok) throw new Error(aliasesData.error || 'Could not load confirmed SKU mappings')
+      const inventoryRows = (inventoryData.rows || []).map((row) => ({
+        STYLE: row.Style,
+        COLOR: row.Color,
+        SIZE: row.Size,
+      }))
       const resolved = resolveProductCatalogRows(
         catalogRows,
-        (inventoryData.rows || []).map((row) => ({
-          STYLE: row.Style,
-          COLOR: row.Color,
-          SIZE: row.Size,
-        })),
+        inventoryRows,
         aliasesData.aliases || {},
       )
+      setCatalogInventoryRows(inventoryRows)
+      setCatalogAliases(aliasesData.aliases || {})
       setCatalogParsed({
         rows: resolved,
         ready: resolved.filter((row) => row.status === 'ready').length,
@@ -529,6 +549,59 @@ export default function ReturnsReceiving() {
       })
     } catch (error) {
       toast.error(error.message, 'Could Not Read Product File')
+    }
+  }
+
+  const catalogSelectionFor = (row, index) => {
+    const selectionKey = `${row.skuId}:${index}`
+    if (catalogSelections[selectionKey]) return catalogSelections[selectionKey]
+    const source = row.sourceComponents?.[index]
+    const learned = source ? catalogAliases[aliasKey(source.style, source.color)] : null
+    if (!learned || learned.components || learned._isNew) return {}
+    const exists = catalogInventoryRows.some((target) =>
+      target.STYLE === learned.STYLE
+      && target.COLOR === learned.COLOR
+      && sameSize(target.SIZE, source.size)
+    )
+    return exists ? { style: learned.STYLE, color: learned.COLOR } : {}
+  }
+
+  const confirmCatalogMapping = async (row) => {
+    try {
+      const selections = (row.sourceComponents || []).map((_, index) =>
+        catalogSelectionFor(row, index)
+      )
+      const result = applyProductCatalogMapping(
+        catalogParsed.rows,
+        row.skuId,
+        selections,
+        catalogInventoryRows,
+      )
+      const nextAliases = { ...catalogAliases }
+      row.sourceComponents.forEach((source, index) => {
+        nextAliases[aliasKey(source.style, source.color)] = {
+          STYLE: selections[index].style,
+          COLOR: selections[index].color,
+          _confirmed: true,
+        }
+      })
+      const aliasRes = await fetch(`${BASE}/auto-deduct?action=save-aliases`, {
+        method: 'POST',
+        headers: headers(getToken, true),
+        body: JSON.stringify({ aliases: nextAliases }),
+      })
+      const aliasData = await aliasRes.json().catch(() => ({}))
+      if (!aliasRes.ok) throw new Error(aliasData.error || 'Could not save this confirmed mapping')
+      const ready = result.rows.filter((item) => item.status === 'ready').length
+      const review = result.rows.length - ready
+      setCatalogAliases(nextAliases)
+      setCatalogParsed({ rows: result.rows, ready, review })
+      toast.success(
+        `${result.updatedSkuIds.length} SKU size variant(s) completed`,
+        'Product Mapping Saved in Preview',
+      )
+    } catch (error) {
+      toast.error(error.message, 'Complete Product Mapping')
     }
   }
 
@@ -1261,15 +1334,110 @@ export default function ReturnsReceiving() {
                   ))}
                 </div>
                 {catalogParsed.review > 0 && (
-                  <div className="rounded-xl border border-amber-200 bg-amber-50 p-3">
-                    <p className="text-sm font-semibold text-amber-800">
-                      Unresolved SKUs will be saved for review but cannot receive inventory yet.
-                    </p>
-                    <ul className="mt-2 space-y-1 text-xs text-amber-700">
-                      {catalogParsed.rows.filter((row) => row.status !== 'ready').slice(0, 10).map((row) => (
-                        <li key={row.skuId}>{row.skuId}: {row.skuCode} ({row.issue})</li>
-                      ))}
-                    </ul>
+                  <div className="space-y-3 rounded-xl border border-amber-200 bg-amber-50 p-3 sm:p-4">
+                    <div>
+                      <p className="text-sm font-semibold text-amber-900">
+                        Complete unresolved SKUs before uploading
+                      </p>
+                      <p className="mt-1 text-xs text-amber-700">
+                        Choose the exact inventory style and color for each source component.
+                        A confirmed color combination automatically carries to its other available sizes.
+                      </p>
+                    </div>
+                    {catalogParsed.rows.filter((row) => row.status !== 'ready').map((row) => (
+                      <details key={row.skuId} className="overflow-hidden rounded-xl border border-amber-200 bg-white">
+                        <summary className="cursor-pointer px-3 py-3">
+                          <span className="block text-sm font-semibold text-slate-800">
+                            {row.skuCode}
+                          </span>
+                          <span className="mt-0.5 block text-xs text-slate-500">
+                            SKU ID {row.skuId} · {row.issue}
+                          </span>
+                        </summary>
+                        <div className="space-y-3 border-t border-slate-100 p-3">
+                          {!row.sourceComponents?.length ? (
+                            <p className="text-xs text-amber-700">
+                              This SKU could not be split into components. Check and correct its SKU货号 in the source file.
+                            </p>
+                          ) : (
+                            row.sourceComponents.map((source, index) => {
+                              const selectionKey = `${row.skuId}:${index}`
+                              const selection = catalogSelectionFor(row, index)
+                              const styleOptions = [...new Set(
+                                catalogInventoryRows
+                                  .filter((target) => sameSize(target.SIZE, source.size))
+                                  .map((target) => target.STYLE),
+                              )].sort()
+                              const colorOptions = [...new Set(
+                                catalogInventoryRows
+                                  .filter((target) =>
+                                    sameSize(target.SIZE, source.size)
+                                    && target.STYLE === selection.style
+                                  )
+                                  .map((target) => target.COLOR),
+                              )].sort()
+                              return (
+                                <div
+                                  key={selectionKey}
+                                  className="rounded-xl border border-slate-200 bg-slate-50 p-3"
+                                >
+                                  <p className="text-xs font-semibold text-slate-700">
+                                    Source: {source.style} / {source.color} / {source.size}
+                                  </p>
+                                  <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                                    <label className="text-xs font-medium text-slate-500">
+                                      Inventory style
+                                      <select
+                                        value={selection.style || ''}
+                                        onChange={(event) => setCatalogSelections((current) => ({
+                                          ...current,
+                                          [selectionKey]: { style: event.target.value, color: '' },
+                                        }))}
+                                        className="mt-1 h-11 w-full rounded-lg border border-slate-300 bg-white px-2 text-sm text-slate-700"
+                                      >
+                                        <option value="">Choose style</option>
+                                        {styleOptions.map((style) => (
+                                          <option key={style} value={style}>{style}</option>
+                                        ))}
+                                      </select>
+                                    </label>
+                                    <label className="text-xs font-medium text-slate-500">
+                                      Inventory color
+                                      <select
+                                        value={selection.color || ''}
+                                        disabled={!selection.style}
+                                        onChange={(event) => setCatalogSelections((current) => ({
+                                          ...current,
+                                          [selectionKey]: {
+                                            style: selection.style,
+                                            color: event.target.value,
+                                          },
+                                        }))}
+                                        className="mt-1 h-11 w-full rounded-lg border border-slate-300 bg-white px-2 text-sm text-slate-700 disabled:bg-slate-100"
+                                      >
+                                        <option value="">Choose color</option>
+                                        {colorOptions.map((color) => (
+                                          <option key={color} value={color}>{color}</option>
+                                        ))}
+                                      </select>
+                                    </label>
+                                  </div>
+                                </div>
+                              )
+                            })
+                          )}
+                          <button
+                            type="button"
+                            disabled={!row.sourceComponents?.length}
+                            onClick={() => confirmCatalogMapping(row)}
+                            className="btn-primary w-full justify-center py-3 disabled:opacity-50 sm:w-auto"
+                          >
+                            <CheckCircle2 className="h-4 w-4" />
+                            Confirm This SKU Combination
+                          </button>
+                        </div>
+                      </details>
+                    ))}
                   </div>
                 )}
                 <button
