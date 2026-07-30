@@ -771,7 +771,6 @@ export default function MetricsAnalytics() {
   const [comparisonLoading, setComparisonLoading] = useState(false)
   const [targets, setTargets] = useState(DEFAULT_TARGETS)
   const [settingsOpen, setSettingsOpen] = useState(false)
-  const [dataManagementOpen, setDataManagementOpen] = useState(false)
   const [storeSettingsOpen, setStoreSettingsOpen] = useState(false)
   const [deleteFrom, setDeleteFrom] = useState('')
   const [deleteTo, setDeleteTo] = useState('')
@@ -785,6 +784,11 @@ export default function MetricsAnalytics() {
   const [salesSummary, setSalesSummary] = useState(null)
   const [salesSummaryLoading, setSalesSummaryLoading] = useState(false)
   const [savedViews, setSavedViews] = useState(loadSavedAnalyticsViews)
+  const [activeWorkspace, setActiveWorkspace] = useState(() => {
+    if (initialProduct) return 'products'
+    if (location.hash === '#analytics-uploads') return 'manage'
+    return 'overview'
+  })
 
   const activeDataDay = useMemo(() => {
     const value = stores.find((store) => store.name === activeStore)?.last_day
@@ -1059,19 +1063,14 @@ export default function MetricsAnalytics() {
     ? Math.floor((Date.parse(todayISO()) - Date.parse(latestSavedDay)) / 86400000)
     : null
   const dataAgeDays = Number.isFinite(rawDataAgeDays) ? Math.max(0, rawDataAgeDays) : null
-  const showDataManagement = dataManagementOpen || !activeStore || !visibleRows.length || Boolean(draftReport)
-
   useEffect(() => {
-    if (location.hash === '#analytics-uploads') setDataManagementOpen(true)
-  }, [location.hash])
-
-  useEffect(() => {
-    if (location.hash !== '#analytics-uploads' || !showDataManagement) return undefined
+    if (location.hash !== '#analytics-uploads') return undefined
+    setActiveWorkspace('manage')
     const frame = window.requestAnimationFrame(() => {
-      document.getElementById('analytics-uploads')?.scrollIntoView({ block: 'start' })
+      document.getElementById('analytics-workspace')?.scrollIntoView({ block: 'start' })
     })
     return () => window.cancelAnimationFrame(frame)
-  }, [location.hash, showDataManagement])
+  }, [location.hash])
 
   useEffect(() => {
     const isInitialDeepLink = initialProduct
@@ -1199,10 +1198,18 @@ export default function MetricsAnalytics() {
     if (!value) return
     setAutoFocusProduct(false)
     setSelectedProduct(value)
+    setActiveWorkspace('products')
     window.requestAnimationFrame(() => {
-      document.getElementById('spu-sku-focus')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      document.getElementById('analytics-workspace')?.scrollIntoView({ block: 'start' })
     })
   }, [])
+
+  const switchWorkspace = (workspace) => {
+    setActiveWorkspace(workspace)
+    window.requestAnimationFrame(() => {
+      document.getElementById('analytics-workspace')?.scrollIntoView({ block: 'start' })
+    })
+  }
 
   const handleCreateStore = async () => {
     const name = newStore.trim()
@@ -1523,7 +1530,7 @@ export default function MetricsAnalytics() {
   }
 
   return (
-    <div className="mx-auto flex max-w-[1500px] flex-col gap-6">
+    <div className="mx-auto flex max-w-[1500px] flex-col gap-4">
       <FloatingStoreSwitcher
         stores={stores}
         activeStore={activeStore}
@@ -1533,6 +1540,7 @@ export default function MetricsAnalytics() {
       />
 
       <nav
+        id="analytics-workspace"
         aria-label="Analytics sections"
         className="sticky top-0 z-30 rounded-2xl border border-slate-200/80 bg-white/95 px-3 py-2.5 shadow-sm backdrop-blur-xl"
         style={{ order: 0 }}
@@ -1553,27 +1561,30 @@ export default function MetricsAnalytics() {
               </div>
             </div>
           </div>
-          <div className="-mx-1 flex items-center gap-1 overflow-x-auto px-1 pb-0.5 lg:mx-0 lg:px-0 lg:pb-0">
+          <div className="-mx-1 flex items-center gap-1 overflow-x-auto rounded-xl bg-slate-100 p-1 lg:mx-0">
             {[
-              ['analytics-performance', 'Performance'],
-              ['spu-sku-focus', 'SPU Focus'],
-              ['analytics-movement', 'Movement'],
-              ['analytics-stores', 'Stores'],
-              ['analytics-data-management', 'Manage'],
-            ].map(([id, label]) => (
-              <a
-                key={id}
-                href={`#${id}`}
-                className="whitespace-nowrap rounded-lg px-2.5 py-1.5 text-xs font-medium text-slate-500 transition hover:bg-slate-100 hover:text-slate-800"
+              ['overview', '经营概览'],
+              ['products', '商品与库存'],
+              ['manage', '数据上传'],
+            ].map(([workspace, label]) => (
+              <button
+                key={workspace}
+                type="button"
+                onClick={() => switchWorkspace(workspace)}
+                className={`whitespace-nowrap rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
+                  activeWorkspace === workspace
+                    ? 'bg-white text-blue-700 shadow-sm'
+                    : 'text-slate-500 hover:text-slate-800'
+                }`}
               >
                 {label}
-              </a>
+              </button>
             ))}
           </div>
         </div>
       </nav>
 
-      <div className="space-y-3" style={{ order: 1 }}>
+      <div className={activeWorkspace === 'overview' ? 'space-y-3' : 'hidden'} style={{ order: 1 }}>
         <DataStatusBanner
           activeStore={activeStore}
           latestSavedDay={latestSavedDay}
@@ -1598,7 +1609,7 @@ export default function MetricsAnalytics() {
         />
       </div>
 
-      <div style={{ order: activeStore ? 2 : 4 }}>
+      <div className={activeWorkspace === 'overview' ? '' : 'hidden'} style={{ order: 3 }}>
         <DateRangeControl
           timeframe={timeframe}
           setTimeframe={setTimeframe}
@@ -1618,7 +1629,7 @@ export default function MetricsAnalytics() {
         />
       </div>
 
-      <div style={{ order: visibleRows.length ? 7 : 8 }}>
+      <div className={activeWorkspace === 'manage' ? '' : 'hidden'} style={{ order: 6 }}>
         <StoreDailyLogCard
           stores={stores}
           activeStore={activeStore}
@@ -1630,8 +1641,8 @@ export default function MetricsAnalytics() {
 
       <section
         id="analytics-stores"
-        className="card scroll-mt-28 p-5 space-y-4"
-        style={{ order: activeStore ? 8 : 2 }}
+        className={`${activeWorkspace === 'manage' ? '' : 'hidden'} card scroll-mt-28 p-5 space-y-4`}
+        style={{ order: 3 }}
       >
         <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
           <div>
@@ -1767,35 +1778,27 @@ export default function MetricsAnalytics() {
 
       <section
         id="analytics-data-management"
-        className="card scroll-mt-28 p-5"
-        style={{ order: activeStore && visibleRows.length && !draftReport ? 9 : 3 }}
+        className={`${activeWorkspace === 'manage' ? '' : 'hidden'} card scroll-mt-28 p-5`}
+        style={{ order: 1 }}
       >
         <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
           <div>
-            <h2 className="font-semibold text-slate-800">Data Management</h2>
+            <h2 className="font-semibold text-slate-800">数据上传与管理</h2>
             <p className="mt-0.5 text-xs text-slate-400">
-              上传数据、调整分析目标或维护 SPU 档案。核心结果保持在上方，这些低频工具按需展开。
+              上传数据、调整分析目标或维护 SPU 档案。工具位置固定，不会因上传结果改变。
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-xs text-slate-400">{products.length} SPU · {storeDays.length} saved days</span>
-            <button
-              type="button"
-              onClick={() => setDataManagementOpen((open) => !open)}
-              disabled={!activeStore || !visibleRows.length || Boolean(draftReport)}
-              className="btn-secondary text-xs disabled:opacity-60"
-            >
-              {!activeStore || !visibleRows.length || draftReport
-                ? 'Required tools shown'
-                : dataManagementOpen ? 'Collapse tools' : 'Open tools'}
-            </button>
+            <span className="rounded-md bg-slate-100 px-2.5 py-1.5 text-xs text-slate-500">
+              位置固定
+            </span>
           </div>
         </div>
       </section>
 
-      {showDataManagement && (
-        <>
-      <section className="card scroll-mt-28 p-5" style={{ order: 11 }}>
+      <>
+      <section className={`${activeWorkspace === 'manage' ? '' : 'hidden'} card scroll-mt-28 p-5`} style={{ order: 7 }}>
         <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
           <div>
             <h2 className="font-semibold text-slate-800">Analytics Settings</h2>
@@ -1823,8 +1826,8 @@ export default function MetricsAnalytics() {
 
       <section
         id="analytics-uploads"
-        className="grid scroll-mt-28 grid-cols-1 gap-4 lg:grid-cols-2"
-        style={{ order: activeStore && visibleRows.length && !draftReport ? 10 : 3 }}
+        className={`${activeWorkspace === 'manage' ? '' : 'hidden'} grid scroll-mt-28 grid-cols-1 gap-4 lg:grid-cols-2`}
+        style={{ order: 2 }}
       >
         <div className="card p-4">
           <div className="flex items-center justify-between mb-3">
@@ -1910,7 +1913,7 @@ export default function MetricsAnalytics() {
         </div>
       </section>
 
-      <div style={{ order: 12 }}>
+      <div className={activeWorkspace === 'manage' ? '' : 'hidden'} style={{ order: 4 }}>
         <ProductCatalogEditor
           activeStore={activeStore}
           products={products}
@@ -1918,13 +1921,12 @@ export default function MetricsAnalytics() {
           onDelete={handleDeleteProduct}
         />
       </div>
-        </>
-      )}
+      </>
 
       <section
         id="spu-sku-focus"
-        className="card scroll-mt-28 p-5 space-y-4"
-        style={{ order: visibleRows.length ? 4 : 6 }}
+        className={`${activeWorkspace === 'products' ? '' : 'hidden'} card scroll-mt-28 p-5 space-y-4`}
+        style={{ order: 5 }}
       >
         <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-3">
           <div>
@@ -1975,8 +1977,8 @@ export default function MetricsAnalytics() {
       <section
         id="analytics-performance"
         aria-label="Performance analytics"
-        className="scroll-mt-28"
-        style={{ order: visibleRows.length ? 3 : activeStore ? 4 : 5 }}
+        className={activeWorkspace === 'overview' ? 'scroll-mt-28' : 'hidden'}
+        style={{ order: 4 }}
       >
         {!visibleRows.length ? (
           <div className="card p-8 text-center text-slate-400">
@@ -2053,7 +2055,7 @@ export default function MetricsAnalytics() {
       </section>
 
       {/* 库存动销 — 来自 Auto Deduct 流水，与店铺数据独立 */}
-      <section id="analytics-movement" aria-label="Inventory movement" className="scroll-mt-28" style={{ order: 6 }}>
+      <section id="analytics-movement" aria-label="Inventory movement" className={activeWorkspace === 'products' ? 'scroll-mt-28' : 'hidden'} style={{ order: 6 }}>
         <MovementAnalytics />
       </section>
     </div>
@@ -2235,21 +2237,23 @@ function SavedViewsBar({
 
 function FloatingStoreSwitcher({ stores, activeStore, setActiveStore, summary, loading }) {
   const [open, setOpen] = useState(false)
-  const active = stores.find((s) => s.name === activeStore)
-  const trend = summary?.trend?.slice(-14) || []
   return (
-    <div className="fixed bottom-3 right-3 z-40 w-64 max-w-[calc(100vw-1.5rem)] sm:w-72 lg:hidden">
+    <div className="fixed bottom-3 right-3 z-40 w-72 max-w-[calc(100vw-1.5rem)]">
       {open && (
-        <div className="mb-2 rounded-lg border border-slate-200 bg-white shadow-xl overflow-hidden">
-          <div className="px-3 py-2 border-b border-slate-100">
-            <div className="text-xs font-semibold text-slate-500 uppercase">Switch Store</div>
+        <div className="mb-2 overflow-hidden rounded-lg border border-slate-200 bg-white shadow-xl">
+          <div className="border-b border-slate-100 px-3 py-2">
+            <div className="text-xs font-semibold uppercase text-slate-500">Switch Store</div>
           </div>
-          <div className="max-h-80 overflow-y-auto p-2 space-y-1">
+          <div className="max-h-80 space-y-1 overflow-y-auto p-2">
             {stores.map((store) => (
               <button
                 key={store.name}
                 onClick={() => { setActiveStore(store.name); setOpen(false) }}
-                className={`w-full text-left rounded-md px-3 py-2 ${activeStore === store.name ? 'bg-blue-50 text-blue-800' : 'hover:bg-slate-50 text-slate-600'}`}
+                className={`w-full rounded-md px-3 py-2 text-left ${
+                  activeStore === store.name
+                    ? 'bg-blue-50 text-blue-800'
+                    : 'text-slate-600 hover:bg-slate-50'
+                }`}
               >
                 <div className="font-semibold truncate">{store.name}</div>
                 <div className="text-xs text-slate-400">{store.days || 0} days · {store.spuCount || 0} SPU</div>
@@ -2261,10 +2265,13 @@ function FloatingStoreSwitcher({ stores, activeStore, setActiveStore, summary, l
       )}
       <button
         onClick={() => setOpen((v) => !v)}
-        className="grid w-full grid-cols-3 items-center gap-2 rounded-lg border border-blue-200 bg-white px-3 py-2 text-left shadow-xl sm:hidden"
+        aria-expanded={open}
+        className="grid w-full grid-cols-3 items-center gap-2 rounded-lg border border-blue-200 bg-white px-3 py-2 text-left shadow-xl"
       >
         <div>
-          <div className="text-[9px] font-semibold uppercase text-blue-500">Latest {summary?.latestDay?.slice(5).replace('-', '/') || '-'}</div>
+          <div className="text-[9px] font-semibold uppercase text-blue-500">
+            Latest {summary?.latestDay?.slice(5).replace('-', '/') || '-'}
+          </div>
           <div className="text-lg font-bold text-slate-800">{loading ? '-' : count(summary?.latestUnits || 0)}</div>
         </div>
         <div className="border-x border-slate-100 px-2 text-center">
@@ -2276,55 +2283,6 @@ function FloatingStoreSwitcher({ stores, activeStore, setActiveStore, summary, l
           <div className="truncate text-xs font-semibold text-slate-700">{activeStore || '未选择'}</div>
         </div>
       </button>
-      <div className="hidden overflow-hidden rounded-lg border border-blue-200 bg-white shadow-xl sm:block">
-        <div className="px-3 py-2 sm:px-4 sm:pb-0 sm:pt-3">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <div className="text-[11px] font-semibold uppercase text-blue-500">All Stores Sales</div>
-              <div className="mt-1 text-xl font-bold text-slate-800 sm:text-2xl">
-                {loading ? '-' : count(summary?.latestUnits || 0)}
-                <span className="ml-1 text-xs font-medium text-slate-400">units</span>
-              </div>
-              <div className="text-[11px] text-slate-400">
-                Latest day {summary?.latestDay ? formatISODate(summary.latestDay) : '-'}
-              </div>
-            </div>
-            <div className="text-right">
-              <div className="text-[10px] uppercase text-slate-400">7-day avg</div>
-              <div className="text-lg font-semibold text-teal-700">{loading ? '-' : count(summary?.sevenDayAverage || 0)}</div>
-              <div className="text-[10px] text-slate-400">units / day</div>
-            </div>
-          </div>
-          <div className="mt-2 hidden h-20 sm:block">
-            {trend.length ? (
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={trend} margin={{ top: 6, right: 3, left: 3, bottom: 2 }}>
-                  <Tooltip
-                    formatter={(value) => [count(value), 'All-store units']}
-                    labelFormatter={(label) => formatISODate(label)}
-                    contentStyle={{ borderRadius: 8, borderColor: '#e2e8f0', fontSize: 11 }}
-                  />
-                  <Line type="monotone" dataKey="units" stroke="#2563eb" strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
-                </LineChart>
-              </ResponsiveContainer>
-            ) : (
-              <div className="flex h-full items-center justify-center text-xs text-slate-400">No daily sales trend</div>
-            )}
-          </div>
-        </div>
-        <button
-          onClick={() => setOpen((v) => !v)}
-          className="flex w-full items-center justify-between border-t border-slate-100 px-4 py-2.5 text-left hover:bg-slate-50"
-        >
-          <div className="min-w-0">
-            <div className="text-[10px] font-semibold uppercase text-slate-400">Current Store</div>
-            <div className="truncate text-sm font-semibold text-slate-700">{activeStore || '未选择店铺'}</div>
-          </div>
-          <div className="ml-3 flex-shrink-0 text-right text-[10px] text-slate-400">
-            {active ? `${active.days || 0} days · ${active.spuCount || 0} SPU` : 'Switch store'}
-          </div>
-        </button>
-      </div>
     </div>
   )
 }
