@@ -6,6 +6,7 @@ import {
 } from 'lucide-react'
 import DataTable from '../components/DataTable.jsx'
 import FileUploadZone from '../components/FileUploadZone.jsx'
+import ReplenishmentPlan from '../components/ReplenishmentPlan.jsx'
 import { useToast } from '../hooks/useToast.js'
 import { useAuth } from '../context/AuthContext.jsx'
 import { parseCSV } from '../utils/autoDeductEngine.js'
@@ -875,7 +876,7 @@ function InitializePanel({ onDone, getToken }) {
 
 // ── Main page ─────────────────────────────────────────────────────────────────
 export default function StockManagement() {
-  const { getToken } = useAuth()
+  const { getToken, user } = useAuth()
   const [balanceData,    setBalanceData]    = useState(null)
   const [loading,        setLoading]        = useState(true)
   const [inputValue,     setInputValue]     = useState('')
@@ -888,6 +889,7 @@ export default function StockManagement() {
   const [showAddRows,    setShowAddRows]    = useState(false)
   const [showRemoveRows, setShowRemoveRows] = useState(false)
   const [editTarget,     setEditTarget]     = useState(null)
+  const [activeView,     setActiveView]     = useState('balance')
   const toast = useToast()
 
   const COLUMNS = useMemo(() => [
@@ -1060,15 +1062,18 @@ export default function StockManagement() {
         <div className="flex-1">
           <h2 className="text-xl font-bold text-slate-800">Stock Management</h2>
           <p className="text-sm text-slate-500 mt-0.5">
-            Real-time inventory balance — updated every time you run Auto Deduct
+            {activeView === 'balance'
+              ? 'Real-time inventory balance — updated every time you run Auto Deduct'
+              : 'Factory replenishment suggestions based on real inventory movement'}
           </p>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <button onClick={() => setShowImport(true)} className="btn-secondary text-sm">
-            <FileUp className="w-4 h-4" />
-            Import Update
-          </button>
-          {initialized && (
+        {activeView === 'balance' && (
+          <div className="flex flex-wrap items-center gap-2">
+            <button onClick={() => setShowImport(true)} className="btn-secondary text-sm">
+              <FileUp className="w-4 h-4" />
+              Import Update
+            </button>
+            {initialized && (
             <>
               <button onClick={() => setShowAddRows(true)} className="btn-secondary text-sm">
                 <Plus className="w-4 h-4" />
@@ -1091,8 +1096,9 @@ export default function StockManagement() {
                 Export CSV
               </button>
             </>
-          )}
-        </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Not initialized → show init panel */}
@@ -1100,99 +1106,127 @@ export default function StockManagement() {
         <InitializePanel onDone={loadBalance} getToken={getToken} />
       ) : (
         <>
-          {/* Stats */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-            <StatCard
-              label="Total Units"     value={balanceData.total_units}
-              icon={Boxes}            iconBg="bg-blue-100"   iconColor="text-blue-600"
-            />
-            <StatCard
-              label="SKUs with Stock" value={balanceData.skus_in_stock}
-              icon={CheckCircle}      iconBg="bg-green-100"  iconColor="text-green-600"
-            />
-            <StatCard
-              label="Low Stock (< 5)"
-              value={allRows.filter(r => Number(r.Quantity) > 0 && Number(r.Quantity) < 5).length}
-              icon={AlertTriangle}    iconBg="bg-yellow-100" iconColor="text-yellow-600"
-            />
-            <StatCard
-              label="Out of Stock"    value={balanceData.skus_zero}
-              icon={XCircle}          iconBg="bg-red-100"    iconColor="text-red-600"
-            />
+          <div className="flex w-full rounded-xl bg-slate-100 p-1 sm:w-fit">
+            {[
+              ['balance', 'Inventory Balance'],
+              ['replenishment', 'Replenishment Plan'],
+            ].map(([value, label]) => (
+              <button
+                key={value}
+                onClick={() => setActiveView(value)}
+                className={`flex-1 rounded-lg px-4 py-2 text-sm font-medium transition-all sm:flex-none ${
+                  activeView === value
+                    ? 'bg-white text-slate-900 shadow-sm'
+                    : 'text-slate-500 hover:text-slate-700'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
           </div>
 
-          {/* Search + filter */}
-          <div className="card p-5 space-y-4">
-            <div className="flex flex-col sm:flex-row gap-3">
-              <div className="relative flex-1">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
-                <input
-                  type="text"
-                  placeholder="Search by Style, Color or Size…"
-                  value={inputValue}
-                  onChange={(e) => {
-                    const v = e.target.value
-                    setInputValue(v)
-                    startTransition(() => setSearchQuery(v))
-                  }}
-                  className="input-base pl-9"
+          {activeView === 'replenishment' ? (
+            <ReplenishmentPlan
+              inventoryRows={allRows}
+              storageOwner={user?.username || user?.name || 'admin'}
+            />
+          ) : (
+            <>
+              {/* Stats */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <StatCard
+                  label="Total Units"     value={balanceData.total_units}
+                  icon={Boxes}            iconBg="bg-blue-100"   iconColor="text-blue-600"
+                />
+                <StatCard
+                  label="SKUs with Stock" value={balanceData.skus_in_stock}
+                  icon={CheckCircle}      iconBg="bg-green-100"  iconColor="text-green-600"
+                />
+                <StatCard
+                  label="Low Stock (< 5)"
+                  value={allRows.filter(r => Number(r.Quantity) > 0 && Number(r.Quantity) < 5).length}
+                  icon={AlertTriangle}    iconBg="bg-yellow-100" iconColor="text-yellow-600"
+                />
+                <StatCard
+                  label="Out of Stock"    value={balanceData.skus_zero}
+                  icon={XCircle}          iconBg="bg-red-100"    iconColor="text-red-600"
                 />
               </div>
 
-              <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-xl flex-shrink-0">
-                {[
-                  { id: 'all',  label: 'All' },
-                  { id: 'low',  label: 'Low (< 5)' },
-                  { id: 'zero', label: 'Out of Stock' },
-                ].map(({ id, label }) => (
-                  <button key={id} onClick={() => setFilter(id)}
-                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
-                      filter === id ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'
-                    }`}
-                  >
-                    {label}
-                  </button>
-                ))}
+              {/* Search + filter */}
+              <div className="card p-5 space-y-4">
+                <div className="flex flex-col sm:flex-row gap-3">
+                  <div className="relative flex-1">
+                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                    <input
+                      type="text"
+                      placeholder="Search by Style, Color or Size…"
+                      value={inputValue}
+                      onChange={(e) => {
+                        const v = e.target.value
+                        setInputValue(v)
+                        startTransition(() => setSearchQuery(v))
+                      }}
+                      className="input-base pl-9"
+                    />
+                  </div>
+
+                  <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-xl flex-shrink-0">
+                    {[
+                      { id: 'all',  label: 'All' },
+                      { id: 'low',  label: 'Low (< 5)' },
+                      { id: 'zero', label: 'Out of Stock' },
+                    ].map(({ id, label }) => (
+                      <button key={id} onClick={() => setFilter(id)}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
+                          filter === id ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {(inputValue || filter !== 'all') && (
+                  <div className="flex items-center gap-2 text-xs text-slate-500">
+                    <span className="bg-blue-100 text-blue-700 px-2.5 py-1 rounded-full font-medium">
+                      {isPending ? '…' : `${displayRows.length.toLocaleString()} results`}
+                    </span>
+                    <button
+                      onClick={() => { setInputValue(''); startTransition(() => setSearchQuery('')); setFilter('all') }}
+                      className="text-slate-400 hover:text-slate-600"
+                    >
+                      Clear filters
+                    </button>
+                  </div>
+                )}
+
+                {/* Legend */}
+                <div className="flex items-center gap-4 text-xs text-slate-500">
+                  <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-red-200" />Out of stock (≤ 0)</span>
+                  <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-yellow-200" />Low stock (&lt; 5)</span>
+                  <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-green-100" />In stock (≥ 5)</span>
+                </div>
+
+                <DataTable
+                  data={displayRows}
+                  columns={COLUMNS}
+                  pageSize={50}
+                  resetPageKey={`${searchQuery}\u0000${filter}`}
+                  rowClassName={rowColor}
+                  emptyMessage={
+                    searchQuery || filter !== 'all'
+                      ? 'No rows match the current filters'
+                      : 'No balance data'
+                  }
+                />
               </div>
-            </div>
 
-            {(inputValue || filter !== 'all') && (
-              <div className="flex items-center gap-2 text-xs text-slate-500">
-                <span className="bg-blue-100 text-blue-700 px-2.5 py-1 rounded-full font-medium">
-                  {isPending ? '…' : `${displayRows.length.toLocaleString()} results`}
-                </span>
-                <button
-                  onClick={() => { setInputValue(''); startTransition(() => setSearchQuery('')); setFilter('all') }}
-                  className="text-slate-400 hover:text-slate-600"
-                >
-                  Clear filters
-                </button>
-              </div>
-            )}
-
-            {/* Legend */}
-            <div className="flex items-center gap-4 text-xs text-slate-500">
-              <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-red-200" />Out of stock (≤ 0)</span>
-              <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-yellow-200" />Low stock (&lt; 5)</span>
-              <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-green-100" />In stock (≥ 5)</span>
-            </div>
-
-            <DataTable
-              data={displayRows}
-              columns={COLUMNS}
-              pageSize={50}
-              resetPageKey={`${searchQuery}\u0000${filter}`}
-              rowClassName={rowColor}
-              emptyMessage={
-                searchQuery || filter !== 'all'
-                  ? 'No rows match the current filters'
-                  : 'No balance data'
-              }
-            />
-          </div>
-
-          {/* Version history + transaction log */}
-          <VersionHistory onRestore={loadBalance} getToken={getToken} />
+              {/* Version history + transaction log */}
+              <VersionHistory onRestore={loadBalance} getToken={getToken} />
+            </>
+          )}
         </>
       )}
     </div>
