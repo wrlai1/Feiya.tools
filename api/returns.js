@@ -140,7 +140,10 @@ function itemIdentity(item) {
     .join('\u0000')
 }
 
-function normalizePackages(rawPackages, store) {
+function normalizePackages(rawPackages, store, {
+  allowEmptyItems = false,
+  status = 'pending',
+} = {}) {
   if (!Array.isArray(rawPackages) || !rawPackages.length) throw new Error('packages array required')
   if (rawPackages.length > MAX_PACKAGES_PER_IMPORT) throw new Error(`Import is limited to ${MAX_PACKAGES_PER_IMPORT} packages`)
 
@@ -150,7 +153,7 @@ function normalizePackages(rawPackages, store) {
     const trackingKey = normalizeTracking(rawPackage.tracking || rawPackage.trackingNumber)
     const trackingNumber = String(rawPackage.trackingNumber || rawPackage.tracking || '').trim()
     if (!trackingKey) throw new Error('Every package requires a tracking number')
-    if (!Array.isArray(rawPackage.items) || !rawPackage.items.length) {
+    if ((!Array.isArray(rawPackage.items) || !rawPackage.items.length) && !allowEmptyItems) {
       throw new Error(`Tracking ${trackingNumber || trackingKey} has no items`)
     }
     const pkg = packages.get(trackingKey) || {
@@ -162,12 +165,17 @@ function normalizePackages(rawPackages, store) {
       return_reasons: new Set(),
       buyer_remarks: new Set(),
       carrier: String(rawPackage.carrier || '').trim(),
+      status,
+      review_reason: cleanText(rawPackage.reviewReason || rawPackage.review_reason, 500),
+      requires_item_resolution: Boolean(
+        rawPackage.requiresItemResolution ?? rawPackage.requires_item_resolution,
+      ),
       items: new Map(),
     }
     for (const value of rawPackage.orders || []) if (String(value || '').trim()) pkg.order_numbers.add(String(value).trim())
     for (const value of rawPackage.reasons || []) if (String(value || '').trim()) pkg.return_reasons.add(String(value).trim())
     for (const value of rawPackage.buyerRemarks || []) if (String(value || '').trim()) pkg.buyer_remarks.add(String(value).trim())
-    for (const rawItem of rawPackage.items) {
+    for (const rawItem of rawPackage.items || []) {
       itemCount += 1
       if (itemCount > MAX_ITEMS_PER_IMPORT) throw new Error(`Import is limited to ${MAX_ITEMS_PER_IMPORT} item rows`)
       const item = {
@@ -200,6 +208,9 @@ function normalizePackages(rawPackages, store) {
       return_reasons: [...pkg.return_reasons],
       buyer_remarks: [...pkg.buyer_remarks],
       carrier: pkg.carrier,
+      status: pkg.status,
+      review_reason: pkg.review_reason,
+      requires_item_resolution: pkg.requires_item_resolution,
       expected_units: items.reduce((sum, item) => sum + item.expected_qty, 0),
       items,
     }
@@ -344,6 +355,10 @@ async function ensureTables(sql) {
   await sql`ALTER TABLE return_packages ADD COLUMN IF NOT EXISTS carrier TEXT`
   await sql`ALTER TABLE return_packages ADD COLUMN IF NOT EXISTS restock_units INTEGER NOT NULL DEFAULT 0`
   await sql`ALTER TABLE return_packages ADD COLUMN IF NOT EXISTS flagged_not_ours BOOLEAN NOT NULL DEFAULT false`
+  await sql`ALTER TABLE return_packages ADD COLUMN IF NOT EXISTS review_reason TEXT`
+  await sql`ALTER TABLE return_packages ADD COLUMN IF NOT EXISTS requires_item_resolution BOOLEAN NOT NULL DEFAULT false`
+  await sql`ALTER TABLE return_packages ADD COLUMN IF NOT EXISTS escalated_by TEXT`
+  await sql`ALTER TABLE return_packages ADD COLUMN IF NOT EXISTS escalated_at TIMESTAMPTZ`
   await sql`
     CREATE TABLE IF NOT EXISTS return_package_items (
       id BIGSERIAL PRIMARY KEY,
@@ -450,7 +465,9 @@ async function loadPackage(sql, trackingKey) {
   const [pkg] = await sql`
     SELECT id, tracking_number, tracking_key, source_file, status, store_name, store_key,
            order_numbers, return_reasons, buyer_remarks, carrier, expected_units,
-           actual_units, restock_units, flagged_not_ours, remark, uploaded_by, uploaded_at, confirmed_by, confirmed_at
+           actual_units, restock_units, flagged_not_ours, remark, uploaded_by, uploaded_at,
+           confirmed_by, confirmed_at, review_reason, requires_item_resolution,
+           escalated_by, escalated_at
     FROM return_packages
     WHERE tracking_key = ${trackingKey}
   `
@@ -943,7 +960,27 @@ export default async function handler(req, res) {
     if (req.method === 'POST' && action === 'import') {
       if (payload.role !== 'admin') return res.status(403).json({ error: 'Admin access required' })
       const store = normalizeStore(req.body?.storeName)
-      const packages = normalizePackages(req.body?.packages, store)
+      const readyInput = Array.isArray(req.body?.packages) ? req.body.packages : []
+      const reviewInput = Array.isArray(req.body?.reviewPackages) ? req.body.reviewPackages : []
+      if (!readyInput.length && !reviewInput.length) {
+        return res.status(400).json({ error: 'No return packages are ready to upload' })
+      }
+      const readyPackages = readyInput.length
+        ? normalizePackages(readyInput, store)
+        : []
+      const reviewPackages = reviewInput.length
+        ? normalizePackages(reviewInput, store, {
+            allowEmptyItems: true,
+            status: 'needs_review',
+          })
+        : []
+      const packages = [...readyPackages, ...reviewPackages]
+      if (packages.length > MAX_PACKAGES_PER_IMPORT) {
+        return res.status(400).json({ error: `Import is limited to ${MAX_PACKAGES_PER_IMPORT} packages` })
+      }
+      if (new Set(packages.map((pkg) => pkg.tracking_key)).size !== packages.length) {
+        return res.status(400).json({ error: 'A tracking number cannot be both ready and under review' })
+      }
       const sourceFile = String(req.body?.sourceFile || '').trim()
       const trackingKeys = packages.map((pkg) => pkg.tracking_key)
       const finalPackages = await sql`
@@ -968,18 +1005,22 @@ export default async function handler(req, res) {
                 AS item(
                   tracking_key TEXT, tracking_number TEXT, store_name TEXT, store_key TEXT,
                   order_numbers JSONB, return_reasons JSONB, buyer_remarks JSONB, carrier TEXT,
+                  status TEXT, review_reason TEXT, requires_item_resolution BOOLEAN,
                   expected_units INTEGER, items JSONB
                 )
             )
             INSERT INTO return_packages (
               tracking_key, tracking_number, store_name, store_key, order_numbers,
               return_reasons, buyer_remarks, carrier, source_file, status, expected_units,
-              actual_units, restock_units, flagged_not_ours, uploaded_by, uploaded_at, confirmed_by, confirmed_at, remark
+              actual_units, restock_units, flagged_not_ours, uploaded_by, uploaded_at,
+              confirmed_by, confirmed_at, remark, review_reason, requires_item_resolution,
+              escalated_by, escalated_at
             )
             SELECT
               tracking_key, tracking_number, store_name, store_key, order_numbers,
-              return_reasons, buyer_remarks, carrier, ${sourceFile}, 'pending', expected_units,
-              0, 0, false, ${payload.username}, NOW(), NULL, NULL, NULL
+              return_reasons, buyer_remarks, carrier, ${sourceFile}, status, expected_units,
+              0, 0, false, ${payload.username}, NOW(), NULL, NULL, NULL,
+              review_reason, requires_item_resolution, NULL, NULL
             FROM incoming
             ON CONFLICT (tracking_key) DO UPDATE SET
               tracking_number = EXCLUDED.tracking_number,
@@ -990,15 +1031,20 @@ export default async function handler(req, res) {
               buyer_remarks = EXCLUDED.buyer_remarks,
               carrier = EXCLUDED.carrier,
               source_file = EXCLUDED.source_file,
+              status = EXCLUDED.status,
               expected_units = EXCLUDED.expected_units,
               actual_units = 0,
               restock_units = 0,
               flagged_not_ours = false,
+              review_reason = EXCLUDED.review_reason,
+              requires_item_resolution = EXCLUDED.requires_item_resolution,
               uploaded_by = EXCLUDED.uploaded_by,
               uploaded_at = NOW(),
               confirmed_by = NULL,
               confirmed_at = NULL,
-              remark = NULL
+              remark = NULL,
+              escalated_by = NULL,
+              escalated_at = NULL
             WHERE return_packages.status = 'pending'
           `,
           txn`
@@ -1013,7 +1059,7 @@ export default async function handler(req, res) {
             USING return_packages packages, incoming
             WHERE items.package_id = packages.id
               AND packages.tracking_key = incoming.tracking_key
-              AND packages.status = 'pending'
+              AND packages.status IN ('pending', 'needs_review')
           `,
           txn`
             WITH incoming_packages AS (
@@ -1046,13 +1092,14 @@ export default async function handler(req, res) {
               items.size, items.expected_qty, NULL, NULL, NULL
             FROM incoming_items items
             JOIN return_packages packages ON packages.tracking_key = items.tracking_key
-            WHERE packages.status = 'pending'
+            WHERE packages.status IN ('pending', 'needs_review')
           `,
         ])
       }
       return res.json({
         ok: true,
         imported_packages: importable.length,
+        review_packages: importable.filter((pkg) => pkg.status === 'needs_review').length,
         imported_units: importable.reduce((sum, pkg) => sum + pkg.expected_units, 0),
         skipped_received: finalKeys.size,
       })
@@ -1070,21 +1117,155 @@ export default async function handler(req, res) {
       const status = String(req.query.status || '')
       const rows = status
         ? await sql`
-            SELECT id, tracking_number, store_name, status, expected_units, actual_units, restock_units, flagged_not_ours,
-                   uploaded_at, confirmed_at
+            SELECT id, tracking_number, store_name, status, expected_units, actual_units,
+                   restock_units, flagged_not_ours, review_reason, requires_item_resolution,
+                   escalated_by, escalated_at, uploaded_at, confirmed_at
             FROM return_packages
             WHERE status = ${status}
             ORDER BY uploaded_at DESC
             LIMIT 200
           `
         : await sql`
-            SELECT id, tracking_number, store_name, status, expected_units, actual_units, restock_units, flagged_not_ours,
-                   uploaded_at, confirmed_at
+            SELECT id, tracking_number, store_name, status, expected_units, actual_units,
+                   restock_units, flagged_not_ours, review_reason, requires_item_resolution,
+                   escalated_by, escalated_at, uploaded_at, confirmed_at
             FROM return_packages
-            ORDER BY CASE WHEN status = 'pending' THEN 0 ELSE 1 END, uploaded_at DESC
+            ORDER BY CASE
+              WHEN status = 'needs_review' THEN 0
+              WHEN status = 'pending' THEN 1
+              ELSE 2
+            END, uploaded_at DESC
             LIMIT 200
           `
       return res.json({ packages: rows })
+    }
+
+    if (req.method === 'POST' && action === 'flag') {
+      const trackingKey = normalizeTracking(req.body?.tracking)
+      if (!trackingKey) return res.status(400).json({ error: 'tracking required' })
+      const pkg = await loadPackage(sql, trackingKey)
+      if (!pkg) return res.status(404).json({ error: 'Tracking is not in the uploaded return manifest' })
+      if (!['pending', 'needs_review'].includes(pkg.status)) {
+        return res.status(409).json({ error: 'This return package has already been completed' })
+      }
+      const reason = cleanText(req.body?.reason || 'worker_flagged', 500)
+      await sql`
+        UPDATE return_packages
+        SET status = 'needs_review',
+            review_reason = CASE
+              WHEN status = 'pending' THEN ${reason}
+              ELSE COALESCE(NULLIF(review_reason, ''), ${reason})
+            END,
+            requires_item_resolution = CASE
+              WHEN status = 'pending' THEN false
+              ELSE requires_item_resolution
+            END,
+            escalated_by = COALESCE(escalated_by, ${payload.username}),
+            escalated_at = COALESCE(escalated_at, NOW())
+        WHERE id = ${pkg.id}
+          AND status IN ('pending', 'needs_review')
+      `
+      return res.json({ ok: true, status: 'needs_review' })
+    }
+
+    if (req.method === 'POST' && action === 'resolve-items') {
+      if (payload.role !== 'admin') return res.status(403).json({ error: 'Admin access required' })
+      const trackingKey = normalizeTracking(req.body?.tracking)
+      if (!trackingKey) return res.status(400).json({ error: 'tracking required' })
+      const pkg = await loadPackage(sql, trackingKey)
+      if (!pkg) return res.status(404).json({ error: 'Tracking is not in the uploaded return manifest' })
+      if (pkg.status !== 'needs_review' || !pkg.requires_item_resolution) {
+        return res.status(409).json({ error: 'This package does not require item selection' })
+      }
+
+      const selections = Array.isArray(req.body?.selections) ? req.body.selections : []
+      const orderItems = new Map(
+        (pkg.related_orders || []).flatMap((order) => order.items || [])
+          .map((item) => [Number(item.id), item]),
+      )
+      const selectedIds = new Set()
+      const resolvedItems = []
+      for (const selection of selections) {
+        const orderItemId = Number(selection.orderItemId)
+        const quantity = Number(selection.quantity)
+        const orderItem = orderItems.get(orderItemId)
+        if (
+          !Number.isSafeInteger(orderItemId)
+          || selectedIds.has(orderItemId)
+          || !Number.isSafeInteger(quantity)
+          || quantity <= 0
+          || !orderItem
+          || quantity > Number(orderItem.quantity)
+        ) {
+          return res.status(400).json({ error: 'Choose valid returned quantities from the original order' })
+        }
+        if (
+          orderItem.catalog_status !== 'ready'
+          || !Array.isArray(orderItem.catalog_components)
+          || !orderItem.catalog_components.length
+        ) {
+          return res.status(409).json({
+            error: `Product mapping is required for ${orderItem.sku_code || orderItem.sku_id || 'this SKU'}`,
+          })
+        }
+        selectedIds.add(orderItemId)
+        for (const component of orderItem.catalog_components) {
+          const componentQty = Number(component.qty || 1)
+          if (
+            !component.style
+            || !component.color
+            || !component.size
+            || !Number.isSafeInteger(componentQty)
+            || componentQty <= 0
+            || componentQty * quantity > 9999
+          ) {
+            return res.status(409).json({ error: 'The selected SKU has an invalid inventory mapping' })
+          }
+          resolvedItems.push({
+            sku_id: cleanText(orderItem.sku_id, 100),
+            sku_code: cleanText(orderItem.sku_code, 300),
+            style: cleanText(component.style, 300),
+            color: cleanText(component.color, 300),
+            size: cleanText(component.size, 100),
+            expected_qty: componentQty * quantity,
+          })
+        }
+      }
+      if (!resolvedItems.length) {
+        return res.status(400).json({ error: 'Select at least one returned product' })
+      }
+
+      const itemsByIdentity = new Map()
+      for (const item of resolvedItems) {
+        const key = itemIdentity(item)
+        const existing = itemsByIdentity.get(key)
+        if (existing) existing.expected_qty += item.expected_qty
+        else itemsByIdentity.set(key, { ...item })
+      }
+      const items = [...itemsByIdentity.values()]
+      const expectedUnits = items.reduce((sum, item) => sum + item.expected_qty, 0)
+
+      await sql.transaction((txn) => [
+        txn`DELETE FROM return_package_items WHERE package_id = ${pkg.id}`,
+        ...items.map((item) => txn`
+          INSERT INTO return_package_items (
+            package_id, sku_id, sku_code, style, color, size,
+            expected_qty, actual_qty, restock_qty, not_ours_qty
+          )
+          VALUES (
+            ${pkg.id}, ${item.sku_id}, ${item.sku_code}, ${item.style}, ${item.color},
+            ${item.size}, ${item.expected_qty}, NULL, NULL, NULL
+          )
+        `),
+        txn`
+          UPDATE return_packages
+          SET expected_units = ${expectedUnits},
+              requires_item_resolution = false
+          WHERE id = ${pkg.id} AND status = 'needs_review'
+        `,
+      ], { isolationLevel: 'Serializable' })
+
+      return res.json({ ok: true, package: await loadPackage(sql, trackingKey) })
     }
 
     if (req.method === 'POST' && action === 'confirm') {
@@ -1092,7 +1273,13 @@ export default async function handler(req, res) {
       if (!trackingKey) return res.status(400).json({ error: 'tracking required' })
       const pkg = await loadPackage(sql, trackingKey)
       if (!pkg) return res.status(404).json({ error: 'Tracking is not in the uploaded return manifest' })
-      if (pkg.status !== 'pending') return res.status(409).json({ error: 'This return package has already been received' })
+      const adminReview = payload.role === 'admin' && pkg.status === 'needs_review'
+      if (pkg.status !== 'pending' && !adminReview) {
+        return res.status(409).json({ error: 'This return package has already been received or needs admin review' })
+      }
+      if (pkg.requires_item_resolution) {
+        return res.status(409).json({ error: 'Choose the returned products before receiving this package' })
+      }
 
       const actualItems = Array.isArray(req.body?.items) ? req.body.items : []
       const countsById = new Map()
@@ -1137,6 +1324,9 @@ export default async function handler(req, res) {
       } catch (error) {
         return res.status(400).json({ error: error.message })
       }
+      if (payload.role !== 'admin' && inspection.status !== 'received') {
+        return res.status(403).json({ error: 'Workers must send any problem to Admin Review' })
+      }
 
       const inventoryRows = pkg.items
         .map((item) => ({
@@ -1168,7 +1358,7 @@ export default async function handler(req, res) {
           WITH claimed AS (
             UPDATE return_packages
             SET status = 'processing'
-            WHERE id = ${pkg.id} AND status = 'pending'
+            WHERE id = ${pkg.id} AND status = ${pkg.status}
             RETURNING id
           )
           SELECT 1 / CASE WHEN COUNT(*) = 1 THEN 1 ELSE 0 END AS claimed

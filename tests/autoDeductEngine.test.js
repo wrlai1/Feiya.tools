@@ -13,6 +13,7 @@ import { findAdditionalComboSizeMappings, findAdditionalSizeMappings } from '../
 import {
   applyProductCatalogMapping,
   applyReturnOrderMatch,
+  chooseReturnManifestSheetName,
   expandConfirmedProductSku,
   getReturnManifestOrderNumbers,
   parseProductCatalogRows,
@@ -856,6 +857,46 @@ test('SKU return manifests group tracking and retain store-facing return details
   assert.equal(result.packages[0].carrier, 'UPS')
 })
 
+test('daily house-return workbooks prefer the flat detail sheet', () => {
+  assert.equal(
+    chooseReturnManifestSheetName(['退货汇总', '退货明细汇总']),
+    '退货明细汇总',
+  )
+  assert.equal(
+    chooseReturnManifestSheetName(['TEMU-STYLES', 'Other']),
+    'TEMU-STYLES',
+  )
+})
+
+test('SKU return manifests split multiple SKU IDs from one spreadsheet cell', () => {
+  const result = parseSkuReturnManifestRows([{
+    '订单号 PO': 'PO-MULTI',
+    'SKU ID': 'SKU-A\nSKU-B',
+    '运单号 Tracking Number': 'RETURN-MULTI',
+  }], [
+    {
+      sku_id: 'SKU-A',
+      sku_code: 'A100BlackS',
+      status: 'ready',
+      components: [{ style: 'A100', color: 'Black', size: 'S', qty: 1 }],
+    },
+    {
+      sku_id: 'SKU-B',
+      sku_code: 'B200NavyM',
+      status: 'ready',
+      components: [{ style: 'B200', color: 'Navy', size: 'M', qty: 1 }],
+    },
+  ])
+
+  assert.equal(result.needsReview.length, 0)
+  assert.equal(result.packages.length, 1)
+  assert.equal(result.packages[0].expectedUnits, 2)
+  assert.deepEqual(
+    result.packages[0].items.map((item) => item.skuId),
+    ['SKU-A', 'SKU-B'],
+  )
+})
+
 test('SKU return manifests isolate missing catalog data without blocking ready packages', () => {
   const result = parseSkuReturnManifestRows([
     { 'SKU ID': 'KNOWN', '运单号 Tracking Number': 'READY-1' },
@@ -913,6 +954,8 @@ test('missing return SKU IDs show every original SKU and require a selection for
 
   assert.deepEqual(getReturnManifestOrderNumbers(rows), ['PO-RECOVER-1', 'PO-RECOVER-1-D01'])
   assert.equal(parsed.packages.length, 0)
+  assert.equal(parsed.reviewPackages.length, 1)
+  assert.equal(parsed.reviewPackages[0].requiresItemResolution, true)
   assert.equal(parsed.pendingOrderMatches.length, 1)
   assert.equal(parsed.pendingOrderMatches[0].candidateOrders[0].candidates.length, 2)
   assert.equal(parsed.needsReview[0].parse_issue, 'order_has_multiple_skus')

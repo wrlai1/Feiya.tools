@@ -20,7 +20,7 @@ import { useToast } from '../hooks/useToast.js'
 import { aliasKey } from '../utils/autoDeductEngine.js'
 import {
   applyProductCatalogMapping,
-  applyReturnOrderMatch,
+  chooseReturnManifestSheetName,
   getReturnManifestOrderNumbers,
   parseProductCatalogRows,
   parseReturnManifestRows,
@@ -84,6 +84,7 @@ function headers(getToken, json = false) {
 function statusBadge(status) {
   if (status === 'received') return 'bg-emerald-100 text-emerald-700'
   if (status === 'discrepancy') return 'bg-amber-100 text-amber-800'
+  if (status === 'needs_review') return 'bg-amber-100 text-amber-800'
   if (status === 'rejected') return 'bg-red-100 text-red-700'
   return 'bg-blue-100 text-blue-700'
 }
@@ -91,6 +92,7 @@ function statusBadge(status) {
 function statusLabel(status) {
   if (status === 'received') return '✅ Received / Recibido'
   if (status === 'discrepancy') return '⚠️ Review / Revisar'
+  if (status === 'needs_review') return '⚠️ Admin Review / Revisión'
   if (status === 'rejected') return '❌ Not ours / No es nuestro'
   return 'Pending / Pendiente'
 }
@@ -227,9 +229,9 @@ export default function ReturnsReceiving() {
   const [remark, setRemark] = useState('')
   const [counted, setCounted] = useState(false)
   const [recent, setRecent] = useState([])
+  const [reviewPackages, setReviewPackages] = useState([])
   const [file, setFile] = useState(null)
   const [parsed, setParsed] = useState(null)
-  const [orderCandidateQuantities, setOrderCandidateQuantities] = useState({})
   const [uploading, setUploading] = useState(false)
   const [stores, setStores] = useState([])
   const [storeName, setStoreName] = useState('')
@@ -247,6 +249,7 @@ export default function ReturnsReceiving() {
   const [orderParsed, setOrderParsed] = useState(null)
   const [orderUploading, setOrderUploading] = useState(false)
   const [orderStats, setOrderStats] = useState([])
+  const [adminSelections, setAdminSelections] = useState({})
 
   const loadRecent = useCallback(async () => {
     if (demoMode) {
@@ -268,9 +271,19 @@ export default function ReturnsReceiving() {
     }
   }, [demoMode, getToken, isAdmin])
 
+  const loadReviewPackages = useCallback(async () => {
+    if (!isAdmin || demoMode) return
+    const res = await fetch(`${BASE}/returns?action=list&status=needs_review`, {
+      headers: headers(getToken),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (res.ok) setReviewPackages(data.packages || [])
+  }, [demoMode, getToken, isAdmin])
+
   useEffect(() => {
     loadRecent()
     loadStores()
+    loadReviewPackages()
     if (demoMode) {
       setPkg(DEMO_PACKAGE)
       setTracking(DEMO_PACKAGE.tracking_number)
@@ -281,7 +294,7 @@ export default function ReturnsReceiving() {
     }
     const frame = requestAnimationFrame(() => scannerRef.current?.focus())
     return () => cancelAnimationFrame(frame)
-  }, [demoMode, loadRecent, loadStores])
+  }, [demoMode, loadRecent, loadReviewPackages, loadStores])
 
   const lookup = useCallback(async (value = tracking, orderStore = '') => {
     const query = String(value || '').trim()
@@ -301,6 +314,7 @@ export default function ReturnsReceiving() {
     setPkg(null)
     setOrderOnly(null)
     setOrderChoices([])
+    setAdminSelections({})
     setCounted(false)
     setRemark('')
     try {
@@ -332,7 +346,7 @@ export default function ReturnsReceiving() {
       setCounts(Object.fromEntries(
         (next.items || []).map((item) => [
           item.id,
-          next.status === 'pending'
+          ['pending', 'needs_review'].includes(next.status)
             ? { good: 0, damaged: 0, notOurs: 0 }
             : {
                 good: Number(item.restock_qty || 0),
@@ -363,9 +377,17 @@ export default function ReturnsReceiving() {
     hasDiscrepancy: discrepancy,
   } = inspection
 
-  const confirmPackage = async () => {
-    if (!pkg || pkg.status !== 'pending' || !counted || loading) return
-    if (discrepancy) {
+  const confirmPackage = async ({ allGood = false } = {}) => {
+    const canConfirm = pkg?.status === 'pending'
+      || (isAdmin && pkg?.status === 'needs_review' && !pkg?.requires_item_resolution)
+    if (!pkg || !canConfirm || (!allGood && !counted) || loading) return
+    const effectiveCounts = allGood
+      ? Object.fromEntries(pkg.items.map((item) => [
+          item.id,
+          { good: Number(item.expected_qty), damaged: 0, notOurs: 0 },
+        ]))
+      : counts
+    if (!allGood && discrepancy) {
       const proceed = window.confirm(
         `Expected / Esperado: ${expectedUnits}\n` +
         `Good / Bueno: ${restockUnits}\nDamaged / Dañado: ${damagedUnits}\nNot ours / No es nuestro: ${notOursUnits}\n\n` +
@@ -382,9 +404,10 @@ export default function ReturnsReceiving() {
           tracking: pkg.tracking_number,
           items: pkg.items.map((item) => ({
             id: item.id,
-            actualQty: Number(counts[item.id]?.good || 0) + Number(counts[item.id]?.damaged || 0),
-            restockQty: Number(counts[item.id]?.good || 0),
-            notOursQty: Number(counts[item.id]?.notOurs || 0),
+            actualQty: Number(effectiveCounts[item.id]?.good || 0)
+              + Number(effectiveCounts[item.id]?.damaged || 0),
+            restockQty: Number(effectiveCounts[item.id]?.good || 0),
+            notOursQty: Number(effectiveCounts[item.id]?.notOurs || 0),
           })),
           remark,
         }),
@@ -395,10 +418,78 @@ export default function ReturnsReceiving() {
         ? 'Not ours / No es nuestro'
         : data.status === 'discrepancy' ? 'Saved / Guardado' : 'Received / Recibido'
       toast.success(`${Number(data.added_units || 0)} added to inventory / agregado al inventario`, title)
-      await lookup(pkg.tracking_number)
+      if (isAdmin) {
+        await lookup(pkg.tracking_number)
+      } else {
+        setPkg(null)
+        setTracking('')
+        requestAnimationFrame(() => scannerRef.current?.focus())
+      }
       await loadRecent()
+      await loadReviewPackages()
     } catch (error) {
       toast.error(error.message, 'Receive Failed')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const flagForAdmin = async () => {
+    if (!pkg || loading || !['pending', 'needs_review'].includes(pkg.status)) return
+    setLoading(true)
+    try {
+      const res = await fetch(`${BASE}/returns?action=flag`, {
+        method: 'POST',
+        headers: headers(getToken, true),
+        body: JSON.stringify({
+          tracking: pkg.tracking_number,
+          reason: pkg.status === 'pending' ? 'worker_flagged' : pkg.review_reason,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not send package to Admin Review')
+      toast.success('Place this package in the Admin Review bin', 'Sent to Admin')
+      setPkg(null)
+      setTracking('')
+      await loadRecent()
+      await loadReviewPackages()
+      requestAnimationFrame(() => scannerRef.current?.focus())
+    } catch (error) {
+      toast.error(error.message, 'Could Not Send to Admin')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const resolveAdminItems = async () => {
+    if (!isAdmin || !pkg?.requires_item_resolution || loading) return
+    const selections = Object.entries(adminSelections)
+      .map(([orderItemId, quantity]) => ({
+        orderItemId: Number(orderItemId),
+        quantity: Number(quantity),
+      }))
+      .filter((selection) => selection.quantity > 0)
+    setLoading(true)
+    try {
+      const res = await fetch(`${BASE}/returns?action=resolve-items`, {
+        method: 'POST',
+        headers: headers(getToken, true),
+        body: JSON.stringify({ tracking: pkg.tracking_number, selections }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not save selected products')
+      const next = data.package
+      setPkg(next)
+      setCounts(Object.fromEntries((next.items || []).map((item) => [
+        item.id,
+        { good: 0, damaged: 0, notOurs: 0 },
+      ])))
+      setAdminSelections({})
+      setCounted(false)
+      toast.success('Returned products selected. Complete the inspection below.', 'Products Saved')
+      await loadReviewPackages()
+    } catch (error) {
+      toast.error(error.message, 'Could Not Resolve Package')
     } finally {
       setLoading(false)
     }
@@ -407,7 +498,6 @@ export default function ReturnsReceiving() {
   const parseFile = async (nextFile) => {
     setFile(nextFile)
     setParsed(null)
-    setOrderCandidateQuantities({})
     if (!nextFile) return
     if (!storeName.trim()) {
       toast.error('Choose or enter a store before reading the return file', 'Store Required')
@@ -416,8 +506,7 @@ export default function ReturnsReceiving() {
     try {
       const XLSX = await import('xlsx')
       const workbook = XLSX.read(await nextFile.arrayBuffer(), { type: 'array' })
-      const sheetName = workbook.SheetNames.find((name) => name.trim().toUpperCase() === 'TEMU-STYLES')
-        || workbook.SheetNames[0]
+      const sheetName = chooseReturnManifestSheetName(workbook.SheetNames)
       const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { raw: false, defval: '' })
       const hasSkuId = Object.keys(rows[0] || {}).some((key) =>
         ['sku id', 'skuid', 'sku_id'].includes(key.trim().toLowerCase())
@@ -471,7 +560,7 @@ export default function ReturnsReceiving() {
       setParsed(result)
       if (result.needsReview.length) {
         toast.warning(
-          `${result.stats.reviewPackages} packages need review and will be skipped; ready packages can still upload`,
+          `${result.stats.reviewPackages} packages will be sent to Admin Review; ready packages can still upload`,
           'Review Required',
         )
       }
@@ -489,6 +578,7 @@ export default function ReturnsReceiving() {
         headers: headers(getToken, true),
         body: JSON.stringify({
           packages: parsed.packages,
+          reviewPackages: parsed.reviewPackages || [],
           storeName: storeName.trim(),
           sourceFile: file?.name || '',
         }),
@@ -496,7 +586,7 @@ export default function ReturnsReceiving() {
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || 'Could not upload return manifest')
       toast.success(
-        `${data.imported_packages} packages · ${data.imported_units} expected units`,
+        `${data.imported_packages} packages · ${Number(data.review_packages || 0)} sent to admin review`,
         'Return Manifest Uploaded',
       )
       setFile(null)
@@ -769,11 +859,13 @@ export default function ReturnsReceiving() {
   useEffect(() => {
     if (tab === 'analytics') loadAnalytics()
     if (tab === 'orders') loadOrderStats()
-  }, [loadAnalytics, loadOrderStats, tab])
+    if (tab === 'review') loadReviewPackages()
+  }, [loadAnalytics, loadOrderStats, loadReviewPackages, tab])
 
   const tabs = [
     { id: 'receive', label: 'Scan & Receive', shortLabel: 'Scan', icon: ScanLine },
     ...(isAdmin ? [
+      { id: 'review', label: 'Admin Review', shortLabel: 'Review', icon: AlertTriangle },
       { id: 'upload', label: 'Upload Manifest', shortLabel: 'Returns', icon: Upload },
       { id: 'catalog', label: 'Product Catalogs', shortLabel: 'Products', icon: Database },
       { id: 'orders', label: 'Order History', shortLabel: 'Orders', icon: ClipboardList },
@@ -902,7 +994,8 @@ export default function ReturnsReceiving() {
                     </div>
                   )}
                 </div>
-                {pkg.status === 'pending' && (
+                {isAdmin && ['pending', 'needs_review'].includes(pkg.status)
+                  && !pkg.requires_item_resolution && (
                   <button
                     type="button"
                     onClick={() => setCounts(Object.fromEntries(
@@ -922,7 +1015,7 @@ export default function ReturnsReceiving() {
                 )}
               </div>
 
-              {pkg.related_orders?.length > 0 && (
+              {pkg.related_orders?.length > 0 && (isAdmin || !pkg.requires_item_resolution) && (
                 <div className="space-y-3 border-b border-slate-200 bg-white px-4 py-4 sm:px-5">
                   <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">
                     Original order contents
@@ -930,6 +1023,66 @@ export default function ReturnsReceiving() {
                   {pkg.related_orders.map((order) => (
                     <OrderDetails key={`${order.store_key}-${order.order_key}`} order={order} compact />
                   ))}
+                </div>
+              )}
+
+              {isAdmin && pkg.status === 'needs_review' && pkg.requires_item_resolution && (
+                <div className="border-b border-amber-200 bg-amber-50 px-4 py-4 sm:px-5">
+                  <p className="font-semibold text-amber-900">Choose the products actually returned</p>
+                  <p className="mt-1 text-sm text-amber-800">
+                    Select every returned product from the original order. This replaces any incomplete automatic match.
+                  </p>
+                  <div className="mt-3 space-y-3">
+                    {(pkg.related_orders || []).flatMap((order) => (order.items || []).map((item) => (
+                      <div key={item.id} className="rounded-xl border border-amber-200 bg-white p-3">
+                        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                          <div className="min-w-0">
+                            <p className="break-words text-sm font-semibold text-slate-800">
+                              {item.sku_code || item.sku_id || 'Unknown SKU'}
+                            </p>
+                            <p className="mt-1 text-xs text-slate-500">{item.attributes}</p>
+                            <p className="mt-1 text-[11px] text-slate-400">
+                              SKU ID {item.sku_id || '—'} · Ordered {item.quantity}
+                            </p>
+                            {item.catalog_status !== 'ready' && (
+                              <p className="mt-1 text-xs font-medium text-red-700">
+                                Product catalog mapping required before this item can be selected.
+                              </p>
+                            )}
+                          </div>
+                          <CountControl
+                            label={`Returned quantity for ${item.sku_code || item.sku_id}`}
+                            value={Number(adminSelections[item.id] || 0)}
+                            max={Number(item.quantity || 0)}
+                            disabled={item.catalog_status !== 'ready'}
+                            onChange={(value) => setAdminSelections((current) => ({
+                              ...current,
+                              [item.id]: value,
+                            }))}
+                          />
+                        </div>
+                      </div>
+                    )))}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={resolveAdminItems}
+                    disabled={loading || !Object.values(adminSelections).some((value) => Number(value) > 0)}
+                    className="btn-primary mt-3 w-full justify-center py-3 disabled:opacity-50 sm:w-auto"
+                  >
+                    <CheckCircle2 className="h-4 w-4" />
+                    Save Selected Products
+                  </button>
+                </div>
+              )}
+
+              {!isAdmin && pkg.status === 'needs_review' && pkg.requires_item_resolution && (
+                <div className="border-b border-amber-200 bg-amber-50 px-4 py-5 text-center sm:px-5">
+                  <AlertTriangle className="mx-auto h-9 w-9 text-amber-600" />
+                  <p className="mt-2 text-lg font-bold text-amber-900">Admin must identify this product</p>
+                  <p className="mt-1 text-sm text-amber-800">
+                    Do not choose a style. Place the package in the Admin Review bin.
+                  </p>
                 </div>
               )}
 
@@ -970,7 +1123,7 @@ export default function ReturnsReceiving() {
                         )}
                         <p className="mt-1 text-xs text-slate-500">
                           Expected / Esperado: <strong>{item.expected_qty}</strong>
-                          {pkg.status !== 'pending' && (
+                          {!['pending', 'needs_review'].includes(pkg.status) && (
                             <>
                               {' '}· Good / Bueno: <strong>{item.restock_qty ?? 0}</strong>
                               {' '}· Damaged / Dañado: <strong>{Math.max(Number(item.actual_qty || 0) - Number(item.restock_qty || 0), 0)}</strong>
@@ -979,7 +1132,8 @@ export default function ReturnsReceiving() {
                           )}
                         </p>
                       </div>
-                      {pkg.status === 'pending' && (
+                      {isAdmin && ['pending', 'needs_review'].includes(pkg.status)
+                        && !pkg.requires_item_resolution && (
                         <>
                           <div className="grid grid-cols-3 gap-2">
                             <button type="button" onClick={() => setWholeOutcome('good')}
@@ -1038,7 +1192,8 @@ export default function ReturnsReceiving() {
                 })}
               </div>
 
-              {pkg.status === 'pending' && (
+              {isAdmin && ['pending', 'needs_review'].includes(pkg.status)
+                && !pkg.requires_item_resolution && (
                 <div className="border-t border-slate-200 bg-slate-50/70 p-4 sm:p-5">
                   <div className={`mb-4 flex items-start gap-2 rounded-xl border px-3 py-2 text-sm ${
                     discrepancy
@@ -1087,6 +1242,43 @@ export default function ReturnsReceiving() {
                   </button>
                 </div>
               )}
+
+              {!isAdmin && pkg.status === 'pending' && (
+                <div className="grid gap-3 border-t border-slate-200 bg-slate-50/70 p-4 sm:grid-cols-2 sm:p-5">
+                  <button
+                    type="button"
+                    onClick={() => confirmPackage({ allGood: true })}
+                    disabled={loading || !pkg.items.length}
+                    className="flex min-h-16 items-center justify-center gap-2 rounded-xl bg-emerald-600 px-5 text-lg font-bold text-white hover:bg-emerald-700 disabled:opacity-40"
+                  >
+                    {loading ? <RefreshCw className="h-5 w-5 animate-spin" /> : <CheckCircle2 className="h-6 w-6" />}
+                    ✅ All Good · Add {expectedUnits}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={flagForAdmin}
+                    disabled={loading}
+                    className="flex min-h-16 items-center justify-center gap-2 rounded-xl bg-amber-500 px-5 text-lg font-bold text-white hover:bg-amber-600 disabled:opacity-40"
+                  >
+                    <AlertTriangle className="h-6 w-6" />
+                    Any Problem · Send to Admin
+                  </button>
+                </div>
+              )}
+
+              {!isAdmin && pkg.status === 'needs_review' && (
+                <div className="border-t border-amber-200 bg-amber-50 p-4 sm:p-5">
+                  <button
+                    type="button"
+                    onClick={flagForAdmin}
+                    disabled={loading}
+                    className="flex min-h-16 w-full items-center justify-center gap-2 rounded-xl bg-amber-500 px-5 text-lg font-bold text-white hover:bg-amber-600 disabled:opacity-40"
+                  >
+                    <AlertTriangle className="h-6 w-6" />
+                    Skip · Place in Admin Review Bin
+                  </button>
+                </div>
+              )}
             </div>
           )}
 
@@ -1127,6 +1319,58 @@ export default function ReturnsReceiving() {
             )}
           </div>
         </>
+      )}
+
+      {tab === 'review' && isAdmin && (
+        <div className="card overflow-hidden">
+          <div className="flex items-center justify-between border-b border-slate-200 px-4 py-4 sm:px-5">
+            <div>
+              <h3 className="font-semibold text-slate-900">Admin Review Queue</h3>
+              <p className="mt-1 text-sm text-slate-500">
+                Damaged, mismatched, and unidentified packages wait here without changing inventory.
+              </p>
+            </div>
+            <button type="button" onClick={loadReviewPackages} className="btn-secondary">
+              <RefreshCw className="h-4 w-4" />
+              Refresh
+            </button>
+          </div>
+          {!reviewPackages.length ? (
+            <p className="px-5 py-12 text-center text-sm text-slate-400">
+              No packages are waiting for admin review.
+            </p>
+          ) : (
+            <div className="divide-y divide-slate-100">
+              {reviewPackages.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => {
+                    setTab('receive')
+                    setTracking(item.tracking_number)
+                    lookup(item.tracking_number)
+                  }}
+                  className="flex w-full flex-col gap-2 px-4 py-4 text-left hover:bg-amber-50 sm:flex-row sm:items-center sm:justify-between sm:px-5"
+                >
+                  <div className="min-w-0">
+                    <p className="font-semibold text-slate-800">{item.tracking_number}</p>
+                    <p className="mt-1 text-xs text-slate-500">
+                      {item.store_name || 'Unassigned store'}
+                      {' · '}
+                      {item.requires_item_resolution ? 'Product selection required' : 'Physical inspection required'}
+                    </p>
+                    {item.review_reason && (
+                      <p className="mt-1 text-xs text-amber-700">{item.review_reason}</p>
+                    )}
+                  </div>
+                  <span className="shrink-0 rounded-full bg-amber-100 px-3 py-1 text-xs font-semibold text-amber-800">
+                    Open Review
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
       )}
 
       {tab === 'upload' && isAdmin && (
@@ -1190,90 +1434,16 @@ export default function ReturnsReceiving() {
                 </div>
               </div>
 
-              {(parsed.pendingOrderMatches || []).map((match) => (
-                <div key={match.tracking} className="rounded-xl border border-indigo-200 bg-indigo-50 p-3 sm:p-4">
-                  <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
-                    <div>
-                      <p className="text-sm font-semibold text-indigo-900">
-                        Choose returned SKUs for {match.trackingNumber}
-                      </p>
-                      <p className="mt-1 text-xs text-indigo-700">
-                        The return file had no SKU ID. Set the quantity only for products included in this return.
-                      </p>
-                    </div>
-                  </div>
-                  <div className="mt-3 space-y-3">
-                    {match.candidateOrders.map((order) => (
-                      <div key={order.orderKey} className="rounded-xl bg-white p-3">
-                        <p className="text-xs font-semibold text-slate-500">
-                          Original order {order.orderKey} · {order.candidates.length} SKU(s)
-                        </p>
-                        <div className="mt-2 divide-y divide-slate-100">
-                          {order.candidates.map((candidate) => (
-                            <div
-                              key={candidate.candidateKey}
-                              className="flex flex-col gap-3 py-3 sm:flex-row sm:items-center sm:justify-between"
-                            >
-                              <div className="min-w-0">
-                                <p className="break-words text-sm font-semibold text-slate-800">
-                                  {candidate.skuCode || candidate.skuId || 'Unknown SKU'}
-                                </p>
-                                {candidate.attributes && (
-                                  <p className="mt-0.5 text-xs text-slate-500">{candidate.attributes}</p>
-                                )}
-                                <p className="mt-1 text-[11px] text-slate-400">
-                                  SKU ID {candidate.skuId || '—'} · Ordered {candidate.maxQuantity}
-                                </p>
-                                {candidate.status !== 'ready' && (
-                                  <p className="mt-1 text-xs font-medium text-amber-700">
-                                    Product mapping required: {candidate.issue}
-                                  </p>
-                                )}
-                              </div>
-                              <div className="flex items-center justify-between gap-3 sm:justify-end">
-                                <span className="text-xs font-medium text-slate-500">Return qty</span>
-                                <CountControl
-                                  label={`Return quantity for ${candidate.skuCode || candidate.skuId}`}
-                                  value={Number(orderCandidateQuantities[candidate.candidateKey] || 0)}
-                                  max={Number.isSafeInteger(candidate.maxQuantity) ? candidate.maxQuantity : 0}
-                                  disabled={candidate.status !== 'ready'}
-                                  onChange={(value) => setOrderCandidateQuantities((current) => ({
-                                    ...current,
-                                    [candidate.candidateKey]: value,
-                                  }))}
-                                />
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      try {
-                        const next = applyReturnOrderMatch(
-                          parsed,
-                          match.tracking,
-                          orderCandidateQuantities,
-                        )
-                        setParsed(next)
-                        toast.success(
-                          `${next.packages.find((pkg) => pkg.tracking === match.tracking)?.expectedUnits || 0} expected units selected`,
-                          'Order SKUs Confirmed',
-                        )
-                      } catch (error) {
-                        toast.error(error.message, 'Choose Return SKUs')
-                      }
-                    }}
-                    className="btn-primary mt-3 w-full justify-center py-3 sm:w-auto"
-                  >
-                    <CheckCircle2 className="h-4 w-4" />
-                    Confirm Selected SKUs
-                  </button>
+              {(parsed.pendingOrderMatches || []).length > 0 && (
+                <div className="rounded-xl border border-amber-200 bg-amber-50 p-3">
+                  <p className="text-sm font-semibold text-amber-800">
+                    {parsed.pendingOrderMatches.length} package(s) have multiple possible order items
+                  </p>
+                  <p className="mt-1 text-xs text-amber-700">
+                    They will upload directly to Admin Review. Workers will not be asked to choose a product.
+                  </p>
                 </div>
-              ))}
+              )}
 
               {(parsed.waitingForTracking || []).length > 0 && (
                 <div className="rounded-xl border border-blue-200 bg-blue-50 p-3">
@@ -1296,7 +1466,7 @@ export default function ReturnsReceiving() {
                 <div className="rounded-xl border border-amber-200 bg-amber-50 p-3">
                   <p className="text-sm font-semibold text-amber-800">Review required for these packages</p>
                   <p className="mt-1 text-xs text-amber-700">
-                    These packages will be skipped. Ready packages can still upload:
+                    These packages will be sent to Admin Review. Ready packages can still upload:
                   </p>
                   <ul className="mt-2 space-y-1 text-xs text-amber-800">
                     {parsed.needsReview
@@ -1322,7 +1492,9 @@ export default function ReturnsReceiving() {
               <button
                 type="button"
                 onClick={uploadManifest}
-                disabled={uploading || !parsed.packages.length || !storeName.trim()}
+                disabled={uploading
+                  || (!parsed.packages.length && !(parsed.reviewPackages || []).length)
+                  || !storeName.trim()}
                 className="btn-primary w-full justify-center py-3 disabled:opacity-50 sm:w-auto"
               >
                 {uploading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}

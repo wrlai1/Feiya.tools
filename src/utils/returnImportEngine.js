@@ -13,6 +13,14 @@ const REMARK_ALIASES = ['买家备注', 'Buyer Remark', 'Buyer Note']
 const CARRIER_ALIASES = ['物流商', 'Carrier']
 const QUANTITY_ALIASES = ['Quantity', 'Qty', '数量', '应履约件数', '商品数量']
 
+export function chooseReturnManifestSheetName(sheetNames = []) {
+  const names = Array.isArray(sheetNames) ? sheetNames : []
+  return names.find((name) => String(name).trim() === '退货明细汇总')
+    || names.find((name) => String(name).trim().toUpperCase() === 'TEMU-STYLES')
+    || names[0]
+    || ''
+}
+
 const CONFIRMED_SHORTHAND_COMBOS = [
   {
     pattern: /^0015DenimDustyWhite(S|M|L|XL)$/i,
@@ -164,6 +172,20 @@ function normalizedIdentity(value) {
   return String(value || '').trim().toLowerCase()
 }
 
+function expandSkuManifestRows(rows, skuIdKey) {
+  return rows.flatMap((row, index) => {
+    const skuIds = String(row[skuIdKey] ?? '')
+      .split(/\r?\n|[;；]/)
+      .map((value) => value.trim())
+      .filter(Boolean)
+    const values = skuIds.length ? skuIds : ['']
+    return values.map((skuId) => ({
+      row: { ...row, [skuIdKey]: skuId },
+      excelRow: index + 2,
+    }))
+  })
+}
+
 export function applyProductCatalogMapping(catalogRows, skuId, selections, inventoryRows) {
   const selectedRow = (catalogRows || []).find((row) => String(row.skuId) === String(skuId))
   if (!selectedRow) throw new Error('SKU is no longer in this product file')
@@ -237,8 +259,9 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
     normalizeOrderNumber(order.order_number || order.orderNumber),
     order,
   ]))
+  const manifestRows = expandSkuManifestRows(rows, skuIdKey)
   const explicitSkuIdsByTracking = new Map()
-  for (const row of rows) {
+  for (const { row } of manifestRows) {
     const tracking = normalizeTracking(row[trackingKey])
     const skuId = String(row[skuIdKey] ?? '').trim()
     if (!tracking || !skuId) continue
@@ -249,8 +272,7 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
   const needsReview = []
   const waitingForTracking = []
 
-  rows.forEach((row, index) => {
-    const excelRow = index + 2
+  manifestRows.forEach(({ row, excelRow }) => {
     const trackingNumber = String(row[trackingKey] ?? '').trim()
     const tracking = normalizeTracking(trackingNumber)
     const skuId = String(row[skuIdKey] ?? '').trim()
@@ -421,10 +443,23 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
   })
 
   const packages = []
+  const reviewPackages = []
   const pendingOrderMatches = []
   for (const group of groups.values()) {
     if (group.review.length) {
       needsReview.push(...group.review)
+      reviewPackages.push({
+        tracking: group.tracking,
+        trackingNumber: group.trackingNumber,
+        orders: [...group.orders],
+        reasons: [...group.reasons],
+        buyerRemarks: [...group.buyerRemarks],
+        carrier: [...group.carriers].join(', '),
+        items: group.items,
+        expectedUnits: group.items.reduce((sum, item) => sum + item.expectedQty, 0),
+        reviewReason: [...new Set(group.review.map((row) => row.parse_issue))].join(','),
+        requiresItemResolution: true,
+      })
       if (
         group.candidateOrders.length
         && group.review.every((row) => row.parse_issue === 'order_has_multiple_skus')
@@ -457,6 +492,7 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
 
   return {
     packages,
+    reviewPackages,
     needsReview,
     waitingForTracking,
     pendingOrderMatches,
