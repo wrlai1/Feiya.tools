@@ -8,6 +8,7 @@ import FileUploadZone from '../components/FileUploadZone.jsx'
 import UnmatchedResolver from '../components/UnmatchedResolver.jsx'
 import { useToast } from '../hooks/useToast.js'
 import { useAuth } from '../context/AuthContext.jsx'
+import { fetchStores as fetchAnalyticsStores } from '../utils/api.js'
 import {
   aliasKey,
   calculateResolvedSourceUnits,
@@ -216,6 +217,9 @@ export default function AutoDeduct() {
   const [resolutionAliasKeys, setResolutionAliasKeys] = useState([])
   const [previewConfirmed, setPreviewConfirmed] = useState(false)
   const [orderArchive, setOrderArchive] = useState(null)
+  const [analyticsStores, setAnalyticsStores] = useState([])
+  const [orderStore, setOrderStore] = useState('')
+  const [storeLoadError, setStoreLoadError] = useState('')
   const toast = useToast()
 
   // Merge resolver output into filledRows:
@@ -326,6 +330,30 @@ export default function AutoDeduct() {
       .then(data => setAliases(data.aliases || {}))
       .catch(() => setAliases({}))
   }, [getToken, isMock])
+
+  useEffect(() => {
+    if (isMock) {
+      setAnalyticsStores([{ name: 'Demo Store' }])
+      setOrderStore('Demo Store')
+      return
+    }
+    fetchAnalyticsStores()
+      .then((data) => {
+        const nextStores = data.stores || []
+        setAnalyticsStores(nextStores)
+        setStoreLoadError('')
+        setOrderStore((current) => (
+          nextStores.some((store) => store.name === current)
+            ? current
+            : nextStores.length === 1 ? nextStores[0].name : ''
+        ))
+      })
+      .catch((error) => {
+        setAnalyticsStores([])
+        setOrderStore('')
+        setStoreLoadError(error.message || 'Could not load Analytics stores')
+      })
+  }, [isMock])
 
   const handleFile = useCallback((file) => {
     setSrcFile(file); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([]); setSourceHash(''); setEditingResolutions(false); setResolutionAliasKeys([]); setPreviewConfirmed(false); setOrderArchive(null)
@@ -490,13 +518,14 @@ export default function AutoDeduct() {
 
   const archiveDailyOrders = useCallback(async () => {
     if (txnType !== 'sales' || !orderArchive?.orders?.length) return { conflicts: [] }
+    if (!orderStore) throw new Error('Choose the Analytics store for this order file')
     const conflicts = []
     for (let index = 0; index < orderArchive.orders.length; index += 500) {
       const res = await fetch(`${BASE}/returns?action=orders-import`, {
         method: 'POST',
         headers: authHeaders(getToken(), true),
         body: JSON.stringify({
-          storeName: 'All Stores',
+          storeName: orderStore,
           sourceFile: srcFile?.name || '',
           sourceHash,
           batchIndex: Math.floor(index / 500),
@@ -508,7 +537,7 @@ export default function AutoDeduct() {
       conflicts.push(...(data.conflicts || []))
     }
     return { conflicts }
-  }, [getToken, orderArchive, sourceHash, srcFile, txnType])
+  }, [getToken, orderArchive, orderStore, sourceHash, srcFile, txnType])
 
   const handleApply = useCallback(async () => {
     if (!mergedFilledRows.length || applying) return
@@ -530,6 +559,13 @@ export default function AutoDeduct() {
       toast.error(
         `${orderImportIssueCount.toLocaleString()} order row(s) have missing or conflicting identity data. Inventory was not changed.`,
         'Order Review Required'
+      )
+      return
+    }
+    if (txnType === 'sales' && orderArchive?.orders?.length > 0 && !orderStore) {
+      toast.error(
+        'Choose the Analytics store that owns this daily order file.',
+        'Store Required'
       )
       return
     }
@@ -576,7 +612,7 @@ export default function AutoDeduct() {
     } finally {
       setApplying(false)
     }
-  }, [archiveDailyOrders, mergedFilledRows, txnType, srcFile, sourceHash, orderClaims, orderImportIssueCount, expectedSourceUnits, inventoryApplyUnits, reconciliationMismatch, skippedUnits, applying, getToken, previewConfirmed, toast])
+  }, [archiveDailyOrders, mergedFilledRows, txnType, srcFile, sourceHash, orderArchive, orderClaims, orderImportIssueCount, orderStore, expectedSourceUnits, inventoryApplyUnits, reconciliationMismatch, skippedUnits, applying, getToken, previewConfirmed, toast])
 
   const stats            = result?.stats
   const hasUnresolved    = result?.unmatchedRows?.length > 0 && resolvedExtras === null
@@ -594,6 +630,8 @@ export default function AutoDeduct() {
       ? `Review ${orderImportIssueCount.toLocaleString()} order row(s) with missing or conflicting identity data before applying.`
     : txnType === 'sales' && !orderClaims.length
       ? 'Sales deductions require the raw TEMU workbook with order numbers; CSV files are download-only.'
+    : txnType === 'sales' && orderArchive?.orders?.length > 0 && !orderStore
+      ? 'Choose the Analytics store for this daily order file.'
     : !previewConfirmed
       ? 'Check the review box above before applying.'
       : ''
@@ -669,6 +707,33 @@ export default function AutoDeduct() {
             </button>
           ))}
         </div>
+
+        {txnType === 'sales' && (
+          <label className="block text-sm font-medium text-slate-700">
+            Analytics store for these orders
+            <select
+              value={orderStore}
+              onChange={(event) => setOrderStore(event.target.value)}
+              className="mt-1.5 h-11 w-full rounded-xl border border-slate-300 bg-white px-3 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 sm:max-w-sm"
+            >
+              <option value="">Choose the store</option>
+              {analyticsStores.map((store) => (
+                <option key={store.name} value={store.name}>{store.name}</option>
+              ))}
+            </select>
+            <span className="mt-1.5 block text-xs font-normal text-slate-500">
+              Required so Returns can find this order under the correct store later.
+            </span>
+            {storeLoadError && (
+              <span className="mt-1 block text-xs font-normal text-red-600">{storeLoadError}</span>
+            )}
+            {!storeLoadError && analyticsStores.length === 0 && (
+              <span className="mt-1 block text-xs font-normal text-amber-700">
+                Create the store in Analytics before applying a sales file.
+              </span>
+            )}
+          </label>
+        )}
 
         {/* File upload */}
         <FileUploadZone
@@ -748,7 +813,8 @@ export default function AutoDeduct() {
             )}
             {txnType === 'sales' && orderArchive?.orders?.length > 0 && (
               <div className="rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm text-indigo-800">
-                {orderArchive.stats.orderCount.toLocaleString()} orders will also be saved in the combined order history.
+                {orderArchive.stats.orderCount.toLocaleString()} orders will also be saved under{' '}
+                <strong>{orderStore || 'the selected Analytics store'}</strong>.
                 Inventory rollback will not delete them.
               </div>
             )}

@@ -41,6 +41,38 @@ export function normalizeTracking(value) {
   return String(value || '').trim().replace(/\s+/g, '').toUpperCase()
 }
 
+function normalizeStoreKey(value) {
+  return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase()
+}
+
+export function mergeAnalyticsReturnStores(analyticsStores = [], returnStores = []) {
+  const returnStats = new Map((returnStores || []).map((store) => [
+    normalizeStoreKey(store.store_key || store.store_name),
+    store,
+  ]))
+
+  return (analyticsStores || [])
+    .map((store) => {
+      const name = String(store?.name || '').trim()
+      if (!name) return null
+      const storeKey = normalizeStoreKey(name)
+      const stats = returnStats.get(storeKey) || {}
+      return {
+        ...stats,
+        analytics_days: Number(store.days || 0),
+        analytics_first_day: store.first_day || null,
+        analytics_last_day: store.last_day || null,
+        store_key: storeKey,
+        store_name: name,
+        product_count: Number(stats.product_count || 0),
+        ready_count: Number(stats.ready_count || 0),
+        order_count: Number(stats.order_count || 0),
+      }
+    })
+    .filter(Boolean)
+    .sort((left, right) => left.store_name.localeCompare(right.store_name))
+}
+
 function normalizeOrderNumber(value) {
   return String(value || '')
     .trim()

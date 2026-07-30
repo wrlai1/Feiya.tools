@@ -16,6 +16,7 @@ import {
   chooseReturnManifestSheetName,
   expandConfirmedProductSku,
   getReturnManifestOrderNumbers,
+  mergeAnalyticsReturnStores,
   parseProductCatalogRows,
   parseReturnManifestRows,
   parseSkuReturnManifestRows,
@@ -26,6 +27,42 @@ import {
 import inventoryTargetResolution from '../lib/inventoryTargetResolution.cjs'
 
 const { resolveInventoryTargets } = inventoryTargetResolution
+
+test('returns store choices use Analytics as the canonical store list', () => {
+  const stores = mergeAnalyticsReturnStores([
+    { name: 'Garden', days: 30, first_day: '2026-07-01', last_day: '2026-07-30' },
+    { name: 'House', days: 12 },
+  ], [
+    {
+      store_key: 'garden',
+      store_name: 'GARDEN',
+      product_count: 25,
+      ready_count: 24,
+      order_count: 900,
+    },
+    {
+      store_key: 'legacy store',
+      store_name: 'Legacy Store',
+      product_count: 10,
+      ready_count: 10,
+      order_count: 100,
+    },
+  ])
+
+  assert.deepEqual(stores.map((store) => store.store_name), ['Garden', 'House'])
+  assert.deepEqual(stores[0], {
+    store_key: 'garden',
+    store_name: 'Garden',
+    product_count: 25,
+    ready_count: 24,
+    order_count: 900,
+    analytics_days: 30,
+    analytics_first_day: '2026-07-01',
+    analytics_last_day: '2026-07-30',
+  })
+  assert.equal(stores[1].product_count, 0)
+  assert.equal(stores[1].order_count, 0)
+})
 
 test('return inspection separates inventory, return-rate, and not-ours outcomes', () => {
   const normal = summarizeReturnInspection([

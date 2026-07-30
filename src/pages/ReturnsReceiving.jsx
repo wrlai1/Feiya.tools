@@ -17,11 +17,13 @@ import {
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import { useToast } from '../hooks/useToast.js'
+import { fetchStores as fetchAnalyticsStores } from '../utils/api.js'
 import { aliasKey } from '../utils/autoDeductEngine.js'
 import {
   applyProductCatalogMapping,
   chooseReturnManifestSheetName,
   getReturnManifestOrderNumbers,
+  mergeAnalyticsReturnStores,
   parseProductCatalogRows,
   parseReturnManifestRows,
   parseSkuReturnManifestRows,
@@ -234,6 +236,7 @@ export default function ReturnsReceiving() {
   const [parsed, setParsed] = useState(null)
   const [uploading, setUploading] = useState(false)
   const [stores, setStores] = useState([])
+  const [storeLoadError, setStoreLoadError] = useState('')
   const [storeName, setStoreName] = useState('')
   const [catalogFile, setCatalogFile] = useState(null)
   const [catalogParsed, setCatalogParsed] = useState(null)
@@ -262,12 +265,40 @@ export default function ReturnsReceiving() {
   }, [demoMode, getToken])
 
   const loadStores = useCallback(async () => {
-    if (!isAdmin || demoMode) return
-    const res = await fetch(`${BASE}/returns?action=stores`, { headers: headers(getToken) })
-    const data = await res.json().catch(() => ({}))
-    if (res.ok) {
-      setStores(data.stores || [])
-      setStoreName((current) => current || data.stores?.[0]?.store_name || '')
+    if (!isAdmin) return
+    if (demoMode) {
+      setStores([{
+        store_key: 'demo store',
+        store_name: 'Demo Store',
+        product_count: 1,
+        ready_count: 1,
+        order_count: 1,
+      }])
+      setStoreName('Demo Store')
+      return
+    }
+    try {
+      const [analyticsData, returnRes] = await Promise.all([
+        fetchAnalyticsStores(),
+        fetch(`${BASE}/returns?action=stores`, { headers: headers(getToken) }),
+      ])
+      const returnData = await returnRes.json().catch(() => ({}))
+      if (!returnRes.ok) throw new Error(returnData.error || 'Could not load return store data')
+      const nextStores = mergeAnalyticsReturnStores(
+        analyticsData.stores || [],
+        returnData.stores || [],
+      )
+      setStores(nextStores)
+      setStoreLoadError('')
+      setStoreName((current) => (
+        nextStores.some((store) => store.store_name === current)
+          ? current
+          : nextStores[0]?.store_name || ''
+      ))
+    } catch (error) {
+      setStores([])
+      setStoreName('')
+      setStoreLoadError(error.message || 'Could not load Analytics stores')
     }
   }, [demoMode, getToken, isAdmin])
 
@@ -1382,26 +1413,34 @@ export default function ReturnsReceiving() {
             <div>
               <h3 className="font-semibold text-slate-900">Upload daily return manifest</h3>
               <p className="mt-1 text-sm text-slate-500">
-                Select the store, then upload Tracking Number, SKU ID, PO, reason, buyer note, and carrier.
+                Select the matching Analytics store, then upload Tracking Number, SKU ID, PO, reason, buyer note, and carrier.
               </p>
             </div>
           </div>
           <label className="mt-5 block text-sm font-semibold text-slate-700">
-            Store
-            <input
-              list="return-store-options"
+            Analytics store
+            <select
               value={storeName}
               onChange={(event) => {
                 setStoreName(event.target.value)
                 setParsed(null)
               }}
-              placeholder="Enter or choose store name"
               className="mt-2 h-11 w-full rounded-xl border border-slate-300 bg-white px-3 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 sm:max-w-sm"
-            />
-            <datalist id="return-store-options">
-              {stores.map((store) => <option key={store.store_key} value={store.store_name} />)}
-            </datalist>
+            >
+              <option value="">Choose a store</option>
+              {stores.map((store) => (
+                <option key={store.store_key} value={store.store_name}>{store.store_name}</option>
+              ))}
+            </select>
           </label>
+          {storeLoadError && (
+            <p className="mt-2 text-sm text-red-600">{storeLoadError}</p>
+          )}
+          {!storeLoadError && stores.length === 0 && (
+            <p className="mt-2 text-sm text-amber-700">
+              No Analytics stores found. Create the store in Analytics before uploading return data.
+            </p>
+          )}
           <input
             type="file"
             accept=".xlsx,.xls,.csv"
@@ -1515,26 +1554,30 @@ export default function ReturnsReceiving() {
               <div>
                 <h3 className="font-semibold text-slate-900">Store product catalog</h3>
                 <p className="mt-1 text-sm text-slate-500">
-                  Upload SKU ID and SKU货号 for one store. Existing SKU IDs update; new products are added immediately.
+                  Choose an existing Analytics store, then upload its 商品基础信息 file with SKU ID and SKU货号.
+                  Existing SKU IDs update; new products are added immediately.
                 </p>
               </div>
             </div>
             <label className="mt-5 block text-sm font-semibold text-slate-700">
-              Store
-              <input
-                list="catalog-store-options"
+              Analytics store
+              <select
                 value={storeName}
                 onChange={(event) => {
                   setStoreName(event.target.value)
                   setCatalogParsed(null)
                 }}
-                placeholder="Enter or choose store name"
                 className="mt-2 h-11 w-full rounded-xl border border-slate-300 bg-white px-3 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 sm:max-w-sm"
-              />
-              <datalist id="catalog-store-options">
-                {stores.map((store) => <option key={store.store_key} value={store.store_name} />)}
-              </datalist>
+              >
+                <option value="">Choose a store</option>
+                {stores.map((store) => (
+                  <option key={store.store_key} value={store.store_name}>{store.store_name}</option>
+                ))}
+              </select>
             </label>
+            <p className="mt-2 text-xs text-slate-500">
+              Product Catalog is only for SKU identification. Do not upload an order export here.
+            </p>
             <input
               type="file"
               accept=".xlsx,.xls,.csv"
@@ -1683,12 +1726,25 @@ export default function ReturnsReceiving() {
           {stores.length > 0 && (
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
               {stores.map((store) => (
-                <div key={store.store_key} className="card p-4">
+                <button
+                  key={store.store_key}
+                  type="button"
+                  onClick={() => {
+                    setStoreName(store.store_name)
+                    setCatalogParsed(null)
+                  }}
+                  className={`card p-4 text-left transition hover:border-violet-300 ${
+                    storeName === store.store_name ? 'border-violet-400 ring-2 ring-violet-100' : ''
+                  }`}
+                >
                   <p className="font-semibold text-slate-800">{store.store_name}</p>
                   <p className="mt-1 text-sm text-slate-500">
                     {Number(store.ready_count || 0).toLocaleString()} ready / {Number(store.product_count || 0).toLocaleString()} products
                   </p>
-                </div>
+                  <p className="mt-2 text-xs font-semibold text-violet-700">
+                    {Number(store.product_count || 0) > 0 ? 'Select to update catalog' : 'Select to add catalog'}
+                  </p>
+                </button>
               ))}
             </div>
           )}
@@ -1705,25 +1761,30 @@ export default function ReturnsReceiving() {
               <div>
                 <h3 className="font-semibold text-slate-900">Historical order data</h3>
                 <p className="mt-1 text-sm text-slate-500">
-                  Choose one store, then upload its TEMU CSV or daily order workbook. Buyer names, phones, emails, and addresses are discarded before upload.
+                  Backfill orders from before the daily Auto Deduct workflow. Choose the matching Analytics store,
+                  then upload its historical TEMU CSV. Buyer names, phones, emails, and addresses are discarded.
                 </p>
               </div>
             </div>
+            <div className="mt-4 rounded-xl border border-blue-200 bg-blue-50 p-3 text-sm text-blue-800">
+              New detailed orders are saved automatically when a daily sales file is applied in Auto Deduct.
+              Analytics performance data is summarized and cannot identify a return by order number on its own.
+            </div>
             <label className="mt-5 block text-sm font-semibold text-slate-700">
-              Store
-              <input
-                list="order-store-options"
+              Analytics store
+              <select
                 value={storeName}
                 onChange={(event) => {
                   setStoreName(event.target.value)
                   setOrderParsed(null)
                 }}
-                placeholder="House, Garden, Medley…"
                 className="mt-2 h-11 w-full rounded-xl border border-slate-300 bg-white px-3 outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100 sm:max-w-sm"
-              />
-              <datalist id="order-store-options">
-                {stores.map((store) => <option key={store.store_key} value={store.store_name} />)}
-              </datalist>
+              >
+                <option value="">Choose a store</option>
+                {stores.map((store) => (
+                  <option key={store.store_key} value={store.store_name}>{store.store_name}</option>
+                ))}
+              </select>
             </label>
             <input
               type="file"
