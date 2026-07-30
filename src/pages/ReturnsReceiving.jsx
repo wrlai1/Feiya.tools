@@ -23,12 +23,11 @@ import {
   applyProductCatalogMapping,
   chooseReturnManifestSheetName,
   getReturnManifestOrderNumbers,
+  getReturnManifestSkuIds,
   mergeAnalyticsReturnStores,
   parseProductCatalogRows,
-  parseReturnManifestRows,
   parseSkuReturnManifestRows,
   resolveProductCatalogRows,
-  resolveReturnManifestPackages,
   suggestProductCatalogSelections,
 } from '../utils/returnImportEngine.js'
 import { parseOrderHistoryRows } from '../utils/orderImportEngine.js'
@@ -240,9 +239,6 @@ export default function ReturnsReceiving() {
   const [storeName, setStoreName] = useState('')
   const [catalogFile, setCatalogFile] = useState(null)
   const [catalogParsed, setCatalogParsed] = useState(null)
-  const [catalogInventoryRows, setCatalogInventoryRows] = useState([])
-  const [catalogSelections, setCatalogSelections] = useState({})
-  const [catalogAliases, setCatalogAliases] = useState({})
   const [catalogUploading, setCatalogUploading] = useState(false)
   const [analytics, setAnalytics] = useState(null)
   const [analyticsDays, setAnalyticsDays] = useState(30)
@@ -253,6 +249,13 @@ export default function ReturnsReceiving() {
   const [orderUploading, setOrderUploading] = useState(false)
   const [orderStats, setOrderStats] = useState([])
   const [adminSelections, setAdminSelections] = useState({})
+  const [reviewCatalogRows, setReviewCatalogRows] = useState([])
+  const [reviewInventoryRows, setReviewInventoryRows] = useState([])
+  const [reviewAliases, setReviewAliases] = useState({})
+  const [reviewSkuSelections, setReviewSkuSelections] = useState({})
+  const [reviewManualTargets, setReviewManualTargets] = useState({})
+  const [reviewMappingLoading, setReviewMappingLoading] = useState(false)
+  const [reviewSavingSku, setReviewSavingSku] = useState('')
 
   const loadRecent = useCallback(async () => {
     if (demoMode) {
@@ -396,6 +399,58 @@ export default function ReturnsReceiving() {
     }
   }, [demoMode, getToken, toast, tracking])
 
+  useEffect(() => {
+    const unresolvedSkus = pkg?.review_data?.unresolvedSkus || []
+    setReviewSkuSelections({})
+    setReviewManualTargets({})
+    if (!isAdmin || !unresolvedSkus.length || demoMode) {
+      setReviewCatalogRows([])
+      setReviewInventoryRows([])
+      setReviewAliases({})
+      setReviewMappingLoading(false)
+      return undefined
+    }
+
+    let active = true
+    setReviewMappingLoading(true)
+    Promise.all([
+      fetch(`${BASE}/inventory-balance?action=list`, { headers: headers(getToken) }),
+      fetch(`${BASE}/auto-deduct?action=aliases`, { headers: headers(getToken) }),
+    ]).then(async ([inventoryRes, aliasesRes]) => {
+      const [inventoryData, aliasesData] = await Promise.all([
+        inventoryRes.json().catch(() => ({})),
+        aliasesRes.json().catch(() => ({})),
+      ])
+      if (!inventoryRes.ok) throw new Error(inventoryData.error || 'Could not load inventory targets')
+      if (!aliasesRes.ok) throw new Error(aliasesData.error || 'Could not load confirmed SKU mappings')
+      const inventoryRows = (inventoryData.rows || []).map((row) => ({
+        STYLE: row.Style,
+        COLOR: row.Color,
+        SIZE: row.Size,
+      }))
+      const aliases = aliasesData.aliases || {}
+      const resolved = resolveProductCatalogRows(
+        unresolvedSkus.map((item) => ({
+          skuId: item.skuId,
+          skuCode: item.skuCode,
+          returnQuantity: Number(item.quantity),
+          reviewIssue: item.issue,
+        })),
+        inventoryRows,
+        aliases,
+      )
+      if (!active) return
+      setReviewInventoryRows(inventoryRows)
+      setReviewAliases(aliases)
+      setReviewCatalogRows(resolved)
+    }).catch((error) => {
+      if (active) toast.error(error.message, 'Could Not Load SKU Review')
+    }).finally(() => {
+      if (active) setReviewMappingLoading(false)
+    })
+    return () => { active = false }
+  }, [demoMode, getToken, isAdmin, pkg, toast])
+
   const expectedUnits = Number(pkg?.expected_units || 0)
   const inspection = useMemo(() => summarizeReturnInspection((pkg?.items || []).map((item) => ({
     expectedQty: Number(item.expected_qty),
@@ -530,10 +585,6 @@ export default function ReturnsReceiving() {
     setFile(nextFile)
     setParsed(null)
     if (!nextFile) return
-    if (!storeName.trim()) {
-      toast.error('Choose or enter a store before reading the return file', 'Store Required')
-      return
-    }
     try {
       const XLSX = await import('xlsx')
       const workbook = XLSX.read(await nextFile.arrayBuffer(), { type: 'array' })
@@ -542,52 +593,34 @@ export default function ReturnsReceiving() {
       const hasSkuId = Object.keys(rows[0] || {}).some((key) =>
         ['sku id', 'skuid', 'sku_id'].includes(key.trim().toLowerCase())
       )
-      let result
-      if (hasSkuId) {
-        const catalogRes = await fetch(
-          `${BASE}/returns?action=catalog&store=${encodeURIComponent(storeName.trim())}`,
-          { headers: headers(getToken) },
-        )
-        const catalogData = await catalogRes.json().catch(() => ({}))
-        if (!catalogRes.ok) throw new Error(catalogData.error || 'Could not load this store’s product catalog')
-        const historicalOrders = []
-        const orderNumbers = getReturnManifestOrderNumbers(rows)
-        for (let index = 0; index < orderNumbers.length; index += 500) {
-          const orderRes = await fetch(`${BASE}/returns?action=orders-lookup`, {
-            method: 'POST',
-            headers: headers(getToken, true),
-            body: JSON.stringify({
-              storeName: storeName.trim(),
-              orderNumbers: orderNumbers.slice(index, index + 500),
-            }),
-          })
-          const orderData = await orderRes.json().catch(() => ({}))
-          if (!orderRes.ok) throw new Error(orderData.error || 'Could not load matching order history')
-          historicalOrders.push(...(orderData.orders || []))
-        }
-        result = parseSkuReturnManifestRows(rows, catalogData.rows || [], historicalOrders)
-      } else {
-        const parsedRows = parseReturnManifestRows(rows)
-        const [inventoryRes, aliasesRes] = await Promise.all([
-          fetch(`${BASE}/inventory-balance?action=list`, { headers: headers(getToken) }),
-          fetch(`${BASE}/auto-deduct?action=aliases`, { headers: headers(getToken) }),
-        ])
-        const [inventoryData, aliasesData] = await Promise.all([
-          inventoryRes.json().catch(() => ({})),
-          aliasesRes.json().catch(() => ({})),
-        ])
-        if (!inventoryRes.ok) throw new Error(inventoryData.error || 'Could not load inventory targets')
-        if (!aliasesRes.ok) throw new Error(aliasesData.error || 'Could not load confirmed SKU mappings')
-        result = resolveReturnManifestPackages(
-          parsedRows,
-          (inventoryData.rows || []).map((row) => ({
-            STYLE: row.Style,
-            COLOR: row.Color,
-            SIZE: row.Size,
-          })),
-          aliasesData.aliases || {},
-        )
+      if (!hasSkuId) {
+        throw new Error('Combined daily return manifests require a SKU ID column')
       }
+      const catalogRows = []
+      const skuIds = getReturnManifestSkuIds(rows)
+      for (let index = 0; index < skuIds.length; index += 500) {
+        const catalogRes = await fetch(`${BASE}/returns?action=catalogs-lookup`, {
+          method: 'POST',
+          headers: headers(getToken, true),
+          body: JSON.stringify({ skuIds: skuIds.slice(index, index + 500) }),
+        })
+        const catalogData = await catalogRes.json().catch(() => ({}))
+        if (!catalogRes.ok) throw new Error(catalogData.error || 'Could not identify stores from SKU IDs')
+        catalogRows.push(...(catalogData.rows || []))
+      }
+      const historicalOrders = []
+      const orderNumbers = getReturnManifestOrderNumbers(rows)
+      for (let index = 0; index < orderNumbers.length; index += 500) {
+        const orderRes = await fetch(`${BASE}/returns?action=orders-lookup-any`, {
+          method: 'POST',
+          headers: headers(getToken, true),
+          body: JSON.stringify({ orderNumbers: orderNumbers.slice(index, index + 500) }),
+        })
+        const orderData = await orderRes.json().catch(() => ({}))
+        if (!orderRes.ok) throw new Error(orderData.error || 'Could not load matching order history')
+        historicalOrders.push(...(orderData.orders || []))
+      }
+      const result = parseSkuReturnManifestRows(rows, catalogRows, historicalOrders)
       setParsed(result)
       if (result.needsReview.length) {
         toast.warning(
@@ -601,7 +634,7 @@ export default function ReturnsReceiving() {
   }
 
   const uploadManifest = async () => {
-    if (!parsed?.packages?.length || !storeName.trim() || uploading) return
+    if ((!parsed?.packages?.length && !parsed?.reviewPackages?.length) || uploading) return
     setUploading(true)
     try {
       const res = await fetch(`${BASE}/returns?action=import`, {
@@ -610,7 +643,6 @@ export default function ReturnsReceiving() {
         body: JSON.stringify({
           packages: parsed.packages,
           reviewPackages: parsed.reviewPackages || [],
-          storeName: storeName.trim(),
           sourceFile: file?.name || '',
         }),
       })
@@ -635,7 +667,6 @@ export default function ReturnsReceiving() {
   const parseCatalogFile = async (nextFile) => {
     setCatalogFile(nextFile)
     setCatalogParsed(null)
-    setCatalogSelections({})
     if (!nextFile) return
     if (!storeName.trim()) {
       toast.error('Enter the store name before reading its product file', 'Store Required')
@@ -667,8 +698,6 @@ export default function ReturnsReceiving() {
         inventoryRows,
         aliasesData.aliases || {},
       )
-      setCatalogInventoryRows(inventoryRows)
-      setCatalogAliases(aliasesData.aliases || {})
       setCatalogParsed({
         rows: resolved,
         ready: resolved.filter((row) => row.status === 'ready').length,
@@ -679,14 +708,14 @@ export default function ReturnsReceiving() {
     }
   }
 
-  const catalogSuggestedSelections = useMemo(() => {
+  const reviewSuggestedSelections = useMemo(() => {
     const suggestions = {}
-    for (const row of catalogParsed?.rows || []) {
+    for (const row of reviewCatalogRows) {
       if (row.status === 'ready' || !row.sourceComponents?.length) continue
       suggestProductCatalogSelections(
         row.sourceComponents,
-        catalogInventoryRows,
-        catalogAliases,
+        reviewInventoryRows,
+        reviewAliases,
       ).forEach((selection, index) => {
         if (selection.style && selection.color) {
           suggestions[`${row.skuId}:${index}`] = selection
@@ -694,50 +723,93 @@ export default function ReturnsReceiving() {
       })
     }
     return suggestions
-  }, [catalogAliases, catalogInventoryRows, catalogParsed])
+  }, [reviewAliases, reviewCatalogRows, reviewInventoryRows])
 
-  const catalogSelectionFor = (row, index) => {
-    const selectionKey = `${row.skuId}:${index}`
-    if (catalogSelections[selectionKey]) return catalogSelections[selectionKey]
-    return catalogSuggestedSelections[selectionKey] || {}
+  const reviewSelectionFor = (row, index) => {
+    const key = `${row.skuId}:${index}`
+    return reviewSkuSelections[key] || reviewSuggestedSelections[key] || {}
   }
 
-  const confirmCatalogMapping = async (row) => {
+  const saveReviewedSkuMapping = async (row) => {
+    if (!pkg || reviewSavingSku) return
+    setReviewSavingSku(row.skuId)
     try {
-      const selections = (row.sourceComponents || []).map((_, index) =>
-        catalogSelectionFor(row, index)
-      )
-      const result = applyProductCatalogMapping(
-        catalogParsed.rows,
-        row.skuId,
-        selections,
-        catalogInventoryRows,
-      )
-      const nextAliases = { ...catalogAliases }
-      row.sourceComponents.forEach((source, index) => {
-        nextAliases[aliasKey(source.style, source.color)] = {
-          STYLE: selections[index].style,
-          COLOR: selections[index].color,
-          _confirmed: true,
-        }
-      })
-      const aliasRes = await fetch(`${BASE}/auto-deduct?action=save-aliases`, {
+      let components = row.components || []
+      let selections = []
+      const canMapSources = row.sourceComponents?.length
+        && row.sourceComponents.every((source) => source.size)
+      if (row.status !== 'ready' && canMapSources) {
+        selections = row.sourceComponents.map((_, index) => reviewSelectionFor(row, index))
+        components = applyProductCatalogMapping(
+          [row],
+          row.skuId,
+          selections,
+          reviewInventoryRows,
+        ).rows[0].components
+      } else if (row.status !== 'ready') {
+        components = reviewManualTargets[row.skuId] || []
+      }
+      if (
+        !components.length
+        || components.some((component) =>
+          !component.style
+          || !component.color
+          || !component.size
+          || !Number.isSafeInteger(Number(component.qty))
+          || Number(component.qty) <= 0
+        )
+      ) {
+        throw new Error(
+          'Choose complete style, color, size, and whole-number quantity / Complete estilo, color, talla y cantidad',
+        )
+      }
+
+      const res = await fetch(`${BASE}/returns?action=resolve-sku-mapping`, {
         method: 'POST',
         headers: headers(getToken, true),
-        body: JSON.stringify({ aliases: nextAliases }),
+        body: JSON.stringify({
+          tracking: pkg.tracking_number,
+          skuId: row.skuId,
+          components,
+        }),
       })
-      const aliasData = await aliasRes.json().catch(() => ({}))
-      if (!aliasRes.ok) throw new Error(aliasData.error || 'Could not save this confirmed mapping')
-      const ready = result.rows.filter((item) => item.status === 'ready').length
-      const review = result.rows.length - ready
-      setCatalogAliases(nextAliases)
-      setCatalogParsed({ rows: result.rows, ready, review })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not save this SKU mapping')
+
+      if (canMapSources && row.sourceComponents.length === components.length) {
+        const nextAliases = { ...reviewAliases }
+        row.sourceComponents.forEach((source, index) => {
+          const target = components[index]
+          nextAliases[aliasKey(source.style, source.color)] = {
+            STYLE: target.style,
+            COLOR: target.color,
+            _confirmed: true,
+          }
+        })
+        const aliasRes = await fetch(`${BASE}/auto-deduct?action=save-aliases`, {
+          method: 'POST',
+          headers: headers(getToken, true),
+          body: JSON.stringify({ aliases: nextAliases }),
+        })
+        if (aliasRes.ok) setReviewAliases(nextAliases)
+      }
+
+      const next = data.package
+      setPkg(next)
+      setCounts(Object.fromEntries((next.items || []).map((item) => [
+        item.id,
+        { good: 0, damaged: 0, notOurs: 0 },
+      ])))
+      setCounted(false)
       toast.success(
-        `${result.updatedSkuIds.length} SKU size variant(s) completed`,
-        'Product Mapping Saved in Preview',
+        'Saved for this package and future returns / Guardado para futuras devoluciones',
+        'SKU Mapping Remembered',
       )
+      await Promise.all([loadReviewPackages(), loadStores()])
     } catch (error) {
-      toast.error(error.message, 'Complete Product Mapping')
+      toast.error(error.message, 'Could Not Save SKU Mapping')
+    } finally {
+      setReviewSavingSku('')
     }
   }
 
@@ -757,7 +829,7 @@ export default function ReturnsReceiving() {
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || 'Could not upload product catalog')
       toast.success(
-        `${data.ready_rows} ready · ${data.review_rows} need mapping review`,
+        `${data.ready_rows} ready · ${data.review_rows} saved for Admin Review when needed`,
         `${data.store_name} Product Catalog Updated`,
       )
       setCatalogFile(null)
@@ -1057,7 +1129,277 @@ export default function ReturnsReceiving() {
                 </div>
               )}
 
-              {isAdmin && pkg.status === 'needs_review' && pkg.requires_item_resolution && (
+              {isAdmin && pkg.status === 'needs_review'
+                && pkg.review_data?.unresolvedSkus?.length > 0 && (
+                <div className="border-b border-amber-200 bg-amber-50 px-4 py-4 sm:px-5">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-700" />
+                    <div>
+                      <p className="font-semibold text-amber-950">
+                        Confirm SKU mapping / Confirmar SKU
+                      </p>
+                      <p className="mt-1 text-sm text-amber-800">
+                        Confirm the exact inventory items once. The same SKU ID will be remembered
+                        for future returns.
+                      </p>
+                    </div>
+                  </div>
+
+                  {reviewMappingLoading ? (
+                    <div className="mt-4 flex items-center gap-2 rounded-xl border border-amber-200 bg-white p-4 text-sm text-slate-600">
+                      <RefreshCw className="h-4 w-4 animate-spin" />
+                      Loading inventory choices / Cargando opciones
+                    </div>
+                  ) : (
+                    <div className="mt-4 space-y-4">
+                      {reviewCatalogRows.map((row) => {
+                        const canMapSources = row.sourceComponents?.length
+                          && row.sourceComponents.every((source) => source.size)
+                        const manualTargets = reviewManualTargets[row.skuId]
+                          || [{ style: '', color: '', size: '', qty: 1 }]
+                        return (
+                          <div key={row.skuId} className="rounded-xl border border-amber-200 bg-white p-3 sm:p-4">
+                            <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
+                              <div className="min-w-0">
+                                <p className="break-words font-semibold text-slate-900">{row.skuCode}</p>
+                                <p className="mt-1 text-xs text-slate-500">
+                                  SKU ID {row.skuId} · Product Qty {row.returnQuantity}
+                                </p>
+                              </div>
+                              <span className="w-fit rounded-full bg-amber-100 px-2 py-1 text-xs font-semibold text-amber-800">
+                                Admin only
+                              </span>
+                            </div>
+
+                            {row.status === 'ready' ? (
+                              <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50 p-3">
+                                <p className="text-xs font-semibold text-emerald-800">
+                                  Exact inventory combination found. Confirm once to remember it.
+                                </p>
+                                <div className="mt-2 flex flex-wrap gap-1.5">
+                                  {row.components.map((component, index) => (
+                                    <span
+                                      key={`${component.style}-${component.color}-${component.size}-${index}`}
+                                      className="rounded-md bg-white px-2 py-1 text-xs text-slate-700"
+                                    >
+                                      {component.style} / {component.color} / {component.size}
+                                      {Number(component.qty || 1) > 1 ? ` ×${component.qty}` : ''}
+                                    </span>
+                                  ))}
+                                </div>
+                              </div>
+                            ) : canMapSources ? (
+                              <div className="mt-3 space-y-3">
+                                {row.sourceComponents.map((source, index) => {
+                                  const selectionKey = `${row.skuId}:${index}`
+                                  const selection = reviewSelectionFor(row, index)
+                                  const styleOptions = [...new Set(
+                                    reviewInventoryRows
+                                      .filter((target) => sameSize(target.SIZE, source.size))
+                                      .map((target) => target.STYLE),
+                                  )].sort()
+                                  const colorOptions = [...new Set(
+                                    reviewInventoryRows
+                                      .filter((target) =>
+                                        sameSize(target.SIZE, source.size)
+                                        && target.STYLE === selection.style
+                                      )
+                                      .map((target) => target.COLOR),
+                                  )].sort()
+                                  return (
+                                    <div key={selectionKey} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                                      <p className="break-words text-xs font-semibold text-slate-700">
+                                        Source: {source.style} / {source.color} / {source.size}
+                                        {Number(source.qty || 1) > 1 ? ` ×${source.qty}` : ''}
+                                      </p>
+                                      {selection.matchedBy && (
+                                        <p className="mt-1 text-xs font-semibold text-emerald-700">
+                                          Auto Deduct suggestion / Sugerencia automática
+                                        </p>
+                                      )}
+                                      <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                                        <label className="text-xs font-medium text-slate-600">
+                                          Inventory style / Estilo
+                                          <select
+                                            value={selection.style || ''}
+                                            onChange={(event) => setReviewSkuSelections((current) => ({
+                                              ...current,
+                                              [selectionKey]: { style: event.target.value, color: '' },
+                                            }))}
+                                            className="mt-1 h-11 w-full rounded-lg border border-slate-300 bg-white px-2 text-sm"
+                                          >
+                                            <option value="">Choose / Elegir</option>
+                                            {styleOptions.map((style) => (
+                                              <option key={style} value={style}>{style}</option>
+                                            ))}
+                                          </select>
+                                        </label>
+                                        <label className="text-xs font-medium text-slate-600">
+                                          Inventory color / Color
+                                          <select
+                                            value={selection.color || ''}
+                                            disabled={!selection.style}
+                                            onChange={(event) => setReviewSkuSelections((current) => ({
+                                              ...current,
+                                              [selectionKey]: {
+                                                style: selection.style,
+                                                color: event.target.value,
+                                              },
+                                            }))}
+                                            className="mt-1 h-11 w-full rounded-lg border border-slate-300 bg-white px-2 text-sm disabled:bg-slate-100"
+                                          >
+                                            <option value="">Choose / Elegir</option>
+                                            {colorOptions.map((color) => (
+                                              <option key={color} value={color}>{color}</option>
+                                            ))}
+                                          </select>
+                                        </label>
+                                      </div>
+                                    </div>
+                                  )
+                                })}
+                              </div>
+                            ) : (
+                              <div className="mt-3 space-y-3">
+                                <p className="text-xs text-amber-800">
+                                  This SKU code cannot be split safely. Add every physical inventory
+                                  item contained in one sold SKU.
+                                </p>
+                                {manualTargets.map((target, index) => {
+                                  const styleOptions = [...new Set(
+                                    reviewInventoryRows.map((item) => item.STYLE),
+                                  )].sort()
+                                  const colorOptions = [...new Set(
+                                    reviewInventoryRows
+                                      .filter((item) => item.STYLE === target.style)
+                                      .map((item) => item.COLOR),
+                                  )].sort()
+                                  const sizeOptions = [...new Set(
+                                    reviewInventoryRows
+                                      .filter((item) =>
+                                        item.STYLE === target.style && item.COLOR === target.color
+                                      )
+                                      .map((item) => item.SIZE),
+                                  )].sort()
+                                  const updateTarget = (changes) => {
+                                    const next = manualTargets.map((item, itemIndex) =>
+                                      itemIndex === index ? { ...item, ...changes } : item
+                                    )
+                                    setReviewManualTargets((current) => ({
+                                      ...current,
+                                      [row.skuId]: next,
+                                    }))
+                                  }
+                                  return (
+                                    <div
+                                      key={`${row.skuId}-manual-${index}`}
+                                      className="grid gap-2 rounded-xl border border-slate-200 bg-slate-50 p-3 sm:grid-cols-4"
+                                    >
+                                      <select
+                                        aria-label="Inventory style"
+                                        value={target.style}
+                                        onChange={(event) => updateTarget({
+                                          style: event.target.value,
+                                          color: '',
+                                          size: '',
+                                        })}
+                                        className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm"
+                                      >
+                                        <option value="">Style / Estilo</option>
+                                        {styleOptions.map((style) => (
+                                          <option key={style} value={style}>{style}</option>
+                                        ))}
+                                      </select>
+                                      <select
+                                        aria-label="Inventory color"
+                                        value={target.color}
+                                        disabled={!target.style}
+                                        onChange={(event) => updateTarget({ color: event.target.value, size: '' })}
+                                        className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm disabled:bg-slate-100"
+                                      >
+                                        <option value="">Color</option>
+                                        {colorOptions.map((color) => (
+                                          <option key={color} value={color}>{color}</option>
+                                        ))}
+                                      </select>
+                                      <select
+                                        aria-label="Inventory size"
+                                        value={target.size}
+                                        disabled={!target.color}
+                                        onChange={(event) => updateTarget({ size: event.target.value })}
+                                        className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm disabled:bg-slate-100"
+                                      >
+                                        <option value="">Size / Talla</option>
+                                        {sizeOptions.map((size) => (
+                                          <option key={size} value={size}>{size}</option>
+                                        ))}
+                                      </select>
+                                      <div className="flex items-center gap-2">
+                                        <input
+                                          type="number"
+                                          min="1"
+                                          max="99"
+                                          inputMode="numeric"
+                                          aria-label="Units in one sold SKU"
+                                          value={target.qty}
+                                          onChange={(event) => updateTarget({ qty: Number(event.target.value) })}
+                                          className="h-11 w-full min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm"
+                                        />
+                                        {manualTargets.length > 1 && (
+                                          <button
+                                            type="button"
+                                            aria-label="Remove inventory item"
+                                            onClick={() => setReviewManualTargets((current) => ({
+                                              ...current,
+                                              [row.skuId]: manualTargets.filter((_, itemIndex) => itemIndex !== index),
+                                            }))}
+                                            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-red-200 text-red-600"
+                                          >
+                                            <XCircle className="h-4 w-4" />
+                                          </button>
+                                        )}
+                                      </div>
+                                    </div>
+                                  )
+                                })}
+                                <button
+                                  type="button"
+                                  onClick={() => setReviewManualTargets((current) => ({
+                                    ...current,
+                                    [row.skuId]: [
+                                      ...manualTargets,
+                                      { style: '', color: '', size: '', qty: 1 },
+                                    ],
+                                  }))}
+                                  className="btn-secondary min-h-11 w-full justify-center sm:w-auto"
+                                >
+                                  <Plus className="h-4 w-4" />
+                                  Add item / Agregar
+                                </button>
+                              </div>
+                            )}
+
+                            <button
+                              type="button"
+                              disabled={Boolean(reviewSavingSku)}
+                              onClick={() => saveReviewedSkuMapping(row)}
+                              className="mt-3 flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-emerald-600 px-4 text-sm font-bold text-white hover:bg-emerald-700 disabled:opacity-50 sm:w-auto"
+                            >
+                              {reviewSavingSku === row.skuId
+                                ? <RefreshCw className="h-4 w-4 animate-spin" />
+                                : <CheckCircle2 className="h-4 w-4" />}
+                              Confirm & Remember / Confirmar y recordar
+                            </button>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {isAdmin && pkg.status === 'needs_review' && pkg.requires_item_resolution
+                && !pkg.review_data?.unresolvedSkus?.length && (
                 <div className="border-b border-amber-200 bg-amber-50 px-4 py-4 sm:px-5">
                   <p className="font-semibold text-amber-900">Choose the products actually returned</p>
                   <p className="mt-1 text-sm text-amber-800">
@@ -1413,34 +1755,15 @@ export default function ReturnsReceiving() {
             <div>
               <h3 className="font-semibold text-slate-900">Upload daily return manifest</h3>
               <p className="mt-1 text-sm text-slate-500">
-                Select the matching Analytics store, then upload Tracking Number, SKU ID, PO, reason, buyer note, and carrier.
+                Upload one combined file with Tracking Number, SKU ID, PO, reason, buyer note, and carrier.
+                The fixed SKU ID identifies the store automatically.
               </p>
             </div>
           </div>
-          <label className="mt-5 block text-sm font-semibold text-slate-700">
-            Analytics store
-            <select
-              value={storeName}
-              onChange={(event) => {
-                setStoreName(event.target.value)
-                setParsed(null)
-              }}
-              className="mt-2 h-11 w-full rounded-xl border border-slate-300 bg-white px-3 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 sm:max-w-sm"
-            >
-              <option value="">Choose a store</option>
-              {stores.map((store) => (
-                <option key={store.store_key} value={store.store_name}>{store.store_name}</option>
-              ))}
-            </select>
-          </label>
-          {storeLoadError && (
-            <p className="mt-2 text-sm text-red-600">{storeLoadError}</p>
-          )}
-          {!storeLoadError && stores.length === 0 && (
-            <p className="mt-2 text-sm text-amber-700">
-              No Analytics stores found. Create the store in Analytics before uploading return data.
-            </p>
-          )}
+          <div className="mt-4 rounded-xl border border-blue-200 bg-blue-50 p-3 text-sm text-blue-800">
+            No store selection is needed. A tracking number containing unknown, duplicate-store,
+            or cross-store SKU IDs will be sent to Admin Review and will not enter inventory.
+          </div>
           <input
             type="file"
             accept=".xlsx,.xls,.csv"
@@ -1450,7 +1773,7 @@ export default function ReturnsReceiving() {
 
           {parsed && (
             <div className="mt-5 space-y-4">
-              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
                 <div className="rounded-xl bg-slate-50 p-3">
                   <p className="text-xl font-bold text-slate-900">{parsed.stats.packageCount}</p>
                   <p className="text-xs text-slate-500">Packages ready</p>
@@ -1470,6 +1793,12 @@ export default function ReturnsReceiving() {
                     {Number(parsed.stats.waitingForTracking || 0)}
                   </p>
                   <p className="text-xs text-slate-500">Waiting for Tracking</p>
+                </div>
+                <div className="rounded-xl bg-violet-50 p-3">
+                  <p className="text-xl font-bold text-violet-800">
+                    {Number(parsed.stats.storeCount || 0)}
+                  </p>
+                  <p className="text-xs text-slate-500">Stores detected</p>
                 </div>
               </div>
 
@@ -1523,7 +1852,7 @@ export default function ReturnsReceiving() {
 
               {Number(parsed.stats.recoveredPackages || 0) > 0 && (
                 <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800">
-                  {parsed.stats.recoveredPackages} package(s) had missing SKU IDs and were completed from this store’s order history.
+                  {parsed.stats.recoveredPackages} package(s) had missing SKU IDs and were completed from matched order history.
                   The original order quantities will be shown to the worker for physical verification.
                 </div>
               )}
@@ -1532,8 +1861,7 @@ export default function ReturnsReceiving() {
                 type="button"
                 onClick={uploadManifest}
                 disabled={uploading
-                  || (!parsed.packages.length && !(parsed.reviewPackages || []).length)
-                  || !storeName.trim()}
+                  || (!parsed.packages.length && !(parsed.reviewPackages || []).length)}
                 className="btn-primary w-full justify-center py-3 disabled:opacity-50 sm:w-auto"
               >
                 {uploading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
@@ -1578,6 +1906,9 @@ export default function ReturnsReceiving() {
             <p className="mt-2 text-xs text-slate-500">
               Product Catalog is only for SKU identification. Do not upload an order export here.
             </p>
+            {storeLoadError && (
+              <p className="mt-2 text-sm text-red-600">{storeLoadError}</p>
+            )}
             <input
               type="file"
               accept=".xlsx,.xls,.csv"
@@ -1599,115 +1930,9 @@ export default function ReturnsReceiving() {
                   ))}
                 </div>
                 {catalogParsed.review > 0 && (
-                  <div className="space-y-3 rounded-xl border border-amber-200 bg-amber-50 p-3 sm:p-4">
-                    <div>
-                      <p className="text-sm font-semibold text-amber-900">
-                        Complete unresolved SKUs before uploading
-                      </p>
-                      <p className="mt-1 text-xs text-amber-700">
-                        Choose the exact inventory style and color for each source component.
-                        A confirmed color combination automatically carries to its other available sizes.
-                      </p>
-                    </div>
-                    {catalogParsed.rows.filter((row) => row.status !== 'ready').map((row) => (
-                      <details key={row.skuId} className="overflow-hidden rounded-xl border border-amber-200 bg-white">
-                        <summary className="cursor-pointer px-3 py-3">
-                          <span className="block text-sm font-semibold text-slate-800">
-                            {row.skuCode}
-                          </span>
-                          <span className="mt-0.5 block text-xs text-slate-500">
-                            SKU ID {row.skuId} · {row.issue}
-                          </span>
-                        </summary>
-                        <div className="space-y-3 border-t border-slate-100 p-3">
-                          {!row.sourceComponents?.length ? (
-                            <p className="text-xs text-amber-700">
-                              This SKU could not be split into components. Check and correct its SKU货号 in the source file.
-                            </p>
-                          ) : (
-                            row.sourceComponents.map((source, index) => {
-                              const selectionKey = `${row.skuId}:${index}`
-                              const selection = catalogSelectionFor(row, index)
-                              const styleOptions = [...new Set(
-                                catalogInventoryRows
-                                  .filter((target) => sameSize(target.SIZE, source.size))
-                                  .map((target) => target.STYLE),
-                              )].sort()
-                              const colorOptions = [...new Set(
-                                catalogInventoryRows
-                                  .filter((target) =>
-                                    sameSize(target.SIZE, source.size)
-                                    && target.STYLE === selection.style
-                                  )
-                                  .map((target) => target.COLOR),
-                              )].sort()
-                              return (
-                                <div
-                                  key={selectionKey}
-                                  className="rounded-xl border border-slate-200 bg-slate-50 p-3"
-                                >
-                                  <p className="text-xs font-semibold text-slate-700">
-                                    Source: {source.style} / {source.color} / {source.size}
-                                  </p>
-                                  {selection.matchedBy && (
-                                    <p className="mt-1 text-xs font-semibold text-emerald-700">
-                                      Auto Deduct match applied
-                                    </p>
-                                  )}
-                                  <div className="mt-2 grid gap-2 sm:grid-cols-2">
-                                    <label className="text-xs font-medium text-slate-500">
-                                      Inventory style
-                                      <select
-                                        value={selection.style || ''}
-                                        onChange={(event) => setCatalogSelections((current) => ({
-                                          ...current,
-                                          [selectionKey]: { style: event.target.value, color: '' },
-                                        }))}
-                                        className="mt-1 h-11 w-full rounded-lg border border-slate-300 bg-white px-2 text-sm text-slate-700"
-                                      >
-                                        <option value="">Choose style</option>
-                                        {styleOptions.map((style) => (
-                                          <option key={style} value={style}>{style}</option>
-                                        ))}
-                                      </select>
-                                    </label>
-                                    <label className="text-xs font-medium text-slate-500">
-                                      Inventory color
-                                      <select
-                                        value={selection.color || ''}
-                                        disabled={!selection.style}
-                                        onChange={(event) => setCatalogSelections((current) => ({
-                                          ...current,
-                                          [selectionKey]: {
-                                            style: selection.style,
-                                            color: event.target.value,
-                                          },
-                                        }))}
-                                        className="mt-1 h-11 w-full rounded-lg border border-slate-300 bg-white px-2 text-sm text-slate-700 disabled:bg-slate-100"
-                                      >
-                                        <option value="">Choose color</option>
-                                        {colorOptions.map((color) => (
-                                          <option key={color} value={color}>{color}</option>
-                                        ))}
-                                      </select>
-                                    </label>
-                                  </div>
-                                </div>
-                              )
-                            })
-                          )}
-                          <button
-                            type="button"
-                            disabled={!row.sourceComponents?.length}
-                            onClick={() => confirmCatalogMapping(row)}
-                            className="btn-primary w-full justify-center py-3 disabled:opacity-50 sm:w-auto"
-                          >
-                            <CheckCircle2 className="h-4 w-4" />
-                            Confirm This SKU Combination
-                          </button>
-                        </div>
-                      </details>
-                    ))}
+                  <div className="rounded-xl border border-blue-200 bg-blue-50 p-3 text-sm text-blue-800">
+                    {catalogParsed.review} SKU(s) are not clear yet. They will still upload now
+                    and only go to Admin Review if they appear in a return.
                   </div>
                 )}
                 <button
@@ -1717,37 +1942,11 @@ export default function ReturnsReceiving() {
                   className="btn-primary w-full justify-center py-3 disabled:opacity-50 sm:w-auto"
                 >
                   {catalogUploading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
-                  Update {storeName.trim() || 'Store'} Catalog
+                  Upload Product Catalog
                 </button>
               </div>
             )}
           </div>
-
-          {stores.length > 0 && (
-            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-              {stores.map((store) => (
-                <button
-                  key={store.store_key}
-                  type="button"
-                  onClick={() => {
-                    setStoreName(store.store_name)
-                    setCatalogParsed(null)
-                  }}
-                  className={`card p-4 text-left transition hover:border-violet-300 ${
-                    storeName === store.store_name ? 'border-violet-400 ring-2 ring-violet-100' : ''
-                  }`}
-                >
-                  <p className="font-semibold text-slate-800">{store.store_name}</p>
-                  <p className="mt-1 text-sm text-slate-500">
-                    {Number(store.ready_count || 0).toLocaleString()} ready / {Number(store.product_count || 0).toLocaleString()} products
-                  </p>
-                  <p className="mt-2 text-xs font-semibold text-violet-700">
-                    {Number(store.product_count || 0) > 0 ? 'Select to update catalog' : 'Select to add catalog'}
-                  </p>
-                </button>
-              ))}
-            </div>
-          )}
         </div>
       )}
 
@@ -1786,6 +1985,9 @@ export default function ReturnsReceiving() {
                 ))}
               </select>
             </label>
+            {storeLoadError && (
+              <p className="mt-2 text-sm text-red-600">{storeLoadError}</p>
+            )}
             <input
               type="file"
               accept=".xlsx,.xls,.csv"

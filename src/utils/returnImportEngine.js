@@ -90,6 +90,13 @@ export function getReturnManifestOrderNumbers(rows) {
     .filter(Boolean))]
 }
 
+export function getReturnManifestSkuIds(rows) {
+  if (!Array.isArray(rows) || !rows.length) return []
+  const skuIdKey = findKey(rows[0], SKU_ID_ALIASES)
+  if (!skuIdKey) return []
+  return [...new Set(rows.flatMap((row) => splitSkuIds(row[skuIdKey])).filter(Boolean))]
+}
+
 export function expandConfirmedProductSku(value) {
   const skuCode = String(value || '').trim()
   for (const rule of CONFIRMED_SHORTHAND_COMBOS) {
@@ -204,12 +211,16 @@ function normalizedIdentity(value) {
   return String(value || '').trim().toLowerCase()
 }
 
+function splitSkuIds(value) {
+  return String(value ?? '')
+    .split(/\r?\n|[;；]/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
 function expandSkuManifestRows(rows, skuIdKey) {
   return rows.flatMap((row, index) => {
-    const skuIds = String(row[skuIdKey] ?? '')
-      .split(/\r?\n|[;；]/)
-      .map((value) => value.trim())
-      .filter(Boolean)
+    const skuIds = splitSkuIds(row[skuIdKey])
     const values = skuIds.length ? skuIds : ['']
     return values.map((skuId) => ({
       row: { ...row, [skuIdKey]: skuId },
@@ -274,6 +285,90 @@ export function applyProductCatalogMapping(catalogRows, skuId, selections, inven
   return { rows, updatedSkuIds }
 }
 
+function catalogStore(product) {
+  const name = String(product?.store_name || product?.storeName || 'Selected Store').trim()
+  const key = String(product?.store_key || product?.storeKey || name).trim().toLowerCase()
+  return { name, key }
+}
+
+function addGroupStore(group, product) {
+  if (!product) return
+  const store = catalogStore(product)
+  group.stores.set(store.key, store.name)
+}
+
+function addUnresolvedSku(group, {
+  skuId,
+  skuCode,
+  quantity,
+  issue,
+}) {
+  const cleanSkuId = String(skuId || '').trim()
+  const cleanSkuCode = String(skuCode || '').trim()
+  const cleanQuantity = Number(quantity)
+  if (
+    !cleanSkuId
+    || !cleanSkuCode
+    || !Number.isSafeInteger(cleanQuantity)
+    || cleanQuantity <= 0
+  ) return
+  const existing = group.unresolvedSkus.get(cleanSkuId)
+  if (existing && existing.skuCode === cleanSkuCode) {
+    existing.quantity += cleanQuantity
+    return
+  }
+  group.unresolvedSkus.set(cleanSkuId, {
+    skuId: cleanSkuId,
+    skuCode: cleanSkuCode,
+    quantity: cleanQuantity,
+    issue: String(issue || 'sku_mapping_needs_review').trim(),
+  })
+}
+
+function resolvedCatalogProduct(catalog, skuId) {
+  const matches = catalog.get(String(skuId || '').trim()) || []
+  if (!matches.length) return { product: null, issue: 'sku_id_not_in_store_catalog' }
+  const stores = new Set(matches.map((product) => catalogStore(product).key))
+  if (stores.size !== 1 || matches.length !== 1) {
+    return { product: null, issue: 'sku_id_store_ambiguous' }
+  }
+  return { product: matches[0], issue: '' }
+}
+
+function resolvedGroupStore(group) {
+  if (group.stores.size === 1) {
+    const [[key, name]] = group.stores
+    return { storeKey: key, storeName: name }
+  }
+  return { storeKey: 'unresolved', storeName: 'Unresolved' }
+}
+
+function orderStore(order) {
+  const name = String(order?.store_name || order?.storeName || '').trim()
+  const key = String(order?.store_key || order?.storeKey || name).trim().toLowerCase()
+  return { name, key }
+}
+
+function resolvedHistoricalOrder(orderMatches, group) {
+  if (!orderMatches?.length) return { order: null, issue: 'order_history_missing' }
+  const groupKeys = [...group.stores.keys()]
+  if (groupKeys.length === 1) {
+    const exact = orderMatches.find((order) => orderStore(order).key === groupKeys[0])
+    if (exact) return { order: exact, issue: '' }
+    const combined = orderMatches.find((order) => orderStore(order).key === 'all stores')
+    return combined
+      ? { order: combined, issue: '' }
+      : { order: null, issue: 'order_store_mismatch' }
+  }
+
+  const storeSpecific = orderMatches.filter((order) => orderStore(order).key !== 'all stores')
+  const storeKeys = new Set(storeSpecific.map((order) => orderStore(order).key))
+  if (storeKeys.size > 1) return { order: null, issue: 'order_store_ambiguous' }
+  if (storeSpecific.length === 1) return { order: storeSpecific[0], issue: '' }
+  if (!storeSpecific.length && orderMatches.length === 1) return { order: orderMatches[0], issue: '' }
+  return { order: null, issue: 'order_store_ambiguous' }
+}
+
 export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders = []) {
   if (!Array.isArray(rows) || !rows.length) throw new Error('Return file is empty')
   const trackingKey = findKey(rows[0], TRACKING_ALIASES)
@@ -286,19 +381,33 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
   const remarkKey = findKey(rows[0], REMARK_ALIASES)
   const carrierKey = findKey(rows[0], CARRIER_ALIASES)
   const quantityKey = findKey(rows[0], QUANTITY_ALIASES)
-  const catalog = new Map((catalogRows || []).map((row) => [String(row.sku_id || row.skuId), row]))
-  const orders = new Map((historicalOrders || []).map((order) => [
-    normalizeOrderNumber(order.order_number || order.orderNumber),
-    order,
-  ]))
+  const catalog = new Map()
+  for (const product of catalogRows || []) {
+    const skuId = String(product.sku_id || product.skuId || '').trim()
+    if (!catalog.has(skuId)) catalog.set(skuId, [])
+    catalog.get(skuId).push(product)
+  }
+  const orders = new Map()
+  for (const order of historicalOrders || []) {
+    const orderKey = normalizeOrderNumber(order.order_number || order.orderNumber)
+    if (!orders.has(orderKey)) orders.set(orderKey, [])
+    orders.get(orderKey).push(order)
+  }
   const manifestRows = expandSkuManifestRows(rows, skuIdKey)
   const explicitSkuIdsByTracking = new Map()
+  const explicitStoresByTracking = new Map()
   for (const { row } of manifestRows) {
     const tracking = normalizeTracking(row[trackingKey])
     const skuId = String(row[skuIdKey] ?? '').trim()
     if (!tracking || !skuId) continue
     if (!explicitSkuIdsByTracking.has(tracking)) explicitSkuIdsByTracking.set(tracking, new Set())
     explicitSkuIdsByTracking.get(tracking).add(skuId)
+    const { product } = resolvedCatalogProduct(catalog, skuId)
+    if (product) {
+      if (!explicitStoresByTracking.has(tracking)) explicitStoresByTracking.set(tracking, new Map())
+      const store = catalogStore(product)
+      explicitStoresByTracking.get(tracking).set(store.key, store.name)
+    }
   }
   const groups = new Map()
   const needsReview = []
@@ -331,6 +440,8 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
       recoveredOrders: new Set(),
       candidateOrders: [],
       review: [],
+      unresolvedSkus: new Map(),
+      stores: new Map(explicitStoresByTracking.get(tracking) || []),
     }
     if (orderNumber) group.orders.add(orderNumber)
     if (reasonKey && row[reasonKey]) group.reasons.add(String(row[reasonKey]).trim())
@@ -339,7 +450,14 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
 
     if (!skuId) {
       const orderKey = normalizeOrderNumber(orderNumber)
-      const historicalOrder = orders.get(orderKey)
+      const orderAlreadyHandled = group.recoveredOrders.has(orderKey)
+        || group.candidateOrders.some((order) => order.orderKey === orderKey)
+      const {
+        order: historicalOrder,
+        issue: historicalOrderIssue,
+      } = orderAlreadyHandled
+        ? { order: null, issue: '' }
+        : resolvedHistoricalOrder(orders.get(orderKey), group)
       if (!orderKey) {
         group.review.push({
           tracking: trackingNumber,
@@ -348,22 +466,28 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
           skuId,
           parse_issue: 'sku_id_missing',
         })
+      } else if (orderAlreadyHandled) {
+        // The same logical order may appear on multiple rows (for example -D01 suffixes).
       } else if (!historicalOrder?.items?.length) {
         group.review.push({
           tracking: trackingNumber,
           excelRow,
           orderNumber,
           skuId,
-          parse_issue: 'order_history_missing',
+          parse_issue: historicalOrderIssue || 'order_history_missing',
         })
-      } else if (
-        !group.recoveredOrders.has(orderKey)
-        && !group.candidateOrders.some((order) => order.orderKey === orderKey)
-      ) {
+      } else {
+        const historicalStore = orderStore(historicalOrder)
+        if (historicalStore.key && historicalStore.key !== 'all stores') {
+          group.stores.set(historicalStore.key, historicalStore.name)
+        }
         const candidates = historicalOrder.items.flatMap((orderItem, itemIndex) => {
           const recoveredSkuId = String(orderItem.sku_id || orderItem.skuId || '').trim()
           const recoveredQuantity = Number(orderItem.quantity)
-          const product = catalog.get(recoveredSkuId)
+          const {
+            product,
+            issue: productIssue,
+          } = resolvedCatalogProduct(catalog, recoveredSkuId)
           if (explicitSkuIdsByTracking.get(tracking)?.has(recoveredSkuId)) return []
           let issue = ''
           if (!recoveredSkuId) {
@@ -371,10 +495,12 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
           } else if (!Number.isSafeInteger(recoveredQuantity) || recoveredQuantity <= 0) {
             issue = 'order_quantity_invalid'
           } else if (!product) {
-            issue = 'sku_id_not_in_store_catalog'
+            issue = productIssue
           } else if (product.status !== 'ready' || !Array.isArray(product.components) || !product.components.length) {
             issue = product.issue || 'sku_mapping_needs_review'
           }
+          if (product) addGroupStore(group, product)
+          const store = product ? catalogStore(product) : { name: '', key: '' }
           return [{
             candidateKey: `${orderKey}\u241f${
               orderItem.id || orderItem.item_key || orderItem.itemKey || itemIndex
@@ -388,6 +514,8 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
             status: issue ? 'review' : 'ready',
             issue,
             components: issue ? [] : product.components,
+            storeName: store.name,
+            storeKey: store.key,
           }]
         })
 
@@ -413,6 +541,12 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
           })
           group.recoveredOrders.add(orderKey)
         } else if (candidates.length === 1) {
+          addUnresolvedSku(group, {
+            skuId: candidates[0].skuId,
+            skuCode: candidates[0].skuCode,
+            quantity: candidates[0].maxQuantity,
+            issue: candidates[0].issue,
+          })
           group.review.push({
             tracking: trackingNumber,
             excelRow,
@@ -441,16 +575,32 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
         parse_issue: 'quantity_invalid',
       })
     } else {
-      const product = catalog.get(skuId)
+      const {
+        product,
+        issue: productIssue,
+      } = resolvedCatalogProduct(catalog, skuId)
       if (!product) {
         group.review.push({
           tracking: trackingNumber,
           excelRow,
           orderNumber,
           skuId,
-          parse_issue: 'sku_id_not_in_store_catalog',
+          parse_issue: productIssue,
         })
-      } else if (product.status !== 'ready' || !Array.isArray(product.components) || !product.components.length) {
+      } else {
+        addGroupStore(group, product)
+      }
+      if (product && (
+        product.status !== 'ready'
+        || !Array.isArray(product.components)
+        || !product.components.length
+      )) {
+        addUnresolvedSku(group, {
+          skuId,
+          skuCode: product.sku_code || product.skuCode,
+          quantity,
+          issue: product.issue || 'sku_mapping_needs_review',
+        })
         group.review.push({
           tracking: trackingNumber,
           excelRow,
@@ -458,7 +608,7 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
           skuId,
           parse_issue: product.issue || 'sku_mapping_needs_review',
         })
-      } else {
+      } else if (product) {
         product.components.forEach((component) => {
           group.items.push({
             skuId,
@@ -478,7 +628,22 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
   const reviewPackages = []
   const pendingOrderMatches = []
   for (const group of groups.values()) {
+    if (group.stores.size > 1) {
+      group.review.push({
+        tracking: group.trackingNumber,
+        skuId: '',
+        parse_issue: 'tracking_cross_store',
+      })
+    }
+    const store = resolvedGroupStore(group)
     if (group.review.length) {
+      const unresolvedSkus = [...group.unresolvedSkus.values()]
+      const unresolvedKeys = new Set(unresolvedSkus.map((item) =>
+        `${item.skuId}\u241f${item.issue}`
+      ))
+      const blockingIssues = [...new Set(group.review
+        .filter((row) => !unresolvedKeys.has(`${row.skuId}\u241f${row.parse_issue}`))
+        .map((row) => row.parse_issue))]
       needsReview.push(...group.review)
       reviewPackages.push({
         tracking: group.tracking,
@@ -491,6 +656,8 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
         expectedUnits: group.items.reduce((sum, item) => sum + item.expectedQty, 0),
         reviewReason: [...new Set(group.review.map((row) => row.parse_issue))].join(','),
         requiresItemResolution: true,
+        reviewData: { unresolvedSkus, blockingIssues },
+        ...store,
       })
       if (
         group.candidateOrders.length
@@ -505,6 +672,7 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
           carrier: [...group.carriers].join(', '),
           baseItems: group.items,
           candidateOrders: group.candidateOrders,
+          ...store,
         })
       }
       continue
@@ -519,6 +687,7 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
       items: group.items,
       expectedUnits: group.items.reduce((sum, item) => sum + item.expectedQty, 0),
       recoveredFromOrders: [...group.recoveredOrders],
+      ...store,
     })
   }
 
@@ -534,6 +703,11 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
       reviewPackages: new Set(needsReview.map((row) => row.tracking || `row:${row.excelRow}`)).size,
       waitingForTracking: waitingForTracking.length,
       recoveredPackages: packages.filter((pkg) => pkg.recoveredFromOrders.length > 0).length,
+      storeCount: new Set(
+        [...packages, ...reviewPackages]
+          .map((pkg) => pkg.storeKey)
+          .filter((key) => key && key !== 'unresolved'),
+      ).size,
     },
   }
 }
@@ -590,6 +764,8 @@ export function applyReturnOrderMatch(parsed, tracking, quantities) {
     items,
     expectedUnits: items.reduce((sum, item) => sum + item.expectedQty, 0),
     recoveredFromOrders: [...recoveredOrders],
+    storeName: match.storeName,
+    storeKey: match.storeKey,
   }
   const packages = [...(parsed.packages || []), pkg]
   const pendingOrderMatches = (parsed.pendingOrderMatches || [])
@@ -614,6 +790,7 @@ export function applyReturnOrderMatch(parsed, tracking, quantities) {
       recoveredPackages: packages.filter(
         (item) => (item.recoveredFromOrders || []).length > 0,
       ).length,
+      storeCount: new Set(packages.map((item) => item.storeKey).filter(Boolean)).size,
     },
   }
 }

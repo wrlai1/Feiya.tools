@@ -16,6 +16,7 @@ import {
   chooseReturnManifestSheetName,
   expandConfirmedProductSku,
   getReturnManifestOrderNumbers,
+  getReturnManifestSkuIds,
   mergeAnalyticsReturnStores,
   parseProductCatalogRows,
   parseReturnManifestRows,
@@ -894,6 +895,98 @@ test('SKU return manifests group tracking and retain store-facing return details
   assert.equal(result.packages[0].carrier, 'UPS')
 })
 
+test('one combined return manifest assigns each tracking to its SKU catalog store', () => {
+  const rows = [
+    { 'SKU ID': 'GARDEN-SKU', '运单号 Tracking Number': 'TRACK-GARDEN' },
+    { 'SKU ID': 'HOUSE-SKU', '运单号 Tracking Number': 'TRACK-HOUSE' },
+  ]
+  const result = parseSkuReturnManifestRows(rows, [
+    {
+      store_name: 'Garden',
+      store_key: 'garden',
+      sku_id: 'GARDEN-SKU',
+      sku_code: 'A100BlackS',
+      status: 'ready',
+      components: [{ style: 'A100', color: 'Black', size: 'S', qty: 1 }],
+    },
+    {
+      store_name: 'House',
+      store_key: 'house',
+      sku_id: 'HOUSE-SKU',
+      sku_code: 'B200NavyM',
+      status: 'ready',
+      components: [{ style: 'B200', color: 'Navy', size: 'M', qty: 1 }],
+    },
+  ])
+
+  assert.deepEqual(getReturnManifestSkuIds(rows), ['GARDEN-SKU', 'HOUSE-SKU'])
+  assert.equal(result.needsReview.length, 0)
+  assert.equal(result.stats.storeCount, 2)
+  assert.deepEqual(
+    result.packages.map((pkg) => [pkg.tracking, pkg.storeName, pkg.storeKey]),
+    [
+      ['TRACK-GARDEN', 'Garden', 'garden'],
+      ['TRACK-HOUSE', 'House', 'house'],
+    ],
+  )
+})
+
+test('one tracking containing SKUs from different stores fails closed for review', () => {
+  const result = parseSkuReturnManifestRows([
+    { 'SKU ID': 'GARDEN-SKU', '运单号 Tracking Number': 'TRACK-MIXED' },
+    { 'SKU ID': 'HOUSE-SKU', '运单号 Tracking Number': 'TRACK-MIXED' },
+  ], [
+    {
+      store_name: 'Garden',
+      store_key: 'garden',
+      sku_id: 'GARDEN-SKU',
+      sku_code: 'A100BlackS',
+      status: 'ready',
+      components: [{ style: 'A100', color: 'Black', size: 'S', qty: 1 }],
+    },
+    {
+      store_name: 'House',
+      store_key: 'house',
+      sku_id: 'HOUSE-SKU',
+      sku_code: 'B200NavyM',
+      status: 'ready',
+      components: [{ style: 'B200', color: 'Navy', size: 'M', qty: 1 }],
+    },
+  ])
+
+  assert.equal(result.packages.length, 0)
+  assert.equal(result.reviewPackages.length, 1)
+  assert.equal(result.reviewPackages[0].storeName, 'Unresolved')
+  assert.ok(result.needsReview.some((row) => row.parse_issue === 'tracking_cross_store'))
+})
+
+test('a SKU ID found in more than one store is never assigned automatically', () => {
+  const result = parseSkuReturnManifestRows([
+    { 'SKU ID': 'DUPLICATE-SKU', '运单号 Tracking Number': 'TRACK-AMBIGUOUS' },
+  ], [
+    {
+      store_name: 'Garden',
+      store_key: 'garden',
+      sku_id: 'DUPLICATE-SKU',
+      sku_code: 'A100BlackS',
+      status: 'ready',
+      components: [{ style: 'A100', color: 'Black', size: 'S', qty: 1 }],
+    },
+    {
+      store_name: 'House',
+      store_key: 'house',
+      sku_id: 'DUPLICATE-SKU',
+      sku_code: 'A100BlackS',
+      status: 'ready',
+      components: [{ style: 'A100', color: 'Black', size: 'S', qty: 1 }],
+    },
+  ])
+
+  assert.equal(result.packages.length, 0)
+  assert.equal(result.reviewPackages[0].storeName, 'Unresolved')
+  assert.equal(result.needsReview[0].parse_issue, 'sku_id_store_ambiguous')
+})
+
 test('daily house-return workbooks prefer the flat detail sheet', () => {
   assert.equal(
     chooseReturnManifestSheetName(['退货汇总', '退货明细汇总']),
@@ -953,6 +1046,65 @@ test('SKU return manifests isolate missing catalog data without blocking ready p
   assert.equal(result.waitingForTracking.length, 1)
   assert.equal(result.waitingForTracking[0].parse_issue, 'tracking_pending')
   assert.equal(result.stats.waitingForTracking, 1)
+})
+
+test('unresolved return SKU mappings retain the SKU code and quantity for Admin Review', () => {
+  const result = parseSkuReturnManifestRows([
+    {
+      'SKU ID': 'SKU-REVIEW',
+      '运单号 Tracking Number': 'RETURN-REVIEW-MAP',
+      Quantity: '2',
+    },
+    {
+      'SKU ID': 'SKU-REVIEW',
+      '运单号 Tracking Number': 'RETURN-REVIEW-MAP',
+      Quantity: '1',
+    },
+  ], [{
+    store_name: 'House',
+    store_key: 'house',
+    sku_id: 'SKU-REVIEW',
+    sku_code: 'A-100DustyBlueM',
+    status: 'review',
+    issue: 'inventory_target_missing',
+    components: [],
+  }])
+
+  assert.equal(result.packages.length, 0)
+  assert.equal(result.reviewPackages.length, 1)
+  assert.deepEqual(result.reviewPackages[0].reviewData, {
+    unresolvedSkus: [{
+      skuId: 'SKU-REVIEW',
+      skuCode: 'A-100DustyBlueM',
+      quantity: 3,
+      issue: 'inventory_target_missing',
+    }],
+    blockingIssues: [],
+  })
+  assert.equal(result.reviewPackages[0].storeName, 'House')
+})
+
+test('a remembered return SKU mapping is reused without another Admin Review', () => {
+  const result = parseSkuReturnManifestRows([{
+    'SKU ID': 'SKU-REMEMBERED',
+    '运单号 Tracking Number': 'RETURN-REMEMBERED',
+    Quantity: '2',
+  }], [{
+    store_name: 'House',
+    store_key: 'house',
+    sku_id: 'SKU-REMEMBERED',
+    sku_code: 'SET-UNKNOWN',
+    status: 'ready',
+    components: [
+      { style: 'A100', color: 'Black', size: 'M', qty: 1 },
+      { style: 'B200', color: 'Navy', size: 'M', qty: 2 },
+    ],
+  }])
+
+  assert.equal(result.needsReview.length, 0)
+  assert.equal(result.reviewPackages.length, 0)
+  assert.equal(result.packages[0].expectedUnits, 6)
+  assert.deepEqual(result.packages[0].items.map((item) => item.expectedQty), [2, 4])
 })
 
 test('missing return SKU IDs show every original SKU and require a selection for multi-SKU orders', () => {
