@@ -7,6 +7,7 @@ const require = createRequire(import.meta.url)
 const {
   normalizeInventoryQuantity,
   normalizeOrderClaims,
+  orderClaimsToSqlRecords,
 } = require('../lib/inventoryTransactionSafety.cjs')
 
 test('parses historical orders without retaining buyer PII', () => {
@@ -83,6 +84,17 @@ test('inventory claims prefer stable SKU IDs over attribute formatting', () => {
   }]), [{
     orderKey: 'po-3',
     itemKey: 'sku:12345',
+  }])
+})
+
+test('serializes inventory claims with the PostgreSQL record field names', () => {
+  const claims = normalizeOrderClaims([
+    { orderKey: ' PO-5 ', itemKey: ' SKU-123 ' },
+  ])
+
+  assert.deepEqual(orderClaimsToSqlRecords(claims), [{
+    order_key: 'po-5',
+    item_key: 'sku-123',
   }])
 })
 

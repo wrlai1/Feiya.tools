@@ -23,7 +23,11 @@ import inventoryTransactionSafety from '../lib/inventoryTransactionSafety.cjs'
 
 const MAX_SNAPSHOTS = 20
 const { resolveInventoryTargets } = inventoryTargetResolution
-const { normalizeInventoryQuantity, normalizeOrderClaims } = inventoryTransactionSafety
+const {
+  normalizeInventoryQuantity,
+  normalizeOrderClaims,
+  orderClaimsToSqlRecords,
+} = inventoryTransactionSafety
 
 function getDB() {
   const url = process.env.DATABASE_URL
@@ -479,6 +483,7 @@ export default async function handler(req, res) {
       } catch (error) {
         return res.status(400).json({ error: error.message })
       }
+      const orderClaimRecords = orderClaimsToSqlRecords(orderClaims)
       if (txnType !== 'sales' && orderClaims.length) {
         return res.status(400).json({ error: 'Order deduction claims are only valid for sales.' })
       }
@@ -500,7 +505,7 @@ export default async function handler(req, res) {
         const existingClaims = await sql`
           WITH incoming AS (
             SELECT *
-            FROM jsonb_to_recordset(${JSON.stringify(orderClaims)}::jsonb)
+            FROM jsonb_to_recordset(${JSON.stringify(orderClaimRecords)}::jsonb)
               AS claim(order_key TEXT, item_key TEXT)
           )
           SELECT claims.order_key, claims.item_key
@@ -628,7 +633,7 @@ export default async function handler(req, res) {
         ...(orderClaims.length ? [txn`
           WITH incoming AS (
             SELECT *
-            FROM jsonb_to_recordset(${JSON.stringify(orderClaims)}::jsonb)
+            FROM jsonb_to_recordset(${JSON.stringify(orderClaimRecords)}::jsonb)
               AS claim(order_key TEXT, item_key TEXT)
           ),
           applied_transaction AS (

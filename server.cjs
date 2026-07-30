@@ -13,6 +13,7 @@ const { resolveInventoryTargets } = require('./lib/inventoryTargetResolution.cjs
 const {
   normalizeInventoryQuantity,
   normalizeOrderClaims,
+  orderClaimsToSqlRecords,
 } = require('./lib/inventoryTransactionSafety.cjs');
 
 const app  = express();
@@ -1696,6 +1697,7 @@ app.all('/api/inventory-balance', async (req, res) => {
       } catch (error) {
         return res.status(400).json({ error: error.message });
       }
+      const orderClaimRecords = orderClaimsToSqlRecords(orderClaims);
       if (txnType !== 'sales' && orderClaims.length) {
         return res.status(400).json({ error: 'Order deduction claims are only valid for sales.' });
       }
@@ -1717,7 +1719,7 @@ app.all('/api/inventory-balance', async (req, res) => {
         const existingClaims = await sql`
           WITH incoming AS (
             SELECT *
-            FROM jsonb_to_recordset(${JSON.stringify(orderClaims)}::jsonb)
+            FROM jsonb_to_recordset(${JSON.stringify(orderClaimRecords)}::jsonb)
               AS claim(order_key TEXT, item_key TEXT)
           )
           SELECT claims.order_key, claims.item_key
@@ -1845,7 +1847,7 @@ app.all('/api/inventory-balance', async (req, res) => {
         ...(orderClaims.length ? [txn`
           WITH incoming AS (
             SELECT *
-            FROM jsonb_to_recordset(${JSON.stringify(orderClaims)}::jsonb)
+            FROM jsonb_to_recordset(${JSON.stringify(orderClaimRecords)}::jsonb)
               AS claim(order_key TEXT, item_key TEXT)
           ),
           applied_transaction AS (
