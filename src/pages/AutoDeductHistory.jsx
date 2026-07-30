@@ -36,7 +36,7 @@ export default function AutoDeductHistory() {
       if (!snapshotsRes.ok) throw new Error(snapshotsData.error || 'Could not load rollback points')
       setTransactions(transactionsData.transactions || [])
       setSnapshots((snapshotsData.snapshots || []).filter((snapshot) =>
-        ['sales', 'return', 'pre_restore'].includes(snapshot.label)
+        ['sales', 'return'].includes(snapshot.label) && snapshot.restorable !== false
       ))
     } catch (err) {
       setError(err.message)
@@ -50,14 +50,11 @@ export default function AutoDeductHistory() {
   const handleRollback = async (snapshot) => {
     const action = snapshot.label === 'sales'
       ? 'the deduction'
-      : snapshot.label === 'return'
-        ? 'the add-back'
-        : 'the previous rollback'
+      : 'the add-back'
     const confirmed = window.confirm(
       `Restore saved inventory quantities from ${formatDate(snapshot.created_at || snapshot.timestamp)}?\n\n` +
       `This restores quantities from before ${action}${snapshot.source_name ? ` for ${snapshot.source_name}` : ''}.\n` +
-      `Styles, colors, and sizes added after that point will be kept.\n\n` +
-      `The current balance will be saved as a new backup first.`
+      `Styles, colors, and sizes added after that point will be kept.`
     )
     if (!confirmed) return
 
@@ -71,7 +68,7 @@ export default function AutoDeductHistory() {
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || 'Could not restore inventory')
       toast.success(
-        `${Number(data.total_units || 0).toLocaleString()} units across ${Number(data.total_rows || 0).toLocaleString()} SKU rows restored`,
+        `${Number(data.total_units || 0).toLocaleString()} units across ${Number(data.total_rows || 0).toLocaleString()} SKU rows restored; ${Number(data.rolled_back_transactions || 0).toLocaleString()} later update(s) reversed`,
         'Rollback Complete'
       )
       await loadHistory()
@@ -119,7 +116,7 @@ export default function AutoDeductHistory() {
           <div className="mt-3 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
             <p>
-              Rollback restores saved quantities but keeps styles, colors, and sizes added later. Quantity changes made after that point to the saved SKUs will be reverted. Your current balance is backed up automatically first.
+              Rollback restores saved quantities but keeps styles, colors, and sizes added later. Every inventory update made after that point is reversed in the audit log, order protection, and return records too.
             </p>
           </div>
         </div>
@@ -136,19 +133,16 @@ export default function AutoDeductHistory() {
           <div className="divide-y divide-slate-100">
             {snapshots.map((snapshot) => {
               const isSale = snapshot.label === 'sales'
-              const isBackup = snapshot.label === 'pre_restore'
               return (
                 <div key={snapshot.id} className="flex flex-col gap-3 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
                       <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${
-                        isBackup
-                          ? 'bg-purple-100 text-purple-700'
-                          : isSale
-                            ? 'bg-orange-100 text-orange-700'
-                            : 'bg-green-100 text-green-700'
+                        isSale
+                          ? 'bg-orange-100 text-orange-700'
+                          : 'bg-green-100 text-green-700'
                       }`}>
-                        {isBackup ? 'Before rollback' : isSale ? 'Before deduction' : 'Before add-back'}
+                        {isSale ? 'Before deduction' : 'Before add-back'}
                       </span>
                       <span className="text-sm font-medium text-slate-700">
                         {formatDate(snapshot.created_at || snapshot.timestamp)}

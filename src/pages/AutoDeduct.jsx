@@ -8,10 +8,19 @@ import FileUploadZone from '../components/FileUploadZone.jsx'
 import UnmatchedResolver from '../components/UnmatchedResolver.jsx'
 import { useToast } from '../hooks/useToast.js'
 import { useAuth } from '../context/AuthContext.jsx'
-import { parseCSV, fillTemplate, generateExcel, aliasKey, normalizeSize, normalizeStyleIdentity } from '../utils/autoDeductEngine.js'
+import {
+  aliasKey,
+  calculateResolvedSourceUnits,
+  countSkippedUnits,
+  fillTemplate,
+  generateExcel,
+  normalizeSize,
+  normalizeStyleIdentity,
+  parseCSV,
+} from '../utils/autoDeductEngine.js'
 import ConsolidateStep from '../components/ConsolidateStep.jsx'
 import { consolidateRows } from '../utils/consolidateEngine.js'
-import { parseOrderHistoryRows } from '../utils/orderImportEngine.js'
+import { buildInventoryOrderClaims, parseOrderHistoryRows } from '../utils/orderImportEngine.js'
 
 const BASE = '/api'
 
@@ -237,6 +246,25 @@ export default function AutoDeduct() {
     }
     return rows
   }, [result, resolvedExtras])
+  const skippedUnits = useMemo(() => countSkippedUnits(skippedRows), [skippedRows])
+  const orderClaims = useMemo(
+    () => buildInventoryOrderClaims(orderArchive?.orders || []),
+    [orderArchive],
+  )
+  const orderImportIssueCount = Number(orderArchive?.skippedRows?.length || 0)
+    + Number(orderArchive?.conflicts?.length || 0)
+  const expectedSourceUnits = useMemo(
+    () => calculateResolvedSourceUnits(result?.stats?.src_total || 0, resolvedExtras || []),
+    [result, resolvedExtras],
+  )
+  const inventoryApplyUnits = useMemo(
+    () => mergedFilledRows.reduce((sum, row) => sum + (Number(row.QTY) || 0), 0),
+    [mergedFilledRows],
+  )
+  const allReviewRowsHandled = !result?.unmatchedRows?.length || resolvedExtras !== null
+  const reconciliationMismatch = Boolean(result)
+    && allReviewRowsHandled
+    && inventoryApplyUnits + skippedUnits !== expectedSourceUnits
 
   const deductionPreview = useMemo(() => {
     const preview = (result?.matchLog || []).map((match) => ({
@@ -484,6 +512,34 @@ export default function AutoDeduct() {
 
   const handleApply = useCallback(async () => {
     if (!mergedFilledRows.length || applying) return
+    if (skippedUnits > 0) {
+      toast.error(
+        `${skippedUnits.toLocaleString()} physical units are still skipped. Resolve every row before applying.`,
+        'Partial Deduction Blocked'
+      )
+      return
+    }
+    if (reconciliationMismatch) {
+      toast.error(
+        `Source has ${expectedSourceUnits.toLocaleString()} physical units, but ${inventoryApplyUnits.toLocaleString()} are ready to apply. Inventory was not changed.`,
+        'Quantity Mismatch'
+      )
+      return
+    }
+    if (txnType === 'sales' && orderImportIssueCount > 0) {
+      toast.error(
+        `${orderImportIssueCount.toLocaleString()} order row(s) have missing or conflicting identity data. Inventory was not changed.`,
+        'Order Review Required'
+      )
+      return
+    }
+    if (txnType === 'sales' && !orderClaims.length) {
+      toast.error(
+        'Use the raw TEMU workbook with order numbers. Consolidated CSV files cannot safely prevent duplicate deductions.',
+        'Order Numbers Required'
+      )
+      return
+    }
     if (!previewConfirmed) {
       toast.error('Review the source-to-inventory preview and confirm it before applying.', 'Review Required')
       return
@@ -491,6 +547,11 @@ export default function AutoDeduct() {
     setApplying(true)
     try {
       const archived = await archiveDailyOrders()
+      if (archived.conflicts.length) {
+        throw new Error(
+          `${archived.conflicts.length} order item(s) conflict with the saved order history. Inventory was not changed; review the order data before applying.`
+        )
+      }
       const res = await fetch(`${BASE}/inventory-balance?action=apply`, {
         method:  'POST',
         headers: authHeaders(getToken(), true),
@@ -499,17 +560,13 @@ export default function AutoDeduct() {
           txnType,
           sourceName:  srcFile?.name || '',
           sourceHash,
+          orderClaims,
+          sourceUnits: expectedSourceUnits,
         }),
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error)
       setApplied(true)
-      if (archived.conflicts.length) {
-        toast.warning(
-          `${archived.conflicts.length} order item conflicts were protected and not overwritten`,
-          'Order History Needs Review'
-        )
-      }
       toast.success(
         `${data.applied_units.toLocaleString()} units ${txnType === 'sales' ? 'deducted from inventory' : 'returned to inventory'}`,
         'Inventory Updated'
@@ -519,15 +576,27 @@ export default function AutoDeduct() {
     } finally {
       setApplying(false)
     }
-  }, [archiveDailyOrders, mergedFilledRows, txnType, srcFile, sourceHash, applying, getToken, previewConfirmed, toast])
+  }, [archiveDailyOrders, mergedFilledRows, txnType, srcFile, sourceHash, orderClaims, orderImportIssueCount, expectedSourceUnits, inventoryApplyUnits, reconciliationMismatch, skippedUnits, applying, getToken, previewConfirmed, toast])
 
   const stats            = result?.stats
   const hasUnresolved    = result?.unmatchedRows?.length > 0 && resolvedExtras === null
   const hasReviewRows    = result?.unmatchedRows?.length > 0
   const showResolver     = hasReviewRows && (hasUnresolved || editingResolutions)
-  const applyBlockReason = !previewConfirmed
-    ? 'Check the review box above before applying.'
-    : ''
+  const isReconciled = Boolean(result)
+    && allReviewRowsHandled
+    && skippedUnits === 0
+    && !reconciliationMismatch
+  const applyBlockReason = skippedUnits > 0
+    ? `Resolve the ${skippedUnits.toLocaleString()} skipped physical units before applying.`
+    : reconciliationMismatch
+      ? `Source total is ${expectedSourceUnits.toLocaleString()}, but ${inventoryApplyUnits.toLocaleString()} physical units are ready to apply.`
+    : txnType === 'sales' && orderImportIssueCount > 0
+      ? `Review ${orderImportIssueCount.toLocaleString()} order row(s) with missing or conflicting identity data before applying.`
+    : txnType === 'sales' && !orderClaims.length
+      ? 'Sales deductions require the raw TEMU workbook with order numbers; CSV files are download-only.'
+    : !previewConfirmed
+      ? 'Check the review box above before applying.'
+      : ''
 
   return (
     <div className="space-y-6 max-w-4xl">
@@ -607,7 +676,7 @@ export default function AutoDeduct() {
           accept=".csv,.xlsx,.xls"
           acceptedTypes="CSV, XLSX"
           label="Drag & drop TEMU order / consolidated file here"
-          sublabel="TEMU-STYLES is selected automatically"
+          sublabel="Raw TEMU workbook is required for sales deductions; CSV is preview/download only"
           currentFile={srcFile}
           onClear={() => { setSrcFile(null); setResult(null); setApplied(false); setPreviewConfirmed(false); setOrderArchive(null) }}
         />
@@ -633,12 +702,12 @@ export default function AutoDeduct() {
             <StatCard label="Matched"       value={stats.filled_total} color="green" />
             <StatCard label="Unmatched"     value={stats.append_total} color={stats.append_total > 0 ? 'yellow' : 'slate'} />
             <div className="card px-4 py-3 flex items-center gap-2.5">
-              {stats.reconciled_total === stats.src_total
+              {isReconciled
                 ? <CheckCircle  className="w-5 h-5 text-green-500 flex-shrink-0" />
                 : <AlertTriangle className="w-5 h-5 text-yellow-500 flex-shrink-0" />}
               <div>
-                <p className={`text-sm font-bold ${stats.reconciled_total === stats.src_total ? 'text-green-600' : 'text-yellow-600'}`}>
-                  {stats.reconciled_total === stats.src_total ? 'Reconciled ✓' : 'Mismatch'}
+                <p className={`text-sm font-bold ${isReconciled ? 'text-green-600' : 'text-yellow-600'}`}>
+                  {isReconciled ? 'Reconciled ✓' : skippedUnits > 0 ? 'Partial — blocked' : 'Mismatch'}
                 </p>
                 <p className="text-xs text-slate-500">Status</p>
               </div>
@@ -669,13 +738,23 @@ export default function AutoDeduct() {
             <h3 className="font-medium text-slate-700 text-sm">Actions</h3>
 
             <div className="rounded-xl bg-slate-50 px-4 py-3 text-sm text-slate-600">
-              Inventory units to {txnType === 'sales' ? 'deduct' : 'add back'}: <strong className="text-slate-800">{mergedFilledRows.reduce((sum, row) => sum + (Number(row.QTY) || 0), 0).toLocaleString()}</strong>
-              {skippedRows.length > 0 && <span className="ml-2 text-amber-600">· {skippedRows.length} skipped row(s) will not be applied</span>}
+              Inventory units to {txnType === 'sales' ? 'deduct' : 'add back'}: <strong className="text-slate-800">{inventoryApplyUnits.toLocaleString()}</strong>
+              {skippedUnits > 0 && <span className="ml-2 font-semibold text-red-600">· {skippedUnits.toLocaleString()} skipped physical unit(s) must be resolved</span>}
             </div>
+            {reconciliationMismatch && (
+              <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">
+                Quantity mismatch: source file contains {expectedSourceUnits.toLocaleString()} physical units, but {inventoryApplyUnits.toLocaleString()} are ready to apply.
+              </div>
+            )}
             {txnType === 'sales' && orderArchive?.orders?.length > 0 && (
               <div className="rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm text-indigo-800">
                 {orderArchive.stats.orderCount.toLocaleString()} orders will also be saved in the combined order history.
                 Inventory rollback will not delete them.
+              </div>
+            )}
+            {txnType === 'sales' && orderImportIssueCount > 0 && (
+              <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">
+                Order import blocked: {Number(orderArchive?.skippedRows?.length || 0).toLocaleString()} incomplete row(s) and {Number(orderArchive?.conflicts?.length || 0).toLocaleString()} conflicting row(s) must be corrected in the source workbook.
               </div>
             )}
 
@@ -764,7 +843,7 @@ export default function AutoDeduct() {
                 )}
                 <button
                   onClick={handleApply}
-                  disabled={applying}
+                  disabled={applying || Boolean(applyBlockReason)}
                   aria-describedby={applyBlockReason ? 'apply-block-reason' : undefined}
                   className={`w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
                     txnType === 'sales'

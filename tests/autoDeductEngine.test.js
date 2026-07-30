@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 
 import {
   aliasKey,
+  calculateResolvedSourceUnits,
+  countSkippedUnits,
   fillTemplate,
 } from '../src/utils/autoDeductEngine.js'
 import { summarizeReturnInspection } from '../src/utils/returnInspection.js'
@@ -90,6 +92,78 @@ test('petite sales sizes are shifted exactly once', () => {
   )
 })
 
+test('known 0015 and 0071 source styles route to their inventory styles', () => {
+  const salesRows = consolidateRows([
+    { SKU: '0015DustyBlueM', 'Product Attribute': 'Dusty Blue / M', Quantity: 2 },
+    { SKU: '0071BlackL', 'Product Attribute': 'Black / L', Quantity: 1 },
+  ]).consolidated
+
+  assert.deepEqual(salesRows.map((row) => row.style), ['0015', '0071'])
+  const result = fillTemplate([
+    { STYLE: '5010015', COLOR: 'Dusty Blue', SIZE: 'M' },
+    { STYLE: '5020071', COLOR: 'Black', SIZE: 'L' },
+  ], salesRows)
+  assert.deepEqual(
+    result.filledRows.filter((row) => row.QTY),
+    [
+      { STYLE: '5010015', COLOR: 'Dusty Blue', SIZE: 'M', QTY: 2 },
+      { STYLE: '5020071', COLOR: 'Black', SIZE: 'L', QTY: 1 },
+    ],
+  )
+})
+
+test('known style routing keeps previously confirmed source color links valid', () => {
+  const result = fillTemplate([
+    { STYLE: '5010015', COLOR: 'DUSTY BLUE', SIZE: 'M' },
+  ], [
+    { style: '0015', color: 'dusty', size: 'M', QTY: 3 },
+  ], {
+    [aliasKey('0015', 'dusty')]: {
+      STYLE: '5010015',
+      COLOR: 'DUSTY BLUE',
+      _confirmed: true,
+    },
+  })
+
+  assert.deepEqual(
+    result.filledRows.filter((row) => row.QTY),
+    [{ STYLE: '5010015', COLOR: 'DUSTY BLUE', SIZE: 'M', QTY: 3 }],
+  )
+})
+
+test('SKU and product-attribute size or ampersand color conflicts require review', () => {
+  const result = consolidateRows([
+    { SKU: '73086mid1XL', 'Product Attribute': '孔雀蓝 / XL', Quantity: 2 },
+    { SKU: 'M022Black&WhiteM', 'Product Attribute': 'Black&Khaki / M', Quantity: 1 },
+  ])
+
+  assert.equal(result.needsReview.length, 3)
+  assert.ok(result.needsReview.some((row) => row.parse_issue === 'sku_attribute_size_conflict'))
+  assert.ok(result.needsReview.every((row) =>
+    /sku_attribute_size_conflict|sku_attribute_color_conflict/.test(row.parse_issue)
+  ))
+})
+
+test('skipped review rows count every physical component', () => {
+  assert.equal(countSkippedUnits([
+    { qty: 2, packCount: 4 },
+    { qty: 3, packCount: 1 },
+  ]), 11)
+})
+
+test('confirmed unknown sets update the protected physical-unit source total', () => {
+  assert.equal(calculateResolvedSourceUnits(10, [{
+    QTY: 2,
+    _isCombo: true,
+    _source: { originalPackCount: 1, packCount: 4 },
+  }]), 16)
+  assert.equal(calculateResolvedSourceUnits(10, [{
+    QTY: 2,
+    _isCombo: true,
+    _source: { originalPackCount: 3, packCount: 3 },
+  }]), 10)
+})
+
 test('explicit ampersand color combinations split for any style', () => {
   const withAttribute = consolidateRows([
     {
@@ -134,11 +208,16 @@ test('non-ampersand color combinations require confirmation', () => {
   assert.equal(result.needsReview.length, 2)
 })
 
-test('M022 routes missy and plus sizes before inventory matching', () => {
+test('M022 routes missy, petite, and plus sizes before inventory matching', () => {
   const salesRows = consolidateRows([
     {
       SKU: 'M022Black&DenimS',
       'Product Attribute': 'Black&Denim / S',
+      Quantity: 1,
+    },
+    {
+      SKU: 'M022DenimPM',
+      'Product Attribute': 'Denim / petite S',
       Quantity: 1,
     },
     {
@@ -150,6 +229,7 @@ test('M022 routes missy and plus sizes before inventory matching', () => {
   const result = fillTemplate([
     { STYLE: 'M022 Missy', COLOR: 'BLACK', SIZE: 'S' },
     { STYLE: 'M022 Missy', COLOR: 'DENIM', SIZE: 'S' },
+    { STYLE: 'M022 Petite', COLOR: 'DENIM', SIZE: 'PS' },
     { STYLE: 'M022 PLUS', COLOR: 'BLACK', SIZE: '1X' },
     { STYLE: 'M022 PLUS', COLOR: 'DENIM', SIZE: '1X' },
   ], salesRows)
@@ -159,6 +239,7 @@ test('M022 routes missy and plus sizes before inventory matching', () => {
     [
       { STYLE: 'M022 Missy', COLOR: 'BLACK', SIZE: 'S', QTY: 1 },
       { STYLE: 'M022 Missy', COLOR: 'DENIM', SIZE: 'S', QTY: 1 },
+      { STYLE: 'M022 Petite', COLOR: 'DENIM', SIZE: 'PS', QTY: 1 },
       { STYLE: 'M022 PLUS', COLOR: 'BLACK', SIZE: '1X', QTY: 2 },
       { STYLE: 'M022 PLUS', COLOR: 'DENIM', SIZE: '1X', QTY: 2 },
     ],
@@ -632,17 +713,17 @@ test('store product catalogs preserve SKU IDs and resolve physical components', 
     { 'SKU ID': 57081504942, SKU货号: '0015DenimDustyWhiteXL' },
   ])
   const resolved = resolveProductCatalogRows(catalog, [
-    { STYLE: '0015', COLOR: 'Denim', SIZE: 'XL' },
-    { STYLE: '0015', COLOR: 'Dusty Blue', SIZE: 'XL' },
-    { STYLE: '0015', COLOR: 'White', SIZE: 'XL' },
+    { STYLE: '5010015', COLOR: 'Denim', SIZE: 'XL' },
+    { STYLE: '5010015', COLOR: 'Dusty Blue', SIZE: 'XL' },
+    { STYLE: '5010015', COLOR: 'White', SIZE: 'XL' },
   ])
 
   assert.equal(resolved[0].skuId, '57081504942')
   assert.equal(resolved[0].status, 'ready')
   assert.deepEqual(resolved[0].components, [
-    { style: '0015', color: 'Denim', size: 'XL', qty: 1 },
-    { style: '0015', color: 'Dusty Blue', size: 'XL', qty: 1 },
-    { style: '0015', color: 'White', size: 'XL', qty: 1 },
+    { style: '5010015', color: 'Denim', size: 'XL', qty: 1 },
+    { style: '5010015', color: 'Dusty Blue', size: 'XL', qty: 1 },
+    { style: '5010015', color: 'White', size: 'XL', qty: 1 },
   ])
 })
 

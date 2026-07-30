@@ -63,6 +63,33 @@ function finalizeItem(item) {
   }
 }
 
+export function buildInventoryOrderClaims(orders) {
+  const claims = []
+  const seen = new Set()
+  for (const order of orders || []) {
+    const orderKey = clean(order?.orderNumber).toLowerCase()
+    if (!orderKey) continue
+    for (const item of order?.items || []) {
+      const skuId = clean(item?.skuId).toLowerCase()
+      const skcId = clean(item?.skcId).toLowerCase()
+      const fallbackKey = clean(item?.itemKey).toLowerCase().replace(/\s+/g, '')
+      const normalizedItemKey = skuId
+        ? `sku:${skuId}`
+        : skcId
+          ? `skc:${skcId}`
+          : fallbackKey
+            ? `item:${fallbackKey}`
+            : ''
+      if (!normalizedItemKey) continue
+      const key = `${orderKey}\u241f${normalizedItemKey}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      claims.push({ orderKey, itemKey: normalizedItemKey })
+    }
+  }
+  return claims
+}
+
 export function parseOrderHistoryRows(rows) {
   if (!Array.isArray(rows) || !rows.length) throw new Error('Order file is empty')
 

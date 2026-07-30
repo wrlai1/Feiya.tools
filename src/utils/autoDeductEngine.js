@@ -76,14 +76,44 @@ export function normalizeSize(s) {
     .replace(/^([123])XL$/, '$1X')   // 1XL→1X, 2XL→2X, 3XL→3X
 }
 
+export function countSkippedUnits(rows) {
+  return (rows || []).reduce((sum, row) => {
+    const qty = Number(row?.qty || 0)
+    const packCount = Math.max(1, parseInt(row?.packCount || row?.pack_count, 10) || 1)
+    return sum + qty * packCount
+  }, 0)
+}
+
+export function calculateResolvedSourceUnits(baseSourceUnits, resolvedItems = []) {
+  return (resolvedItems || []).reduce((total, item) => {
+    const source = item?._source
+    if (!item?._isCombo || !source) return total
+    const confirmedPackCount = Math.max(1, parseInt(source.packCount, 10) || 1)
+    const originalPackCount = Math.max(1, parseInt(source.originalPackCount, 10) || confirmedPackCount)
+    return total + (Number(item.QTY) || 0) * (confirmedPackCount - originalPackCount)
+  }, Number(baseSourceUnits) || 0)
+}
+
 const M022_MISSY_SIZES = new Set(['S', 'M', 'L', 'XL'])
+const M022_PETITE_SIZES = new Set(['PS', 'PM', 'PL', 'PXL'])
 const M022_PLUS_SIZES = new Set(['1X', '2X', '3X'])
+const KNOWN_INVENTORY_STYLE_ROUTES = new Map([
+  ['0015', '5010015'],
+  ['0071', '5020071'],
+])
 
 export function m022InventoryStyle(style, normalizedSize) {
   if (normalizeStyleIdentity(style) !== 'm022') return ''
   if (M022_MISSY_SIZES.has(normalizedSize)) return 'M022 Missy'
+  if (M022_PETITE_SIZES.has(normalizedSize)) return 'M022 Petite'
   if (M022_PLUS_SIZES.has(normalizedSize)) return 'M022 PLUS'
   return null
+}
+
+export function routedInventoryStyle(style, normalizedSize) {
+  const m022Style = m022InventoryStyle(style, normalizedSize)
+  if (m022Style !== '') return m022Style
+  return KNOWN_INVENTORY_STYLE_ROUTES.get(normalizeStyleIdentity(style)) || ''
 }
 
 // ── Fuzzy helpers ─────────────────────────────────────────────────────────────
@@ -336,11 +366,11 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
     // Consolidated rows already contain warehouse sizes. Petite conversion must
     // happen exactly once in consolidateRows, never again during matching.
     const normSize  = normalizeSize(rawSize)
-    const routedM022Style = m022InventoryStyle(style, normSize)
-    if (routedM022Style === null) {
+    const routedStyle = routedInventoryStyle(style, normSize)
+    if (routedStyle === null) {
       parseIssue = [...new Set([...parseIssue.split(';'), 'm022_size_unknown'].filter(Boolean))].join(';')
     }
-    const matchStyle = routedM022Style || style
+    const matchStyle = routedStyle || style
     const normStyle = normalizeStyle(matchStyle)
     const key       = `${normStyle}||${normSize}`
     let candidates = buckets.get(key) || []
@@ -352,8 +382,8 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
       || asConfirmedAlias(savedGeneralAlias)
       || savedGeneralAlias
       || inferConfirmedStyleColorAlias(aliases, baseAliasKey)
-    if (routedM022Style && aliasTarget?._confirmed && !Array.isArray(aliasTarget.components)) {
-      aliasTarget = { ...aliasTarget, STYLE: routedM022Style }
+    if (normalizeStyleIdentity(style) === 'm022' && routedStyle && aliasTarget?._confirmed && !Array.isArray(aliasTarget.components)) {
+      aliasTarget = { ...aliasTarget, STYLE: routedStyle }
     }
 
     const confirmedStyleColorRule = aliasTarget?._confirmed === true

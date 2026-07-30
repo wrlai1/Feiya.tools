@@ -1,6 +1,13 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseOrderHistoryRows } from '../src/utils/orderImportEngine.js'
+import { createRequire } from 'node:module'
+import { buildInventoryOrderClaims, parseOrderHistoryRows } from '../src/utils/orderImportEngine.js'
+
+const require = createRequire(import.meta.url)
+const {
+  normalizeInventoryQuantity,
+  normalizeOrderClaims,
+} = require('../lib/inventoryTransactionSafety.cjs')
 
 test('parses historical orders without retaining buyer PII', () => {
   const result = parseOrderHistoryRows([
@@ -38,6 +45,52 @@ test('preserves repeated rows as quantity within one order snapshot', () => {
   assert.equal(result.stats.itemCount, 1)
   assert.equal(result.stats.unitCount, 2)
   assert.equal(result.orders[0].items[0].quantity, 2)
+})
+
+test('builds one stable inventory claim per logical order item', () => {
+  const parsed = parseOrderHistoryRows([
+    {
+      '订单号': ' PO-2 ',
+      'SKU货号': '0015BlackM',
+      '商品属性': 'Black / M',
+      '应履约件数': 1,
+    },
+    {
+      '订单号': 'PO-2',
+      'SKU货号': '0015BlackM',
+      '商品属性': 'Black / M',
+      '应履约件数': 2,
+    },
+  ])
+
+  assert.deepEqual(buildInventoryOrderClaims(parsed.orders), [{
+    orderKey: 'po-2',
+    itemKey: 'item:0015blackm\u241fblack/m',
+  }])
+  assert.deepEqual(normalizeOrderClaims([
+    { orderKey: ' PO-2 ', itemKey: ' SKU-A ' },
+    { orderNumber: 'po-2', itemKey: 'sku-a' },
+  ]), [{ orderKey: 'po-2', itemKey: 'sku-a' }])
+})
+
+test('inventory claims prefer stable SKU IDs over attribute formatting', () => {
+  assert.deepEqual(buildInventoryOrderClaims([{
+    orderNumber: 'PO-3',
+    items: [
+      { skuId: ' 12345 ', itemKey: '0015blackm\u241fblack / m' },
+      { skuId: '12345', itemKey: '0015blackm\u241fBlack/M' },
+    ],
+  }]), [{
+    orderKey: 'po-3',
+    itemKey: 'sku:12345',
+  }])
+})
+
+test('manual inventory quantities reject partial, negative, and non-numeric values', () => {
+  assert.equal(normalizeInventoryQuantity('12'), 12)
+  assert.throws(() => normalizeInventoryQuantity('12 boxes'), /whole number/)
+  assert.throws(() => normalizeInventoryQuantity(1.5), /whole number/)
+  assert.throws(() => normalizeInventoryQuantity(-1), /whole number/)
 })
 
 test('uses daily fulfillment quantity and aggregates shipment references', () => {

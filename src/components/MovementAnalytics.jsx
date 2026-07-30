@@ -80,6 +80,7 @@ export default function MovementAnalytics() {
     const agg = new Map()
     const activeDays = new Set()
     for (const m of movements) {
+      if (m.txn_type !== 'sales' && m.txn_type !== 'return') continue
       const day = String(m.day).slice(0, 10)
       if (day < cutoff) continue
       activeDays.add(day)
@@ -92,7 +93,7 @@ export default function MovementAnalytics() {
         size: m.size,
       }
       if (m.txn_type === 'sales') a.sales += m.qty
-      else a.returns += m.qty
+      else if (m.txn_type === 'return') a.returns += m.qty
       agg.set(k, a)
     }
     return [...agg.entries()].map(([k, a]) => {

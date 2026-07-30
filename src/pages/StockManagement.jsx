@@ -64,18 +64,22 @@ function rowColor(row) {
 // ── Edit Quantity Modal ────────────────────────────────────────────────────────
 function EditQtyModal({ row, onClose, onDone, getToken }) {
   const [qty,     setQty]     = useState(String(row.Quantity ?? 0))
+  const [reason,  setReason]  = useState('')
   const [loading, setLoading] = useState(false)
   const toast = useToast()
 
   const handleSave = async () => {
-    const n = parseInt(qty, 10)
-    if (isNaN(n)) { toast.error('Please enter a valid number'); return }
+    const n = Number(qty)
+    if (!Number.isSafeInteger(n) || n < 0) {
+      toast.error('Quantity must be a whole number of 0 or more')
+      return
+    }
     setLoading(true)
     try {
       const data = await apiFetch(`${BASE}/inventory-balance?action=edit&id=${row.id}`, {
         method:  'PATCH',
         headers: authHeaders(getToken(), true),
-        body:    JSON.stringify({ quantity: n }),
+        body:    JSON.stringify({ quantity: n, reason }),
       })
       toast.success(
         `${row.Style} / ${row.Color} / ${row.Size}: ${data.old_quantity} → ${data.new_quantity}`,
@@ -112,6 +116,8 @@ function EditQtyModal({ row, onClose, onDone, getToken }) {
           <label className="block text-xs font-medium text-slate-500 mb-1.5">New Quantity</label>
           <input
             type="number"
+            min="0"
+            step="1"
             value={qty}
             onChange={(e) => setQty(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleSave()}
@@ -119,6 +125,19 @@ function EditQtyModal({ row, onClose, onDone, getToken }) {
             autoFocus
           />
           <p className="text-xs text-slate-400 mt-1">Current: {row.Quantity}</p>
+        </div>
+
+        <div>
+          <label className="block text-xs font-medium text-slate-500 mb-1.5">Reason / Remark (optional)</label>
+          <input
+            type="text"
+            value={reason}
+            maxLength={300}
+            onChange={(event) => setReason(event.target.value)}
+            placeholder="Example: Physical count correction"
+            className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+          />
+          <p className="mt-1.5 text-xs text-slate-400">The old value, new value, user, and remark will be kept in the audit history.</p>
         </div>
 
         <div className="flex gap-2">
@@ -515,7 +534,9 @@ function VersionHistory({ onRestore, getToken }) {
     if (!snapOpen) return
     setLoadingS(true)
     apiFetch(`${BASE}/inventory-balance?action=history`, { headers: authHeaders(getToken()) })
-      .then((d) => setSnapshots(d.snapshots || []))
+      .then((d) => setSnapshots((d.snapshots || []).filter((snapshot) =>
+        snapshot.label !== 'pre_restore' && snapshot.restorable !== false
+      )))
       .catch(() => {})
       .finally(() => setLoadingS(false))
   }, [snapOpen, getToken])
@@ -532,8 +553,7 @@ function VersionHistory({ onRestore, getToken }) {
   const handleRestore = async (snap) => {
     if (!window.confirm(
       `Restore balance to the snapshot from ${snap.timestamp}?\n\n` +
-      `This will revert to ${snap.total_units.toLocaleString()} units across ${snap.total_rows.toLocaleString()} SKUs.\n\n` +
-      `Your current balance will be saved as a backup first.`
+      `This will revert to ${snap.total_units.toLocaleString()} units across ${snap.total_rows.toLocaleString()} SKUs.`
     )) return
 
     setRestoring(snap.id)
@@ -548,7 +568,9 @@ function VersionHistory({ onRestore, getToken }) {
       )
       onRestore()
       const d = await apiFetch(`${BASE}/inventory-balance?action=history`, { headers: authHeaders(getToken()) })
-      setSnapshots(d.snapshots || [])
+      setSnapshots((d.snapshots || []).filter((snapshot) =>
+        snapshot.label !== 'pre_restore' && snapshot.restorable !== false
+      ))
     } catch (err) {
       toast.error(err.message, 'Restore Failed')
     } finally {
@@ -559,9 +581,9 @@ function VersionHistory({ onRestore, getToken }) {
   const labelColors = {
     sales:       'bg-orange-100 text-orange-700',
     return:      'bg-green-100 text-green-700',
+    adjustment:  'bg-amber-100 text-amber-700',
     pre_init:    'bg-blue-100 text-blue-700',
     pre_reset:   'bg-red-100 text-red-700',
-    pre_restore: 'bg-purple-100 text-purple-700',
     pre_remove:  'bg-rose-100 text-rose-700',
   }
 
@@ -654,7 +676,11 @@ function VersionHistory({ onRestore, getToken }) {
                   <div key={i} className="flex items-center justify-between text-sm py-2 border-b border-slate-50 last:border-0">
                     <div className="flex items-center gap-2.5">
                       <span className={`w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 ${
-                        t.transaction_type === 'sales' ? 'bg-orange-100 text-orange-600' : 'bg-green-100 text-green-600'
+                        t.transaction_type === 'sales'
+                          ? 'bg-orange-100 text-orange-600'
+                          : t.transaction_type === 'return'
+                            ? 'bg-green-100 text-green-600'
+                            : 'bg-amber-100 text-amber-600'
                       }`}>
                         {t.transaction_type === 'sales'
                           ? <XCircle    className="w-3.5 h-3.5" />
@@ -666,8 +692,15 @@ function VersionHistory({ onRestore, getToken }) {
                       </div>
                     </div>
                     <div className="text-right flex-shrink-0 ml-4">
-                      <p className={`font-semibold ${t.transaction_type === 'sales' ? 'text-orange-600' : 'text-green-600'}`}>
-                        {t.transaction_type === 'sales' ? '−' : '+'}{(t.applied_units || 0).toLocaleString()} units
+                      <p className={`font-semibold ${
+                        t.transaction_type === 'sales'
+                          ? 'text-orange-600'
+                          : t.transaction_type === 'return'
+                            ? 'text-green-600'
+                            : 'text-amber-600'
+                      }`}>
+                        {t.transaction_type === 'sales' ? '−' : t.transaction_type === 'return' ? '+' : '±'}
+                        {(t.applied_units || 0).toLocaleString()} units
                       </p>
                       <p className="text-xs text-slate-400 capitalize">{t.transaction_type}</p>
                     </div>

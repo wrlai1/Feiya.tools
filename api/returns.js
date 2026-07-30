@@ -260,6 +260,10 @@ async function ensureTables(sql) {
       rolled_back_at TIMESTAMPTZ
     )
   `
+  await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS source_file TEXT`
+  await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS applied_units INTEGER DEFAULT 0`
+  await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS applied_by TEXT`
+  await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS applied_at TIMESTAMPTZ DEFAULT NOW()`
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS source_hash TEXT`
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS row_count INTEGER`
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS rollback_snapshot_id INTEGER`
@@ -283,6 +287,27 @@ async function ensureTables(sql) {
       applied_by TEXT,
       applied_at TIMESTAMPTZ DEFAULT NOW()
     )
+  `
+  await sql`ALTER TABLE inventory_txn_rows ADD COLUMN IF NOT EXISTS transaction_id INTEGER`
+  await sql`
+    UPDATE inventory_txn_rows rows
+    SET transaction_id = (
+      SELECT transactions.id
+      FROM inventory_transactions transactions
+      WHERE transactions.transaction_type = rows.txn_type
+        AND transactions.source_file IS NOT DISTINCT FROM rows.source_file
+        AND transactions.applied_by IS NOT DISTINCT FROM rows.applied_by
+        AND ABS(EXTRACT(EPOCH FROM (transactions.applied_at - rows.applied_at))) <= 30
+      ORDER BY
+        ABS(EXTRACT(EPOCH FROM (transactions.applied_at - rows.applied_at))),
+        transactions.id DESC
+      LIMIT 1
+    )
+    WHERE rows.transaction_id IS NULL
+  `
+  await sql`
+    CREATE INDEX IF NOT EXISTS inventory_txn_rows_transaction_id_idx
+    ON inventory_txn_rows (transaction_id)
   `
   await sql`
     CREATE TABLE IF NOT EXISTS inventory_snapshots (
@@ -1181,12 +1206,15 @@ export default async function handler(req, res) {
           `,
           txn`
             INSERT INTO inventory_txn_rows (
-              txn_type, style, color, size, qty, source_file, applied_by
+              transaction_id, txn_type, style, color, size, qty, source_file, applied_by
             )
-            VALUES (
-              'return', ${row.style}, ${row.color}, ${row.size}, ${row.qty},
-              ${sourceName}, ${payload.username}
-            )
+            SELECT
+              transactions.id, 'return', ${row.style}, ${row.color}, ${row.size},
+              ${row.qty}, ${sourceName}, ${payload.username}
+            FROM inventory_transactions transactions
+            WHERE transactions.transaction_type = 'return'
+              AND transactions.source_hash = ${sourceHash}
+              AND transactions.rolled_back_at IS NULL
           `,
         ]),
         ...pkg.items.map((item) => txn`
@@ -1252,10 +1280,16 @@ export default async function handler(req, res) {
             SELECT 1
             FROM inventory_transactions transactions
             WHERE transactions.rolled_back_at IS NOT NULL
-              AND transactions.transaction_type = rows.txn_type
-              AND transactions.source_file IS NOT DISTINCT FROM rows.source_file
-              AND transactions.applied_by IS NOT DISTINCT FROM rows.applied_by
-              AND transactions.applied_at = rows.applied_at
+              AND (
+                transactions.id = rows.transaction_id
+                OR (
+                  rows.transaction_id IS NULL
+                  AND transactions.transaction_type = rows.txn_type
+                  AND transactions.source_file IS NOT DISTINCT FROM rows.source_file
+                  AND transactions.applied_by IS NOT DISTINCT FROM rows.applied_by
+                  AND ABS(EXTRACT(EPOCH FROM (transactions.applied_at - rows.applied_at))) <= 30
+                )
+              )
           )
       `
       summary.sold_units = Number(salesSummary?.sold_units || 0)
@@ -1294,10 +1328,18 @@ export default async function handler(req, res) {
               SELECT 1
               FROM inventory_transactions transactions
               WHERE transactions.rolled_back_at IS NOT NULL
-                AND transactions.transaction_type = inventory_txn_rows.txn_type
-                AND transactions.source_file IS NOT DISTINCT FROM inventory_txn_rows.source_file
-                AND transactions.applied_by IS NOT DISTINCT FROM inventory_txn_rows.applied_by
-                AND transactions.applied_at = inventory_txn_rows.applied_at
+                AND (
+                  transactions.id = inventory_txn_rows.transaction_id
+                  OR (
+                    inventory_txn_rows.transaction_id IS NULL
+                    AND transactions.transaction_type = inventory_txn_rows.txn_type
+                    AND transactions.source_file IS NOT DISTINCT FROM inventory_txn_rows.source_file
+                    AND transactions.applied_by IS NOT DISTINCT FROM inventory_txn_rows.applied_by
+                    AND ABS(EXTRACT(EPOCH FROM (
+                      transactions.applied_at - inventory_txn_rows.applied_at
+                    ))) <= 30
+                  )
+                )
             )
           GROUP BY 1, 2, 3
         ),

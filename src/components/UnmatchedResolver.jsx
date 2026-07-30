@@ -9,6 +9,8 @@ const REVIEW_REASONS = {
   confirmed_mapping_requires_review: 'This saved mapping changes style or uses a combo and must be confirmed again.',
   confirmed_mapping_size_missing: 'The previously confirmed target does not contain this exact size.',
   m022_size_unknown: 'M022 must use S–XL for Missy or 1X–3X for Plus.',
+  sku_attribute_size_conflict: 'The SKU size and Product Attribute size disagree. Confirm whether this is Missy, Plus, or Petite.',
+  sku_attribute_color_conflict: 'The SKU color combination and Product Attribute color combination disagree.',
 }
 
 function DeferredSearchInput({ value, onCommit, onFocus }) {
@@ -252,7 +254,13 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
           components: r.entry.components,
           QTY: row.qty,
           _isCombo: true,
-          _source: { style: row.style, color: row.color, size: row.size, packCount: expectedPackCount(i, row) },
+          _source: {
+            style: row.style,
+            color: row.color,
+            size: row.size,
+            packCount: expectedPackCount(i, row),
+            originalPackCount: row.packCount,
+          },
           _learnAlias: true,
         })
         continue

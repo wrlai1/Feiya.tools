@@ -30,6 +30,7 @@ const STYLE_NORMALIZE = {
   '5010071': '5020071',
   '7010015': '5010015-PLUS',
   '5010109': 'M022 Missy',
+  '6010109': 'M022 Petite',
   '7010109': 'M022 PLUS',
   '11006': '1106',
   '5020077': '5010077',
@@ -144,6 +145,30 @@ function attributeParts(raw) {
   }
 }
 
+function normalizedColorList(colors) {
+  return colors
+    .map((color) => String(color || '').toLowerCase().replace(/[^a-z0-9]/g, ''))
+    .filter(Boolean)
+    .sort()
+}
+
+function hasSizeConflict(skuSize, attributeSize) {
+  const sku = String(skuSize || '').trim().toUpperCase()
+  const attr = String(attributeSize || '').trim().toUpperCase()
+  if (!sku || !attr) return false
+
+  const plus = (value) => /^(1X|1XL|2X|2XL|3X|3XL|\d+W)$/.test(value)
+  if (plus(sku) !== plus(attr)) return true
+  if (plus(sku)) {
+    return sku.replace(/^([123])XL$/, '$1X') !== attr.replace(/^([123])XL$/, '$1X')
+  }
+
+  // Numeric and petite labels use style-specific grids in TEMU. Only compare
+  // plain Missy labels when both sides use that same unambiguous grid.
+  const missy = /^(XXS|XS|S|M|L|XL|XXL)$/
+  return missy.test(sku) && missy.test(attr) && sku !== attr
+}
+
 /**
  * rows: 解析好的对象数组（须含 Style/SKU 列 + Quantity/Qty/数量 列）
  */
@@ -173,6 +198,16 @@ export function consolidateRows(rows) {
     const qty = Number(r[qtyKey]) || 0
     const p = parseStyleColorSize(rawStyle)
     const attr = attributeParts(rawAttr)
+    if (p.size && attr.size && hasSizeConflict(p.size, attr.size)) {
+      p.issue = appendIssue(p.issue, 'sku_attribute_size_conflict')
+    }
+    const skuColors = p.color.includes('&')
+      ? normalizedColorList(p.color.split('&'))
+      : []
+    const attrColors = normalizedColorList(attr.colors)
+    if (skuColors.length > 1 && attrColors.length > 1 && skuColors.join('|') !== attrColors.join('|')) {
+      p.issue = appendIssue(p.issue, 'sku_attribute_color_conflict')
+    }
     if (!p.size && attr.size) {
       p.size = attr.size
       p.color = p.color.replace(/\s+sx$/i, '').trim()
