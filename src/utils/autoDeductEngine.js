@@ -417,8 +417,8 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
         const wantColor = String(wanted.COLOR || '').trim()
         const wantSize = normalizeSize(wanted.SIZE || normSize)
         const matches = items.filter(c => {
-          const styleOk = !wantStyle || c.style === wantStyle
-          const colorOk = !wantColor || c.color === wantColor
+          const styleOk = !wantStyle || normalizeStyleIdentity(c.style) === normalizeStyleIdentity(wantStyle)
+          const colorOk = !wantColor || normalizeColor(c.color) === normalizeColor(wantColor)
           const sizeOk = !wantSize || normalizeSize(c.size) === wantSize
           return styleOk && colorOk && sizeOk
         })
@@ -481,21 +481,6 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
         })
         return true
       }
-      if (target._isNew && target.STYLE && target.COLOR) {
-        entries.push({ style: target.STYLE, color: target.COLOR, size: target.SIZE || normSize, qty })
-        filledTotal += qty
-        matchLog.push({
-          style,
-          salesColor: color,
-          size: normSize,
-          qty,
-          targetStyle: target.STYLE,
-          targetColor: target.COLOR,
-          targetSize: target.SIZE || normSize,
-          via: 'confirmed new',
-        })
-        return true
-      }
       return false
     }
 
@@ -518,7 +503,14 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
 
     if (!candidates?.length && target) {
       if (applyAliasTarget([])) return
-      unmatchedRows.push({ style, color, size: normSize, qty, packCount: effectivePackCount, parseIssue: 'confirmed_mapping_size_missing' })
+      unmatchedRows.push({
+        style,
+        color,
+        size: normSize,
+        qty,
+        packCount: effectivePackCount,
+        parseIssue: target._isNew ? 'confirmed_new_target_missing' : 'confirmed_mapping_size_missing',
+      })
       return
     }
 
@@ -541,7 +533,14 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
 
     if (aliasTarget) {
       if (applyAliasTarget(candidates)) return
-      unmatchedRows.push({ style, color, size: normSize, qty, packCount: effectivePackCount, parseIssue: 'confirmed_mapping_size_missing' })
+      unmatchedRows.push({
+        style,
+        color,
+        size: normSize,
+        qty,
+        packCount: effectivePackCount,
+        parseIssue: target?._isNew ? 'confirmed_new_target_missing' : 'confirmed_mapping_size_missing',
+      })
       return
     }
 

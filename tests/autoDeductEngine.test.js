@@ -561,6 +561,48 @@ test('confirmed style and color rule stops when target size does not exist', () 
   assert.equal(result.unmatchedRows[0].parseIssue, 'confirmed_mapping_size_missing')
 })
 
+test('remembered new mapping reuses the unique normalized inventory target', () => {
+  const aliases = {
+    [aliasKey('95536', 'blackwhiteflw', 'S')]: {
+      STYLE: '95536',
+      COLOR: 'blackwhiteflw',
+      SIZE: 'S',
+      _isNew: true,
+      _confirmed: true,
+    },
+  }
+  const result = fillTemplate([
+    { STYLE: '95536', COLOR: 'Black White FLW', SIZE: 'S' },
+  ], [
+    { style: '95536', color: 'blackwhiteflw', size: 'S', QTY: 2 },
+  ], aliases)
+
+  assert.deepEqual(
+    result.filledRows.filter((row) => row.QTY),
+    [{ STYLE: '95536', COLOR: 'Black White FLW', SIZE: 'S', QTY: 2 }],
+  )
+  assert.equal(result.unmatchedRows.length, 0)
+})
+
+test('remembered new mapping requires review when its inventory target no longer exists', () => {
+  const aliases = {
+    [aliasKey('95536', 'blackwhiteflw', 'S')]: {
+      STYLE: '95536',
+      COLOR: 'blackwhiteflw',
+      SIZE: 'S',
+      _isNew: true,
+      _confirmed: true,
+    },
+  }
+  const result = fillTemplate([], [
+    { style: '95536', color: 'blackwhiteflw', size: 'S', QTY: 2 },
+  ], aliases)
+
+  assert.equal(result.filledRows.reduce((sum, row) => sum + row.QTY, 0), 0)
+  assert.equal(result.unmatchedRows[0].parseIssue, 'confirmed_new_target_missing')
+  assert.equal(result.stats.reconciled_total, 2)
+})
+
 test('existing confirmed combo mappings extend to corresponding target sizes', () => {
   const aliases = {
     [aliasKey('62300', 'set', 'S')]: {
@@ -707,6 +749,20 @@ test('manual create reuses an existing capitalization match and merges quantitie
   assert.deepEqual(result.rows, [
     { style: '543924', color: 'Brown', size: 'L', qty: 3, allowCreate: false },
   ])
+})
+
+test('manual create remains eligible to insert when no inventory target exists', () => {
+  const result = resolveInventoryTargets([
+    { style: '95536', color: 'blackwhiteflw', size: 'S', qty: 2, allowCreate: true },
+  ], [
+    { target_index: 0, match_count: 0 },
+  ])
+
+  assert.deepEqual(result.rows, [
+    { style: '95536', color: 'blackwhiteflw', size: 'S', qty: 2, allowCreate: true },
+  ])
+  assert.equal(result.missing.length, 0)
+  assert.equal(result.ambiguous.length, 0)
 })
 
 test('return manifests group tracking numbers and expand ampersand sets', () => {

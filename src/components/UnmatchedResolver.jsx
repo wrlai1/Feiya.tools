@@ -8,6 +8,7 @@ const REVIEW_REASONS = {
   ambiguous_inventory_color: 'More than one inventory color has the same cleaned identity.',
   confirmed_mapping_requires_review: 'This saved mapping changes style or uses a combo and must be confirmed again.',
   confirmed_mapping_size_missing: 'The previously confirmed target does not contain this exact size.',
+  confirmed_new_target_missing: 'This previously created inventory target no longer exists. Choose an existing target or confirm Create new entry again.',
   m022_size_unknown: 'M022 must use S–XL for Missy or 1X–3X for Plus.',
   sku_attribute_size_conflict: 'The SKU size and Product Attribute size disagree. Confirm whether this is Missy, Plus, or Petite.',
   sku_attribute_color_conflict: 'The SKU color combination and Product Attribute color combination disagree.',
