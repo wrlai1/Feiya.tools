@@ -44,6 +44,11 @@ function verifyToken(header, secret) {
   try { return jwt.verify(header.slice(7), secret) } catch { return null }
 }
 
+function normalizeStore(value) {
+  const name = String(value || '').trim().replace(/\s+/g, ' ').slice(0, 100)
+  return name ? { name, key: name.toLowerCase() } : { name: '', key: '' }
+}
+
 async function ensureTables(sql) {
   await sql`
     CREATE TABLE IF NOT EXISTS inventory_balance (
@@ -91,7 +96,11 @@ async function ensureTables(sql) {
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS source_hash TEXT`
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS rollback_snapshot_id INTEGER`
   await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS rolled_back_at TIMESTAMPTZ`
+  await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS store_name TEXT`
+  await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS store_key TEXT`
   await sql`ALTER TABLE inventory_txn_rows ADD COLUMN IF NOT EXISTS transaction_id INTEGER`
+  await sql`ALTER TABLE inventory_txn_rows ADD COLUMN IF NOT EXISTS store_name TEXT`
+  await sql`ALTER TABLE inventory_txn_rows ADD COLUMN IF NOT EXISTS store_key TEXT`
   await sql`
     UPDATE inventory_txn_rows rows
     SET transaction_id = (
@@ -467,10 +476,15 @@ export default async function handler(req, res) {
         sourceHash: rawSourceHash = '',
         orderClaims: rawOrderClaims = [],
         sourceUnits: rawSourceUnits,
+        storeName: rawStoreName = '',
       } = req.body || {}
       if (!['sales', 'return'].includes(txnType)) return res.status(400).json({ error: 'Invalid transaction type' })
       const sourceHash = String(rawSourceHash || '').trim()
+      const store = normalizeStore(rawStoreName)
       if (!sourceHash) return res.status(400).json({ error: 'A source file fingerprint is required before inventory can be changed.' })
+      if (txnType === 'sales' && !store.key) {
+        return res.status(400).json({ error: 'The Analytics store is required before sales inventory can be changed.' })
+      }
       let sourceUnits
       try {
         sourceUnits = normalizeInventoryQuantity(rawSourceUnits)
@@ -623,11 +637,12 @@ export default async function handler(req, res) {
           )
           INSERT INTO inventory_transactions (
             transaction_type, source_file, source_hash, applied_units, row_count,
-            applied_by, rollback_snapshot_id
+            applied_by, rollback_snapshot_id, store_name, store_key
           )
           SELECT
             ${txnType}, ${sourceName}, ${sourceHash}, ${appliedUnits},
-            ${applyRows.length}, ${payload.username}, saved_snapshot.id
+            ${applyRows.length}, ${payload.username}, saved_snapshot.id,
+            ${store.name}, ${store.key}
           FROM saved_snapshot
         `,
         ...(orderClaims.length ? [txn`
@@ -669,11 +684,12 @@ export default async function handler(req, res) {
             update,
             txn`
               INSERT INTO inventory_txn_rows (
-                transaction_id, txn_type, style, color, size, qty, source_file, applied_by
+                transaction_id, txn_type, style, color, size, qty, source_file, applied_by,
+                store_name, store_key
               )
               SELECT
                 transactions.id, ${txnType}, ${row.style}, ${row.color}, ${row.size},
-                ${row.qty}, ${sourceName}, ${payload.username}
+                ${row.qty}, ${sourceName}, ${payload.username}, ${store.name}, ${store.key}
               FROM inventory_transactions transactions
               WHERE transactions.transaction_type = ${txnType}
                 AND transactions.source_hash = ${sourceHash}
@@ -681,6 +697,20 @@ export default async function handler(req, res) {
             `,
           ]
         }),
+        ...(txnType === 'sales' ? [
+          txn`
+            UPDATE return_orders
+            SET inventory_status = 'applied', updated_at = NOW()
+            WHERE source_hash = ${sourceHash}
+              AND inventory_status = 'pending'
+          `,
+          txn`
+            UPDATE return_order_imports
+            SET inventory_status = 'applied'
+            WHERE source_hash = ${sourceHash}
+              AND inventory_status = 'pending'
+          `,
+        ] : []),
         txn`
           DELETE FROM inventory_snapshots
           WHERE id NOT IN (
@@ -840,6 +870,9 @@ export default async function handler(req, res) {
           `
         : []
       const rollbackTransactionIds = rollbackTransactions.map((transaction) => Number(transaction.id))
+      const salesSourceHashes = [...new Set(rollbackTransactions
+        .map((transaction) => String(transaction.source_hash || ''))
+        .filter((sourceHash) => sourceHash && !sourceHash.startsWith('return-package:')))]
       const returnTrackingKeys = [...new Set(rollbackTransactions
         .map((transaction) => String(transaction.source_hash || ''))
         .filter((sourceHash) => sourceHash.startsWith('return-package:'))
@@ -910,6 +943,20 @@ export default async function handler(req, res) {
                     confirmed_by = NULL,
                     confirmed_at = NULL
                 WHERE tracking_key = ANY(${returnTrackingKeys}::text[])
+              `,
+            ]
+          : []),
+        ...(salesSourceHashes.length
+          ? [
+              txn`
+                UPDATE return_orders
+                SET inventory_status = 'pending', updated_at = NOW()
+                WHERE source_hash = ANY(${salesSourceHashes}::text[])
+              `,
+              txn`
+                UPDATE return_order_imports
+                SET inventory_status = 'pending'
+                WHERE source_hash = ANY(${salesSourceHashes}::text[])
               `,
             ]
           : []),

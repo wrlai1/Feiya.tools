@@ -8,6 +8,7 @@
 //   GET  ?action=aliases         — return learned unmatched-row aliases
 //   POST ?action=upload-template — save template rows (JSON body from client)
 //   POST ?action=save-aliases    — save learned unmatched-row aliases
+//   POST ?action=patch-aliases   — atomically merge/remove learned aliases
 //   POST ?action=apply           — log a deduction/return transaction
 
 import { neon } from '@neondatabase/serverless'
@@ -135,6 +136,53 @@ export default async function handler(req, res) {
         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
       `
       return res.json({ ok: true, count: Object.keys(aliases).length })
+    }
+
+    if (req.method === 'POST' && action === 'patch-aliases') {
+      if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
+      const rawUpserts = req.body?.upserts
+      const rawDeleteKeys = req.body?.deleteKeys
+      const upserts = rawUpserts == null ? {} : rawUpserts
+      const deleteKeys = rawDeleteKeys == null ? [] : rawDeleteKeys
+      if (!upserts || typeof upserts !== 'object' || Array.isArray(upserts)) {
+        return res.status(400).json({ error: 'upserts object required' })
+      }
+      if (!Array.isArray(deleteKeys) || deleteKeys.some((key) => typeof key !== 'string')) {
+        return res.status(400).json({ error: 'deleteKeys array required' })
+      }
+      const cleanDeleteKeys = [...new Set(deleteKeys.map((key) => key.trim()).filter(Boolean))]
+      if (Object.keys(upserts).length + cleanDeleteKeys.length > 10000) {
+        return res.status(400).json({ error: 'Too many alias changes in one request' })
+      }
+      const upsertsJson = JSON.stringify(upserts)
+      const deleteKeysJson = JSON.stringify(cleanDeleteKeys)
+      const [saved] = await sql`
+        INSERT INTO app_data (key, value, updated_at)
+        VALUES (
+          'autodeduct_aliases',
+          jsonb_build_object(
+            'aliases', ${upsertsJson}::jsonb,
+            'updatedAt', NOW(),
+            'updatedBy', ${payload.username}
+          ),
+          NOW()
+        )
+        ON CONFLICT (key) DO UPDATE SET
+          value = jsonb_build_object(
+            'aliases',
+            (
+              COALESCE(app_data.value->'aliases', '{}'::jsonb)
+              - ARRAY(
+                  SELECT jsonb_array_elements_text(${deleteKeysJson}::jsonb)
+                )
+            ) || ${upsertsJson}::jsonb,
+            'updatedAt', NOW(),
+            'updatedBy', ${payload.username}
+          ),
+          updated_at = NOW()
+        RETURNING jsonb_object_length(value->'aliases')::int AS count
+      `
+      return res.json({ ok: true, count: Number(saved?.count || 0) })
     }
 
     // ── POST apply ──────────────────────────────────────────────────────────

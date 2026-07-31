@@ -424,12 +424,12 @@ export default function AutoDeduct() {
   // Called by UnmatchedResolver when user finishes reviewing.
   // Skipped rows are NOT deducted, but they must stay visible on the Unmatched
   // sheet — a skip is "leave for later", never "silently discard".
-  const saveAliases = useCallback(async (nextAliases) => {
+  const saveAliases = useCallback(async ({ upserts = {}, deleteKeys = [] }) => {
     if (isMock) return
-    const res = await fetch(`${BASE}/auto-deduct?action=save-aliases`, {
+    const res = await fetch(`${BASE}/auto-deduct?action=patch-aliases`, {
       method: 'POST',
       headers: authHeaders(getToken(), true),
-      body: JSON.stringify({ aliases: nextAliases }),
+      body: JSON.stringify({ upserts, deleteKeys }),
     })
     const data = await res.json()
     if (!res.ok) throw new Error(data.error || 'Could not save learned matches')
@@ -476,17 +476,21 @@ export default function AutoDeduct() {
     const learnedCount = Object.keys(learned).length
     if (learnedCount || resolutionAliasKeys.length) {
       const nextAliases = { ...aliases }
+      const deleteKeys = new Set(resolutionAliasKeys)
       for (const key of resolutionAliasKeys) delete nextAliases[key]
       for (const [key, value] of Object.entries(learned)) {
         if (value._isNew || value.SIZE) continue
         for (const existingKey of Object.keys(nextAliases)) {
-          if (existingKey.startsWith(`${key}::`)) delete nextAliases[existingKey]
+          if (existingKey.startsWith(`${key}::`)) {
+            deleteKeys.add(existingKey)
+            delete nextAliases[existingKey]
+          }
         }
       }
       Object.assign(nextAliases, learned)
       setAliases(nextAliases)
       setResolutionAliasKeys(Object.keys(learned))
-      saveAliases(nextAliases)
+      saveAliases({ upserts: learned, deleteKeys: [...deleteKeys] })
         .then(() => toast.success(
           learnedCount
             ? `${learnedCount} match${learnedCount !== 1 ? 'es' : ''} remembered for next time`
@@ -529,6 +533,7 @@ export default function AutoDeduct() {
           sourceFile: srcFile?.name || '',
           sourceHash,
           batchIndex: Math.floor(index / 500),
+          inventoryStatus: 'pending',
           orders: orderArchive.orders.slice(index, index + 500),
         }),
       })
@@ -598,6 +603,7 @@ export default function AutoDeduct() {
           sourceHash,
           orderClaims,
           sourceUnits: expectedSourceUnits,
+          storeName: orderStore,
         }),
       })
       const data = await res.json()

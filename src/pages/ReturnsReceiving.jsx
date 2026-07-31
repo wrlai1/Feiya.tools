@@ -241,6 +241,7 @@ export default function ReturnsReceiving() {
   const [catalogParsed, setCatalogParsed] = useState(null)
   const [catalogUploading, setCatalogUploading] = useState(false)
   const [analytics, setAnalytics] = useState(null)
+  const [integrity, setIntegrity] = useState(null)
   const [analyticsDays, setAnalyticsDays] = useState(30)
   const [orderOnly, setOrderOnly] = useState(null)
   const [orderChoices, setOrderChoices] = useState([])
@@ -778,18 +779,21 @@ export default function ReturnsReceiving() {
 
       if (canMapSources && row.sourceComponents.length === components.length) {
         const nextAliases = { ...reviewAliases }
+        const aliasUpserts = {}
         row.sourceComponents.forEach((source, index) => {
           const target = components[index]
-          nextAliases[aliasKey(source.style, source.color)] = {
+          const key = aliasKey(source.style, source.color)
+          aliasUpserts[key] = {
             STYLE: target.style,
             COLOR: target.color,
             _confirmed: true,
           }
+          nextAliases[key] = aliasUpserts[key]
         })
-        const aliasRes = await fetch(`${BASE}/auto-deduct?action=save-aliases`, {
+        const aliasRes = await fetch(`${BASE}/auto-deduct?action=patch-aliases`, {
           method: 'POST',
           headers: headers(getToken, true),
-          body: JSON.stringify({ aliases: nextAliases }),
+          body: JSON.stringify({ upserts: aliasUpserts, deleteKeys: [] }),
         })
         if (aliasRes.ok) setReviewAliases(nextAliases)
       }
@@ -801,10 +805,14 @@ export default function ReturnsReceiving() {
         { good: 0, damaged: 0, notOurs: 0 },
       ])))
       setCounted(false)
+      const reusedText = data.reused_packages > 0
+        ? ` · ${data.reused_packages} other waiting package${data.reused_packages === 1 ? '' : 's'} updated`
+        : ''
       toast.success(
-        'Saved for this package and future returns / Guardado para futuras devoluciones',
+        `Saved for this package and future returns${reusedText} / Guardado para futuras devoluciones`,
         'SKU Mapping Remembered',
       )
+      if (data.reuse_warning) toast.info(data.reuse_warning, 'Older Reviews')
       await Promise.all([loadReviewPackages(), loadStores()])
     } catch (error) {
       toast.error(error.message, 'Could Not Save SKU Mapping')
@@ -828,8 +836,11 @@ export default function ReturnsReceiving() {
       })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || 'Could not upload product catalog')
+      const protectedText = data.protected_rows > 0
+        ? ` · ${data.protected_rows} Admin-confirmed mapping${data.protected_rows === 1 ? '' : 's'} protected`
+        : ''
       toast.success(
-        `${data.ready_rows} ready · ${data.review_rows} saved for Admin Review when needed`,
+        `${data.ready_rows} ready · ${data.review_rows} saved for Admin Review when needed${protectedText}`,
         `${data.store_name} Product Catalog Updated`,
       )
       setCatalogFile(null)
@@ -946,12 +957,22 @@ export default function ReturnsReceiving() {
     if (!isAdmin) return
     setLoading(true)
     try {
-      const res = await fetch(`${BASE}/returns?action=analytics&days=${analyticsDays}`, {
-        headers: headers(getToken),
-      })
-      const data = await res.json().catch(() => ({}))
-      if (!res.ok) throw new Error(data.error || 'Could not load return analytics')
-      setAnalytics(data)
+      const [analyticsRes, integrityRes] = await Promise.all([
+        fetch(`${BASE}/returns?action=analytics&days=${analyticsDays}`, {
+          headers: headers(getToken),
+        }),
+        fetch(`${BASE}/returns?action=integrity`, {
+          headers: headers(getToken),
+        }),
+      ])
+      const [analyticsData, integrityData] = await Promise.all([
+        analyticsRes.json().catch(() => ({})),
+        integrityRes.json().catch(() => ({})),
+      ])
+      if (!analyticsRes.ok) throw new Error(analyticsData.error || 'Could not load return analytics')
+      if (!integrityRes.ok) throw new Error(integrityData.error || 'Could not run data checks')
+      setAnalytics(analyticsData)
+      setIntegrity(integrityData)
     } catch (error) {
       toast.error(error.message, 'Analytics Failed')
     } finally {
@@ -2102,6 +2123,58 @@ export default function ReturnsReceiving() {
 
           {analytics && (
             <>
+              {integrity && (
+                <div className={`card border p-4 sm:p-5 ${
+                  integrity.ok
+                    ? 'border-emerald-200 bg-emerald-50/40'
+                    : 'border-amber-200 bg-amber-50/50'
+                }`}>
+                  <div className="flex items-start gap-3">
+                    {integrity.ok
+                      ? <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-600" />
+                      : <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-600" />}
+                    <div className="min-w-0 flex-1">
+                      <h3 className="font-semibold text-slate-900">
+                        Batch Integrity / Integridad de lotes
+                      </h3>
+                      <p className="mt-1 text-xs text-slate-500">
+                        Checked by each apply or rollback batch—not by a fixed 24-hour day.
+                      </p>
+                    </div>
+                  </div>
+                  <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                    {(integrity.checks || []).map((checkItem) => {
+                      const hasIssues = Number(checkItem.issue_count) > 0
+                      return (
+                        <div
+                          key={checkItem.id}
+                          className={`flex items-start gap-2 rounded-xl border bg-white p-3 ${
+                            hasIssues
+                              ? checkItem.severity === 'warning'
+                                ? 'border-amber-200'
+                                : 'border-red-200'
+                              : 'border-emerald-100'
+                          }`}
+                        >
+                          {hasIssues
+                            ? <XCircle className={`mt-0.5 h-4 w-4 shrink-0 ${
+                                checkItem.severity === 'warning' ? 'text-amber-500' : 'text-red-500'
+                              }`} />
+                            : <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-500" />}
+                          <div className="min-w-0">
+                            <p className="text-xs font-medium text-slate-700">{checkItem.label}</p>
+                            <p className={`mt-1 text-xs font-semibold ${
+                              hasIssues ? 'text-red-700' : 'text-emerald-700'
+                            }`}>
+                              {hasIssues ? `${checkItem.issue_count} need review` : 'Passed / Correcto'}
+                            </p>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
               <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
                 {[
                   ['Received Packages', analytics.summary.received_packages],
@@ -2109,10 +2182,15 @@ export default function ReturnsReceiving() {
                   ['Not Ours / Flagged', analytics.summary.flagged_packages],
                   ['Actual Returned Units', analytics.summary.returned_units],
                   ['Restocked Units', analytics.summary.restocked_units],
-                  ['Sold Units', analytics.summary.sold_units],
-                  ['Total Return Rate', analytics.summary.total_return_rate == null
+                  ['Physical Units Sold', analytics.summary.sold_units],
+                  ['Physical Unit Return Rate', analytics.summary.total_return_rate == null
                     ? '—'
                     : `${Number(analytics.summary.total_return_rate).toFixed(2)}%`],
+                  ['Product Units Sold', analytics.summary.sold_product_units],
+                  ['Complete Product Returns', analytics.summary.returned_product_units],
+                  ['Product Unit Return Rate', analytics.summary.product_return_rate == null
+                    ? '—'
+                    : `${Number(analytics.summary.product_return_rate).toFixed(2)}%`],
                 ].map(([label, value]) => (
                   <div key={label} className="card p-4">
                     <p className="text-2xl font-bold text-slate-900">
@@ -2122,15 +2200,37 @@ export default function ReturnsReceiving() {
                   </div>
                 ))}
               </div>
+              {analytics.summary.return_product_groups
+                > analytics.summary.covered_return_product_groups && (
+                <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                  Product-unit return rate covers{' '}
+                  {analytics.summary.covered_return_product_groups} of{' '}
+                  {analytics.summary.return_product_groups} returned SKU groups. Older returns without
+                  product quantities remain in the physical-unit rate only.
+                </div>
+              )}
               <div className="card overflow-hidden">
                 <div className="border-b border-slate-200 px-4 py-3 sm:px-5">
                   <h3 className="text-sm font-semibold text-slate-800">Returns by store</h3>
                   <p className="mt-1 text-xs text-slate-400">
-                    Store counts are shown separately; the total return rate above combines every store.
+                    Physical pieces and complete product/SKU units are kept separate.
                   </p>
                 </div>
-                <div className="overflow-x-auto">
-                  <table className="w-full min-w-[700px] text-sm">
+                <div className="space-y-3 p-3 sm:hidden">
+                  {(analytics.stores || []).map((store) => (
+                    <div key={store.store_name} className="rounded-xl border border-slate-200 p-3">
+                      <p className="font-semibold text-slate-800">{store.store_name}</p>
+                      <div className="mt-3 grid grid-cols-2 gap-3 text-xs">
+                        <div><p className="text-slate-400">Physical sold</p><p className="font-semibold">{store.sold_units}</p></div>
+                        <div><p className="text-slate-400">Physical returned</p><p className="font-semibold text-blue-700">{store.returned_units}</p></div>
+                        <div><p className="text-slate-400">Physical rate</p><p className="font-semibold">{store.physical_return_rate == null ? '—' : `${Number(store.physical_return_rate).toFixed(2)}%`}</p></div>
+                        <div><p className="text-slate-400">Product rate</p><p className="font-semibold">{store.product_return_rate == null ? '—' : `${Number(store.product_return_rate).toFixed(2)}%`}</p></div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="hidden overflow-x-auto sm:block">
+                  <table className="w-full min-w-[1050px] text-sm">
                     <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
                       <tr>
                         <th className="px-4 py-3">Store</th>
@@ -2139,6 +2239,11 @@ export default function ReturnsReceiving() {
                         <th className="px-4 py-3 text-right">Not Ours</th>
                         <th className="px-4 py-3 text-right">Returned</th>
                         <th className="px-4 py-3 text-right">Restocked</th>
+                        <th className="px-4 py-3 text-right">Physical Sold</th>
+                        <th className="px-4 py-3 text-right">Physical Rate</th>
+                        <th className="px-4 py-3 text-right">Products Sold</th>
+                        <th className="px-4 py-3 text-right">Product Returns</th>
+                        <th className="px-4 py-3 text-right">Product Rate</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
@@ -2150,6 +2255,11 @@ export default function ReturnsReceiving() {
                           <td className="px-4 py-3 text-right font-semibold text-red-700">{store.flagged_packages}</td>
                           <td className="px-4 py-3 text-right font-semibold text-blue-700">{store.returned_units}</td>
                           <td className="px-4 py-3 text-right font-semibold text-emerald-700">{store.restocked_units}</td>
+                          <td className="px-4 py-3 text-right">{store.sold_units}</td>
+                          <td className="px-4 py-3 text-right">{store.physical_return_rate == null ? '—' : `${Number(store.physical_return_rate).toFixed(2)}%`}</td>
+                          <td className="px-4 py-3 text-right">{store.sold_product_units}</td>
+                          <td className="px-4 py-3 text-right">{store.returned_product_units}</td>
+                          <td className="px-4 py-3 text-right">{store.product_return_rate == null ? '—' : `${Number(store.product_return_rate).toFixed(2)}%`}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -2158,10 +2268,27 @@ export default function ReturnsReceiving() {
               </div>
               <div className="card overflow-hidden">
                 <div className="border-b border-slate-200 px-4 py-3 sm:px-5">
-                  <h3 className="text-sm font-semibold text-slate-800">Return rate by SKU</h3>
+                  <h3 className="text-sm font-semibold text-slate-800">Physical inventory return rate</h3>
                   <p className="mt-1 text-xs text-slate-400">Actual received units ÷ sold units in the selected period</p>
                 </div>
-                <div className="overflow-x-auto">
+                <div className="space-y-3 p-3 sm:hidden">
+                  {(analytics.rows || []).map((row, index) => (
+                    <div
+                      key={`${row.style}-${row.color}-${row.size}-mobile-${index}`}
+                      className="rounded-xl border border-slate-200 p-3"
+                    >
+                      <p className="font-semibold text-slate-800">
+                        {row.style} / {row.color} / {row.size}
+                      </p>
+                      <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
+                        <div><p className="text-slate-400">Sold</p><p className="font-semibold">{row.sold_qty}</p></div>
+                        <div><p className="text-slate-400">Returned</p><p className="font-semibold text-blue-700">{row.returned_qty}</p></div>
+                        <div><p className="text-slate-400">Rate</p><p className="font-semibold">{row.return_rate == null ? '—' : `${Number(row.return_rate).toFixed(2)}%`}</p></div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="hidden overflow-x-auto sm:block">
                   <table className="w-full min-w-[700px] text-sm">
                     <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
                       <tr>

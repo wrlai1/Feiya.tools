@@ -26,8 +26,10 @@ import {
   suggestProductCatalogSelections,
 } from '../src/utils/returnImportEngine.js'
 import inventoryTargetResolution from '../lib/inventoryTargetResolution.cjs'
+import returnPackageSafety from '../lib/returnPackageSafety.cjs'
 
 const { resolveInventoryTargets } = inventoryTargetResolution
+const { mergeReturnPackageItems } = returnPackageSafety
 
 test('returns store choices use Analytics as the canonical store list', () => {
   const stores = mergeAnalyticsReturnStores([
@@ -111,6 +113,65 @@ test('return inspection supports mixed set outcomes and rejects over-counting', 
     ]),
     /cannot exceed/,
   )
+})
+
+test('Admin item resolution preserves already identified return items', () => {
+  const items = mergeReturnPackageItems([
+    {
+      sku_id: 'KNOWN-SKU',
+      sku_code: 'A100BlackM',
+      style: 'A100',
+      color: 'Black',
+      size: 'M',
+      expected_qty: 1,
+      source_qty: 1,
+    },
+  ], [{
+    sku_id: 'RECOVERED-SKU',
+    sku_code: 'B200NavyL',
+    style: 'B200',
+    color: 'Navy',
+    size: 'L',
+    expected_qty: 2,
+    source_qty: 2,
+  }])
+
+  assert.deepEqual(items.map((item) => item.sku_id), ['KNOWN-SKU', 'RECOVERED-SKU'])
+  assert.equal(items.reduce((sum, item) => sum + item.expected_qty, 0), 3)
+})
+
+test('return item merging keeps product-unit coverage only when every source quantity is known', () => {
+  const covered = mergeReturnPackageItems([{
+    sku_id: 'SET-1',
+    sku_code: 'SET1M',
+    style: 'SET1',
+    color: 'Black',
+    size: 'M',
+    expected_qty: 1,
+    source_qty: 1,
+  }], [{
+    sku_id: 'SET-1',
+    sku_code: 'SET1M',
+    style: 'SET1',
+    color: 'Black',
+    size: 'M',
+    expected_qty: 2,
+    source_qty: 2,
+  }])
+  assert.equal(covered[0].expected_qty, 3)
+  assert.equal(covered[0].source_qty, 3)
+
+  const legacyMixed = mergeReturnPackageItems(covered, [{
+    sku_id: 'SET-1',
+    sku_code: 'SET1M',
+    style: 'SET1',
+    color: 'Black',
+    size: 'M',
+    expected_qty: 1,
+    source_qty: null,
+  }])
+  assert.equal(legacyMixed[0].expected_qty, 4)
+  assert.equal(legacyMixed[0].source_qty, null)
 })
 
 test('petite sales sizes are shifted exactly once', () => {
@@ -1160,8 +1221,8 @@ test('missing return SKU IDs show every original SKU and require a selection for
   assert.equal(result.stats.recoveredPackages, 1)
   assert.equal(result.packages[0].expectedUnits, 3)
   assert.deepEqual(result.packages[0].items, [
-    { skuId: 'SKU-A', skuCode: 'A100BlackM', style: 'A100', color: 'Black', size: 'M', expectedQty: 1 },
-    { skuId: 'SKU-B', skuCode: 'B200NavyL', style: 'B200', color: 'Navy', size: 'L', expectedQty: 2 },
+    { skuId: 'SKU-A', skuCode: 'A100BlackM', style: 'A100', color: 'Black', size: 'M', expectedQty: 1, sourceQty: 1 },
+    { skuId: 'SKU-B', skuCode: 'B200NavyL', style: 'B200', color: 'Navy', size: 'L', expectedQty: 2, sourceQty: 2 },
   ])
 })
 

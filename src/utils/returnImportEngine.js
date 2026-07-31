@@ -537,6 +537,7 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
               color: component.color,
               size: component.size,
               expectedQty: Number(component.qty || 1) * candidate.maxQuantity,
+              sourceQty: candidate.maxQuantity,
             })
           })
           group.recoveredOrders.add(orderKey)
@@ -617,6 +618,7 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
             color: component.color,
             size: component.size,
             expectedQty: Number(component.qty || 1) * quantity,
+            sourceQty: quantity,
           })
         })
       }
@@ -738,6 +740,7 @@ export function applyReturnOrderMatch(parsed, tracking, quantities) {
           color: component.color,
           size: component.size,
           expectedQty: Number(component.qty || 1) * quantity,
+          sourceQty: quantity,
         })
       })
     }
@@ -750,7 +753,12 @@ export function applyReturnOrderMatch(parsed, tracking, quantities) {
       .map((value) => String(value || '').trim().toLowerCase())
       .join('\u241f')
     const existing = itemsByKey.get(key)
-    if (existing) existing.expectedQty += Number(item.expectedQty)
+    if (existing) {
+      existing.expectedQty += Number(item.expectedQty)
+      existing.sourceQty = existing.sourceQty != null && item.sourceQty != null
+        ? Number(existing.sourceQty) + Number(item.sourceQty)
+        : undefined
+    }
     else itemsByKey.set(key, { ...item, expectedQty: Number(item.expectedQty) })
   }
   const items = [...itemsByKey.values()]
