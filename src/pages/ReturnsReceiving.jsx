@@ -31,7 +31,7 @@ import {
   suggestProductCatalogSelections,
 } from '../utils/returnImportEngine.js'
 import { parseOrderHistoryRows } from '../utils/orderImportEngine.js'
-import { summarizeReturnInspection } from '../utils/returnInspection.js'
+import { groupReturnProducts, summarizeReturnInspection } from '../utils/returnInspection.js'
 
 const BASE = '/api'
 
@@ -47,10 +47,10 @@ const DEMO_PACKAGE = {
   expected_units: 4,
   actual_units: 0,
   items: [
-    { id: 'demo-black', sku_id: 'DEMO-SKU', sku_code: '62300SETM', style: '62300SET', color: 'BLACK', size: 'M', expected_qty: 1 },
-    { id: 'demo-denim', sku_id: 'DEMO-SKU', sku_code: '62300SETM', style: '62300SET', color: 'DENIM', size: 'M', expected_qty: 1 },
-    { id: 'demo-khaki', sku_id: 'DEMO-SKU', sku_code: '62300SETM', style: '62300SET', color: 'KHAKI', size: 'M', expected_qty: 1 },
-    { id: 'demo-white', sku_id: 'DEMO-SKU', sku_code: '62300SETM', style: '62300SET', color: 'WHITE', size: 'M', expected_qty: 1 },
+    { id: 'demo-black', sku_id: 'DEMO-SKU', sku_code: '62300SETM', style: '62300SET', color: 'BLACK', size: 'M', expected_qty: 1, source_qty: 1 },
+    { id: 'demo-denim', sku_id: 'DEMO-SKU', sku_code: '62300SETM', style: '62300SET', color: 'DENIM', size: 'M', expected_qty: 1, source_qty: 1 },
+    { id: 'demo-khaki', sku_id: 'DEMO-SKU', sku_code: '62300SETM', style: '62300SET', color: 'KHAKI', size: 'M', expected_qty: 1, source_qty: 1 },
+    { id: 'demo-white', sku_id: 'DEMO-SKU', sku_code: '62300SETM', style: '62300SET', color: 'WHITE', size: 'M', expected_qty: 1, source_qty: 1 },
   ],
   related_orders: [{
     order_key: 'PO-DEMO-1',
@@ -378,11 +378,14 @@ export default function ReturnsReceiving() {
       const next = data.package
       setPkg(next)
       setTracking(next.tracking_number)
+      const workerVerified = next.review_data?.workerInspection?.status === 'all_good'
       setCounts(Object.fromEntries(
         (next.items || []).map((item) => [
           item.id,
           ['pending', 'needs_review'].includes(next.status)
-            ? { good: 0, damaged: 0, notOurs: 0 }
+            ? workerVerified
+              ? { good: Number(item.expected_qty), damaged: 0, notOurs: 0 }
+              : { good: 0, damaged: 0, notOurs: 0 }
             : {
                 good: Number(item.restock_qty || 0),
                 damaged: Math.max(Number(item.actual_qty || 0) - Number(item.restock_qty || 0), 0),
@@ -453,6 +456,14 @@ export default function ReturnsReceiving() {
   }, [demoMode, getToken, isAdmin, pkg, toast])
 
   const expectedUnits = Number(pkg?.expected_units || 0)
+  const productGroups = useMemo(() => groupReturnProducts(
+    pkg?.items || [],
+    pkg?.review_data?.unresolvedSkus || [],
+  ), [pkg])
+  const expectedProducts = productGroups.reduce(
+    (sum, product) => sum + Number(product.productQty || 0),
+    0,
+  )
   const inspection = useMemo(() => summarizeReturnInspection((pkg?.items || []).map((item) => ({
     expectedQty: Number(item.expected_qty),
     goodQty: Number(counts[item.id]?.good || 0),
@@ -460,7 +471,7 @@ export default function ReturnsReceiving() {
     notOursQty: Number(counts[item.id]?.notOurs || 0),
   }))), [counts, pkg])
   const {
-    actualUnits, restockUnits, damagedUnits, notOursUnits, categorizedUnits,
+    actualUnits, restockUnits, damagedUnits, notOursUnits, categorizedUnits, missingUnits,
     hasDiscrepancy: discrepancy,
   } = inspection
 
@@ -477,7 +488,8 @@ export default function ReturnsReceiving() {
     if (!allGood && discrepancy) {
       const proceed = window.confirm(
         `Expected / Esperado: ${expectedUnits}\n` +
-        `Good / Bueno: ${restockUnits}\nDamaged / Dañado: ${damagedUnits}\nNot ours / No es nuestro: ${notOursUnits}\n\n` +
+        `Good / Bueno: ${restockUnits}\nDamaged / Dañado: ${damagedUnits}\nNot ours / No es nuestro: ${notOursUnits}\n` +
+        `Missing / Faltante: ${missingUnits}\n\n` +
         'Confirm these results? / ¿Confirmar estos resultados?'
       )
       if (!proceed) return
@@ -505,13 +517,12 @@ export default function ReturnsReceiving() {
         ? 'Not ours / No es nuestro'
         : data.status === 'discrepancy' ? 'Saved / Guardado' : 'Received / Recibido'
       toast.success(`${Number(data.added_units || 0)} added to inventory / agregado al inventario`, title)
-      if (isAdmin) {
-        await lookup(pkg.tracking_number)
-      } else {
-        setPkg(null)
-        setTracking('')
-        requestAnimationFrame(() => scannerRef.current?.focus())
-      }
+      setPkg(null)
+      setTracking('')
+      setCounts({})
+      setCounted(false)
+      setRemark('')
+      requestAnimationFrame(() => scannerRef.current?.focus())
       await loadRecent()
       await loadReviewPackages()
     } catch (error) {
@@ -521,7 +532,7 @@ export default function ReturnsReceiving() {
     }
   }
 
-  const flagForAdmin = async () => {
+  const flagForAdmin = async ({ workerChecked = false, reason = '' } = {}) => {
     if (!pkg || loading || !['pending', 'needs_review'].includes(pkg.status)) return
     setLoading(true)
     try {
@@ -530,14 +541,23 @@ export default function ReturnsReceiving() {
         headers: headers(getToken, true),
         body: JSON.stringify({
           tracking: pkg.tracking_number,
-          reason: pkg.status === 'pending' ? 'worker_flagged' : pkg.review_reason,
+          reason: reason || (pkg.status === 'pending' ? 'worker_flagged' : pkg.review_reason),
+          workerChecked,
         }),
       })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || 'Could not send package to Admin Review')
-      toast.success('Place this package in the Admin Review bin', 'Sent to Admin')
+      toast.success(
+        workerChecked
+          ? 'Checked. Place this package in the Admin Review bin and scan the next one.'
+          : 'Place this package in the Admin Review bin',
+        'Sent to Admin',
+      )
       setPkg(null)
       setTracking('')
+      setCounts({})
+      setCounted(false)
+      setRemark('')
       await loadRecent()
       await loadReviewPackages()
       requestAnimationFrame(() => scannerRef.current?.focus())
@@ -567,9 +587,12 @@ export default function ReturnsReceiving() {
       if (!res.ok) throw new Error(data.error || 'Could not save selected products')
       const next = data.package
       setPkg(next)
+      const workerVerified = next.review_data?.workerInspection?.status === 'all_good'
       setCounts(Object.fromEntries((next.items || []).map((item) => [
         item.id,
-        { good: 0, damaged: 0, notOurs: 0 },
+        workerVerified
+          ? { good: Number(item.expected_qty), damaged: 0, notOurs: 0 }
+          : { good: 0, damaged: 0, notOurs: 0 },
       ])))
       setAdminSelections({})
       setCounted(false)
@@ -800,9 +823,12 @@ export default function ReturnsReceiving() {
 
       const next = data.package
       setPkg(next)
+      const workerVerified = next.review_data?.workerInspection?.status === 'all_good'
       setCounts(Object.fromEntries((next.items || []).map((item) => [
         item.id,
-        { good: 0, damaged: 0, notOurs: 0 },
+        workerVerified
+          ? { good: Number(item.expected_qty), damaged: 0, notOurs: 0 }
+          : { good: 0, damaged: 0, notOurs: 0 },
       ])))
       setCounted(false)
       const reusedText = data.reused_packages > 0
@@ -1102,7 +1128,16 @@ export default function ReturnsReceiving() {
                     </span>
                   </div>
                   <p className="mt-1 text-xs text-slate-500">
-                    Expected {expectedUnits} units · {pkg.items.length} SKU lines
+                    {isAdmin ? (
+                      <>Expected {expectedUnits} inventory pieces · {pkg.items.length} inventory lines</>
+                    ) : (
+                      <>
+                        Expected {expectedProducts || '—'} product{expectedProducts === 1 ? '' : 's'}
+                        {expectedUnits
+                          ? <> · {expectedUnits} inventory pieces</>
+                          : ' · inventory mapping pending'}
+                      </>
+                    )}
                   </p>
                   <div className="mt-2 flex flex-wrap gap-2 text-xs text-slate-500">
                     {pkg.store_name && <span className="rounded-md bg-slate-100 px-2 py-1">Store: {pkg.store_name}</span>}
@@ -1139,7 +1174,7 @@ export default function ReturnsReceiving() {
                 )}
               </div>
 
-              {pkg.related_orders?.length > 0 && (isAdmin || !pkg.requires_item_resolution) && (
+              {pkg.related_orders?.length > 0 && (
                 <div className="space-y-3 border-b border-slate-200 bg-white px-4 py-4 sm:px-5">
                   <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">
                     Original order contents
@@ -1147,6 +1182,16 @@ export default function ReturnsReceiving() {
                   {pkg.related_orders.map((order) => (
                     <OrderDetails key={`${order.store_key}-${order.order_key}`} order={order} compact />
                   ))}
+                </div>
+              )}
+
+              {isAdmin && pkg.review_data?.workerInspection?.status === 'all_good' && (
+                <div className="border-b border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900 sm:px-5">
+                  <strong>✅ Worker checked the physical return.</strong>{' '}
+                  {Number(pkg.review_data.workerInspection.productUnits) > 0
+                    ? <>{pkg.review_data.workerInspection.productUnits} sold product(s) looked correct.</>
+                    : 'The package looked correct; product quantity still needs Admin confirmation.'}
+                  {' '}Confirm the inventory style and physical-piece quantities below before adding stock.
                 </div>
               )}
 
@@ -1283,8 +1328,8 @@ export default function ReturnsReceiving() {
                             ) : (
                               <div className="mt-3 space-y-3">
                                 <p className="text-xs text-amber-800">
-                                  This SKU code cannot be split safely. Add every physical inventory
-                                  item contained in one sold SKU.
+                                  Add one row per inventory style/color/size. Quantity is the number
+                                  of physical pieces inside one sold product; use Add item for a mixed set.
                                 </p>
                                 {manualTargets.map((target, index) => {
                                   const styleOptions = [...new Set(
@@ -1355,17 +1400,21 @@ export default function ReturnsReceiving() {
                                           <option key={size} value={size}>{size}</option>
                                         ))}
                                       </select>
-                                      <div className="flex items-center gap-2">
-                                        <input
-                                          type="number"
-                                          min="1"
-                                          max="99"
-                                          inputMode="numeric"
-                                          aria-label="Units in one sold SKU"
-                                          value={target.qty}
-                                          onChange={(event) => updateTarget({ qty: Number(event.target.value) })}
-                                          className="h-11 w-full min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm"
-                                        />
+                                      <div className="flex items-end gap-2">
+                                        <label className="min-w-0 flex-1 text-[11px] font-semibold text-slate-600">
+                                          Pieces / Piezas
+                                          <input
+                                            type="number"
+                                            min="1"
+                                            max="9999"
+                                            step="1"
+                                            inputMode="numeric"
+                                            aria-label="Units in one sold SKU"
+                                            value={target.qty}
+                                            onChange={(event) => updateTarget({ qty: Number(event.target.value) })}
+                                            className="mt-1 h-11 w-full min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm"
+                                          />
+                                        </label>
                                         {manualTargets.length > 1 && (
                                           <button
                                             type="button"
@@ -1473,13 +1522,50 @@ export default function ReturnsReceiving() {
               {!isAdmin && pkg.status === 'needs_review' && pkg.requires_item_resolution && (
                 <div className="border-b border-amber-200 bg-amber-50 px-4 py-5 text-center sm:px-5">
                   <AlertTriangle className="mx-auto h-9 w-9 text-amber-600" />
-                  <p className="mt-2 text-lg font-bold text-amber-900">Admin must identify this product</p>
+                  <p className="mt-2 text-lg font-bold text-amber-900">
+                    Check the product, then send it to Admin / Revise y envíe a Admin
+                  </p>
                   <p className="mt-1 text-sm text-amber-800">
-                    Do not choose a style. Place the package in the Admin Review bin.
+                    One 3-piece set is shown as 1 sold product. Do not choose an inventory style here;
+                    Admin will confirm the exact styles and physical-piece quantities before inventory is added.
                   </p>
                 </div>
               )}
 
+              {!isAdmin ? (
+                <div className="divide-y divide-slate-100">
+                  {productGroups.length ? productGroups.map((product) => (
+                    <div key={product.key} className="px-4 py-5 sm:px-5">
+                      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                        <div className="min-w-0">
+                          <p className="break-words text-base font-bold text-slate-900">
+                            {product.skuCode || 'Product pending Admin / Producto pendiente'}
+                          </p>
+                          {product.skuId && (
+                            <p className="mt-1 text-xs text-slate-400">SKU ID {product.skuId}</p>
+                          )}
+                          <p className="mt-1 text-xs text-slate-500">
+                            {product.mappingPending
+                              ? 'Styles and pieces pending Admin / Estilos y piezas pendientes'
+                              : <>
+                                  {product.inventoryPieces} physical piece
+                                  {product.inventoryPieces === 1 ? '' : 's'} inside / piezas físicas
+                                </>}
+                          </p>
+                        </div>
+                        <div className="rounded-xl bg-blue-50 px-4 py-3 text-center text-blue-800">
+                          <p className="text-2xl font-black">{product.productQty}</p>
+                          <p className="text-xs font-semibold">PRODUCT / PRODUCTO</p>
+                        </div>
+                      </div>
+                    </div>
+                  )) : (
+                    <div className="px-4 py-5 text-sm text-amber-800 sm:px-5">
+                      Admin will select the product and quantity / Admin seleccionará el producto y la cantidad.
+                    </div>
+                  )}
+                </div>
+              ) : (
               <div className="divide-y divide-slate-100">
                 {pkg.items.map((item) => {
                   const expected = Number(item.expected_qty)
@@ -1522,6 +1608,12 @@ export default function ReturnsReceiving() {
                               {' '}· Good / Bueno: <strong>{item.restock_qty ?? 0}</strong>
                               {' '}· Damaged / Dañado: <strong>{Math.max(Number(item.actual_qty || 0) - Number(item.restock_qty || 0), 0)}</strong>
                               {' '}· Not ours / No es nuestro: <strong>{item.not_ours_qty ?? 0}</strong>
+                              {' '}· Missing / Faltante: <strong>{Math.max(
+                                Number(item.expected_qty || 0)
+                                  - Number(item.actual_qty || 0)
+                                  - Number(item.not_ours_qty || 0),
+                                0,
+                              )}</strong>
                             </>
                           )}
                         </p>
@@ -1574,10 +1666,10 @@ export default function ReturnsReceiving() {
                               ))}
                             </div>
                           )}
-                          <p className={`text-xs font-semibold ${selected === expected ? 'text-emerald-700' : 'text-red-700'}`}>
+                          <p className={`text-xs font-semibold ${selected === expected ? 'text-emerald-700' : 'text-amber-700'}`}>
                             {selected === expected
                               ? '✓ Complete / Completo'
-                              : `${expected - selected} not selected / sin seleccionar`}
+                              : `${expected - selected} missing / faltante`}
                           </p>
                         </>
                       )}
@@ -1585,6 +1677,7 @@ export default function ReturnsReceiving() {
                   )
                 })}
               </div>
+              )}
 
               {isAdmin && ['pending', 'needs_review'].includes(pkg.status)
                 && !pkg.requires_item_resolution && (
@@ -1597,11 +1690,12 @@ export default function ReturnsReceiving() {
                     {discrepancy
                       ? <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
                       : <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />}
-                    <div className="grid w-full grid-cols-2 gap-2 sm:grid-cols-4">
+                    <div className="grid w-full grid-cols-2 gap-2 sm:grid-cols-5">
                       <span className="font-semibold text-emerald-700">✅ Good / Bueno: {restockUnits}</span>
                       <span className="font-semibold text-amber-700">⚠️ Damaged / Dañado: {damagedUnits}</span>
                       <span className="font-semibold text-red-700">❌ Not ours / No nuestro: {notOursUnits}</span>
-                      <span className="font-semibold text-slate-600">Unselected / Pendiente: {expectedUnits - categorizedUnits}</span>
+                      <span className="font-semibold text-orange-700">📭 Missing / Faltante: {missingUnits}</span>
+                      <span className="font-semibold text-slate-600">Checked / Revisado: {categorizedUnits}</span>
                     </div>
                   </div>
                   <textarea
@@ -1619,20 +1713,28 @@ export default function ReturnsReceiving() {
                       onChange={(event) => setCounted(event.target.checked)}
                       className="mt-0.5 h-4 w-4 rounded border-slate-300"
                     />
-                    I opened and checked every item. / Abrí y revisé cada artículo.
+                    {pkg.review_data?.workerInspection?.status === 'all_good'
+                      ? 'I verified the Admin mapping and physical-piece quantities. / Verifiqué el mapeo y las cantidades.'
+                      : 'I opened and checked every item. / Abrí y revisé cada artículo.'}
                   </label>
                   <button
                     type="button"
                     onClick={confirmPackage}
-                    disabled={!counted || loading || categorizedUnits !== expectedUnits}
+                    disabled={!counted || loading || categorizedUnits > expectedUnits}
                     className={`mt-4 flex min-h-14 w-full items-center justify-center gap-2 rounded-xl px-5 text-base font-bold text-white disabled:opacity-40 sm:w-auto sm:min-w-64 ${
-                      notOursUnits > 0 && actualUnits === 0 ? 'bg-red-600 hover:bg-red-700' : 'bg-emerald-600 hover:bg-emerald-700'
+                      notOursUnits > 0 && actualUnits === 0
+                        ? 'bg-red-600 hover:bg-red-700'
+                        : discrepancy
+                          ? 'bg-amber-600 hover:bg-amber-700'
+                          : 'bg-emerald-600 hover:bg-emerald-700'
                     }`}
                   >
                     {loading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <PackageOpen className="h-4 w-4" />}
                     {notOursUnits > 0 && actualUnits === 0
                       ? '❌ Flag Not Ours / Marcar no nuestro'
-                      : `✅ Confirm / Confirmar · ${restockUnits} to inventory`}
+                      : discrepancy
+                        ? `⚠️ Confirm Discrepancy / Confirmar discrepancia · ${restockUnits} to inventory`
+                        : `✅ Confirm / Confirmar · ${restockUnits} to inventory`}
                   </button>
                 </div>
               )}
@@ -1661,15 +1763,27 @@ export default function ReturnsReceiving() {
               )}
 
               {!isAdmin && pkg.status === 'needs_review' && (
-                <div className="border-t border-amber-200 bg-amber-50 p-4 sm:p-5">
+                <div className="grid gap-3 border-t border-amber-200 bg-amber-50 p-4 sm:grid-cols-2 sm:p-5">
                   <button
                     type="button"
-                    onClick={flagForAdmin}
+                    onClick={() => flagForAdmin({
+                      workerChecked: true,
+                      reason: 'worker_checked_mapping_needed',
+                    })}
+                    disabled={loading}
+                    className="flex min-h-16 w-full items-center justify-center gap-2 rounded-xl bg-emerald-600 px-5 text-lg font-bold text-white hover:bg-emerald-700 disabled:opacity-40"
+                  >
+                    <CheckCircle2 className="h-6 w-6" />
+                    ✅ Checked · Admin · Next / Revisado · Siguiente
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => flagForAdmin({ reason: 'worker_found_problem' })}
                     disabled={loading}
                     className="flex min-h-16 w-full items-center justify-center gap-2 rounded-xl bg-amber-500 px-5 text-lg font-bold text-white hover:bg-amber-600 disabled:opacity-40"
                   >
                     <AlertTriangle className="h-6 w-6" />
-                    Skip · Place in Admin Review Bin
+                    Problem · Admin · Next / Problema · Siguiente
                   </button>
                 </div>
               )}
@@ -2200,6 +2314,33 @@ export default function ReturnsReceiving() {
                   </div>
                 ))}
               </div>
+              {analytics.summary.sales_catalog_coverage
+                && !analytics.summary.sales_catalog_coverage.complete && (
+                <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+                  <p className="font-bold">Sales mapping incomplete / Mapeo de ventas incompleto</p>
+                  <p className="mt-1">
+                    {Number(analytics.summary.sales_catalog_coverage.uncovered_product_units || 0).toLocaleString()}
+                    {' '}product unit(s) still need a unique ready SKU catalog mapping. Physical return rates are hidden until coverage is complete.
+                    {' / '}
+                    Falta relacionar SKU de forma única; las tasas físicas quedan ocultas hasta completar la cobertura.
+                  </p>
+                </div>
+              )}
+              {Number(
+                analytics.summary.sales_catalog_coverage?.unreconciled_product_units || 0,
+              ) > 0 && (
+                <div className="rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-900">
+                  <p className="font-bold">Inventory reconciliation pending / Conciliación pendiente</p>
+                  <p className="mt-1">
+                    {Number(
+                      analytics.summary.sales_catalog_coverage.unreconciled_product_units,
+                    ).toLocaleString()}
+                    {' '}product unit(s) come from saved orders whose inventory transaction is pending or was rolled back. They remain in true order sales and are flagged separately for audit.
+                    {' / '}
+                    Estas ventas permanecen en pedidos reales y se señalan por separado para auditoría.
+                  </p>
+                </div>
+              )}
               {analytics.summary.return_product_groups
                 > analytics.summary.covered_return_product_groups && (
                 <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">

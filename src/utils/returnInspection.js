@@ -50,3 +50,50 @@ export function summarizeReturnInspection(lines) {
     status,
   }
 }
+
+export function groupReturnProducts(items = [], unresolvedSkus = []) {
+  const groups = new Map()
+
+  for (const item of items || []) {
+    const skuId = String(item.sku_id || item.skuId || '').trim()
+    const skuCode = String(item.sku_code || item.skuCode || '').trim()
+    const key = `${skuId}\u241f${skuCode}`
+    const expectedQty = toCount(item.expected_qty ?? item.expectedQty, 'Expected quantity')
+    const rawSourceQty = item.source_qty ?? item.sourceQty
+    const sourceQty = rawSourceQty == null ? null : toCount(rawSourceQty, 'Product quantity')
+    const group = groups.get(key) || {
+      key,
+      skuId,
+      skuCode,
+      productQty: 0,
+      inventoryPieces: 0,
+      inventoryLines: 0,
+      mappingPending: false,
+    }
+    group.inventoryPieces += expectedQty
+    group.inventoryLines += 1
+    group.productQty = Math.max(group.productQty, sourceQty || 0)
+    groups.set(key, group)
+  }
+
+  for (const item of unresolvedSkus || []) {
+    const skuId = String(item.skuId || item.sku_id || '').trim()
+    const skuCode = String(item.skuCode || item.sku_code || '').trim()
+    const key = `${skuId}\u241f${skuCode}`
+    if (groups.has(key)) continue
+    groups.set(key, {
+      key,
+      skuId,
+      skuCode,
+      productQty: toCount(item.quantity, 'Product quantity'),
+      inventoryPieces: null,
+      inventoryLines: 0,
+      mappingPending: true,
+    })
+  }
+
+  return [...groups.values()].map((group) => ({
+    ...group,
+    productQty: group.productQty || (group.inventoryPieces > 0 ? 1 : 0),
+  }))
+}

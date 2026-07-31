@@ -1,10 +1,11 @@
 import { neon } from '@neondatabase/serverless'
-import jwt from 'jsonwebtoken'
+import authentication from '../lib/authentication.cjs'
 import inventoryTargetResolution from '../lib/inventoryTargetResolution.cjs'
 import returnPackageSafety from '../lib/returnPackageSafety.cjs'
 import { summarizeReturnInspection } from '../src/utils/returnInspection.js'
 
 const { resolveInventoryTargets } = inventoryTargetResolution
+const { authenticateUser } = authentication
 const { itemIdentity, mergeReturnPackageItems } = returnPackageSafety
 const MAX_PACKAGES_PER_IMPORT = 5000
 const MAX_ITEMS_PER_IMPORT = 50000
@@ -19,11 +20,6 @@ function getDB() {
   const url = process.env.DATABASE_URL
   if (!url) throw new Error('DATABASE_URL not set')
   return neon(url)
-}
-
-function verifyToken(header) {
-  if (!header?.startsWith('Bearer ') || !process.env.JWT_SECRET) return null
-  try { return jwt.verify(header.slice(7), process.env.JWT_SECRET) } catch { return null }
 }
 
 function normalizeTracking(value) {
@@ -161,10 +157,48 @@ function normalizeReviewData(rawData) {
       unresolved.set(skuId, { skuId, skuCode, quantity, issue })
     }
   }
+  const rawInspection = data.workerInspection || data.worker_inspection
+  let workerInspection = null
+  if (rawInspection && typeof rawInspection === 'object' && !Array.isArray(rawInspection)) {
+    const status = rawInspection.status === 'all_good' ? 'all_good' : ''
+    const productUnits = Number(rawInspection.productUnits ?? rawInspection.product_units)
+    const checkedBy = cleanText(rawInspection.checkedBy || rawInspection.checked_by, 100)
+    const checkedAt = cleanText(rawInspection.checkedAt || rawInspection.checked_at, 100)
+    if (
+      status
+      && Number.isSafeInteger(productUnits)
+      && productUnits >= 0
+      && productUnits <= 9999
+      && checkedBy
+      && checkedAt
+    ) {
+      workerInspection = { status, productUnits, checkedBy, checkedAt }
+    }
+  }
   return {
     unresolvedSkus: [...unresolved.values()],
     blockingIssues: cleanTextArray(data.blockingIssues, 200),
+    workerInspection,
   }
+}
+
+function packageProductUnits(pkg) {
+  const reviewData = normalizeReviewData(pkg.review_data)
+  const products = new Map()
+  for (const item of pkg.items || []) {
+    const key = `${item.sku_id || ''}\u241f${item.sku_code || ''}`
+    const sourceQty = Number(item.source_qty)
+    const fallbackQty = Number(item.expected_qty)
+    const productQty = Number.isSafeInteger(sourceQty) && sourceQty > 0
+      ? sourceQty
+      : Number.isSafeInteger(fallbackQty) && fallbackQty > 0 ? 1 : 0
+    products.set(key, Math.max(products.get(key) || 0, productQty))
+  }
+  for (const item of reviewData.unresolvedSkus) {
+    const key = `${item.skuId || ''}\u241f${item.skuCode || ''}`
+    if (!products.has(key)) products.set(key, Number(item.quantity || 0))
+  }
+  return [...products.values()].reduce((sum, quantity) => sum + quantity, 0)
 }
 
 function normalizePackages(rawPackages, fallbackStore = null, {
@@ -201,7 +235,7 @@ function normalizePackages(rawPackages, fallbackStore = null, {
       requires_item_resolution: Boolean(
         rawPackage.requiresItemResolution ?? rawPackage.requires_item_resolution,
       ),
-      review_data: { unresolvedSkus: [], blockingIssues: [] },
+      review_data: { unresolvedSkus: [], blockingIssues: [], workerInspection: null },
       items: new Map(),
     }
     if (pkg.store_key !== store.key) {
@@ -212,6 +246,7 @@ function normalizePackages(rawPackages, fallbackStore = null, {
     for (const value of rawPackage.buyerRemarks || []) if (String(value || '').trim()) pkg.buyer_remarks.add(String(value).trim())
     pkg.review_data.unresolvedSkus.push(...reviewData.unresolvedSkus)
     pkg.review_data.blockingIssues.push(...reviewData.blockingIssues)
+    if (reviewData.workerInspection) pkg.review_data.workerInspection = reviewData.workerInspection
     for (const rawItem of rawPackage.items || []) {
       itemCount += 1
       if (itemCount > MAX_ITEMS_PER_IMPORT) throw new Error(`Import is limited to ${MAX_ITEMS_PER_IMPORT} item rows`)
@@ -291,7 +326,7 @@ function normalizeCatalogRows(rawRows) {
     })) : []
     if (status === 'ready' && (!components.length || components.some((component) =>
       !component.style || !component.color || !component.size
-      || !Number.isSafeInteger(component.qty) || component.qty <= 0
+      || !Number.isSafeInteger(component.qty) || component.qty <= 0 || component.qty > 9999
     ))) throw new Error(`Resolved SKU ${skuId} has invalid physical components`)
     return { sku_id: skuId, sku_code: skuCode, status, issue, components }
   })
@@ -353,6 +388,12 @@ async function ensureTables(sql) {
     )
   `
   await sql`ALTER TABLE inventory_txn_rows ADD COLUMN IF NOT EXISTS transaction_id INTEGER`
+  await sql`ALTER TABLE inventory_txn_rows ADD COLUMN IF NOT EXISTS business_day DATE`
+  await sql`
+    UPDATE inventory_txn_rows
+    SET business_day = applied_at::date
+    WHERE business_day IS NULL
+  `
   await sql`
     UPDATE inventory_txn_rows rows
     SET transaction_id = (
@@ -587,12 +628,15 @@ async function loadOrdersByKeys(sql, storeKey, orderNumbers) {
     SELECT
       orders.id, orders.store_name, orders.store_key, orders.order_number, orders.order_key,
       orders.site, orders.status, orders.order_created_at, orders.order_confirmed_at,
-      orders.shipped_at, orders.delivered_at, orders.source_file, orders.updated_at
+      orders.shipped_at, orders.delivered_at, orders.source_file, orders.updated_at,
+      orders.inventory_status
     FROM return_orders orders
     JOIN wanted ON wanted.order_key = orders.order_key
-    WHERE orders.inventory_status = 'applied'
-      AND (${storeKey || ''} = '' OR orders.store_key = ${storeKey || ''})
-    ORDER BY orders.order_created_at DESC NULLS LAST, orders.order_number
+    WHERE (${storeKey || ''} = '' OR orders.store_key = ${storeKey || ''})
+    ORDER BY
+      CASE WHEN orders.inventory_status = 'applied' THEN 0 ELSE 1 END,
+      orders.order_created_at DESC NULLS LAST,
+      orders.order_number
   `
   if (!orders.length) return []
   const orderIds = orders.map((order) => String(order.id))
@@ -606,13 +650,31 @@ async function loadOrdersByKeys(sql, storeKey, orderNumbers) {
       items.sku_code, items.product_name, items.attributes, items.quantity,
       items.outbound_trackings, items.package_numbers, items.carriers, items.warehouses,
       catalog.components AS catalog_components,
-      catalog.status AS catalog_status
+      catalog.status AS catalog_status,
+      catalog.store_name AS catalog_store_name,
+      catalog.store_key AS catalog_store_key
     FROM return_order_items items
     JOIN wanted ON wanted.order_id = items.order_id
     JOIN return_orders orders ON orders.id = items.order_id
-    LEFT JOIN return_product_catalog catalog
-      ON catalog.store_key = orders.store_key
-     AND catalog.sku_id = items.sku_id
+    LEFT JOIN LATERAL (
+      SELECT
+        candidate.components,
+        candidate.status,
+        candidate.store_name,
+        candidate.store_key
+      FROM return_product_catalog candidate
+      WHERE candidate.sku_id = items.sku_id
+        AND (
+          orders.store_key = ${COMBINED_ORDER_STORE_KEY}
+          OR candidate.store_key = orders.store_key
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM return_product_catalog other
+          WHERE other.sku_id = candidate.sku_id
+            AND other.id <> candidate.id
+        )
+    ) catalog ON true
     ORDER BY items.order_id, items.sku_code, items.attributes
   `
   const itemsByOrder = new Map()
@@ -707,6 +769,7 @@ async function reuseSkuMappingForQueuedPackages(
     const nextReviewData = {
       unresolvedSkus: remainingSkus,
       blockingIssues: reviewData.blockingIssues,
+      workerInspection: reviewData.workerInspection,
     }
     const reviewReason = [...new Set([
       ...remainingSkus.map((item) => item.issue),
@@ -783,9 +846,13 @@ async function reuseSkuMappingForQueuedPackages(
 
 export default async function handler(req, res) {
   try {
-    const payload = verifyToken(req.headers.authorization)
-    if (!payload) return res.status(401).json({ error: 'Not authenticated' })
     const sql = getDB()
+    const payload = await authenticateUser(
+      sql,
+      req.headers.authorization,
+      process.env.JWT_SECRET,
+    )
+    if (!payload) return res.status(401).json({ error: 'Not authenticated' })
     const action = String(req.query.action || '')
     await ensureTables(sql)
 
@@ -1484,6 +1551,17 @@ export default async function handler(req, res) {
         return res.status(409).json({ error: 'This return package has already been completed' })
       }
       const reason = cleanText(req.body?.reason || 'worker_flagged', 500)
+      const workerChecked = req.body?.workerChecked === true
+      const reviewData = normalizeReviewData(pkg.review_data)
+      if (workerChecked) {
+        const productUnits = packageProductUnits(pkg)
+        reviewData.workerInspection = {
+          status: 'all_good',
+          productUnits,
+          checkedBy: payload.username,
+          checkedAt: new Date().toISOString(),
+        }
+      }
       await sql`
         UPDATE return_packages
         SET status = 'needs_review',
@@ -1495,6 +1573,7 @@ export default async function handler(req, res) {
               WHEN status = 'pending' THEN false
               ELSE requires_item_resolution
             END,
+            review_data = ${JSON.stringify(reviewData)}::jsonb,
             escalated_by = COALESCE(escalated_by, ${payload.username}),
             escalated_at = COALESCE(escalated_at, NOW())
         WHERE id = ${pkg.id}
@@ -1574,6 +1653,7 @@ export default async function handler(req, res) {
       const nextReviewData = {
         unresolvedSkus: remainingSkus,
         blockingIssues: reviewData.blockingIssues,
+        workerInspection: reviewData.workerInspection,
       }
       const requiresItemResolution = Boolean(
         remainingSkus.length || reviewData.blockingIssues.length,
@@ -1877,12 +1957,112 @@ export default async function handler(req, res) {
       }
 
       const receivedRows = resolved.rows
+      const inventoryLockTargets = [...new Map(receivedRows.map((row) => [
+        [row.style, row.color, row.size]
+          .map((value) => String(value || '').trim().toLowerCase())
+          .join('\u0000'),
+        { style: row.style, color: row.color, size: row.size },
+      ])).values()]
+      const packageItemsForValidation = pkg.items.map((item) => ({
+        id: String(item.id),
+        sku_id: item.sku_id,
+        sku_code: item.sku_code,
+        style: item.style,
+        color: item.color,
+        size: item.size,
+        expected_qty: Number(item.expected_qty),
+        source_qty: item.source_qty == null ? null : Number(item.source_qty),
+      }))
       const { actualUnits, restockUnits, notOursUnits, status: finalStatus } = inspection
       const sourceName = `Return ${pkg.tracking_number}`
       const sourceHash = `return-package:${pkg.tracking_key}`
       const remark = String(req.body?.remark || '').trim().slice(0, 1000)
 
       await sql.transaction((txn) => [
+        txn`SELECT pg_advisory_xact_lock(hashtext('inventory-balance-write'))`,
+        txn`
+          WITH targets AS (
+            SELECT
+              (target.ordinality - 1)::int AS target_index,
+              target.value->>'style' AS style,
+              target.value->>'color' AS color,
+              target.value->>'size' AS size
+            FROM jsonb_array_elements(${JSON.stringify(inventoryLockTargets)}::jsonb)
+              WITH ORDINALITY AS target(value, ordinality)
+          ),
+          expected_package_items AS (
+            SELECT *
+            FROM jsonb_to_recordset(${JSON.stringify(packageItemsForValidation)}::jsonb)
+              AS expected(
+                id BIGINT, sku_id TEXT, sku_code TEXT, style TEXT, color TEXT, size TEXT,
+                expected_qty INTEGER, source_qty INTEGER
+              )
+          ),
+          current_package_items AS MATERIALIZED (
+            SELECT
+              id, sku_id, sku_code, style, color, size, expected_qty, source_qty
+            FROM return_package_items
+            WHERE package_id = ${pkg.id}
+          ),
+          package_item_changes AS (
+            SELECT COALESCE(expected.id, current.id) AS id
+            FROM expected_package_items expected
+            FULL JOIN current_package_items current USING (id)
+            WHERE expected.id IS NULL
+               OR current.id IS NULL
+               OR expected.sku_id IS DISTINCT FROM current.sku_id
+               OR expected.sku_code IS DISTINCT FROM current.sku_code
+               OR expected.style IS DISTINCT FROM current.style
+               OR expected.color IS DISTINCT FROM current.color
+               OR expected.size IS DISTINCT FROM current.size
+               OR expected.expected_qty IS DISTINCT FROM current.expected_qty
+               OR expected.source_qty IS DISTINCT FROM current.source_qty
+          ),
+          package_validation AS (
+            SELECT
+              EXISTS (
+                SELECT 1
+                FROM return_packages
+                WHERE id = ${pkg.id}
+                  AND status = ${pkg.status}
+                  AND requires_item_resolution = false
+              )
+              AND NOT EXISTS (SELECT 1 FROM package_item_changes) AS valid
+          ),
+          locked AS MATERIALIZED (
+            SELECT target.target_index, inventory.id
+            FROM targets target
+            JOIN inventory_balance inventory
+              ON LOWER(BTRIM(inventory.style)) = LOWER(BTRIM(target.style))
+             AND LOWER(BTRIM(inventory.color)) = LOWER(BTRIM(target.color))
+             AND (
+               CASE UPPER(BTRIM(inventory.size))
+                 WHEN '1XL' THEN '1X' WHEN '2XL' THEN '2X' WHEN '3XL' THEN '3X'
+                 ELSE UPPER(BTRIM(inventory.size))
+               END
+             ) = (
+               CASE UPPER(BTRIM(target.size))
+                 WHEN '1XL' THEN '1X' WHEN '2XL' THEN '2X' WHEN '3XL' THEN '3X'
+                 ELSE UPPER(BTRIM(target.size))
+               END
+             )
+            FOR UPDATE OF inventory
+          ),
+          validation AS (
+            SELECT targets.target_index, COUNT(locked.id)::int AS match_count
+            FROM targets
+            LEFT JOIN locked USING (target_index)
+            GROUP BY targets.target_index
+          )
+          SELECT CASE
+            WHEN NOT (SELECT valid FROM package_validation)
+              THEN ('return_package_changed_'
+                || (SELECT COUNT(*)::text FROM package_item_changes))::int
+            WHEN COUNT(*) FILTER (WHERE match_count = 1) = COUNT(*) THEN 1
+            ELSE ('return_inventory_target_changed_' || COUNT(*)::text)::int
+          END AS targets_valid
+          FROM validation
+        `,
         txn`
           WITH claimed AS (
             UPDATE return_packages
@@ -1958,9 +2138,24 @@ export default async function handler(req, res) {
           WHERE id = ${pkg.id} AND status = 'processing'
         `,
         txn`
-          DELETE FROM inventory_snapshots
-          WHERE id NOT IN (
-            SELECT id FROM inventory_snapshots ORDER BY created_at DESC LIMIT 20
+          DELETE FROM inventory_snapshots snapshots
+          WHERE NOT EXISTS (
+            SELECT 1
+            FROM inventory_transactions transactions
+            WHERE transactions.rolled_back_at IS NULL
+              AND transactions.rollback_snapshot_id = snapshots.id
+          )
+            AND snapshots.id NOT IN (
+              SELECT candidate.id
+              FROM inventory_snapshots candidate
+              WHERE NOT EXISTS (
+                SELECT 1
+                FROM inventory_transactions transactions
+                WHERE transactions.rolled_back_at IS NULL
+                  AND transactions.rollback_snapshot_id = candidate.id
+              )
+              ORDER BY candidate.created_at DESC, candidate.id DESC
+              LIMIT 20
           )
         `,
       ], { isolationLevel: 'Serializable' })
@@ -1985,6 +2180,8 @@ export default async function handler(req, res) {
         rollbackMismatches,
         pendingOrderArchives,
         rememberedSkuReviews,
+        salesCatalogCoverageMismatches,
+        duplicateOrderConflicts,
       ] = await Promise.all([
         sql`
           WITH issues AS (
@@ -2184,6 +2381,221 @@ export default async function handler(req, res) {
           ORDER BY tracking_number, sku_id
           LIMIT 20
         `,
+        sql`
+          WITH order_item_candidates AS (
+            SELECT
+              orders.id AS order_id,
+              items.id AS item_id,
+              orders.order_number,
+              orders.order_key,
+              orders.store_key AS order_store_key,
+              orders.store_name AS order_store_name,
+              orders.inventory_status,
+              orders.updated_at AS order_updated_at,
+              items.item_key,
+              items.sku_id,
+              items.sku_code,
+              items.quantity,
+              LOWER(BTRIM(items.item_key)) AS logical_item_key
+            FROM return_orders orders
+            JOIN return_order_items items ON items.order_id = orders.id
+          ),
+          order_item_scope AS (
+            SELECT
+              candidates.*,
+              BOOL_OR(order_store_key = ${COMBINED_ORDER_STORE_KEY}) OVER (
+                PARTITION BY order_key
+              ) AS has_combined_order,
+              BOOL_OR(
+                order_store_key = ${COMBINED_ORDER_STORE_KEY}
+                AND inventory_status = 'pending'
+              ) OVER (PARTITION BY order_key) AS has_pending_combined_order,
+              BOOL_OR(
+                order_store_key = ${COMBINED_ORDER_STORE_KEY}
+                AND inventory_status = 'applied'
+              ) OVER (PARTITION BY order_key) AS has_applied_combined_order
+            FROM order_item_candidates candidates
+          ),
+          order_item_sku_metadata AS (
+            SELECT
+              order_key,
+              logical_item_key,
+              CASE
+                WHEN COUNT(DISTINCT NULLIF(BTRIM(sku_id), '')) = 1
+                  THEN MIN(NULLIF(BTRIM(sku_id), ''))
+                ELSE NULL
+              END AS unique_sku_id
+            FROM order_item_candidates
+            GROUP BY order_key, logical_item_key
+          ),
+          ranked_order_items AS (
+            SELECT
+              scoped.*,
+              metadata.unique_sku_id,
+              ROW_NUMBER() OVER (
+                PARTITION BY
+                  order_key,
+                  logical_item_key,
+                  CASE WHEN has_combined_order THEN 0 ELSE order_id END
+                ORDER BY
+                  CASE
+                    WHEN order_store_key = ${COMBINED_ORDER_STORE_KEY}
+                     AND inventory_status = 'applied' THEN 0
+                    WHEN order_store_key <> ${COMBINED_ORDER_STORE_KEY}
+                     AND inventory_status = 'applied' THEN 1
+                    WHEN order_store_key = ${COMBINED_ORDER_STORE_KEY}
+                     AND inventory_status = 'pending' THEN 2
+                    ELSE 3
+                  END,
+                  CASE WHEN NULLIF(BTRIM(sku_id), '') IS NOT NULL THEN 0 ELSE 1 END,
+                  order_updated_at DESC NULLS LAST,
+                  order_id DESC,
+                  item_id DESC
+              ) AS canonical_rank
+            FROM order_item_scope scoped
+            JOIN order_item_sku_metadata metadata USING (order_key, logical_item_key)
+          ),
+          canonical_order_items AS (
+            SELECT
+              ranked.*,
+              COALESCE(
+                NULLIF(BTRIM(ranked.sku_id), ''),
+                CASE WHEN ranked.has_combined_order THEN ranked.unique_sku_id END
+              ) AS resolved_sku_id,
+              CASE
+                WHEN ranked.has_applied_combined_order THEN true
+                WHEN ranked.has_pending_combined_order THEN false
+                ELSE ranked.inventory_status = 'applied'
+              END AS inventory_reconciled
+            FROM ranked_order_items ranked
+            WHERE canonical_rank = 1
+          ),
+          catalog_counts AS (
+            SELECT sku_id, COUNT(*)::int AS match_count
+            FROM return_product_catalog
+            GROUP BY sku_id
+          ),
+          unique_catalog AS (
+            SELECT catalog.*
+            FROM return_product_catalog catalog
+            JOIN catalog_counts counts USING (sku_id)
+            WHERE counts.match_count = 1
+          ),
+          checked AS (
+            SELECT
+              items.order_number,
+              items.order_store_name,
+              items.resolved_sku_id AS sku_id,
+              items.sku_code,
+              items.quantity,
+              catalog.store_name AS catalog_store_name,
+              CASE
+                WHEN items.resolved_sku_id IS NULL THEN 'sku_id_missing'
+                WHEN counts.sku_id IS NULL THEN 'catalog_missing'
+                WHEN counts.match_count <> 1 THEN 'catalog_ambiguous'
+                WHEN items.order_store_key <> ${COMBINED_ORDER_STORE_KEY}
+                 AND catalog.store_key IS DISTINCT FROM items.order_store_key
+                  THEN 'catalog_store_mismatch'
+                WHEN catalog.status IS DISTINCT FROM 'ready' THEN 'catalog_not_ready'
+                WHEN CASE
+                  WHEN jsonb_typeof(catalog.components) = 'array'
+                    THEN jsonb_array_length(catalog.components) = 0
+                  ELSE true
+                END THEN 'catalog_components_missing'
+                WHEN EXISTS (
+                  SELECT 1
+                  FROM jsonb_array_elements(
+                    CASE
+                      WHEN jsonb_typeof(catalog.components) = 'array' THEN catalog.components
+                      ELSE '[]'::jsonb
+                    END
+                  ) component(value)
+                  WHERE NULLIF(BTRIM(component.value->>'style'), '') IS NULL
+                     OR NULLIF(BTRIM(component.value->>'color'), '') IS NULL
+                     OR NULLIF(BTRIM(component.value->>'size'), '') IS NULL
+                     OR COALESCE(component.value->>'qty', '') !~ '^[1-9][0-9]{0,3}$'
+                ) THEN 'catalog_components_invalid'
+                ELSE NULL
+              END AS issue
+            FROM canonical_order_items items
+            LEFT JOIN catalog_counts counts ON counts.sku_id = items.resolved_sku_id
+            LEFT JOIN unique_catalog catalog ON catalog.sku_id = items.resolved_sku_id
+          ),
+          issues AS (
+            SELECT * FROM checked WHERE issue IS NOT NULL
+          )
+          SELECT issues.*, COUNT(*) OVER()::int AS issue_count
+          FROM issues
+          ORDER BY order_number, sku_id
+          LIMIT 20
+        `,
+        sql`
+          WITH order_signatures AS (
+            SELECT
+              orders.id AS order_id,
+              orders.order_number,
+              orders.order_key,
+              orders.store_name,
+              orders.store_key,
+              COUNT(*)::int AS item_count,
+              jsonb_agg(
+                LOWER(BTRIM(items.item_key))
+                ORDER BY LOWER(BTRIM(items.item_key)), items.id
+              ) AS item_keys,
+              jsonb_agg(
+                jsonb_build_array(LOWER(BTRIM(items.item_key)), items.quantity)
+                ORDER BY LOWER(BTRIM(items.item_key)), items.id
+              ) AS quantities,
+              jsonb_agg(
+                jsonb_build_array(
+                  LOWER(BTRIM(items.item_key)),
+                  NULLIF(BTRIM(items.sku_id), '')
+                )
+                ORDER BY LOWER(BTRIM(items.item_key)), items.id
+              ) AS sku_ids
+            FROM return_orders orders
+            JOIN return_order_items items ON items.order_id = orders.id
+            GROUP BY
+              orders.id, orders.order_number, orders.order_key,
+              orders.store_name, orders.store_key
+          ),
+          combined_orders AS (
+            SELECT *
+            FROM order_signatures
+            WHERE store_key = ${COMBINED_ORDER_STORE_KEY}
+          ),
+          historical_orders AS (
+            SELECT *
+            FROM order_signatures
+            WHERE store_key <> ${COMBINED_ORDER_STORE_KEY}
+          ),
+          issues AS (
+            SELECT
+              combined.order_number,
+              historical.store_name AS historical_store,
+              combined.item_count AS daily_item_count,
+              historical.item_count AS historical_item_count,
+              CASE
+                WHEN combined.item_keys IS DISTINCT FROM historical.item_keys
+                  THEN 'item_set_mismatch'
+                WHEN combined.quantities IS DISTINCT FROM historical.quantities
+                 AND combined.sku_ids IS DISTINCT FROM historical.sku_ids
+                  THEN 'quantity_and_sku_mismatch'
+                WHEN combined.quantities IS DISTINCT FROM historical.quantities
+                  THEN 'quantity_mismatch'
+                ELSE 'sku_mismatch'
+              END AS issue
+            FROM combined_orders combined
+            JOIN historical_orders historical USING (order_key)
+            WHERE combined.item_keys IS DISTINCT FROM historical.item_keys
+               OR combined.quantities IS DISTINCT FROM historical.quantities
+               OR combined.sku_ids IS DISTINCT FROM historical.sku_ids
+          )
+          SELECT issues.*, COUNT(*) OVER()::int AS issue_count
+          FROM issues
+          ORDER BY order_number, historical_store
+          LIMIT 20
+        `,
       ])
       const check = (id, label, rows, severity = 'error') => ({
         id,
@@ -2199,6 +2611,18 @@ export default async function handler(req, res) {
         check('rollback_state', 'Rollback and package status agree', rollbackMismatches),
         check('pending_orders', 'Order archives waiting for inventory apply', pendingOrderArchives, 'warning'),
         check('remembered_reviews', 'Remembered SKUs still waiting in Admin Review', rememberedSkuReviews, 'warning'),
+        check(
+          'sales_catalog_coverage',
+          'Canonical order items have one ready product catalog mapping',
+          salesCatalogCoverageMismatches,
+          'warning',
+        ),
+        check(
+          'duplicate_order_conflicts',
+          'Duplicate daily and historical order items agree',
+          duplicateOrderConflicts,
+          'warning',
+        ),
       ]
       return res.json({
         ok: checks.every((item) => item.issue_count === 0),
@@ -2228,7 +2652,7 @@ export default async function handler(req, res) {
         SELECT COALESCE(SUM(rows.qty), 0)::int AS sold_units
         FROM inventory_txn_rows rows
         WHERE rows.txn_type = 'sales'
-          AND rows.applied_at >= ${from}
+          AND COALESCE(rows.business_day, rows.applied_at::date) >= ${from}::date
           AND NOT EXISTS (
             SELECT 1
             FROM inventory_transactions transactions
@@ -2246,14 +2670,7 @@ export default async function handler(req, res) {
           )
       `
       const [productSummary] = await sql`
-        WITH sold AS (
-          SELECT COALESCE(SUM(items.quantity), 0)::int AS sold_product_units
-          FROM return_order_items items
-          JOIN return_orders orders ON orders.id = items.order_id
-          WHERE orders.inventory_status = 'applied'
-            AND orders.order_created_at >= ${from}
-        ),
-        sku_return_groups AS (
+        WITH sku_return_groups AS (
           SELECT
             items.package_id,
             items.sku_id,
@@ -2274,28 +2691,18 @@ export default async function handler(req, res) {
           GROUP BY items.package_id, items.sku_id
         )
         SELECT
-          sold.sold_product_units,
           COALESCE(SUM(returned_product_units) FILTER (WHERE has_source_qty), 0)::int
             AS returned_product_units,
           COUNT(sku_return_groups.package_id)::int AS return_product_groups,
           COUNT(sku_return_groups.package_id) FILTER (WHERE has_source_qty)::int
             AS covered_return_product_groups
-        FROM sold
-        LEFT JOIN sku_return_groups ON true
-        GROUP BY sold.sold_product_units
+        FROM sku_return_groups
       `
-      summary.sold_units = Number(salesSummary?.sold_units || 0)
-      summary.total_return_rate = summary.sold_units > 0
-        ? Number(summary.returned_units || 0) * 100 / summary.sold_units
-        : null
-      summary.sold_product_units = Number(productSummary?.sold_product_units || 0)
+      summary.inventory_physical_units = Number(salesSummary?.sold_units || 0)
       summary.returned_product_units = Number(productSummary?.returned_product_units || 0)
-      summary.product_return_rate = summary.sold_product_units > 0
-        ? summary.returned_product_units * 100 / summary.sold_product_units
-        : null
       summary.return_product_groups = Number(productSummary?.return_product_groups || 0)
       summary.covered_return_product_groups = Number(productSummary?.covered_return_product_groups || 0)
-      const stores = await sql`
+      const [analyticsBreakdown] = await sql`
         WITH package_returns AS (
           SELECT
             COALESCE(NULLIF(store_key, ''), 'unassigned') AS store_key,
@@ -2312,43 +2719,193 @@ export default async function handler(req, res) {
             AND confirmed_at >= ${from}
           GROUP BY COALESCE(NULLIF(store_key, ''), 'unassigned')
         ),
+        order_item_candidates AS (
+          SELECT
+            orders.id AS order_id,
+            items.id AS item_id,
+            orders.order_key,
+            orders.store_key AS order_store_key,
+            orders.store_name AS order_store_name,
+            orders.inventory_status,
+            orders.updated_at AS order_updated_at,
+            items.item_key,
+            items.sku_id,
+            items.quantity,
+            LOWER(BTRIM(items.item_key)) AS logical_item_key
+          FROM return_orders orders
+          JOIN return_order_items items ON items.order_id = orders.id
+          WHERE orders.order_created_at::date >= ${from}::date
+        ),
+        order_item_scope AS (
+          SELECT
+            candidates.*,
+            BOOL_OR(order_store_key = ${COMBINED_ORDER_STORE_KEY}) OVER (
+              PARTITION BY order_key
+            ) AS has_combined_order,
+            BOOL_OR(
+              order_store_key = ${COMBINED_ORDER_STORE_KEY}
+              AND inventory_status = 'pending'
+            ) OVER (PARTITION BY order_key) AS has_pending_combined_order,
+            BOOL_OR(
+              order_store_key = ${COMBINED_ORDER_STORE_KEY}
+              AND inventory_status = 'applied'
+            ) OVER (PARTITION BY order_key) AS has_applied_combined_order
+          FROM order_item_candidates candidates
+        ),
+        order_item_sku_metadata AS (
+          SELECT
+            order_key,
+            logical_item_key,
+            CASE
+              WHEN COUNT(DISTINCT NULLIF(BTRIM(sku_id), '')) = 1
+                THEN MIN(NULLIF(BTRIM(sku_id), ''))
+              ELSE NULL
+            END AS unique_sku_id
+          FROM order_item_candidates
+          GROUP BY order_key, logical_item_key
+        ),
+        ranked_order_items AS (
+          SELECT
+            scoped.*,
+            metadata.unique_sku_id,
+            ROW_NUMBER() OVER (
+              PARTITION BY
+                order_key,
+                logical_item_key,
+                CASE WHEN has_combined_order THEN 0 ELSE order_id END
+              ORDER BY
+                CASE
+                  WHEN order_store_key = ${COMBINED_ORDER_STORE_KEY}
+                   AND inventory_status = 'applied' THEN 0
+                  WHEN order_store_key <> ${COMBINED_ORDER_STORE_KEY}
+                   AND inventory_status = 'applied' THEN 1
+                  WHEN order_store_key = ${COMBINED_ORDER_STORE_KEY}
+                   AND inventory_status = 'pending' THEN 2
+                  ELSE 3
+                END,
+                CASE WHEN NULLIF(BTRIM(sku_id), '') IS NOT NULL THEN 0 ELSE 1 END,
+                order_updated_at DESC NULLS LAST,
+                order_id DESC,
+                item_id DESC
+            ) AS canonical_rank
+          FROM order_item_scope scoped
+          JOIN order_item_sku_metadata metadata USING (order_key, logical_item_key)
+        ),
+        canonical_order_items AS (
+          SELECT
+            ranked.*,
+            COALESCE(
+              NULLIF(BTRIM(ranked.sku_id), ''),
+              CASE WHEN ranked.has_combined_order THEN ranked.unique_sku_id END
+            ) AS resolved_sku_id,
+            CASE
+              WHEN ranked.has_applied_combined_order THEN true
+              WHEN ranked.has_pending_combined_order THEN false
+              ELSE ranked.inventory_status = 'applied'
+            END AS inventory_reconciled
+          FROM ranked_order_items ranked
+          WHERE canonical_rank = 1
+        ),
+        catalog_counts AS (
+          SELECT sku_id, COUNT(*)::int AS match_count
+          FROM return_product_catalog
+          GROUP BY sku_id
+        ),
+        unique_catalog AS (
+          SELECT
+            catalog.*,
+            catalog.status = 'ready'
+              AND CASE
+                WHEN jsonb_typeof(catalog.components) = 'array'
+                  THEN jsonb_array_length(catalog.components) > 0
+                ELSE false
+              END
+              AND NOT EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements(
+                  CASE
+                    WHEN jsonb_typeof(catalog.components) = 'array' THEN catalog.components
+                    ELSE '[]'::jsonb
+                  END
+                ) component(value)
+                WHERE NULLIF(BTRIM(component.value->>'style'), '') IS NULL
+                   OR NULLIF(BTRIM(component.value->>'color'), '') IS NULL
+                   OR NULLIF(BTRIM(component.value->>'size'), '') IS NULL
+                   OR COALESCE(component.value->>'qty', '') !~ '^[1-9][0-9]{0,3}$'
+          ) AS physical_mapping_ready
+          FROM return_product_catalog catalog
+          JOIN catalog_counts counts USING (sku_id)
+          WHERE counts.match_count = 1
+        ),
+        sales_items AS (
+          SELECT
+            items.quantity,
+            items.inventory_reconciled,
+            CASE
+              WHEN items.order_store_key <> ${COMBINED_ORDER_STORE_KEY}
+               AND NULLIF(BTRIM(items.order_store_key), '') IS NOT NULL
+                THEN items.order_store_key
+              WHEN catalog.id IS NOT NULL THEN catalog.store_key
+              ELSE 'unassigned'
+            END AS store_key,
+            CASE
+              WHEN items.order_store_key <> ${COMBINED_ORDER_STORE_KEY}
+               AND NULLIF(BTRIM(items.order_store_key), '') IS NOT NULL
+                THEN items.order_store_name
+              WHEN catalog.id IS NOT NULL THEN catalog.store_name
+              ELSE 'Unassigned'
+            END AS store_name,
+            catalog.components,
+            COALESCE(catalog.physical_mapping_ready, false)
+              AND (
+                items.order_store_key = ${COMBINED_ORDER_STORE_KEY}
+                OR catalog.store_key = items.order_store_key
+              ) AS physical_mapping_ready
+          FROM canonical_order_items items
+          LEFT JOIN unique_catalog catalog ON catalog.sku_id = items.resolved_sku_id
+        ),
         physical_sales AS (
           SELECT
-            COALESCE(NULLIF(rows.store_key, ''), 'unassigned') AS store_key,
-            MIN(COALESCE(NULLIF(rows.store_name, ''), 'Unassigned')) AS store_name,
-            COALESCE(SUM(rows.qty), 0)::int AS sold_units
-          FROM inventory_txn_rows rows
-          WHERE rows.txn_type = 'sales'
-            AND rows.applied_at >= ${from}
-            AND NOT EXISTS (
-              SELECT 1
-              FROM inventory_transactions transactions
-              WHERE transactions.rolled_back_at IS NOT NULL
-                AND (
-                  transactions.id = rows.transaction_id
-                  OR (
-                    rows.transaction_id IS NULL
-                    AND transactions.transaction_type = rows.txn_type
-                    AND transactions.source_file IS NOT DISTINCT FROM rows.source_file
-                    AND transactions.applied_by IS NOT DISTINCT FROM rows.applied_by
-                    AND ABS(EXTRACT(EPOCH FROM (
-                      transactions.applied_at - rows.applied_at
-                    ))) <= 30
-                  )
-                )
-            )
-          GROUP BY COALESCE(NULLIF(rows.store_key, ''), 'unassigned')
+            items.store_key,
+            MIN(items.store_name) AS store_name,
+            COALESCE(SUM(items.quantity * component.qty), 0)::int AS sold_units
+          FROM sales_items items
+          CROSS JOIN LATERAL jsonb_to_recordset(
+            CASE WHEN items.physical_mapping_ready THEN items.components ELSE '[]'::jsonb END
+          ) AS component(style TEXT, color TEXT, size TEXT, qty INTEGER)
+          GROUP BY items.store_key
+        ),
+        physical_sku_sales AS (
+          SELECT
+            LOWER(BTRIM(component.style)) AS style_key,
+            LOWER(BTRIM(component.color)) AS color_key,
+            CASE UPPER(BTRIM(component.size))
+              WHEN '1XL' THEN '1X' WHEN '2XL' THEN '2X' WHEN '3XL' THEN '3X'
+              ELSE UPPER(BTRIM(component.size))
+            END AS size_key,
+            MIN(component.style) AS style,
+            MIN(component.color) AS color,
+            MIN(component.size) AS size,
+            COALESCE(SUM(items.quantity * component.qty), 0)::int AS sold_qty
+          FROM sales_items items
+          CROSS JOIN LATERAL jsonb_to_recordset(
+            CASE WHEN items.physical_mapping_ready THEN items.components ELSE '[]'::jsonb END
+          ) AS component(style TEXT, color TEXT, size TEXT, qty INTEGER)
+          GROUP BY 1, 2, 3
         ),
         product_sales AS (
           SELECT
-            orders.store_key,
-            MIN(orders.store_name) AS store_name,
-            COALESCE(SUM(items.quantity), 0)::int AS sold_product_units
-          FROM return_orders orders
-          JOIN return_order_items items ON items.order_id = orders.id
-          WHERE orders.inventory_status = 'applied'
-            AND orders.order_created_at >= ${from}
-          GROUP BY orders.store_key
+            store_key,
+            MIN(store_name) AS store_name,
+            COALESCE(SUM(quantity), 0)::int AS sold_product_units,
+            COALESCE(SUM(quantity) FILTER (WHERE physical_mapping_ready), 0)::int
+              AS covered_product_units,
+            COALESCE(SUM(quantity) FILTER (WHERE NOT physical_mapping_ready), 0)::int
+              AS uncovered_product_units,
+            COALESCE(SUM(quantity) FILTER (WHERE NOT inventory_reconciled), 0)::int
+              AS unreconciled_product_units
+          FROM sales_items
+          GROUP BY store_key
         ),
         sku_product_returns AS (
           SELECT
@@ -2381,117 +2938,201 @@ export default async function handler(req, res) {
           FROM sku_product_returns
           GROUP BY store_key
         ),
-        keys AS (
+        store_keys AS (
           SELECT store_key FROM package_returns
           UNION SELECT store_key FROM physical_sales
           UNION SELECT store_key FROM product_sales
           UNION SELECT store_key FROM product_returns
-        )
-        SELECT
-          COALESCE(packages.store_name, physical.store_name, sold_products.store_name,
-                   returned_products.store_name, 'Unassigned') AS store_name,
-          COALESCE(packages.received_packages, 0)::int AS received_packages,
-          COALESCE(packages.discrepancy_packages, 0)::int AS discrepancy_packages,
-          COALESCE(packages.flagged_packages, 0)::int AS flagged_packages,
-          COALESCE(packages.expected_units, 0)::int AS expected_units,
-          COALESCE(packages.returned_units, 0)::int AS returned_units,
-          COALESCE(packages.restocked_units, 0)::int AS restocked_units,
-          COALESCE(physical.sold_units, 0)::int AS sold_units,
-          COALESCE(sold_products.sold_product_units, 0)::int AS sold_product_units,
-          COALESCE(returned_products.returned_product_units, 0)::int AS returned_product_units,
-          CASE WHEN COALESCE(physical.sold_units, 0) > 0
-            THEN ROUND(COALESCE(packages.returned_units, 0)::numeric * 100 / physical.sold_units, 2)
-            ELSE NULL END AS physical_return_rate,
-          CASE WHEN COALESCE(sold_products.sold_product_units, 0) > 0
-            THEN ROUND(
-              COALESCE(returned_products.returned_product_units, 0)::numeric
-              * 100 / sold_products.sold_product_units,
-              2
-            )
-            ELSE NULL END AS product_return_rate
-        FROM keys
-        LEFT JOIN package_returns packages USING (store_key)
-        LEFT JOIN physical_sales physical USING (store_key)
-        LEFT JOIN product_sales sold_products USING (store_key)
-        LEFT JOIN product_returns returned_products USING (store_key)
-        ORDER BY returned_units DESC, store_name
-      `
-      const rows = await sql`
-        WITH sales AS (
-          SELECT
-            LOWER(BTRIM(style)) AS style_key,
-            LOWER(BTRIM(color)) AS color_key,
-            UPPER(BTRIM(size)) AS size_key,
-            MIN(style) AS style,
-            MIN(color) AS color,
-            MIN(size) AS size,
-            SUM(qty)::int AS sold_qty
-          FROM inventory_txn_rows
-          WHERE txn_type = 'sales'
-            AND applied_at >= ${from}
-            AND NOT EXISTS (
-              SELECT 1
-              FROM inventory_transactions transactions
-              WHERE transactions.rolled_back_at IS NOT NULL
-                AND (
-                  transactions.id = inventory_txn_rows.transaction_id
-                  OR (
-                    inventory_txn_rows.transaction_id IS NULL
-                    AND transactions.transaction_type = inventory_txn_rows.txn_type
-                    AND transactions.source_file IS NOT DISTINCT FROM inventory_txn_rows.source_file
-                    AND transactions.applied_by IS NOT DISTINCT FROM inventory_txn_rows.applied_by
-                    AND ABS(EXTRACT(EPOCH FROM (
-                      transactions.applied_at - inventory_txn_rows.applied_at
-                    ))) <= 30
-                  )
-                )
-            )
-          GROUP BY 1, 2, 3
         ),
-        returns AS (
+        store_output AS (
+          SELECT
+            keys.store_key,
+            COALESCE(packages.store_name, physical.store_name, sold_products.store_name,
+                     returned_products.store_name, 'Unassigned') AS store_name,
+            COALESCE(packages.received_packages, 0)::int AS received_packages,
+            COALESCE(packages.discrepancy_packages, 0)::int AS discrepancy_packages,
+            COALESCE(packages.flagged_packages, 0)::int AS flagged_packages,
+            COALESCE(packages.expected_units, 0)::int AS expected_units,
+            COALESCE(packages.returned_units, 0)::int AS returned_units,
+            COALESCE(packages.restocked_units, 0)::int AS restocked_units,
+            COALESCE(physical.sold_units, 0)::int AS sold_units,
+            COALESCE(sold_products.sold_product_units, 0)::int AS sold_product_units,
+            COALESCE(sold_products.covered_product_units, 0)::int
+              AS covered_sales_product_units,
+            COALESCE(sold_products.uncovered_product_units, 0)::int
+              AS uncovered_sales_product_units,
+            COALESCE(sold_products.unreconciled_product_units, 0)::int
+              AS unreconciled_sales_product_units,
+            COALESCE(returned_products.returned_product_units, 0)::int
+              AS returned_product_units,
+            CASE
+              WHEN COALESCE(sold_products.uncovered_product_units, 0) > 0 THEN NULL
+              WHEN COALESCE(physical.sold_units, 0) > 0
+              THEN ROUND(
+                COALESCE(packages.returned_units, 0)::numeric * 100 / physical.sold_units,
+                2
+              )
+              ELSE NULL
+            END AS physical_return_rate,
+            CASE WHEN COALESCE(sold_products.sold_product_units, 0) > 0
+              THEN ROUND(
+                COALESCE(returned_products.returned_product_units, 0)::numeric
+                * 100 / sold_products.sold_product_units,
+                2
+              )
+              ELSE NULL
+            END AS product_return_rate
+          FROM store_keys keys
+          LEFT JOIN package_returns packages USING (store_key)
+          LEFT JOIN physical_sales physical USING (store_key)
+          LEFT JOIN product_sales sold_products USING (store_key)
+          LEFT JOIN product_returns returned_products USING (store_key)
+        ),
+        physical_sku_returns AS (
           SELECT
             LOWER(BTRIM(items.style)) AS style_key,
             LOWER(BTRIM(items.color)) AS color_key,
-            UPPER(BTRIM(items.size)) AS size_key,
+            CASE UPPER(BTRIM(items.size))
+              WHEN '1XL' THEN '1X' WHEN '2XL' THEN '2X' WHEN '3XL' THEN '3X'
+              ELSE UPPER(BTRIM(items.size))
+            END AS size_key,
             MIN(items.style) AS style,
             MIN(items.color) AS color,
             MIN(items.size) AS size,
-            SUM(items.actual_qty)::int AS returned_qty
+            COALESCE(SUM(items.actual_qty), 0)::int AS returned_qty,
+            COALESCE(SUM(items.restock_qty), 0)::int AS restocked_qty
           FROM return_package_items items
           JOIN return_packages packages ON packages.id = items.package_id
           WHERE packages.status IN ('received', 'discrepancy')
             AND packages.confirmed_at >= ${from}
           GROUP BY 1, 2, 3
         ),
-        keys AS (
-          SELECT style_key, color_key, size_key FROM sales
+        physical_sku_keys AS (
+          SELECT style_key, color_key, size_key FROM physical_sku_sales
           UNION
-          SELECT style_key, color_key, size_key FROM returns
+          SELECT style_key, color_key, size_key FROM physical_sku_returns
+        ),
+        physical_sku_output AS (
+          SELECT
+            COALESCE(sales.style, returned.style) AS style,
+            COALESCE(sales.color, returned.color) AS color,
+            COALESCE(sales.size, returned.size) AS size,
+            COALESCE(sales.sold_qty, 0)::int AS sold_qty,
+            COALESCE(returned.returned_qty, 0)::int AS returned_qty,
+            COALESCE(returned.restocked_qty, 0)::int AS restocked_qty,
+            NOT EXISTS (
+              SELECT 1 FROM product_sales WHERE uncovered_product_units > 0
+            ) AS coverage_complete,
+            NOT EXISTS (
+              SELECT 1 FROM product_sales WHERE unreconciled_product_units > 0
+            ) AS inventory_reconciliation_complete,
+            'canonical_orders_catalog'::text AS sales_source,
+            CASE
+              WHEN EXISTS (
+                SELECT 1 FROM product_sales WHERE uncovered_product_units > 0
+              ) THEN NULL
+              WHEN COALESCE(sales.sold_qty, 0) > 0
+              THEN ROUND(
+                COALESCE(returned.returned_qty, 0)::numeric * 100 / sales.sold_qty,
+                2
+              )
+              ELSE NULL
+            END AS return_rate
+          FROM physical_sku_keys keys
+          LEFT JOIN physical_sku_sales sales USING (style_key, color_key, size_key)
+          LEFT JOIN physical_sku_returns returned USING (style_key, color_key, size_key)
+          WHERE COALESCE(returned.returned_qty, 0) > 0
         )
         SELECT
-          COALESCE(sales.style, returns.style) AS style,
-          COALESCE(sales.color, returns.color) AS color,
-          COALESCE(sales.size, returns.size) AS size,
-          COALESCE(sales.sold_qty, 0)::int AS sold_qty,
-          COALESCE(returns.returned_qty, 0)::int AS returned_qty,
-          CASE
-            WHEN COALESCE(sales.sold_qty, 0) > 0
-            THEN ROUND(COALESCE(returns.returned_qty, 0)::numeric * 100 / sales.sold_qty, 2)
-            ELSE NULL
-          END AS return_rate
-        FROM keys
-        LEFT JOIN sales USING (style_key, color_key, size_key)
-        LEFT JOIN returns USING (style_key, color_key, size_key)
-        WHERE COALESCE(returns.returned_qty, 0) > 0
-        ORDER BY returned_qty DESC, style, color, size
-        LIMIT 500
+          COALESCE((
+            SELECT jsonb_agg(to_jsonb(store_output)
+              ORDER BY returned_units DESC, store_name)
+            FROM store_output
+          ), '[]'::jsonb) AS stores,
+          COALESCE((
+            SELECT jsonb_agg(to_jsonb(physical_sku_output)
+              ORDER BY returned_qty DESC, style, color, size)
+            FROM (
+              SELECT * FROM physical_sku_output
+              ORDER BY returned_qty DESC, style, color, size
+              LIMIT 500
+            ) physical_sku_output
+          ), '[]'::jsonb) AS rows
       `
+      const stores = Array.isArray(analyticsBreakdown?.stores)
+        ? analyticsBreakdown.stores
+        : []
+      const rows = Array.isArray(analyticsBreakdown?.rows)
+        ? analyticsBreakdown.rows
+        : []
+      const salesCoverage = stores.reduce((totals, store) => ({
+        product_units: totals.product_units + Number(store.sold_product_units || 0),
+        covered_product_units:
+          totals.covered_product_units + Number(store.covered_sales_product_units || 0),
+        uncovered_product_units:
+          totals.uncovered_product_units + Number(store.uncovered_sales_product_units || 0),
+        unreconciled_product_units:
+          totals.unreconciled_product_units
+          + Number(store.unreconciled_sales_product_units || 0),
+        unassigned_product_units: totals.unassigned_product_units
+          + (store.store_key === 'unassigned' ? Number(store.sold_product_units || 0) : 0),
+        mapped_physical_units: totals.mapped_physical_units + Number(store.sold_units || 0),
+      }), {
+        product_units: 0,
+        covered_product_units: 0,
+        uncovered_product_units: 0,
+        unreconciled_product_units: 0,
+        unassigned_product_units: 0,
+        mapped_physical_units: 0,
+      })
+      summary.sales_catalog_coverage = {
+        ...salesCoverage,
+        inventory_physical_units: summary.inventory_physical_units,
+        complete: salesCoverage.uncovered_product_units === 0
+          && salesCoverage.unassigned_product_units === 0,
+        inventory_reconciliation_complete:
+          salesCoverage.unreconciled_product_units === 0,
+        unresolved: stores
+          .filter((store) => Number(store.uncovered_sales_product_units || 0) > 0)
+          .map((store) => ({
+            store_key: store.store_key,
+            store_name: store.store_name,
+            product_units: Number(store.uncovered_sales_product_units || 0),
+          })),
+      }
+      summary.sold_units = salesCoverage.mapped_physical_units
+      summary.total_return_rate = summary.sales_catalog_coverage.complete
+        && summary.sold_units > 0
+        ? Number(summary.returned_units || 0) * 100 / summary.sold_units
+        : null
+      summary.physical_sales_source = 'canonical_orders_catalog'
+      summary.inventory_reconciliation_delta = summary.sold_units
+        - summary.inventory_physical_units
+      summary.sold_product_units = salesCoverage.product_units
+      summary.product_return_rate = summary.sold_product_units > 0
+        ? summary.returned_product_units * 100 / summary.sold_product_units
+        : null
       return res.json({ days, summary, stores, rows })
     }
 
     return res.status(400).json({ error: `Unknown action: ${action}` })
   } catch (error) {
     console.error('[/api/returns]', error.message)
+    if (/return_inventory_target_changed/.test(error.message)) {
+      return res.status(409).json({
+        error: 'One or more inventory targets changed before the return could be saved. Refresh the package and try again.',
+      })
+    }
+    if (/return_package_changed/.test(error.message)) {
+      return res.status(409).json({
+        error: 'This return package changed while it was being saved. Refresh the package and confirm it again.',
+      })
+    }
+    if (/could not serialize access|serialization failure/i.test(error.message)) {
+      return res.status(409).json({
+        error: 'Inventory or return data changed while it was being saved. Refresh and try again.',
+      })
+    }
     if (/division by zero|inventory_transactions_active_source_hash_uq/.test(error.message)) {
       return res.status(409).json({ error: 'This return package was already received. Inventory was not changed.' })
     }
