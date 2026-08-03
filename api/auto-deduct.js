@@ -55,6 +55,42 @@ async function ensureDeductLogTable(sql) {
   `
 }
 
+export function patchAliasesQuery(sql, upsertsJson, deleteKeysJson, username) {
+  return sql`
+    WITH saved_aliases AS (
+      INSERT INTO app_data (key, value, updated_at)
+      VALUES (
+        'autodeduct_aliases',
+        jsonb_build_object(
+          'aliases', ${upsertsJson}::jsonb,
+          'updatedAt', NOW(),
+          'updatedBy', ${username}::text
+        ),
+        NOW()
+      )
+      ON CONFLICT (key) DO UPDATE SET
+        value = jsonb_build_object(
+          'aliases',
+          (
+            COALESCE(app_data.value->'aliases', '{}'::jsonb)
+            - ARRAY(
+                SELECT jsonb_array_elements_text(${deleteKeysJson}::jsonb)
+              )
+          ) || ${upsertsJson}::jsonb,
+          'updatedAt', NOW(),
+          'updatedBy', ${username}::text
+        ),
+        updated_at = NOW()
+      RETURNING value
+    )
+    SELECT COUNT(alias_key)::int AS count
+    FROM saved_aliases
+    CROSS JOIN LATERAL jsonb_object_keys(
+      COALESCE(saved_aliases.value->'aliases', '{}'::jsonb)
+    ) AS alias_keys(alias_key)
+  `
+}
+
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*')
   res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type')
@@ -156,39 +192,12 @@ export default async function handler(req, res) {
       }
       const upsertsJson = JSON.stringify(upserts)
       const deleteKeysJson = JSON.stringify(cleanDeleteKeys)
-      const [saved] = await sql`
-        WITH saved_aliases AS (
-          INSERT INTO app_data (key, value, updated_at)
-          VALUES (
-            'autodeduct_aliases',
-            jsonb_build_object(
-              'aliases', ${upsertsJson}::jsonb,
-              'updatedAt', NOW(),
-              'updatedBy', ${payload.username}
-            ),
-            NOW()
-          )
-          ON CONFLICT (key) DO UPDATE SET
-            value = jsonb_build_object(
-              'aliases',
-              (
-                COALESCE(app_data.value->'aliases', '{}'::jsonb)
-                - ARRAY(
-                    SELECT jsonb_array_elements_text(${deleteKeysJson}::jsonb)
-                  )
-              ) || ${upsertsJson}::jsonb,
-              'updatedAt', NOW(),
-              'updatedBy', ${payload.username}
-            ),
-            updated_at = NOW()
-          RETURNING value
-        )
-        SELECT COUNT(alias_key)::int AS count
-        FROM saved_aliases
-        CROSS JOIN LATERAL jsonb_object_keys(
-          COALESCE(saved_aliases.value->'aliases', '{}'::jsonb)
-        ) AS alias_keys(alias_key)
-      `
+      const [saved] = await patchAliasesQuery(
+        sql,
+        upsertsJson,
+        deleteKeysJson,
+        payload.username,
+      )
       return res.json({ ok: true, count: Number(saved?.count || 0) })
     }
 
