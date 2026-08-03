@@ -157,30 +157,37 @@ export default async function handler(req, res) {
       const upsertsJson = JSON.stringify(upserts)
       const deleteKeysJson = JSON.stringify(cleanDeleteKeys)
       const [saved] = await sql`
-        INSERT INTO app_data (key, value, updated_at)
-        VALUES (
-          'autodeduct_aliases',
-          jsonb_build_object(
-            'aliases', ${upsertsJson}::jsonb,
-            'updatedAt', NOW(),
-            'updatedBy', ${payload.username}
-          ),
-          NOW()
+        WITH saved_aliases AS (
+          INSERT INTO app_data (key, value, updated_at)
+          VALUES (
+            'autodeduct_aliases',
+            jsonb_build_object(
+              'aliases', ${upsertsJson}::jsonb,
+              'updatedAt', NOW(),
+              'updatedBy', ${payload.username}
+            ),
+            NOW()
+          )
+          ON CONFLICT (key) DO UPDATE SET
+            value = jsonb_build_object(
+              'aliases',
+              (
+                COALESCE(app_data.value->'aliases', '{}'::jsonb)
+                - ARRAY(
+                    SELECT jsonb_array_elements_text(${deleteKeysJson}::jsonb)
+                  )
+              ) || ${upsertsJson}::jsonb,
+              'updatedAt', NOW(),
+              'updatedBy', ${payload.username}
+            ),
+            updated_at = NOW()
+          RETURNING value
         )
-        ON CONFLICT (key) DO UPDATE SET
-          value = jsonb_build_object(
-            'aliases',
-            (
-              COALESCE(app_data.value->'aliases', '{}'::jsonb)
-              - ARRAY(
-                  SELECT jsonb_array_elements_text(${deleteKeysJson}::jsonb)
-                )
-            ) || ${upsertsJson}::jsonb,
-            'updatedAt', NOW(),
-            'updatedBy', ${payload.username}
-          ),
-          updated_at = NOW()
-        RETURNING jsonb_object_length(value->'aliases')::int AS count
+        SELECT COUNT(alias_key)::int AS count
+        FROM saved_aliases
+        CROSS JOIN LATERAL jsonb_object_keys(
+          COALESCE(saved_aliases.value->'aliases', '{}'::jsonb)
+        ) AS alias_keys(alias_key)
       `
       return res.json({ ok: true, count: Number(saved?.count || 0) })
     }
