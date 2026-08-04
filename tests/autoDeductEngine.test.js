@@ -29,7 +29,7 @@ import inventoryTargetResolution from '../lib/inventoryTargetResolution.cjs'
 import returnPackageSafety from '../lib/returnPackageSafety.cjs'
 
 const { resolveInventoryTargets } = inventoryTargetResolution
-const { mergeReturnPackageItems } = returnPackageSafety
+const { mergeInventoryComponents, mergeReturnPackageItems } = returnPackageSafety
 
 test('returns store choices use Analytics as the canonical store list', () => {
   const stores = mergeAnalyticsReturnStores([
@@ -172,6 +172,19 @@ test('return item merging keeps product-unit coverage only when every source qua
   }])
   assert.equal(legacyMixed[0].expected_qty, 4)
   assert.equal(legacyMixed[0].source_qty, null)
+})
+
+test('admin return combinations keep multiple inventory targets and merge duplicate selections', () => {
+  const components = mergeInventoryComponents([
+    { style: '62300SET', color: 'BLACK', size: '1X', qty: 1 },
+    { style: '62300SET', color: 'DENIM', size: '1X', qty: 1 },
+    { style: '62300SET', color: 'black', size: '1XL', qty: 2 },
+  ])
+
+  assert.deepEqual(components, [
+    { style: '62300SET', color: 'BLACK', size: '1X', qty: 3 },
+    { style: '62300SET', color: 'DENIM', size: '1X', qty: 1 },
+  ])
 })
 
 test('petite sales sizes are shifted exactly once', () => {

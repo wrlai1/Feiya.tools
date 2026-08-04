@@ -6,7 +6,7 @@ import { summarizeReturnInspection } from '../src/utils/returnInspection.js'
 
 const { resolveInventoryTargets } = inventoryTargetResolution
 const { authenticateUser } = authentication
-const { itemIdentity, mergeReturnPackageItems } = returnPackageSafety
+const { itemIdentity, mergeInventoryComponents, mergeReturnPackageItems } = returnPackageSafety
 const MAX_PACKAGES_PER_IMPORT = 5000
 const MAX_ITEMS_PER_IMPORT = 50000
 const MAX_CATALOG_ROWS_PER_IMPORT = 20000
@@ -1618,12 +1618,12 @@ export default async function handler(req, res) {
           error: 'One or more selected style, color, and size targets are not unique in inventory',
         })
       }
-      const components = resolution.rows.map((component) => ({
+      const components = mergeInventoryComponents(resolution.rows.map((component) => ({
         style: component.style,
         color: component.color,
         size: component.size,
         qty: component.qty,
-      }))
+      })))
       const packageItems = components.map((component) => ({
         sku_id: skuId,
         sku_code: unresolvedSku.skuCode,

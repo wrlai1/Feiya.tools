@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle,
   BarChart3,
+  Camera,
   CheckCircle2,
   ClipboardList,
   Database,
@@ -161,6 +162,113 @@ function CountControl({ value, onChange, disabled, max = 9999, label = 'Actual q
   )
 }
 
+function PhoneCameraScanner({ open, onClose, onDetected }) {
+  const videoRef = useRef(null)
+  const controlsRef = useRef(null)
+  const detectedRef = useRef(false)
+  const [starting, setStarting] = useState(false)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    if (!open) return undefined
+    let active = true
+    detectedRef.current = false
+    setStarting(true)
+    setError('')
+
+    const start = async () => {
+      try {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          throw new Error('Camera scanning is not supported by this browser')
+        }
+        const { BrowserMultiFormatReader } = await import('@zxing/browser')
+        const reader = new BrowserMultiFormatReader()
+        const controls = await reader.decodeFromConstraints({
+          audio: false,
+          video: {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
+        }, videoRef.current, (result, _scanError, scanControls) => {
+          const value = String(result?.getText?.() || '').trim()
+          if (!value || detectedRef.current || !active) return
+          detectedRef.current = true
+          scanControls.stop()
+          navigator.vibrate?.(100)
+          onDetected(value)
+        })
+        if (!active) {
+          controls.stop()
+          return
+        }
+        controlsRef.current = controls
+      } catch (cameraError) {
+        if (!active) return
+        const permissionDenied = cameraError?.name === 'NotAllowedError'
+          || cameraError?.name === 'PermissionDeniedError'
+        setError(permissionDenied
+          ? 'Allow camera access in your browser settings / Permita acceso a la cámara'
+          : `${cameraError.message || 'Could not start camera'} / No se pudo abrir la cámara`)
+      } finally {
+        if (active) setStarting(false)
+      }
+    }
+
+    start()
+    return () => {
+      active = false
+      controlsRef.current?.stop()
+      controlsRef.current = null
+    }
+  }, [onDetected, open])
+
+  if (!open) return null
+  return (
+    <div className="fixed inset-0 z-[100] flex flex-col bg-slate-950 text-white" role="dialog" aria-modal="true">
+      <div className="flex items-center justify-between gap-3 px-4 py-4 safe-area-inset-top">
+        <div>
+          <p className="font-bold">Scan Tracking / Escanear rastreo</p>
+          <p className="mt-0.5 text-xs text-slate-300">Point the back camera at the barcode.</p>
+        </div>
+        <button
+          type="button"
+          onClick={onClose}
+          className="flex h-11 w-11 items-center justify-center rounded-full bg-white/15"
+          aria-label="Close camera"
+        >
+          <XCircle className="h-6 w-6" />
+        </button>
+      </div>
+      <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-black">
+        <video ref={videoRef} playsInline muted className="h-full w-full object-cover" />
+        {!error && (
+          <div className="pointer-events-none absolute left-1/2 top-1/2 h-36 w-[86%] max-w-xl -translate-x-1/2 -translate-y-1/2 rounded-2xl border-2 border-emerald-400 shadow-[0_0_0_999px_rgba(0,0,0,0.35)]">
+            <div className="absolute left-4 right-4 top-1/2 h-0.5 bg-red-400/90" />
+          </div>
+        )}
+        {starting && (
+          <div className="absolute inset-0 flex items-center justify-center bg-slate-950/70">
+            <RefreshCw className="h-8 w-8 animate-spin" />
+          </div>
+        )}
+        {error && (
+          <div className="mx-5 rounded-2xl border border-red-300/30 bg-red-950/90 p-5 text-center">
+            <AlertTriangle className="mx-auto h-8 w-8 text-red-300" />
+            <p className="mt-3 text-sm font-semibold">{error}</p>
+            <button type="button" onClick={onClose} className="mt-4 min-h-11 rounded-xl bg-white px-5 text-sm font-bold text-slate-900">
+              Close / Cerrar
+            </button>
+          </div>
+        )}
+      </div>
+      <p className="px-4 py-4 text-center text-sm text-slate-300">
+        The package opens automatically after a successful scan.
+      </p>
+    </div>
+  )
+}
+
 function OrderDetails({ order, compact = false }) {
   if (!order) return null
   return (
@@ -229,6 +337,7 @@ export default function ReturnsReceiving() {
   const [counts, setCounts] = useState({})
   const [remark, setRemark] = useState('')
   const [counted, setCounted] = useState(false)
+  const [cameraOpen, setCameraOpen] = useState(false)
   const [recent, setRecent] = useState([])
   const [reviewPackages, setReviewPackages] = useState([])
   const [file, setFile] = useState(null)
@@ -255,6 +364,7 @@ export default function ReturnsReceiving() {
   const [reviewAliases, setReviewAliases] = useState({})
   const [reviewSkuSelections, setReviewSkuSelections] = useState({})
   const [reviewManualTargets, setReviewManualTargets] = useState({})
+  const [reviewMappingModes, setReviewMappingModes] = useState({})
   const [reviewMappingLoading, setReviewMappingLoading] = useState(false)
   const [reviewSavingSku, setReviewSavingSku] = useState('')
 
@@ -403,10 +513,17 @@ export default function ReturnsReceiving() {
     }
   }, [demoMode, getToken, toast, tracking])
 
+  const handleCameraScan = useCallback((value) => {
+    setCameraOpen(false)
+    setTracking(value)
+    lookup(value)
+  }, [lookup])
+
   useEffect(() => {
     const unresolvedSkus = pkg?.review_data?.unresolvedSkus || []
     setReviewSkuSelections({})
     setReviewManualTargets({})
+    setReviewMappingModes({})
     if (!isAdmin || !unresolvedSkus.length || demoMode) {
       setReviewCatalogRows([])
       setReviewInventoryRows([])
@@ -751,7 +868,7 @@ export default function ReturnsReceiving() {
 
   const reviewSelectionFor = (row, index) => {
     const key = `${row.skuId}:${index}`
-    return reviewSkuSelections[key] || reviewSuggestedSelections[key] || {}
+    return reviewSkuSelections[key] || {}
   }
 
   const saveReviewedSkuMapping = async (row) => {
@@ -762,7 +879,8 @@ export default function ReturnsReceiving() {
       let selections = []
       const canMapSources = row.sourceComponents?.length
         && row.sourceComponents.every((source) => source.size)
-      if (row.status !== 'ready' && canMapSources) {
+      const useManualMapping = reviewMappingModes[row.skuId] === 'manual' || !canMapSources
+      if (row.status !== 'ready' && !useManualMapping) {
         selections = row.sourceComponents.map((_, index) => reviewSelectionFor(row, index))
         components = applyProductCatalogMapping(
           [row],
@@ -800,7 +918,7 @@ export default function ReturnsReceiving() {
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || 'Could not save this SKU mapping')
 
-      if (canMapSources && row.sourceComponents.length === components.length) {
+      if (!useManualMapping && canMapSources && row.sourceComponents.length === components.length) {
         const nextAliases = { ...reviewAliases }
         const aliasUpserts = {}
         row.sourceComponents.forEach((source, index) => {
@@ -1083,9 +1201,23 @@ export default function ReturnsReceiving() {
               </button>
             </div>
             <p className="mt-2 text-xs text-slate-400">
-              Scanner or phone works here / Use escáner o teléfono aquí.
+              Scanner, manual entry, or phone camera / Escáner, texto o cámara del teléfono.
             </p>
+            <button
+              type="button"
+              onClick={() => setCameraOpen(true)}
+              className="mt-3 flex min-h-12 w-full items-center justify-center gap-2 rounded-xl border border-blue-200 bg-blue-50 px-4 text-sm font-bold text-blue-700 hover:bg-blue-100 sm:w-auto"
+            >
+              <Camera className="h-5 w-5" />
+              Scan with phone camera / Escanear con cámara
+            </button>
           </form>
+
+          <PhoneCameraScanner
+            open={cameraOpen}
+            onClose={() => setCameraOpen(false)}
+            onDetected={handleCameraScan}
+          />
 
           {orderChoices.length > 0 && (
             <div className="card p-4 sm:p-5">
@@ -1221,6 +1353,10 @@ export default function ReturnsReceiving() {
                       {reviewCatalogRows.map((row) => {
                         const canMapSources = row.sourceComponents?.length
                           && row.sourceComponents.every((source) => source.size)
+                        const useParsedSources = canMapSources
+                          && reviewMappingModes[row.skuId] !== 'manual'
+                        const useReadyMapping = row.status === 'ready'
+                          && reviewMappingModes[row.skuId] !== 'manual'
                         const manualTargets = reviewManualTargets[row.skuId]
                           || [{ style: '', color: '', size: '', qty: 1 }]
                         return (
@@ -1237,7 +1373,7 @@ export default function ReturnsReceiving() {
                               </span>
                             </div>
 
-                            {row.status === 'ready' ? (
+                            {useReadyMapping ? (
                               <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50 p-3">
                                 <p className="text-xs font-semibold text-emerald-800">
                                   Exact inventory combination found. Confirm once to remember it.
@@ -1253,12 +1389,23 @@ export default function ReturnsReceiving() {
                                     </span>
                                   ))}
                                 </div>
+                                <button
+                                  type="button"
+                                  onClick={() => setReviewMappingModes((current) => ({
+                                    ...current,
+                                    [row.skuId]: 'manual',
+                                  }))}
+                                  className="mt-3 text-xs font-semibold text-blue-700 underline underline-offset-2"
+                                >
+                                  Not correct? Choose manually or build a combination / Elegir manualmente
+                                </button>
                               </div>
-                            ) : canMapSources ? (
+                            ) : useParsedSources ? (
                               <div className="mt-3 space-y-3">
                                 {row.sourceComponents.map((source, index) => {
                                   const selectionKey = `${row.skuId}:${index}`
                                   const selection = reviewSelectionFor(row, index)
+                                  const suggestion = reviewSuggestedSelections[selectionKey] || {}
                                   const styleOptions = [...new Set(
                                     reviewInventoryRows
                                       .filter((target) => sameSize(target.SIZE, source.size))
@@ -1278,10 +1425,25 @@ export default function ReturnsReceiving() {
                                         Source: {source.style} / {source.color} / {source.size}
                                         {Number(source.qty || 1) > 1 ? ` ×${source.qty}` : ''}
                                       </p>
-                                      {selection.matchedBy && (
-                                        <p className="mt-1 text-xs font-semibold text-emerald-700">
-                                          Auto Deduct suggestion / Sugerencia automática
-                                        </p>
+                                      {suggestion.style && suggestion.color && (
+                                        <div className="mt-2 flex flex-col gap-2 rounded-lg border border-blue-200 bg-blue-50 p-2 sm:flex-row sm:items-center sm:justify-between">
+                                          <p className="text-xs text-blue-800">
+                                            Suggested / Sugerido: <strong>{suggestion.style} / {suggestion.color}</strong>
+                                          </p>
+                                          <button
+                                            type="button"
+                                            onClick={() => setReviewSkuSelections((current) => ({
+                                              ...current,
+                                              [selectionKey]: {
+                                                style: suggestion.style,
+                                                color: suggestion.color,
+                                              },
+                                            }))}
+                                            className="min-h-9 rounded-lg border border-blue-300 bg-white px-3 text-xs font-semibold text-blue-700"
+                                          >
+                                            Use suggestion / Usar
+                                          </button>
+                                        </div>
                                       )}
                                       <div className="mt-2 grid gap-2 sm:grid-cols-2">
                                         <label className="text-xs font-medium text-slate-600">
@@ -1324,9 +1486,32 @@ export default function ReturnsReceiving() {
                                     </div>
                                   )
                                 })}
+                                <button
+                                  type="button"
+                                  onClick={() => setReviewMappingModes((current) => ({
+                                    ...current,
+                                    [row.skuId]: 'manual',
+                                  }))}
+                                  className="btn-secondary min-h-11 w-full justify-center sm:w-auto"
+                                >
+                                  <Plus className="h-4 w-4" />
+                                  Choose a combination / Elegir combinación
+                                </button>
                               </div>
                             ) : (
                               <div className="mt-3 space-y-3">
+                                {canMapSources && (
+                                  <button
+                                    type="button"
+                                    onClick={() => setReviewMappingModes((current) => ({
+                                      ...current,
+                                      [row.skuId]: 'parsed',
+                                    }))}
+                                    className="text-xs font-semibold text-blue-700 underline underline-offset-2"
+                                  >
+                                    Back to listed pieces / Volver a piezas detectadas
+                                  </button>
+                                )}
                                 <p className="text-xs text-amber-800">
                                   Add one row per inventory style/color/size. Quantity is the number
                                   of physical pieces inside one sold product; use Add item for a mixed set.
