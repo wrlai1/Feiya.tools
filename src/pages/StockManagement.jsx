@@ -5,6 +5,7 @@ import {
   Pencil, Plus, Minus,
 } from 'lucide-react'
 import DataTable from '../components/DataTable.jsx'
+import DailyStyleReport from '../components/DailyStyleReport.jsx'
 import FileUploadZone from '../components/FileUploadZone.jsx'
 import ReplenishmentPlan from '../components/ReplenishmentPlan.jsx'
 import { useToast } from '../hooks/useToast.js'
@@ -1064,7 +1065,9 @@ export default function StockManagement() {
           <p className="text-sm text-slate-500 mt-0.5">
             {activeView === 'balance'
               ? 'Real-time inventory balance — updated every time you run Auto Deduct'
-              : 'Factory replenishment suggestions based on real inventory movement'}
+              : activeView === 'daily-report'
+                ? 'One-style daily inventory, sales comparison, and days-of-stock report'
+                : 'Factory replenishment suggestions based on real inventory movement'}
           </p>
         </div>
         {activeView === 'balance' && (
@@ -1109,6 +1112,7 @@ export default function StockManagement() {
           <div className="flex w-full rounded-xl bg-slate-100 p-1 sm:w-fit">
             {[
               ['balance', 'Inventory Balance'],
+              ['daily-report', 'Daily Style Report'],
               ['replenishment', 'Replenishment Plan'],
             ].map(([value, label]) => (
               <button
@@ -1130,6 +1134,8 @@ export default function StockManagement() {
               inventoryRows={allRows}
               storageOwner={user?.username || user?.name || 'admin'}
             />
+          ) : activeView === 'daily-report' ? (
+            <DailyStyleReport inventoryRows={allRows} />
           ) : (
             <>
               {/* Stats */}
