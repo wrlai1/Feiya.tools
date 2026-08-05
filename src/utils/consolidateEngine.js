@@ -263,6 +263,13 @@ export function consolidateRows(rows) {
       continue
     }
 
+    // A slash inside the SKU color is ambiguous: it may separate physical
+    // pieces, or it may be part of one color name. Never guess the unit count.
+    if (p.color.includes('/')) {
+      expanded.push({ ...p, issue: appendIssue(p.issue, 'ambiguous_color_separator') })
+      continue
+    }
+
     const crossStyleCombo = /\d/.test(p.color)
     if (crossStyleCombo) {
       expanded.push({ ...p, issue: appendIssue(p.issue, 'cross_style_combo') })
@@ -332,7 +339,7 @@ export function consolidateRows(rows) {
       unknownPackRows: needsReview.filter(r => /set_components_unknown|cross_style_combo/.test(r.parse_issue)).length,
       hasUnknownUnitCounts: needsReview.some(r =>
         (/set_components_unknown/.test(r.parse_issue) && (r.pack_count || 1) === 1) ||
-        /cross_style_combo/.test(r.parse_issue)
+        /cross_style_combo|ambiguous_color_separator/.test(r.parse_issue)
       ),
     },
   }

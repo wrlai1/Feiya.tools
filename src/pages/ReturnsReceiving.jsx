@@ -330,6 +330,7 @@ export default function ReturnsReceiving() {
     && new URLSearchParams(window.location.search).get('mock') === '1'
   const isAdmin = user?.role === 'admin' || demoMode
   const scannerRef = useRef(null)
+  const confirmationRef = useRef(null)
   const [tab, setTab] = useState('receive')
   const [tracking, setTracking] = useState('')
   const [loading, setLoading] = useState(false)
@@ -591,6 +592,23 @@ export default function ReturnsReceiving() {
     actualUnits, restockUnits, damagedUnits, notOursUnits, categorizedUnits, missingUnits,
     hasDiscrepancy: discrepancy,
   } = inspection
+
+  const markAllGood = () => {
+    setCounts(Object.fromEntries(
+      pkg.items.map((item) => [
+        item.id,
+        {
+          good: Number(item.expected_qty),
+          damaged: 0,
+          notOurs: 0,
+        },
+      ]),
+    ))
+    requestAnimationFrame(() => confirmationRef.current?.scrollIntoView({
+      behavior: 'smooth',
+      block: 'start',
+    }))
+  }
 
   const confirmPackage = async ({ allGood = false } = {}) => {
     const canConfirm = pkg?.status === 'pending'
@@ -1289,16 +1307,7 @@ export default function ReturnsReceiving() {
                   && !pkg.requires_item_resolution && (
                   <button
                     type="button"
-                    onClick={() => setCounts(Object.fromEntries(
-                      pkg.items.map((item) => [
-                        item.id,
-                        {
-                          good: Number(item.expected_qty),
-                          damaged: 0,
-                          notOurs: 0,
-                        },
-                      ]),
-                    ))}
+                    onClick={markAllGood}
                     className="flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-emerald-600 px-4 text-sm font-bold text-white hover:bg-emerald-700 sm:w-auto"
                   >
                     <CheckCircle2 className="h-5 w-5" /> All Good / Todo bien
@@ -1866,7 +1875,7 @@ export default function ReturnsReceiving() {
 
               {isAdmin && ['pending', 'needs_review'].includes(pkg.status)
                 && !pkg.requires_item_resolution && (
-                <div className="border-t border-slate-200 bg-slate-50/70 p-4 sm:p-5">
+                <div ref={confirmationRef} className="scroll-mt-4 border-t border-slate-200 bg-slate-50/70 p-4 sm:p-5">
                   <div className={`mb-4 flex items-start gap-2 rounded-xl border px-3 py-2 text-sm ${
                     discrepancy
                       ? 'border-amber-200 bg-amber-50 text-amber-800'

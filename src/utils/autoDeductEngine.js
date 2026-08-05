@@ -88,7 +88,10 @@ export function calculateResolvedSourceUnits(baseSourceUnits, resolvedItems = []
   return (resolvedItems || []).reduce((total, item) => {
     const source = item?._source
     if (!item?._isCombo || !source) return total
-    const confirmedPackCount = Math.max(1, parseInt(source.packCount, 10) || 1)
+    const componentPackCount = (item.components || []).reduce((sum, component) =>
+      sum + Math.max(1, parseInt(component?.multiplier, 10) || 1), 0)
+    const confirmedPackCount = componentPackCount
+      || Math.max(1, parseInt(source.packCount, 10) || 1)
     const originalPackCount = Math.max(1, parseInt(source.originalPackCount, 10) || confirmedPackCount)
     return total + (Number(item.QTY) || 0) * (confirmedPackCount - originalPackCount)
   }, Number(baseSourceUnits) || 0)
@@ -490,7 +493,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
       && parseIssue
         .split(';')
         .filter(Boolean)
-        .every((issue) => ['set_components_unknown', 'cross_style_combo'].includes(issue))
+        .every((issue) => ['set_components_unknown', 'cross_style_combo', 'ambiguous_color_separator'].includes(issue))
     if (parseIssue && !comboResolvedIssue) {
       unmatchedRows.push({ style, color, size: normSize, qty, packCount: effectivePackCount, parseIssue })
       return

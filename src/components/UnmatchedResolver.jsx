@@ -12,6 +12,7 @@ const REVIEW_REASONS = {
   m022_size_unknown: 'M022 must use S–XL for Missy or 1X–3X for Plus.',
   sku_attribute_size_conflict: 'The SKU size and Product Attribute size disagree. Confirm whether this is Missy, Plus, or Petite.',
   sku_attribute_color_conflict: 'The SKU color combination and Product Attribute color combination disagree.',
+  ambiguous_color_separator: 'This SKU uses "/" instead of the confirmed "&" color format. The system cannot know whether this is one color name or multiple physical pieces. Confirm the units per sold SKU and choose the exact inventory item(s).',
 }
 
 function DeferredSearchInput({ value, onCommit, onFocus }) {
@@ -206,7 +207,7 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
   }
 
   function isSetReview(row) {
-    return row.packCount > 1 || /set_components_unknown|cross_style_combo/.test(row.parseIssue || '')
+    return row.packCount > 1 || /set_components_unknown|cross_style_combo|ambiguous_color_separator/.test(row.parseIssue || '')
   }
 
   function expectedPackCount(i, row) {
@@ -251,6 +252,8 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
         continue
       }
       if (r.type === 'combo') {
+        const confirmedPackCount = r.entry.components.reduce((sum, component) =>
+          sum + Math.max(1, parseInt(component.multiplier, 10) || 1), 0)
         items.push({
           components: r.entry.components,
           QTY: row.qty,
@@ -259,7 +262,7 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
             style: row.style,
             color: row.color,
             size: row.size,
-            packCount: expectedPackCount(i, row),
+            packCount: confirmedPackCount,
             originalPackCount: row.packCount,
           },
           _learnAlias: true,
@@ -488,7 +491,7 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
               {setReview && !r && (
                 <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
                   <div className="flex items-center gap-2 flex-wrap">
-                    <span>This set has no confirmed component mapping. Enter units per set, then build the exact combo:</span>
+                    <span>Physical pieces are not confirmed. Enter units per sold SKU, then build the exact inventory target(s):</span>
                     <input
                       type="number"
                       min="1"
