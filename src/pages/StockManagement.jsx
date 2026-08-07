@@ -11,6 +11,11 @@ import ReplenishmentPlan from '../components/ReplenishmentPlan.jsx'
 import { useToast } from '../hooks/useToast.js'
 import { useAuth } from '../context/AuthContext.jsx'
 import { parseCSV } from '../utils/autoDeductEngine.js'
+import {
+  inventoryImportKey,
+  inventoryRowsToCsv,
+  normalizeInventoryImportRows,
+} from '../utils/inventoryImport.js'
 
 const BASE = '/api'
 const MAX_SNAPSHOTS = 20
@@ -42,8 +47,33 @@ async function parseFileRows(file) {
   const XLSX = await import('xlsx')
   const buf  = await file.arrayBuffer()
   const wb   = XLSX.read(buf, { type: 'array' })
-  const ws   = wb.Sheets[wb.SheetNames[0]]
-  return XLSX.utils.sheet_to_json(ws, { defval: '' })
+  const candidates = wb.SheetNames.flatMap((sheetName) => {
+    const matrix = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], {
+      header: 1,
+      raw: false,
+      defval: '',
+    })
+    const headerIndex = matrix.findIndex((row) => {
+      const keys = row.map((value) => String(value || '').trim().toLowerCase())
+      return keys.includes('style')
+        && keys.includes('color')
+        && keys.includes('size')
+        && (keys.includes('quantity') || keys.includes('qty'))
+    })
+    if (headerIndex < 0) return []
+    const headers = matrix[headerIndex].map((value) => String(value || '').trim())
+    const rows = matrix.slice(headerIndex + 1).map((values) => Object.fromEntries(
+      headers.map((header, index) => [header, values[index] ?? '']),
+    )).filter((row) => Object.values(row).some((value) => String(value || '').trim() !== ''))
+    return [{ sheetName, rows }]
+  })
+  if (!candidates.length) {
+    throw new Error('No worksheet contains Style, Color, Size, and Quantity columns')
+  }
+  if (candidates.length > 1) {
+    throw new Error(`More than one worksheet looks like inventory (${candidates.map((item) => item.sheetName).join(', ')}). Upload a file with one inventory sheet.`)
+  }
+  return candidates[0].rows
 }
 
 /** Normalise a row from any case convention into {Style, Color, Size, Quantity} */
@@ -171,16 +201,15 @@ function AddRowsModal({ onClose, onDone, currentRows, getToken }) {
     setLoading(true)
     try {
       const uploaded   = await parseFileRows(file)
-      const balanceSet = new Set(currentRows.map(r => `${r.Style}|||${r.Color}|||${r.Size}`))
+      const normalized = normalizeInventoryImportRows(uploaded).rows
+      const balanceMap = new Map(currentRows.map((row) => [inventoryImportKey(row), row]))
       const to_add        = []
       const already_exists = []
 
-      for (const raw of uploaded) {
-        const r = normaliseRow(raw)
-        if (!r.Style || !r.Color || !r.Size) continue
-        const key = `${r.Style}|||${r.Color}|||${r.Size}`
-        if (balanceSet.has(key)) {
-          const existing = currentRows.find(x => x.Style === r.Style && x.Color === r.Color && x.Size === r.Size)
+      for (const r of normalized) {
+        const key = inventoryImportKey(r)
+        if (balanceMap.has(key)) {
+          const existing = balanceMap.get(key)
           already_exists.push({ Style: r.Style, Color: r.Color, Size: r.Size, current_quantity: existing?.Quantity ?? 0 })
         } else {
           to_add.push({ Style: r.Style, Color: r.Color, Size: r.Size, Quantity: r.Quantity })
@@ -728,14 +757,19 @@ function ImportModal({ onClose, onDone, getToken }) {
     setLoading(true)
     try {
       const uploaded = await parseFileRows(file)
-      const rows     = uploaded.map(normaliseRow).filter(r => r.Style && r.Color && r.Size)
-      if (!rows.length) throw new Error('No valid rows found in file')
+      const { rows, totalUnits } = normalizeInventoryImportRows(uploaded)
+      if (!window.confirm(
+        `Replace the entire inventory balance with ${rows.length.toLocaleString()} rows and ${totalUnits.toLocaleString()} units from ${file.name}?\n\nThe current balance will be saved as a restore point first.`
+      )) return
 
       const data = await apiFetch(`${BASE}/inventory-balance?action=init`, {
         method:  'POST',
         headers: authHeaders(getToken(), true),
         body:    JSON.stringify({ rows, sourceName: file.name }),
       })
+      if (Number(data.total_rows) !== rows.length || Number(data.total_units) !== totalUnits) {
+        throw new Error('Server row or unit totals did not match the uploaded inventory file')
+      }
       toast.success(
         `Balance updated: ${data.total_rows.toLocaleString()} rows · ${data.total_units.toLocaleString()} units`,
         'Inventory Imported'
@@ -821,14 +855,16 @@ function InitializePanel({ onDone, getToken }) {
     setLoading(true)
     try {
       const uploaded = await parseFileRows(file)
-      const rows     = uploaded.map(normaliseRow).filter(r => r.Style && r.Color && r.Size)
-      if (!rows.length) throw new Error('No valid rows found in file')
+      const { rows, totalUnits } = normalizeInventoryImportRows(uploaded)
 
       const data = await apiFetch(`${BASE}/inventory-balance?action=init`, {
         method:  'POST',
         headers: authHeaders(getToken(), true),
         body:    JSON.stringify({ rows, sourceName: file.name }),
       })
+      if (Number(data.total_rows) !== rows.length || Number(data.total_units) !== totalUnits) {
+        throw new Error('Server row or unit totals did not match the uploaded inventory file')
+      }
       toast.success(
         `Balance initialized: ${data.total_rows.toLocaleString()} rows · ${data.total_units.toLocaleString()} units`,
         'Balance Ready'
@@ -994,18 +1030,17 @@ export default function StockManagement() {
   }, [allRows, searchQuery, filter])
 
   const handleExport = useCallback(() => {
-    if (!displayRows.length) return
-    const header = 'Style,Color,Size,Quantity\n'
-    const body   = displayRows.map(r =>
-      [r.Style, r.Color, r.Size, r.Quantity].map(v => `"${v ?? ''}"`).join(',')
-    ).join('\n')
-    const blob = new Blob([header + body], { type: 'text/csv' })
+    if (!allRows.length) return
+    const csv = inventoryRowsToCsv(allRows)
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
     const url  = URL.createObjectURL(blob)
     const a    = document.createElement('a')
-    a.href = url; a.download = `inventory_balance_${Date.now()}.csv`; a.click()
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+    a.href = url; a.download = `inventory_balance_${stamp}.csv`; a.click()
     URL.revokeObjectURL(url)
-    toast.success(`Exported ${displayRows.length.toLocaleString()} rows`)
-  }, [displayRows, toast])
+    const totalUnits = allRows.reduce((sum, row) => sum + Number(row.Quantity || 0), 0)
+    toast.success(`Exported all ${allRows.length.toLocaleString()} rows · ${totalUnits.toLocaleString()} units`)
+  }, [allRows, toast])
 
   // ── Render states ──────────────────────────────────────────────────────────
   if (serverError) {
@@ -1096,7 +1131,7 @@ export default function StockManagement() {
               </button>
               <button onClick={handleExport} className="btn-primary text-sm">
                 <Download className="w-4 h-4" />
-                Export CSV
+                Export Full CSV
               </button>
             </>
             )}

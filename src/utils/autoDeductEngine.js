@@ -236,30 +236,54 @@ function colorScore(templateColor, salesColor) {
 
 /** Parse CSV text → array of plain objects keyed by header row */
 export function parseCSV(text) {
-  const lines = text.split(/\r?\n/).filter(l => l.trim())
-  if (!lines.length) return []
+  const rows = []
+  let row = []
+  let field = ''
+  let quoted = false
+  const source = String(text || '').replace(/^\uFEFF/, '')
 
-  // Tokenise one line, handling quoted fields that may contain commas
-  function tokenize(line) {
-    const fields = []
-    let cur = '', inQ = false
-    for (const ch of line) {
-      if (ch === '"') { inQ = !inQ; continue }
-      if (ch === ',' && !inQ) { fields.push(cur.trim()); cur = '' }
-      else cur += ch
-    }
-    fields.push(cur.trim())
-    return fields
+  const finishField = () => {
+    row.push(field.trim())
+    field = ''
+  }
+  const finishRow = () => {
+    finishField()
+    if (row.some((value) => value !== '')) rows.push(row)
+    row = []
   }
 
-  const header = tokenize(lines[0]).map(h => h.replace(/^"|"$/g, '').trim())
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index]
+    if (char === '"') {
+      if (quoted && source[index + 1] === '"') {
+        field += '"'
+        index += 1
+      } else {
+        quoted = !quoted
+      }
+      continue
+    }
+    if (char === ',' && !quoted) {
+      finishField()
+      continue
+    }
+    if ((char === '\n' || char === '\r') && !quoted) {
+      if (char === '\r' && source[index + 1] === '\n') index += 1
+      finishRow()
+      continue
+    }
+    field += char
+  }
+  if (quoted) throw new Error('CSV contains an unterminated quoted field')
+  if (field || row.length) finishRow()
+  if (!rows.length) return []
 
-  return lines.slice(1).map(line => {
-    const fields = tokenize(line)
+  const header = rows[0].map((value) => value.trim())
+  return rows.slice(1).map((fields) => {
     const obj = {}
-    header.forEach((h, i) => { obj[h] = (fields[i] ?? '').replace(/^"|"$/g, '').trim() })
+    header.forEach((key, index) => { obj[key] = fields[index] ?? '' })
     return obj
-  }).filter(r => Object.values(r).some(v => v !== ''))
+  }).filter((record) => Object.values(record).some((value) => value !== ''))
 }
 
 // ── Core fill algorithm ───────────────────────────────────────────────────────
@@ -352,6 +376,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
     const style    = String(row.style || row.STYLE || '').trim()
     const color    = String(row.color || row.COLOR || '').trim()
     const rawSize  = String(row.size  || row.SIZE  || '').trim()
+    const businessDay = String(row.business_day || row.businessDay || '').trim()
     const rawQty   = row.QTY ?? row.qty ?? 0
     const qty      = Number(rawQty)
 
@@ -363,7 +388,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
     let parseIssue = String(row.parse_issue || row.parseIssue || '')
     if (!style) {
       srcTotal += qty * packCount
-      unmatchedRows.push({ style, color, size: normalizeSize(rawSize), qty, packCount, parseIssue: parseIssue || 'missing_style' })
+      unmatchedRows.push({ style, color, size: normalizeSize(rawSize), qty, packCount, businessDay, parseIssue: parseIssue || 'missing_style' })
       return
     }
     // Consolidated rows already contain warehouse sizes. Petite conversion must
@@ -406,7 +431,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
         && !confirmedStyleColorRule
     )
     if (aliasNeedsReview) {
-      unmatchedRows.push({ style, color, size: normSize, qty, packCount: effectivePackCount, parseIssue: parseIssue || 'confirmed_mapping_requires_review' })
+      unmatchedRows.push({ style, color, size: normSize, qty, packCount: effectivePackCount, businessDay, parseIssue: parseIssue || 'confirmed_mapping_requires_review' })
       return
     }
 
@@ -451,6 +476,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
             targetStyle: matched.style,
             targetColor: matched.color,
             targetSize: matched.size,
+            businessDay,
             via: 'confirmed combo',
           })
         }
@@ -480,6 +506,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
           targetStyle: matched.style,
           targetColor: matched.color,
           targetSize: matched.size,
+          businessDay,
           via: 'confirmed',
         })
         return true
@@ -495,7 +522,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
         .filter(Boolean)
         .every((issue) => ['set_components_unknown', 'cross_style_combo', 'ambiguous_color_separator'].includes(issue))
     if (parseIssue && !comboResolvedIssue) {
-      unmatchedRows.push({ style, color, size: normSize, qty, packCount: effectivePackCount, parseIssue })
+      unmatchedRows.push({ style, color, size: normSize, qty, packCount: effectivePackCount, businessDay, parseIssue })
       return
     }
 
@@ -512,6 +539,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
         size: normSize,
         qty,
         packCount: effectivePackCount,
+        businessDay,
         parseIssue: target._isNew ? 'confirmed_new_target_missing' : 'confirmed_mapping_size_missing',
       })
       return
@@ -524,13 +552,14 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
         size: normSize,
         qty,
         packCount: effectivePackCount,
+        businessDay,
         parseIssue: hadLooseStyleCandidates ? 'style_identity_mismatch' : parseIssue,
       })
       return
     }
 
     if (!aliasTarget && new Set(candidates.map((candidate) => candidate.style)).size > 1) {
-      unmatchedRows.push({ style, color, size: normSize, qty, packCount: effectivePackCount, parseIssue: 'ambiguous_inventory_style' })
+      unmatchedRows.push({ style, color, size: normSize, qty, packCount: effectivePackCount, businessDay, parseIssue: 'ambiguous_inventory_style' })
       return
     }
 
@@ -542,6 +571,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
         size: normSize,
         qty,
         packCount: effectivePackCount,
+        businessDay,
         parseIssue: target?._isNew ? 'confirmed_new_target_missing' : 'confirmed_mapping_size_missing',
       })
       return
@@ -559,7 +589,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
         ]),
     )
     if (exactTargets.size > 1) {
-      unmatchedRows.push({ style, color, size: normSize, qty, packCount, parseIssue: 'ambiguous_inventory_color' })
+      unmatchedRows.push({ style, color, size: normSize, qty, packCount, businessDay, parseIssue: 'ambiguous_inventory_color' })
       return
     }
 
@@ -598,10 +628,11 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
         targetStyle: matched.style,
         targetColor: matched.color,
         targetSize: matched.size,
+        businessDay,
         via: chosenScore >= 0.999 ? 'exact' : `fuzzy ${chosenScore.toFixed(2)}`,
       })
     } else {
-      unmatchedRows.push({ style, color, size: normSize, qty, packCount, parseIssue })
+      unmatchedRows.push({ style, color, size: normSize, qty, packCount, businessDay, parseIssue })
     }
   })
 

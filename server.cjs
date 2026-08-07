@@ -28,6 +28,12 @@ app.all('/api/returns', async (req, res) => {
   return (await returnsHandlerPromise)(req, res);
 });
 
+let inventoryBalanceHandlerPromise;
+app.all('/api/inventory-balance', async (req, res) => {
+  inventoryBalanceHandlerPromise ||= import('./api/inventory-balance.js').then((module) => module.default);
+  return (await inventoryBalanceHandlerPromise)(req, res);
+});
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function getDB() {

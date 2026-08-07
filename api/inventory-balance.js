@@ -20,6 +20,10 @@ import { neon } from '@neondatabase/serverless'
 import jwt from 'jsonwebtoken'
 import inventoryTargetResolution from '../lib/inventoryTargetResolution.cjs'
 import inventoryTransactionSafety from '../lib/inventoryTransactionSafety.cjs'
+import { businessDayFromFilename, validBusinessDay } from '../src/utils/fileBusinessDay.js'
+import { normalizeInventoryImportRows } from '../src/utils/inventoryImport.js'
+
+export { validBusinessDay }
 
 const MAX_SNAPSHOTS = 20
 const { resolveInventoryTargets } = inventoryTargetResolution
@@ -47,6 +51,13 @@ function verifyToken(header, secret) {
 function normalizeStore(value) {
   const name = String(value || '').trim().replace(/\s+/g, ' ').slice(0, 100)
   return name ? { name, key: name.toLowerCase() } : { name: '', key: '' }
+}
+
+function inventoryMovementKey(style, color, size) {
+  const normalizedSize = String(size || '').trim().toUpperCase().replace(/^([123])XL$/, '$1X')
+  return [style, color, normalizedSize]
+    .map((value) => String(value || '').trim().toLowerCase())
+    .join('\u241f')
 }
 
 async function ensureTables(sql) {
@@ -83,6 +94,7 @@ async function ensureTables(sql) {
       qty         INTEGER NOT NULL,
       source_file TEXT,
       applied_by  TEXT,
+      business_day DATE,
       applied_at  TIMESTAMPTZ DEFAULT NOW()
     )
   `
@@ -101,6 +113,7 @@ async function ensureTables(sql) {
   await sql`ALTER TABLE inventory_txn_rows ADD COLUMN IF NOT EXISTS transaction_id INTEGER`
   await sql`ALTER TABLE inventory_txn_rows ADD COLUMN IF NOT EXISTS store_name TEXT`
   await sql`ALTER TABLE inventory_txn_rows ADD COLUMN IF NOT EXISTS store_key TEXT`
+  await sql`ALTER TABLE inventory_txn_rows ADD COLUMN IF NOT EXISTS business_day DATE`
   await sql`
     UPDATE inventory_txn_rows rows
     SET transaction_id = (
@@ -321,26 +334,54 @@ export default async function handler(req, res) {
       if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
       const { rows, sourceName = '' } = req.body || {}
       if (!Array.isArray(rows)) return res.status(400).json({ error: 'rows array required' })
-
-      await saveSnapshot(sql, 'pre_init', sourceName)
-      await sql`DELETE FROM inventory_balance`
-
-      for (const [i, r] of rows.entries()) {
-        const style      = String(r.Style || r.style || '').trim()
-        const color      = String(r.Color || r.color || '').trim()
-        const size       = String(r.Size  || r.size  || '').trim()
-        const qty        = parseInt(r.Quantity || r.quantity || 0, 10) || 0
-        const sort_order = r.SortOrder !== undefined ? parseInt(r.SortOrder, 10) : i
-        if (!style || !color || !size) continue
-        await sql`
-          INSERT INTO inventory_balance (style, color, size, quantity, sort_order)
-          VALUES (${style}, ${color}, ${size}, ${qty}, ${sort_order})
-          ON CONFLICT (style, color, size)
-          DO UPDATE SET quantity = EXCLUDED.quantity, sort_order = EXCLUDED.sort_order, updated_at = NOW()
-        `
+      let normalized
+      try {
+        normalized = normalizeInventoryImportRows(rows)
+      } catch (error) {
+        return res.status(400).json({ error: error.message })
       }
-
-      const [stat] = await sql`SELECT COUNT(*)::int AS c, COALESCE(SUM(quantity),0)::int AS u FROM inventory_balance`
+      const records = normalized.rows.map((row) => ({
+        style: row.Style,
+        color: row.Color,
+        size: row.Size,
+        quantity: row.Quantity,
+        sort_order: row.SortOrder,
+      }))
+      const results = await sql.transaction((txn) => [
+        txn`
+          INSERT INTO inventory_snapshots (label, source_name, data, total_rows, total_units)
+          SELECT
+            'pre_init', ${String(sourceName || '').trim()},
+            COALESCE(jsonb_agg(jsonb_build_object(
+              'style', style, 'color', color, 'size', size, 'quantity', quantity,
+              'sort_order', sort_order
+            ) ORDER BY sort_order NULLS LAST, id), '[]'::jsonb),
+            COUNT(*)::int, COALESCE(SUM(quantity), 0)::int
+          FROM inventory_balance
+        `,
+        txn`DELETE FROM inventory_balance`,
+        txn`
+          INSERT INTO inventory_balance (style, color, size, quantity, sort_order)
+          SELECT style, color, size, quantity, sort_order
+          FROM jsonb_to_recordset(${JSON.stringify(records)}::jsonb)
+            AS item(style TEXT, color TEXT, size TEXT, quantity INTEGER, sort_order INTEGER)
+        `,
+        txn`
+          SELECT 1 / CASE
+            WHEN COUNT(*) = ${records.length}
+             AND COALESCE(SUM(quantity), 0) = ${normalized.totalUnits}
+            THEN 1 ELSE 0 END AS import_reconciled
+          FROM inventory_balance
+        `,
+        txn`
+          DELETE FROM inventory_snapshots
+          WHERE id NOT IN (
+            SELECT id FROM inventory_snapshots ORDER BY created_at DESC LIMIT ${MAX_SNAPSHOTS}
+          )
+        `,
+        txn`SELECT COUNT(*)::int AS c, COALESCE(SUM(quantity),0)::int AS u FROM inventory_balance`,
+      ], { isolationLevel: 'Serializable' })
+      const [stat] = results[5]
       return res.json({ ok: true, total_rows: stat.c, total_units: stat.u })
     }
 
@@ -426,25 +467,66 @@ export default async function handler(req, res) {
       if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
       const { rows } = req.body || {}
       if (!Array.isArray(rows)) return res.status(400).json({ error: 'rows required' })
-
-      let added = 0
-      for (const r of rows) {
-        const style      = String(r.Style || r.style || '').trim()
-        const color      = String(r.Color || r.color || '').trim()
-        const size       = String(r.Size  || r.size  || '').trim()
-        const qty        = parseInt(r.Quantity || r.quantity || 0, 10) || 0
-        const sort_order = r.SortOrder !== undefined ? parseInt(r.SortOrder, 10) : null
-        if (!style || !color || !size) continue
-        const result = await sql`
-          INSERT INTO inventory_balance (style, color, size, quantity, sort_order)
-          VALUES (${style}, ${color}, ${size}, ${qty}, ${sort_order})
-          ON CONFLICT (style, color, size)
-          DO UPDATE SET sort_order = COALESCE(EXCLUDED.sort_order, inventory_balance.sort_order)
-          RETURNING id
-        `
-        if (result.length) added++
+      let normalized
+      try {
+        normalized = normalizeInventoryImportRows(rows)
+      } catch (error) {
+        return res.status(400).json({ error: error.message })
       }
-      return res.json({ ok: true, added })
+      const records = normalized.rows.map((row) => ({
+        style: row.Style,
+        color: row.Color,
+        size: row.Size,
+        quantity: row.Quantity,
+        sort_order: row.SortOrder,
+      }))
+      const results = await sql.transaction((txn) => [
+        txn`
+          INSERT INTO inventory_snapshots (label, source_name, data, total_rows, total_units)
+          SELECT
+            'pre_add', 'Add inventory styles',
+            COALESCE(jsonb_agg(jsonb_build_object(
+              'style', style, 'color', color, 'size', size, 'quantity', quantity,
+              'sort_order', sort_order
+            ) ORDER BY sort_order NULLS LAST, id), '[]'::jsonb),
+            COUNT(*)::int, COALESCE(SUM(quantity), 0)::int
+          FROM inventory_balance
+        `,
+        txn`
+          WITH incoming AS (
+            SELECT *
+            FROM jsonb_to_recordset(${JSON.stringify(records)}::jsonb)
+              AS item(style TEXT, color TEXT, size TEXT, quantity INTEGER, sort_order INTEGER)
+          )
+          INSERT INTO inventory_balance (style, color, size, quantity, sort_order)
+          SELECT incoming.style, incoming.color, incoming.size, incoming.quantity, incoming.sort_order
+          FROM incoming
+          WHERE NOT EXISTS (
+            SELECT 1
+            FROM inventory_balance inventory
+            WHERE LOWER(BTRIM(inventory.style)) = LOWER(BTRIM(incoming.style))
+              AND LOWER(BTRIM(inventory.color)) = LOWER(BTRIM(incoming.color))
+              AND CASE UPPER(BTRIM(inventory.size))
+                    WHEN '1XL' THEN '1X' WHEN '2XL' THEN '2X' WHEN '3XL' THEN '3X'
+                    ELSE UPPER(BTRIM(inventory.size))
+                  END
+                  = CASE UPPER(BTRIM(incoming.size))
+                      WHEN '1XL' THEN '1X' WHEN '2XL' THEN '2X' WHEN '3XL' THEN '3X'
+                      ELSE UPPER(BTRIM(incoming.size))
+                    END
+          )
+          ON CONFLICT (style, color, size) DO NOTHING
+          RETURNING id
+        `,
+        txn`
+          DELETE FROM inventory_snapshots
+          WHERE id NOT IN (
+            SELECT id FROM inventory_snapshots ORDER BY created_at DESC LIMIT ${MAX_SNAPSHOTS}
+          )
+        `,
+      ], { isolationLevel: 'Serializable' })
+      const added = results[1].length
+      return res.json({ ok: true, added, skipped: records.length - added })
     }
 
     // ── DELETE remove-rows — delete by ids ────────────────────────────────────
@@ -471,17 +553,29 @@ export default async function handler(req, res) {
       if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
       const {
         filledRows = [],
+        movementRows: rawMovementRows = [],
         txnType = 'sales',
         sourceName = '',
         sourceHash: rawSourceHash = '',
+        sourceBusinessDay: rawSourceBusinessDay = '',
         orderClaims: rawOrderClaims = [],
         sourceUnits: rawSourceUnits,
         storeName: rawStoreName = '',
       } = req.body || {}
       if (!['sales', 'return'].includes(txnType)) return res.status(400).json({ error: 'Invalid transaction type' })
       const sourceHash = String(rawSourceHash || '').trim()
+      const sourceBusinessDay = validBusinessDay(rawSourceBusinessDay)
+      const filenameBusinessDay = businessDayFromFilename(sourceName)
       const store = normalizeStore(rawStoreName)
       if (!sourceHash) return res.status(400).json({ error: 'A source file fingerprint is required before inventory can be changed.' })
+      if (!sourceBusinessDay) {
+        return res.status(400).json({ error: 'A valid Auto Deduct business date is required before inventory can be changed.' })
+      }
+      if (filenameBusinessDay.day && filenameBusinessDay.day !== sourceBusinessDay) {
+        return res.status(409).json({
+          error: `The filename date is ${filenameBusinessDay.day}, but the submitted business date is ${sourceBusinessDay}. Inventory was not changed.`,
+        })
+      }
       if (txnType === 'sales' && !store.key) {
         return res.status(400).json({ error: 'The Analytics store is required before sales inventory can be changed.' })
       }
@@ -508,14 +602,13 @@ export default async function handler(req, res) {
       }
 
       const duplicate = await sql`
-        SELECT id FROM inventory_transactions
+        SELECT id, applied_units FROM inventory_transactions
         WHERE transaction_type = ${txnType}
           AND source_hash = ${sourceHash}
           AND rolled_back_at IS NULL
         LIMIT 1
       `
-      if (duplicate.length) return res.status(409).json({ error: 'This exact file has already been applied. Inventory was not changed.' })
-      if (orderClaims.length) {
+      if (!duplicate.length && orderClaims.length) {
         const existingClaims = await sql`
           WITH incoming AS (
             SELECT *
@@ -591,10 +684,139 @@ export default async function handler(req, res) {
       applyRows = resolvedTargets.rows
       const existingTargets = applyRows.filter((row) => !row.allowCreate)
 
+      const applyTotals = new Map()
+      const applyTargets = new Map()
+      for (const row of applyRows) {
+        const key = inventoryMovementKey(row.style, row.color, row.size)
+        applyTotals.set(key, (applyTotals.get(key) || 0) + row.qty)
+        applyTargets.set(key, row)
+      }
+      if (txnType === 'sales' && (!Array.isArray(rawMovementRows) || !rawMovementRows.length)) {
+        return res.status(400).json({ error: 'Sales deductions require the source file business date for the daily report.' })
+      }
+      const movementInput = Array.isArray(rawMovementRows) && rawMovementRows.length
+        ? rawMovementRows
+        : applyRows.map((row) => ({ ...row, businessDay: '' }))
+      const movementGroups = new Map()
+      for (const raw of movementInput) {
+        const style = String(raw.STYLE || raw.style || '').trim()
+        const color = String(raw.COLOR || raw.color || '').trim()
+        const size = String(raw.SIZE || raw.size || '').trim()
+        const qty = Number(raw.QTY ?? raw.qty)
+        const rawBusinessDay = String(raw.businessDay || raw.business_day || '').trim()
+        const businessDay = validBusinessDay(rawBusinessDay)
+        if (
+          !style || !color || !size
+          || !Number.isSafeInteger(qty) || qty <= 0
+          || (rawBusinessDay && !businessDay)
+          || (txnType === 'sales' && !businessDay)
+          || businessDay !== sourceBusinessDay
+        ) {
+          return res.status(400).json({ error: 'Every movement row must use the same validated business date as the source filename.' })
+        }
+        const targetKey = inventoryMovementKey(style, color, size)
+        const target = applyTargets.get(targetKey)
+        if (!target) {
+          return res.status(409).json({ error: `Movement date allocation does not match inventory target: ${style} / ${color} / ${size}` })
+        }
+        const groupKey = `${targetKey}\u241f${businessDay}`
+        const current = movementGroups.get(groupKey) || {
+          style: target.style,
+          color: target.color,
+          size: target.size,
+          qty: 0,
+          businessDay,
+        }
+        current.qty += qty
+        movementGroups.set(groupKey, current)
+      }
+      const movementRows = [...movementGroups.values()]
+      const movementTotals = new Map()
+      for (const row of movementRows) {
+        const key = inventoryMovementKey(row.style, row.color, row.size)
+        movementTotals.set(key, (movementTotals.get(key) || 0) + row.qty)
+      }
+      if (
+        applyTotals.size !== movementTotals.size
+        || [...applyTotals].some(([key, qty]) => movementTotals.get(key) !== qty)
+      ) {
+        return res.status(409).json({ error: 'Order-date movement totals do not match the inventory update. Inventory was not changed.' })
+      }
+
       const appliedUnits = applyRows.reduce((sum, row) => sum + row.qty, 0)
       if (appliedUnits !== sourceUnits) {
         return res.status(409).json({
           error: `Source physical-unit total (${sourceUnits}) does not match the inventory update total (${appliedUnits}). Inventory was not changed.`,
+        })
+      }
+      if (duplicate.length) {
+        const existingRows = await sql`
+          SELECT style, color, size, SUM(qty)::int AS qty,
+                 MIN(business_day)::text AS first_day,
+                 MAX(business_day)::text AS last_day
+          FROM inventory_txn_rows
+          WHERE transaction_id = ${duplicate[0].id}
+          GROUP BY style, color, size
+        `
+        const existingTotals = new Map(existingRows.map((row) => [
+          inventoryMovementKey(row.style, row.color, row.size),
+          Number(row.qty),
+        ]))
+        const exactExistingAllocation = existingTotals.size === applyTotals.size
+          && [...applyTotals].every(([key, qty]) => existingTotals.get(key) === qty)
+        if (!exactExistingAllocation || Number(duplicate[0].applied_units) !== appliedUnits) {
+          return res.status(409).json({
+            error: 'This file was applied before, but its saved SKU totals do not match the current preview. The report date was not changed.',
+          })
+        }
+        const alreadyDated = existingRows.length > 0 && existingRows.every((row) =>
+          row.first_day === sourceBusinessDay && row.last_day === sourceBusinessDay
+        )
+        if (alreadyDated) {
+          if (txnType === 'sales') {
+            await sql`
+              UPDATE return_order_imports
+              SET inventory_status = 'applied'
+              WHERE source_hash = ${sourceHash}
+                AND inventory_status = 'pending'
+            `
+          }
+          return res.status(409).json({ error: 'This exact file has already been applied. Inventory was not changed.' })
+        }
+        const repairResults = await sql.transaction((txn) => [
+          txn`
+            UPDATE inventory_txn_rows
+            SET business_day = ${sourceBusinessDay}::date
+            WHERE transaction_id = ${duplicate[0].id}
+            RETURNING id
+          `,
+          ...(txnType === 'sales' ? [
+            txn`
+              UPDATE return_orders
+              SET inventory_status = 'applied', updated_at = NOW()
+              WHERE source_hash = ${sourceHash}
+                AND inventory_status = 'pending'
+            `,
+            txn`
+              UPDATE return_order_imports
+              SET inventory_status = 'applied'
+              WHERE source_hash = ${sourceHash}
+                AND inventory_status = 'pending'
+            `,
+          ] : []),
+        ])
+        const repairedRows = repairResults[0] || []
+        if (!repairedRows.length) {
+          return res.status(409).json({
+            error: 'This historical transaction has no auditable movement rows, so its report date could not be changed automatically.',
+          })
+        }
+        return res.json({
+          ok: true,
+          history_repaired: true,
+          applied_units: 0,
+          original_applied_units: appliedUnits,
+          business_day: sourceBusinessDay,
         })
       }
       await sql.transaction((txn) => [
@@ -641,7 +863,7 @@ export default async function handler(req, res) {
           )
           SELECT
             ${txnType}, ${sourceName}, ${sourceHash}, ${appliedUnits},
-            ${applyRows.length}, ${payload.username}, saved_snapshot.id,
+            ${movementRows.length}, ${payload.username}, saved_snapshot.id,
             ${store.name}, ${store.key}
           FROM saved_snapshot
         `,
@@ -680,23 +902,22 @@ export default async function handler(req, res) {
                 SET quantity = quantity + ${delta}, updated_at = NOW()
                 WHERE style = ${row.style} AND color = ${row.color} AND size = ${row.size}
               `
-          return [
-            update,
-            txn`
-              INSERT INTO inventory_txn_rows (
-                transaction_id, txn_type, style, color, size, qty, source_file, applied_by,
-                store_name, store_key
-              )
-              SELECT
-                transactions.id, ${txnType}, ${row.style}, ${row.color}, ${row.size},
-                ${row.qty}, ${sourceName}, ${payload.username}, ${store.name}, ${store.key}
-              FROM inventory_transactions transactions
-              WHERE transactions.transaction_type = ${txnType}
-                AND transactions.source_hash = ${sourceHash}
-                AND transactions.rolled_back_at IS NULL
-            `,
-          ]
+          return [update]
         }),
+        ...movementRows.map((row) => txn`
+          INSERT INTO inventory_txn_rows (
+            transaction_id, txn_type, style, color, size, qty, source_file, applied_by,
+            store_name, store_key, business_day
+          )
+          SELECT
+            transactions.id, ${txnType}, ${row.style}, ${row.color}, ${row.size},
+            ${row.qty}, ${sourceName}, ${payload.username}, ${store.name}, ${store.key},
+            ${row.businessDay || null}::date
+          FROM inventory_transactions transactions
+          WHERE transactions.transaction_type = ${txnType}
+            AND transactions.source_hash = ${sourceHash}
+            AND transactions.rolled_back_at IS NULL
+        `),
         ...(txnType === 'sales' ? [
           txn`
             UPDATE return_orders
@@ -724,11 +945,12 @@ export default async function handler(req, res) {
     // ── GET movements — per-SKU dated flow for the 动销 view ─────────────────
     if (req.method === 'GET' && action === 'movements') {
       const days = Math.min(Math.max(parseInt(req.query.days, 10) || 30, 1), 365)
-      const from = new Date(Date.now() - days * 86400000).toISOString()
+      const fromDay = new Date(Date.now() - (days - 1) * 86400000).toISOString().slice(0, 10)
       const rows = await sql`
-        SELECT rows.txn_type, rows.style, rows.color, rows.size, rows.qty, rows.applied_at::date AS day
+        SELECT rows.txn_type, rows.style, rows.color, rows.size, rows.qty,
+               COALESCE(rows.business_day, rows.applied_at::date) AS day
         FROM inventory_txn_rows rows
-        WHERE rows.applied_at >= ${from}
+        WHERE COALESCE(rows.business_day, rows.applied_at::date) >= ${fromDay}::date
           AND NOT EXISTS (
             SELECT 1
             FROM inventory_transactions transactions
@@ -744,7 +966,7 @@ export default async function handler(req, res) {
                 )
               )
           )
-        ORDER BY rows.applied_at
+        ORDER BY COALESCE(rows.business_day, rows.applied_at::date), rows.applied_at
       `
       return res.json({ days, rows })
     }
