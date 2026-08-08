@@ -21,6 +21,7 @@ import {
 import ConsolidateStep from '../components/ConsolidateStep.jsx'
 import { consolidateRows } from '../utils/consolidateEngine.js'
 import { buildInventoryOrderClaims, parseOrderHistoryRows } from '../utils/orderImportEngine.js'
+import { businessDayFromFilename, validBusinessDay } from '../utils/fileBusinessDay.js'
 
 const BASE = '/api'
 const COMBINED_STORE = 'All Stores'
@@ -213,6 +214,9 @@ export default function AutoDeduct() {
   const [showSettings,    setShowSettings]    = useState(false)
   const [aliases,         setAliases]         = useState({})
   const [sourceHash,      setSourceHash]      = useState('')
+  const [sourceBusinessDay, setSourceBusinessDay] = useState('')
+  const [businessDaySource, setBusinessDaySource] = useState('')
+  const [filenameDayStatus, setFilenameDayStatus] = useState('missing')
   const [editingResolutions, setEditingResolutions] = useState(false)
   const [resolutionAliasKeys, setResolutionAliasKeys] = useState([])
   const [previewConfirmed, setPreviewConfirmed] = useState(false)
@@ -276,6 +280,7 @@ export default function AutoDeduct() {
       targetColor: match.targetColor,
       targetSize: match.targetSize,
       qty: match.qty,
+      businessDay: match.businessDay || '',
       via: match.via,
     }))
     for (const extra of resolvedExtras || []) {
@@ -289,6 +294,7 @@ export default function AutoDeduct() {
             targetColor: component.COLOR,
             targetSize: component.SIZE,
             qty: extra.QTY * Math.max(1, parseInt(component.multiplier, 10) || 1),
+            businessDay: extra._source?.businessDay || '',
             via: 'manual combo',
           })
         }
@@ -301,12 +307,33 @@ export default function AutoDeduct() {
           targetColor: extra.COLOR,
           targetSize: extra.SIZE,
           qty: extra.QTY,
+          businessDay: extra._source?.businessDay || '',
           via: extra._isNew ? 'manual new' : 'manual',
         })
       }
     }
     return preview
   }, [result, resolvedExtras])
+
+  const businessMovementRows = useMemo(() => {
+    const groups = new Map()
+    for (const item of deductionPreview) {
+      const qty = Number(item.qty || 0)
+      if (!Number.isSafeInteger(qty) || qty <= 0) continue
+      const businessDay = /^\d{4}-\d{2}-\d{2}$/.test(item.businessDay || '') ? item.businessDay : ''
+      const key = [item.targetStyle, item.targetColor, item.targetSize, businessDay].join('\u241f')
+      const current = groups.get(key) || {
+        STYLE: item.targetStyle,
+        COLOR: item.targetColor,
+        SIZE: item.targetSize,
+        QTY: 0,
+        businessDay,
+      }
+      current.QTY += qty
+      groups.set(key, current)
+    }
+    return [...groups.values()]
+  }, [deductionPreview])
 
   const hasCrossStylePreview = deductionPreview.some((item) =>
     normalizeStyleIdentity(item.sourceStyle) !== normalizeStyleIdentity(item.targetStyle)
@@ -329,6 +356,10 @@ export default function AutoDeduct() {
   }, [getToken, isMock])
 
   const handleFile = useCallback((file) => {
+    const parsedDay = businessDayFromFilename(file?.name)
+    setSourceBusinessDay(parsedDay.day)
+    setBusinessDaySource(parsedDay.day ? 'filename' : '')
+    setFilenameDayStatus(parsedDay.status)
     setSrcFile(file); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([]); setSourceHash(''); setEditingResolutions(false); setResolutionAliasKeys([]); setPreviewConfirmed(false); setOrderArchive(null)
   }, [])
 
@@ -341,6 +372,10 @@ export default function AutoDeduct() {
       return
     }
     if (!srcFile || processing) return
+    if (!validBusinessDay(sourceBusinessDay)) {
+      toast.error('The file date could not be read safely. Select the Auto Deduct business date before continuing.', 'Business Date Required')
+      return
+    }
     setProcessing(true); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([]); setEditingResolutions(false); setResolutionAliasKeys([]); setPreviewConfirmed(false)
     try {
       // 1. Fetch template from inventory balance (canonical SKU list)
@@ -357,7 +392,10 @@ export default function AutoDeduct() {
 
       let salesRows
       if (/\.csv$/i.test(srcFile.name)) {
-        salesRows = parseCSV(new TextDecoder().decode(bytes))
+        salesRows = parseCSV(new TextDecoder().decode(bytes)).map((row) => ({
+          ...row,
+          business_day: sourceBusinessDay,
+        }))
         setOrderArchive(null)
       } else {
         const XLSX = await import('xlsx')
@@ -366,7 +404,7 @@ export default function AutoDeduct() {
         const rawRows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { raw: false, defval: '' })
         const parsedOrders = parseOrderHistoryRows(rawRows)
         setOrderArchive(parsedOrders)
-        salesRows = consolidateRows(rawRows).consolidated
+        salesRows = consolidateRows(rawRows, { businessDay: sourceBusinessDay }).consolidated
       }
 
       // 3. Match & fill — pure JS, no server needed
@@ -392,7 +430,7 @@ export default function AutoDeduct() {
     } finally {
       setProcessing(false)
     }
-  }, [srcFile, processing, getToken, toast, aliases])
+  }, [srcFile, processing, getToken, toast, aliases, sourceBusinessDay])
 
   // Called by UnmatchedResolver when user finishes reviewing.
   // Skipped rows are NOT deducted, but they must stay visible on the Unmatched
@@ -563,9 +601,11 @@ export default function AutoDeduct() {
         headers: authHeaders(getToken(), true),
         body:    JSON.stringify({
           filledRows:  mergedFilledRows,
+          movementRows: businessMovementRows,
           txnType,
           sourceName:  srcFile?.name || '',
           sourceHash,
+          sourceBusinessDay,
           orderClaims,
           sourceUnits: expectedSourceUnits,
           storeName: COMBINED_STORE,
@@ -574,6 +614,13 @@ export default function AutoDeduct() {
       const data = await res.json()
       if (!res.ok) throw new Error(data.error)
       setApplied(true)
+      if (data.history_repaired) {
+        toast.success(
+          `The existing transaction was moved to ${sourceBusinessDay}. Inventory quantities were not deducted again.`,
+          'Report Date Repaired'
+        )
+        return
+      }
       toast.success(
         `${data.applied_units.toLocaleString()} units ${txnType === 'sales' ? 'deducted from inventory' : 'returned to inventory'}`,
         'Inventory Updated'
@@ -583,7 +630,7 @@ export default function AutoDeduct() {
     } finally {
       setApplying(false)
     }
-  }, [archiveDailyOrders, mergedFilledRows, txnType, srcFile, sourceHash, orderArchive, orderClaims, orderImportIssueCount, expectedSourceUnits, inventoryApplyUnits, reconciliationMismatch, skippedUnits, applying, getToken, previewConfirmed, toast])
+  }, [archiveDailyOrders, mergedFilledRows, businessMovementRows, txnType, srcFile, sourceHash, sourceBusinessDay, orderArchive, orderClaims, orderImportIssueCount, expectedSourceUnits, inventoryApplyUnits, reconciliationMismatch, skippedUnits, applying, getToken, previewConfirmed, toast])
 
   const stats            = result?.stats
   const hasUnresolved    = result?.unmatchedRows?.length > 0 && resolvedExtras === null
@@ -685,13 +732,52 @@ export default function AutoDeduct() {
           label="Drag & drop TEMU order / consolidated file here"
           sublabel="Raw TEMU workbook is required for sales deductions; CSV is preview/download only"
           currentFile={srcFile}
-          onClear={() => { setSrcFile(null); setResult(null); setApplied(false); setPreviewConfirmed(false); setOrderArchive(null) }}
+          onClear={() => { setSrcFile(null); setResult(null); setApplied(false); setPreviewConfirmed(false); setOrderArchive(null); setSourceBusinessDay(''); setBusinessDaySource(''); setFilenameDayStatus('missing') }}
         />
+
+        {srcFile && (
+          <div className={`rounded-xl border px-4 py-3 ${
+            validBusinessDay(sourceBusinessDay)
+              ? 'border-emerald-200 bg-emerald-50'
+              : 'border-amber-300 bg-amber-50'
+          }`}>
+            {businessDaySource === 'filename' ? (
+              <div className="flex items-center gap-2 text-sm text-emerald-800">
+                <CheckCircle className="h-4 w-4 shrink-0" />
+                Auto Deduct date: <strong>{sourceBusinessDay}</strong>
+                <span className="text-emerald-600">(read from filename)</span>
+              </div>
+            ) : (
+              <label className="block text-sm font-medium text-amber-900">
+                {filenameDayStatus === 'ambiguous'
+                  ? 'More than one YYYYMMDD date was found in the filename. Which date should this Auto Deduct use?'
+                  : filenameDayStatus === 'invalid'
+                    ? 'The YYYYMMDD date in the filename is not a real calendar date. Which date should this Auto Deduct use?'
+                    : 'No YYYYMMDD date was found in the filename. Which date should this Auto Deduct use?'}
+                <input
+                  type="date"
+                  value={sourceBusinessDay}
+                  onChange={(event) => {
+                    setSourceBusinessDay(event.target.value)
+                    setBusinessDaySource(event.target.value ? 'manual' : '')
+                    setResult(null)
+                    setApplied(false)
+                    setPreviewConfirmed(false)
+                  }}
+                  className="mt-2 block rounded-lg border border-amber-300 bg-white px-3 py-2 text-sm text-slate-800"
+                />
+                {businessDaySource === 'manual' && validBusinessDay(sourceBusinessDay) && (
+                  <span className="mt-2 block text-xs text-amber-700">Selected business date: {sourceBusinessDay}</span>
+                )}
+              </label>
+            )}
+          </div>
+        )}
 
         {/* Run button */}
         <button
           onClick={handleRun}
-          disabled={!isMock && (!srcFile || processing || templateMissing)}
+          disabled={!isMock && (!srcFile || processing || templateMissing || !validBusinessDay(sourceBusinessDay))}
           className="btn-primary w-full justify-center py-3 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {processing
@@ -746,6 +832,7 @@ export default function AutoDeduct() {
 
             <div className="rounded-xl bg-slate-50 px-4 py-3 text-sm text-slate-600">
               Inventory units to {txnType === 'sales' ? 'deduct' : 'add back'}: <strong className="text-slate-800">{inventoryApplyUnits.toLocaleString()}</strong>
+              <span className="ml-2">· Business date: <strong className="text-slate-800">{sourceBusinessDay}</strong></span>
               {skippedUnits > 0 && <span className="ml-2 font-semibold text-red-600">· {skippedUnits.toLocaleString()} skipped physical unit(s) must be resolved</span>}
             </div>
             {reconciliationMismatch && (
@@ -777,6 +864,7 @@ export default function AutoDeduct() {
                       <th className="px-3 py-2 font-semibold">Source</th>
                       <th className="px-3 py-2 font-semibold">Inventory target</th>
                       <th className="px-3 py-2 text-right font-semibold">Qty</th>
+                      <th className="px-3 py-2 font-semibold">Business date</th>
                       <th className="px-3 py-2 font-semibold">Method</th>
                     </tr>
                   </thead>
@@ -799,6 +887,7 @@ export default function AutoDeduct() {
                             {crossStyle && <span className="ml-2 rounded-full bg-red-100 px-2 py-0.5 font-bold text-red-700">Cross-style</span>}
                           </td>
                           <td className="px-3 py-2 text-right font-bold tabular-nums text-slate-800">{Number(item.qty || 0).toLocaleString()}</td>
+                          <td className="px-3 py-2 font-mono text-slate-600">{item.businessDay || '—'}</td>
                           <td className="px-3 py-2 text-slate-500">{item.via}</td>
                         </tr>
                       )

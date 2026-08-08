@@ -708,6 +708,26 @@ test('invalid source quantities stop the run instead of being partially parsed',
   )
 })
 
+test('sales movements retain order business days after consolidation and matching', () => {
+  const sales = consolidateRows([
+    { SKU: 'A100BlackS', Quantity: 2, '订单创建时间': '2026-08-03 10:00:00' },
+    { SKU: 'A100BlackS', Quantity: 3, '订单创建时间': '2026-08-04T23:30:00-04:00' },
+  ]).consolidated
+  assert.deepEqual(sales.map((row) => [row.QTY, row.business_day]), [
+    [2, '2026-08-03'],
+    [3, '2026-08-04'],
+  ])
+
+  const result = fillTemplate([
+    { STYLE: 'A100', COLOR: 'black', SIZE: 'S' },
+  ], sales)
+  assert.equal(result.filledRows[0].QTY, 5)
+  assert.deepEqual(result.matchLog.map((row) => [row.qty, row.businessDay]), [
+    [2, '2026-08-03'],
+    [3, '2026-08-04'],
+  ])
+})
+
 test('apply resolves inventory capitalization without changing SKU identity', () => {
   const result = resolveInventoryTargets([
     { style: '543924', color: 'brown', size: 'L', qty: 2, allowCreate: false },

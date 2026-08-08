@@ -7,6 +7,8 @@
  * consolidateRows(rows) → { consolidated, needsReview, stats }
  */
 
+import { validBusinessDay } from './fileBusinessDay.js'
+
 // 长后缀优先：PXL 先于 XL，14W 先于 14，10P 先于 10。
 const SIZE_SUFFIXES = [
   '24W', '22W', '20W', '18W', '16W', '14W',
@@ -132,6 +134,43 @@ function appendIssue(issue, next) {
   return [...new Set([...(issue ? issue.split(';') : []), next].filter(Boolean))].join(';')
 }
 
+function businessDayValue(value) {
+  const text = String(value ?? '').trim()
+  if (!text) return ''
+
+  const formatDay = (year, month, day) => {
+    const y = Number(year)
+    const m = Number(month)
+    const d = Number(day)
+    const checked = new Date(Date.UTC(y, m - 1, d))
+    if (
+      !Number.isSafeInteger(y) || y < 1900 || y > 9999
+      || checked.getUTCFullYear() !== y
+      || checked.getUTCMonth() !== m - 1
+      || checked.getUTCDate() !== d
+    ) return ''
+    return `${String(y).padStart(4, '0')}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`
+  }
+
+  // Preserve the calendar date printed in the order file. Converting a late
+  // US order to UTC first can otherwise move it into the following day.
+  const yearFirst = text.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:\D|$)/)
+  if (yearFirst) return formatDay(yearFirst[1], yearFirst[2], yearFirst[3])
+  const monthFirst = text.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2}|\d{4})(?:\D|$)/)
+  if (monthFirst) {
+    const rawYear = Number(monthFirst[3])
+    const year = monthFirst[3].length === 2
+      ? (rawYear >= 70 ? 1900 + rawYear : 2000 + rawYear)
+      : rawYear
+    return formatDay(year, monthFirst[1], monthFirst[2])
+  }
+
+  const parsed = new Date(text)
+  return Number.isFinite(parsed.getTime())
+    ? formatDay(parsed.getFullYear(), parsed.getMonth() + 1, parsed.getDate())
+    : ''
+}
+
 function attributeParts(raw) {
   const parts = String(raw || '').split('/').map(x => x.trim())
   const colorText = parts[0] || ''
@@ -172,11 +211,17 @@ function hasSizeConflict(skuSize, attributeSize) {
 /**
  * rows: 解析好的对象数组（须含 Style/SKU 列 + Quantity/Qty/数量 列）
  */
-export function consolidateRows(rows) {
+export function consolidateRows(rows, options = {}) {
   if (!rows.length) throw new Error('文件是空的')
+  const rawSuppliedBusinessDay = String(options.businessDay || '').trim()
+  const suppliedBusinessDay = validBusinessDay(rawSuppliedBusinessDay)
+  if (rawSuppliedBusinessDay && !suppliedBusinessDay) {
+    throw new Error('文件业务日期必须使用 YYYY-MM-DD 格式')
+  }
   const styleKey = findKey(rows[0], 'Style', ['SKU', 'SKU货号'])
   const qtyKey = findKey(rows[0], 'Quantity', ['Qty', 'QTY', '数量', '件数', '应履约件数'])
   const attrKey = findKey(rows[0], 'Product Attribute', ['商品属性', 'Attributes'])
+  const dateKey = findKey(rows[0], 'Order Created At', ['订单创建时间'])
   if (!styleKey) throw new Error('找不到 Style/SKU 列')
   if (!qtyKey) throw new Error('找不到 Quantity/Qty/数量 列')
 
@@ -213,7 +258,15 @@ export function consolidateRows(rows) {
       p.color = p.color.replace(/\s+sx$/i, '').trim()
       p.issue = p.issue.split(';').filter(x => x !== 'no_size_suffix_match').join(';')
     }
-    return { rawStyle, rawAttr, qty, attr, packCount: 1, ...p }
+    return {
+      rawStyle,
+      rawAttr,
+      qty,
+      attr,
+      packCount: 1,
+      businessDay: suppliedBusinessDay || businessDayValue(dateKey ? r[dateKey] : ''),
+      ...p,
+    }
   })
 
   // 别名款号：改款号 + 颜色加前缀
@@ -300,8 +353,16 @@ export function consolidateRows(rows) {
   // 合并：按 (style,color,size) 汇总
   const groups = new Map()
   for (const p of parsed) {
-    const k = `${p.style}||${p.color}||${p.size}||${p.issue}||${p.packCount}`
-    const g = groups.get(k) || { style: p.style, color: p.color, size: p.size, QTY: 0, pack_count: p.packCount || 1, parse_issue: p.issue || '' }
+    const k = `${p.style}||${p.color}||${p.size}||${p.issue}||${p.packCount}||${p.businessDay}`
+    const g = groups.get(k) || {
+      style: p.style,
+      color: p.color,
+      size: p.size,
+      QTY: 0,
+      pack_count: p.packCount || 1,
+      parse_issue: p.issue || '',
+      business_day: p.businessDay || '',
+    }
     g.QTY += p.qty
     groups.set(k, g)
   }
@@ -315,8 +376,17 @@ export function consolidateRows(rows) {
   const reviewMap = new Map()
   for (const p of parsed) {
     if (!p.issue) continue
-    const k = `${p.rawStyle}||${p.style}||${p.color}||${p.size}||${p.issue}`
-    const g = reviewMap.get(k) || { raw_style: p.rawStyle, style: p.style, color: p.color, size: p.size, pack_count: p.packCount || 1, parse_issue: p.issue, QTY: 0 }
+    const k = `${p.rawStyle}||${p.style}||${p.color}||${p.size}||${p.issue}||${p.businessDay}`
+    const g = reviewMap.get(k) || {
+      raw_style: p.rawStyle,
+      style: p.style,
+      color: p.color,
+      size: p.size,
+      pack_count: p.packCount || 1,
+      parse_issue: p.issue,
+      business_day: p.businessDay || '',
+      QTY: 0,
+    }
     g.QTY += p.qty
     reviewMap.set(k, g)
   }

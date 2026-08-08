@@ -64,6 +64,30 @@ test('sales windows end on the latest available order date instead of upload tim
   assert.equal(report.dailyRows.at(-1).day, '2026-08-02')
 })
 
+test('5010015 export keeps each Auto Deduct batch on its filename business date', () => {
+  const report = buildDailyStyleReport({
+    inventoryRows: [
+      { Style: '5010015', Color: 'BLACK', Size: 'S', Quantity: 58 },
+      { Style: '5010015', Color: 'BLACK', Size: 'M', Quantity: 88 },
+    ],
+    movements: [
+      { txn_type: 'sales', style: '5010015', color: 'BLACK', size: 'S', qty: 500, day: '2026-08-03' },
+      { txn_type: 'sales', style: '5010015', color: 'BLACK', size: 'M', qty: 365, day: '2026-08-03' },
+      { txn_type: 'sales', style: '5010015', color: 'BLACK', size: 'S', qty: 197, day: '2026-08-04' },
+    ],
+    style: '5010015',
+    today: '2026-08-04',
+  })
+  const workbookData = buildDailyStyleWorkbookData(report)
+  const salesTrendRows = workbookData.sheets.find((sheet) => sheet.name === 'Sales Trend').rows
+  const august3 = salesTrendRows.find((row) => row[0] === '2026-08-03')
+  const august4 = salesTrendRows.find((row) => row[0] === '2026-08-04')
+
+  assert.deepEqual(august3.slice(0, 4), ['2026-08-03', 500, 365, 865])
+  assert.deepEqual(august4.slice(0, 4), ['2026-08-04', 197, 0, 197])
+  assert.ok(report.sourceMovements.some((row) => row.day === '2026-08-03' && row.quantity === 365))
+})
+
 test('gross sales drive sales comparison while returns do not reduce reported demand', () => {
   const report = buildDailyStyleReport({
     inventoryRows,
