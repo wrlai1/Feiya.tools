@@ -90,15 +90,6 @@ export function getReturnManifestOrderNumbers(rows) {
     .filter(Boolean))]
 }
 
-export function getReturnManifestTrackingNumbers(rows) {
-  if (!Array.isArray(rows) || !rows.length) return []
-  const trackingKey = findKey(rows[0], TRACKING_ALIASES)
-  if (!trackingKey) return []
-  return [...new Set(rows
-    .map((row) => normalizeTracking(row[trackingKey]))
-    .filter(Boolean))]
-}
-
 export function resolveStyleSearchValue(options, rawValue) {
   const value = String(rawValue ?? '')
   const normalized = value.trim().toLowerCase()
@@ -368,17 +359,6 @@ function orderStore(order) {
   return { name, key }
 }
 
-function orderTrackingNumbers(order) {
-  return [...new Set((order?.items || []).flatMap((item) => (
-    item.outbound_trackings || item.outboundTrackings || []
-  )).map(normalizeTracking).filter(Boolean))]
-}
-
-function orderMatchesTracking(order, tracking) {
-  const trackingKey = normalizeTracking(tracking)
-  return Boolean(trackingKey && orderTrackingNumbers(order).includes(trackingKey))
-}
-
 function resolvedHistoricalOrder(orderMatches, group) {
   if (!orderMatches?.length) return { order: null, issue: 'order_history_missing' }
   const groupKeys = [...group.stores.keys()]
@@ -423,7 +403,6 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
     if (!orders.has(orderKey)) orders.set(orderKey, [])
     orders.get(orderKey).push(order)
   }
-  const poByTracking = decisions?.poByTracking || {}
   const storeByTracking = decisions?.storeByTracking || {}
   const skippedTrackings = new Set(
     (decisions?.skippedTrackings || []).map(normalizeTracking).filter(Boolean),
@@ -455,9 +434,7 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
     const tracking = normalizeTracking(trackingNumber)
     if (skippedTrackings.has(tracking)) return
     const skuId = String(row[skuIdKey] ?? '').trim()
-    const orderNumber = String(
-      poByTracking[tracking] || (poKey ? row[poKey] ?? '' : ''),
-    ).trim()
+    const orderNumber = String(poKey ? row[poKey] ?? '' : '').trim()
     const rawQty = quantityKey ? row[quantityKey] : 1
     const quantity = rawQty === '' || rawQty == null ? 1 : Number(rawQty)
     if (!tracking) {
@@ -681,50 +658,9 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
     }
     const claimedOrderKeys = [...group.orders].map(normalizeOrderNumber).filter(Boolean)
     const claimedHistoricalOrders = claimedOrderKeys.flatMap((orderKey) => orders.get(orderKey) || [])
-    const trackingOrders = (historicalOrders || []).filter((order) => (
-      orderMatchesTracking(order, group.tracking)
-    ))
-    const exactTrackingOrder = group.orders.size === 1
-      ? trackingOrders.find((order) => (
-          normalizeOrderNumber(order.order_number || order.orderNumber) === claimedOrderKeys[0]
-        ))
-      : null
-    const hasTrackingEvidence = trackingOrders.length > 0
-      || claimedHistoricalOrders.some((order) => orderTrackingNumbers(order).length > 0)
-    if (hasTrackingEvidence && !exactTrackingOrder) {
-      const candidates = [...new Map(trackingOrders.map((order) => {
-        const store = orderStore(order)
-        const orderNumber = String(order.order_number || order.orderNumber || '').trim()
-        return [`${store.key}\u241f${normalizeOrderNumber(orderNumber)}`, {
-          orderNumber,
-          storeName: store.name,
-          storeKey: store.key,
-        }]
-      })).values()]
-      if (candidates.length || !selectedStore?.key || !selectedStore?.name) {
-        pendingUploadDecisions.push({
-          tracking: group.tracking,
-          trackingNumber: group.trackingNumber,
-          issue: 'tracking_po_mismatch',
-          claimedOrders: [...group.orders],
-          candidateOrders: candidates,
-        })
-        continue
-      }
-      group.review.push({
-        tracking: group.trackingNumber,
-        excelRow: null,
-        orderNumber: [...group.orders].join(', '),
-        skuId: '',
-        parse_issue: 'tracking_po_mismatch_manual_store',
-      })
-    }
 
     if (!group.stores.size) {
-      const selectedOrders = claimedHistoricalOrders.filter((order) => (
-        !exactTrackingOrder || order === exactTrackingOrder
-      ))
-      const selectedOrderStores = new Map(selectedOrders.map((order) => {
+      const selectedOrderStores = new Map(claimedHistoricalOrders.map((order) => {
         const store = orderStore(order)
         return [store.key, store.name]
       }).filter(([key]) => key && key !== 'all stores'))

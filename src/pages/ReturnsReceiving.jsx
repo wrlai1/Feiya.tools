@@ -25,7 +25,6 @@ import {
   chooseReturnManifestSheetName,
   getReturnManifestOrderNumbers,
   getReturnManifestSkuIds,
-  getReturnManifestTrackingNumbers,
   mergeAnalyticsReturnStores,
   parseProductCatalogRows,
   parseSkuReturnManifestRows,
@@ -373,7 +372,6 @@ export default function ReturnsReceiving() {
   const [parsed, setParsed] = useState(null)
   const [manifestContext, setManifestContext] = useState(null)
   const [manifestDecisions, setManifestDecisions] = useState({
-    poByTracking: {},
     storeByTracking: {},
     skippedTrackings: [],
   })
@@ -948,7 +946,7 @@ export default function ReturnsReceiving() {
     setFile(nextFile)
     setParsed(null)
     setManifestContext(null)
-    setManifestDecisions({ poByTracking: {}, storeByTracking: {}, skippedTrackings: [] })
+    setManifestDecisions({ storeByTracking: {}, skippedTrackings: [] })
     setManifestChoiceDrafts({})
     if (!nextFile) return
     try {
@@ -976,15 +974,12 @@ export default function ReturnsReceiving() {
       }
       const historicalOrders = []
       const orderNumbers = getReturnManifestOrderNumbers(rows)
-      const trackingNumbers = getReturnManifestTrackingNumbers(rows)
-      const lookupCount = Math.max(orderNumbers.length, trackingNumbers.length)
-      for (let index = 0; index < lookupCount; index += 500) {
+      for (let index = 0; index < orderNumbers.length; index += 500) {
         const orderRes = await fetch(`${BASE}/returns?action=orders-lookup-any`, {
           method: 'POST',
           headers: headers(getToken, true),
           body: JSON.stringify({
             orderNumbers: orderNumbers.slice(index, index + 500),
-            trackingNumbers: trackingNumbers.slice(index, index + 500),
           }),
         })
         const orderData = await orderRes.json().catch(() => ({}))
@@ -1001,7 +996,7 @@ export default function ReturnsReceiving() {
       setParsed(result)
       if (result.pendingUploadDecisions.length) {
         toast.warning(
-          `${result.pendingUploadDecisions.length} tracking package(s) require a PO or Store decision before upload`,
+          `${result.pendingUploadDecisions.length} tracking package(s) require a Store decision before upload`,
           'Upload Decision Required',
         )
       }
@@ -1025,15 +1020,6 @@ export default function ReturnsReceiving() {
       manifestContext.historicalOrders,
       nextDecisions,
     ))
-  }
-
-  const chooseManifestPo = (trackingKey) => {
-    const orderNumber = manifestChoiceDrafts[trackingKey]?.orderNumber
-    if (!orderNumber) return
-    applyManifestDecisions({
-      ...manifestDecisions,
-      poByTracking: { ...manifestDecisions.poByTracking, [trackingKey]: orderNumber },
-    })
   }
 
   const chooseManifestStore = (trackingKey) => {
@@ -1085,7 +1071,7 @@ export default function ReturnsReceiving() {
       setFile(null)
       setParsed(null)
       setManifestContext(null)
-      setManifestDecisions({ poByTracking: {}, storeByTracking: {}, skippedTrackings: [] })
+      setManifestDecisions({ storeByTracking: {}, skippedTrackings: [] })
       setManifestChoiceDrafts({})
       await loadRecent()
       setTab('receive')
@@ -2710,9 +2696,9 @@ export default function ReturnsReceiving() {
             </div>
           </div>
           <div className="mt-4 rounded-xl border border-blue-200 bg-blue-50 p-3 text-sm text-blue-800">
-            A PO/tracking mismatch or missing/conflicting Store blocks that tracking before upload.
-            Choose the correct PO or Store, or skip it. Review packages wait for a worker scan before
-            they appear in Admin Review.
+            Return Tracking is a new inbound label and is not compared with the original outbound Tracking.
+            The uploaded PO identifies the original products. Only a missing/conflicting Store blocks upload;
+            review packages wait for a worker scan before they appear in Admin Review.
           </div>
           <input
             type="file"
@@ -2759,7 +2745,7 @@ export default function ReturnsReceiving() {
                     <div>
                       <p className="font-semibold text-red-900">Action required before upload</p>
                       <p className="mt-1 text-xs text-red-700">
-                        Choose the correct PO or Store, or explicitly skip that tracking. Unresolved rows cannot upload.
+                        Choose the correct Store or explicitly skip that tracking. Unresolved rows cannot upload.
                       </p>
                     </div>
                   </div>
@@ -2768,114 +2754,38 @@ export default function ReturnsReceiving() {
                     return (
                       <div key={decision.tracking} className="rounded-xl border border-red-200 bg-white p-3">
                         <p className="font-semibold text-slate-900">Tracking {decision.trackingNumber}</p>
-                        {decision.issue === 'tracking_po_mismatch' ? (
-                          <>
-                            <p className="mt-1 text-xs text-red-700">
-                              Tracking does not match the uploaded PO: {decision.claimedOrders.join(', ') || 'No PO'}
-                            </p>
-                            {decision.candidateOrders.length ? (
-                              <div className="mt-3 flex flex-col gap-2 sm:flex-row">
-                                <select
-                                  aria-label={`Correct PO for ${decision.trackingNumber}`}
-                                  value={draft.orderNumber || ''}
-                                  onChange={(event) => setManifestChoiceDrafts((current) => ({
-                                    ...current,
-                                    [decision.tracking]: {
-                                      ...current[decision.tracking],
-                                      orderNumber: event.target.value,
-                                    },
-                                  }))}
-                                  className="h-11 min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-3 text-sm"
-                                >
-                                  <option value="">Choose matching PO</option>
-                                  {decision.candidateOrders.map((order) => (
-                                    <option key={`${order.storeKey}-${order.orderNumber}`} value={order.orderNumber}>
-                                      {order.orderNumber}{order.storeName ? ` · ${order.storeName}` : ''}
-                                    </option>
-                                  ))}
-                                </select>
-                                <button
-                                  type="button"
-                                  disabled={!draft.orderNumber}
-                                  onClick={() => chooseManifestPo(decision.tracking)}
-                                  className="btn-primary min-h-11 justify-center disabled:opacity-40"
-                                >
-                                  Use selected PO
-                                </button>
-                              </div>
-                            ) : (
-                              <div className="mt-3 space-y-2">
-                                <p className="text-xs font-medium text-red-700">
-                                  No matching PO was found. Choose the correct Store to send this package through worker and Admin review, or skip it.
-                                </p>
-                                <div className="flex flex-col gap-2 sm:flex-row">
-                                  <select
-                                    aria-label={`Store for mismatched tracking ${decision.trackingNumber}`}
-                                    value={draft.storeKey || ''}
-                                    onChange={(event) => setManifestChoiceDrafts((current) => ({
-                                      ...current,
-                                      [decision.tracking]: {
-                                        ...current[decision.tracking],
-                                        storeKey: event.target.value,
-                                      },
-                                    }))}
-                                    className="h-11 min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-3 text-sm"
-                                  >
-                                    <option value="">Choose Store</option>
-                                    {stores.map((store) => (
-                                      <option key={store.store_key} value={store.store_key}>
-                                        {store.store_name}
-                                      </option>
-                                    ))}
-                                  </select>
-                                  <button
-                                    type="button"
-                                    disabled={!draft.storeKey}
-                                    onClick={() => chooseManifestStore(decision.tracking)}
-                                    className="btn-primary min-h-11 justify-center disabled:opacity-40"
-                                  >
-                                    Use Store & Review
-                                  </button>
-                                </div>
-                              </div>
-                            )}
-                          </>
-                        ) : (
-                          <>
-                            <p className="mt-1 text-xs text-red-700">
-                              Store could not be identified for this tracking.
-                            </p>
-                            <div className="mt-3 flex flex-col gap-2 sm:flex-row">
-                              <select
-                                aria-label={`Store for ${decision.trackingNumber}`}
-                                value={draft.storeKey || ''}
-                                onChange={(event) => setManifestChoiceDrafts((current) => ({
-                                  ...current,
-                                  [decision.tracking]: {
-                                    ...current[decision.tracking],
-                                    storeKey: event.target.value,
-                                  },
-                                }))}
-                                className="h-11 min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-3 text-sm"
-                              >
-                                <option value="">Choose Store</option>
-                                {stores.map((store) => (
-                                  <option key={store.store_key} value={store.store_key}>
-                                    {store.store_name}
-                                  </option>
-                                ))}
-                              </select>
-                              <button
-                                type="button"
-                                disabled={!draft.storeKey}
-                                onClick={() => chooseManifestStore(decision.tracking)}
-                                className="btn-primary min-h-11 justify-center disabled:opacity-40"
-                              >
-                                Use selected Store
-                              </button>
-                            </div>
-                          </>
-                        )}
+                        <p className="mt-1 text-xs text-red-700">
+                          Store could not be identified for this tracking.
+                        </p>
+                        <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+                          <select
+                            aria-label={`Store for ${decision.trackingNumber}`}
+                            value={draft.storeKey || ''}
+                            onChange={(event) => setManifestChoiceDrafts((current) => ({
+                              ...current,
+                              [decision.tracking]: {
+                                ...current[decision.tracking],
+                                storeKey: event.target.value,
+                              },
+                            }))}
+                            className="h-11 min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-3 text-sm"
+                          >
+                            <option value="">Choose Store</option>
+                            {stores.map((store) => (
+                              <option key={store.store_key} value={store.store_key}>
+                                {store.store_name}
+                              </option>
+                            ))}
+                          </select>
+                          <button
+                            type="button"
+                            disabled={!draft.storeKey}
+                            onClick={() => chooseManifestStore(decision.tracking)}
+                            className="btn-primary min-h-11 justify-center disabled:opacity-40"
+                          >
+                            Use selected Store
+                          </button>
+                        </div>
                         <button
                           type="button"
                           onClick={() => skipManifestTracking(decision.tracking)}

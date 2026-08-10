@@ -21,7 +21,6 @@ import {
   expandConfirmedProductSku,
   getReturnManifestOrderNumbers,
   getReturnManifestSkuIds,
-  getReturnManifestTrackingNumbers,
   mergeAnalyticsReturnStores,
   parseProductCatalogRows,
   parseReturnManifestRows,
@@ -1432,21 +1431,7 @@ test('a SKU ID found in more than one store is never assigned automatically', ()
   assert.equal(result.pendingUploadDecisions[0].issue, 'store_unresolved')
 })
 
-test('return manifest tracking lookup extracts unique non-empty tracking numbers', () => {
-  const rows = [
-    { '运单号 Tracking Number': ' TRACK-ONE ', 'SKU ID': 'SKU-A' },
-    { '运单号 Tracking Number': 'TRACK-ONE', 'SKU ID': 'SKU-B' },
-    { '运单号 Tracking Number': '', 'SKU ID': 'SKU-C' },
-    { '运单号 Tracking Number': 'track-two', 'SKU ID': 'SKU-D' },
-  ]
-
-  assert.deepEqual(
-    getReturnManifestTrackingNumbers(rows),
-    ['TRACK-ONE', 'TRACK-TWO'],
-  )
-})
-
-test('tracking and PO mismatches require an explicit PO choice before import', () => {
+test('a new return tracking never overrides the uploaded original PO', () => {
   const rows = [{
     '订单号 PO': 'PO-WRONG',
     'SKU ID': 'SKU-A',
@@ -1472,29 +1457,12 @@ test('tracking and PO mismatches require an explicit PO choice before import', (
     items: [{ sku_id: 'SKU-A', quantity: 1, outbound_trackings: [' TRACK-CORRECT '] }],
   }]
 
-  const blocked = parseSkuReturnManifestRows(rows, catalog, orders)
+  const result = parseSkuReturnManifestRows(rows, catalog, orders)
 
-  assert.equal(blocked.packages.length, 0)
-  assert.equal(blocked.reviewPackages.length, 0)
-  assert.deepEqual(blocked.pendingUploadDecisions, [{
-    tracking: 'TRACK-CORRECT',
-    trackingNumber: 'track-correct',
-    issue: 'tracking_po_mismatch',
-    claimedOrders: ['PO-WRONG'],
-    candidateOrders: [{
-      orderNumber: 'PO-CORRECT',
-      storeName: 'House',
-      storeKey: 'house',
-    }],
-  }])
-
-  const resolved = parseSkuReturnManifestRows(rows, catalog, orders, {
-    poByTracking: { 'TRACK-CORRECT': 'PO-CORRECT' },
-  })
-
-  assert.equal(resolved.pendingUploadDecisions.length, 0)
-  assert.equal(resolved.packages.length, 1)
-  assert.deepEqual(resolved.packages[0].orders, ['PO-CORRECT'])
+  assert.equal(result.pendingUploadDecisions.length, 0)
+  assert.equal(result.reviewPackages.length, 0)
+  assert.equal(result.packages.length, 1)
+  assert.deepEqual(result.packages[0].orders, ['PO-WRONG'])
 })
 
 test('a worker may explicitly skip a tracking blocked during manifest upload', () => {
@@ -1525,11 +1493,11 @@ test('a worker may explicitly skip a tracking blocked during manifest upload', (
   assert.equal(result.stats.skippedPackages, 1)
 })
 
-test('a tracking and PO mismatch without a candidate PO can use a validated store for review', () => {
+test('a suffixed PO loads original order contents even when return and outbound tracking differ', () => {
   const rows = [{
-    '订单号 PO': 'PO-WRONG',
-    'SKU ID': 'SKU-A',
-    '运单号 Tracking Number': 'track-manual-store',
+    '订单号 PO': 'PO-211-21604060406393228-D01',
+    'SKU ID': '',
+    '运单号 Tracking Number': '1Z0JA1729096605959',
   }]
   const catalog = [{
     store_name: 'House',
@@ -1540,27 +1508,26 @@ test('a tracking and PO mismatch without a candidate PO can use a validated stor
     components: [{ style: 'A100', color: 'Black', size: 'S', qty: 1 }],
   }]
   const orders = [{
-    order_number: 'PO-WRONG',
+    order_number: 'PO-211-21604060406393228',
     store_name: 'House',
     store_key: 'house',
-    items: [{ sku_id: 'SKU-A', quantity: 1, outbound_trackings: ['TRACK-OTHER'] }],
+    items: [{
+      sku_id: 'SKU-A',
+      sku_code: 'A100BlackS',
+      attributes: 'Black / S',
+      quantity: 1,
+      outbound_trackings: ['1Z-ORIGINAL-OUTBOUND'],
+    }],
   }]
 
-  const blocked = parseSkuReturnManifestRows(rows, catalog, orders)
-  assert.equal(blocked.pendingUploadDecisions[0].issue, 'tracking_po_mismatch')
-  assert.deepEqual(blocked.pendingUploadDecisions[0].candidateOrders, [])
+  const result = parseSkuReturnManifestRows(rows, catalog, orders)
 
-  const resolved = parseSkuReturnManifestRows(rows, catalog, orders, {
-    storeByTracking: {
-      'TRACK-MANUAL-STORE': { key: 'house', name: 'House' },
-    },
-  })
-
-  assert.equal(resolved.pendingUploadDecisions.length, 0)
-  assert.equal(resolved.packages.length, 0)
-  assert.equal(resolved.reviewPackages.length, 1)
-  assert.equal(resolved.reviewPackages[0].storeKey, 'house')
-  assert.equal(resolved.reviewPackages[0].reviewReason, 'tracking_po_mismatch_manual_store')
+  assert.equal(result.pendingUploadDecisions.length, 0)
+  assert.equal(result.reviewPackages.length, 0)
+  assert.equal(result.packages.length, 1)
+  assert.equal(result.packages[0].recoveredFromOrders[0], 'PO-211-21604060406393228')
+  assert.equal(result.packages[0].items[0].skuId, 'SKU-A')
+  assert.equal(result.packages[0].items[0].style, 'A100')
 })
 
 test('an unresolved return store requires an explicit existing-store choice', () => {
