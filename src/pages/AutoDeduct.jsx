@@ -20,6 +20,7 @@ import {
   reviewAliasKey,
 } from '../utils/autoDeductEngine.js'
 import { fetchAliases, patchAliasesAndVerify } from '../utils/autoDeductAliases.js'
+import { applyManualTargetEdits, buildBusinessMovementRows } from '../utils/autoDeductMovements.js'
 import ConsolidateStep from '../components/ConsolidateStep.jsx'
 import { consolidateRows } from '../utils/consolidateEngine.js'
 import { buildInventoryOrderClaims, parseOrderHistoryRows } from '../utils/orderImportEngine.js'
@@ -174,6 +175,66 @@ function StatCard({ label, value, color = 'slate' }) {
   )
 }
 
+function ManualTargetModal({ item, templateRows, onClose, onSelect }) {
+  const [query, setQuery] = useState('')
+  const candidates = useMemo(() => {
+    const words = query.toLowerCase().trim().split(/\s+/).filter(Boolean)
+    return templateRows
+      .filter((row) => {
+        const text = `${row.STYLE} ${row.COLOR} ${row.SIZE}`.toLowerCase()
+        return words.every((word) => text.includes(word))
+      })
+      .slice(0, 100)
+  }, [query, templateRows])
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+      <div className="w-full max-w-2xl overflow-hidden rounded-2xl bg-white shadow-xl">
+        <div className="flex items-start justify-between border-b border-slate-100 px-5 py-4">
+          <div>
+            <h3 className="font-semibold text-slate-800">Manual Inventory Target</h3>
+            <p className="mt-1 text-xs text-slate-500">
+              Source: {item.sourceStyle || '—'} / {item.sourceColor || '—'} / {item.sourceSize || '—'} · Qty {item.qty} · {item.businessDay || '—'}
+            </p>
+          </div>
+          <button onClick={onClose} className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600">
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+        <div className="space-y-3 p-5">
+          <input
+            autoFocus
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Search inventory style, color, or size…"
+            className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+          <div className="max-h-80 divide-y divide-slate-100 overflow-auto rounded-xl border border-slate-200">
+            {candidates.map((row) => (
+              <button
+                key={`${row.STYLE}\u241f${row.COLOR}\u241f${row.SIZE}`}
+                onClick={() => onSelect(row)}
+                className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left text-sm hover:bg-blue-50"
+              >
+                <span className="font-mono font-semibold text-slate-800">{row.STYLE}</span>
+                <span className="flex-1 text-slate-600">{row.COLOR}</span>
+                <span className="rounded bg-slate-100 px-2 py-0.5 font-medium text-slate-700">{row.SIZE}</span>
+              </button>
+            ))}
+            {!candidates.length && (
+              <p className="px-4 py-6 text-center text-sm text-slate-500">No existing inventory target found.</p>
+            )}
+          </div>
+          {candidates.length === 100 && (
+            <p className="text-xs text-amber-700">Showing the first 100 results. Enter more style, color, or size details.</p>
+          )}
+          <p className="text-xs text-slate-500">Quantity and business date remain locked to the source file.</p>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── Mock data for UI preview (only active when ?mock=1 in the URL) ─────────────
 const MOCK_TEMPLATE = [
   { STYLE: '50073', COLOR: 'dark denim#2',         SIZE: 'S' },
@@ -225,6 +286,8 @@ export default function AutoDeduct() {
   const [editingResolutions, setEditingResolutions] = useState(false)
   const [resolutionAliasKeys, setResolutionAliasKeys] = useState([])
   const [previewConfirmed, setPreviewConfirmed] = useState(false)
+  const [manualTargetEdits, setManualTargetEdits] = useState({})
+  const [manualEditIndex, setManualEditIndex] = useState(null)
   const [orderArchive, setOrderArchive] = useState(null)
   const toast = useToast()
 
@@ -267,14 +330,7 @@ export default function AutoDeduct() {
     () => calculateResolvedSourceUnits(result?.stats?.src_total || 0, resolvedExtras || []),
     [result, resolvedExtras],
   )
-  const inventoryApplyUnits = useMemo(
-    () => mergedFilledRows.reduce((sum, row) => sum + (Number(row.QTY) || 0), 0),
-    [mergedFilledRows],
-  )
   const allReviewRowsHandled = !result?.unmatchedRows?.length || resolvedExtras !== null
-  const reconciliationMismatch = Boolean(result)
-    && allReviewRowsHandled
-    && inventoryApplyUnits + skippedUnits !== expectedSourceUnits
 
   const deductionPreview = useMemo(() => {
     const preview = (result?.matchLog || []).map((match) => ({
@@ -320,27 +376,36 @@ export default function AutoDeduct() {
     return preview
   }, [result, resolvedExtras])
 
-  const businessMovementRows = useMemo(() => {
-    const groups = new Map()
-    for (const item of deductionPreview) {
-      const qty = Number(item.qty || 0)
-      if (!Number.isSafeInteger(qty) || qty <= 0) continue
-      const businessDay = /^\d{4}-\d{2}-\d{2}$/.test(item.businessDay || '') ? item.businessDay : ''
-      const key = [item.targetStyle, item.targetColor, item.targetSize, businessDay].join('\u241f')
-      const current = groups.get(key) || {
-        STYLE: item.targetStyle,
-        COLOR: item.targetColor,
-        SIZE: item.targetSize,
-        QTY: 0,
-        businessDay,
+  const manualAdjustment = useMemo(() => {
+    try {
+      return {
+        ...applyManualTargetEdits(mergedFilledRows, deductionPreview, manualTargetEdits),
+        error: '',
       }
-      current.QTY += qty
-      groups.set(key, current)
+    } catch (err) {
+      return {
+        filledRows: mergedFilledRows,
+        previewRows: deductionPreview,
+        error: err.message,
+      }
     }
-    return [...groups.values()]
-  }, [deductionPreview])
+  }, [mergedFilledRows, deductionPreview, manualTargetEdits])
+  const effectiveFilledRows = manualAdjustment.filledRows
+  const effectiveDeductionPreview = manualAdjustment.previewRows
+  const inventoryApplyUnits = useMemo(
+    () => effectiveFilledRows.reduce((sum, row) => sum + (Number(row.QTY) || 0), 0),
+    [effectiveFilledRows],
+  )
+  const reconciliationMismatch = Boolean(result)
+    && allReviewRowsHandled
+    && inventoryApplyUnits + skippedUnits !== expectedSourceUnits
 
-  const hasCrossStylePreview = deductionPreview.some((item) =>
+  const businessMovementRows = useMemo(
+    () => buildBusinessMovementRows(effectiveDeductionPreview, sourceBusinessDay),
+    [effectiveDeductionPreview, sourceBusinessDay],
+  )
+
+  const hasCrossStylePreview = effectiveDeductionPreview.some((item) =>
     normalizeStyleIdentity(item.sourceStyle) !== normalizeStyleIdentity(item.targetStyle)
   )
 
@@ -381,14 +446,14 @@ export default function AutoDeduct() {
     setSourceBusinessDay(parsedDay.day)
     setBusinessDaySource(parsedDay.day ? 'filename' : '')
     setFilenameDayStatus(parsedDay.status)
-    setSrcFile(file); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([]); setSourceHash(''); setEditingResolutions(false); setResolutionAliasKeys([]); setPreviewConfirmed(false); setOrderArchive(null)
+    setSrcFile(file); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([]); setSourceHash(''); setEditingResolutions(false); setResolutionAliasKeys([]); setPreviewConfirmed(false); setManualTargetEdits({}); setManualEditIndex(null); setOrderArchive(null)
   }, [])
 
   const handleRun = useCallback(async () => {
     if (isMock) {
       setResult(MOCK_RESULT)
       setTemplateRows(MOCK_TEMPLATE)
-      setApplied(false); setResolvedExtras(null); setSkippedRows([]); setEditingResolutions(false); setResolutionAliasKeys([]); setPreviewConfirmed(false)
+      setApplied(false); setResolvedExtras(null); setSkippedRows([]); setEditingResolutions(false); setResolutionAliasKeys([]); setPreviewConfirmed(false); setManualTargetEdits({}); setManualEditIndex(null)
       toast.info('3 rows need review', 'Mock Run Complete')
       return
     }
@@ -401,7 +466,7 @@ export default function AutoDeduct() {
       toast.error('Saved Inventory Target matches must load successfully before Auto Deduct can run', 'Auto Deduct Blocked')
       return
     }
-    setProcessing(true); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([]); setEditingResolutions(false); setResolutionAliasKeys([]); setPreviewConfirmed(false)
+    setProcessing(true); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([]); setEditingResolutions(false); setResolutionAliasKeys([]); setPreviewConfirmed(false); setManualTargetEdits({}); setManualEditIndex(null)
     try {
       // 1. Fetch template from inventory balance (canonical SKU list)
       const tRes  = await fetch(`${BASE}/inventory-balance?action=list`, { headers: authHeaders(getToken()) })
@@ -482,6 +547,8 @@ export default function AutoDeduct() {
     setSkippedRows(skipped)
     setEditingResolutions(false)
     setPreviewConfirmed(false)
+    setManualTargetEdits({})
+    setManualEditIndex(null)
     const learned = {}
     for (const item of items) {
       if (!item._learnAlias || !item._source) continue
@@ -592,15 +659,19 @@ export default function AutoDeduct() {
   const handleDownload = useCallback(async () => {
     if (!result) return
     // Before the resolver runs: all unmatched rows. After: only the skipped ones
-    // (linked/created rows are already merged into mergedFilledRows).
+    // (linked/created/manual target rows are already merged into effectiveFilledRows).
     const unmatchedSheet = resolvedExtras !== null ? skippedRows : result.unmatchedRows
+    if (manualAdjustment.error) {
+      toast.error(manualAdjustment.error, 'Manual Review Required')
+      return
+    }
     try {
-      await generateExcel(mergedFilledRows, unmatchedSheet, srcFile?.name || 'output')
+      await generateExcel(effectiveFilledRows, unmatchedSheet, srcFile?.name || 'output')
       toast.success('Excel downloaded')
     } catch (err) {
       toast.error(err.message, 'Download Failed')
     }
-  }, [result, resolvedExtras, skippedRows, mergedFilledRows, srcFile, toast])
+  }, [result, resolvedExtras, skippedRows, effectiveFilledRows, manualAdjustment.error, srcFile, toast])
 
   const archiveDailyOrders = useCallback(async () => {
     if (txnType !== 'sales' || !orderArchive?.orders?.length) return { conflicts: [] }
@@ -626,7 +697,11 @@ export default function AutoDeduct() {
   }, [getToken, orderArchive, sourceHash, srcFile, txnType])
 
   const handleApply = useCallback(async () => {
-    if (!mergedFilledRows.length || applying) return
+    if (!effectiveFilledRows.length || applying) return
+    if (manualAdjustment.error) {
+      toast.error(manualAdjustment.error, 'Manual Review Required')
+      return
+    }
     if (aliasesLoading || aliasesSaving || aliasesError) {
       toast.error(
         'Saved Inventory Target matches must be loaded and verified before inventory can be changed.',
@@ -678,7 +753,7 @@ export default function AutoDeduct() {
         method:  'POST',
         headers: authHeaders(getToken(), true),
         body:    JSON.stringify({
-          filledRows:  mergedFilledRows,
+          filledRows:  effectiveFilledRows,
           movementRows: businessMovementRows,
           txnType,
           sourceName:  srcFile?.name || '',
@@ -708,7 +783,7 @@ export default function AutoDeduct() {
     } finally {
       setApplying(false)
     }
-  }, [archiveDailyOrders, mergedFilledRows, businessMovementRows, txnType, srcFile, sourceHash, sourceBusinessDay, orderArchive, orderClaims, orderImportIssueCount, expectedSourceUnits, inventoryApplyUnits, reconciliationMismatch, skippedUnits, applying, getToken, previewConfirmed, toast, aliasesLoading, aliasesSaving, aliasesError])
+  }, [archiveDailyOrders, effectiveFilledRows, manualAdjustment.error, businessMovementRows, txnType, srcFile, sourceHash, sourceBusinessDay, orderArchive, orderClaims, orderImportIssueCount, expectedSourceUnits, inventoryApplyUnits, reconciliationMismatch, skippedUnits, applying, getToken, previewConfirmed, toast, aliasesLoading, aliasesSaving, aliasesError])
 
   const stats            = result?.stats
   const hasUnresolved    = result?.unmatchedRows?.length > 0 && resolvedExtras === null
@@ -722,6 +797,8 @@ export default function AutoDeduct() {
     ? 'Saved Inventory Target matches are still being verified.'
     : aliasesError
       ? 'Saved Inventory Target matches could not be verified. Retry before changing inventory.'
+    : manualAdjustment.error
+      ? manualAdjustment.error
     : skippedUnits > 0
     ? `Resolve the ${skippedUnits.toLocaleString()} skipped physical units before applying.`
     : reconciliationMismatch
@@ -736,6 +813,29 @@ export default function AutoDeduct() {
 
   return (
     <div className="space-y-6 max-w-4xl">
+      {manualEditIndex !== null && effectiveDeductionPreview[manualEditIndex] && (
+        <ManualTargetModal
+          item={effectiveDeductionPreview[manualEditIndex]}
+          templateRows={templateRows}
+          onClose={() => setManualEditIndex(null)}
+          onSelect={(target) => {
+            const index = manualEditIndex
+            const original = deductionPreview[index]
+            const isOriginal = original
+              && original.targetStyle === target.STYLE
+              && original.targetColor === target.COLOR
+              && original.targetSize === target.SIZE
+            setManualTargetEdits((current) => {
+              const next = { ...current }
+              if (isOriginal) delete next[index]
+              else next[index] = { STYLE: target.STYLE, COLOR: target.COLOR, SIZE: target.SIZE }
+              return next
+            })
+            setManualEditIndex(null)
+            setPreviewConfirmed(false)
+          }}
+        />
+      )}
       {showSettings && (
         <SettingsModal
           getToken={getToken}
@@ -809,7 +909,7 @@ export default function AutoDeduct() {
             { id: 'sales',  label: 'Sales — Deduct',    icon: Minus,       active: 'text-orange-600' },
             { id: 'return', label: 'Return — Add Back', icon: TrendingUp,  active: 'text-green-600'  },
           ].map(({ id, label, icon: Icon, active }) => (
-            <button key={id} onClick={() => { setTxnType(id); setPreviewConfirmed(false) }}
+            <button key={id} onClick={() => { setTxnType(id); setPreviewConfirmed(false); setManualTargetEdits({}); setManualEditIndex(null) }}
               className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${
                 txnType === id ? `bg-white shadow-sm ${active}` : 'text-slate-500 hover:text-slate-700'
               }`}>
@@ -827,7 +927,7 @@ export default function AutoDeduct() {
           label="Drag & drop TEMU order / consolidated file here"
           sublabel="Raw TEMU workbook is required for sales deductions; CSV is preview/download only"
           currentFile={srcFile}
-          onClear={() => { setSrcFile(null); setResult(null); setApplied(false); setPreviewConfirmed(false); setOrderArchive(null); setSourceBusinessDay(''); setBusinessDaySource(''); setFilenameDayStatus('missing') }}
+          onClear={() => { setSrcFile(null); setResult(null); setApplied(false); setPreviewConfirmed(false); setManualTargetEdits({}); setManualEditIndex(null); setOrderArchive(null); setSourceBusinessDay(''); setBusinessDaySource(''); setFilenameDayStatus('missing') }}
         />
 
         {srcFile && (
@@ -858,6 +958,8 @@ export default function AutoDeduct() {
                     setResult(null)
                     setApplied(false)
                     setPreviewConfirmed(false)
+                    setManualTargetEdits({})
+                    setManualEditIndex(null)
                   }}
                   className="mt-2 block rounded-lg border border-amber-300 bg-white px-3 py-2 text-sm text-slate-800"
                 />
@@ -977,9 +1079,20 @@ export default function AutoDeduct() {
               </div>
             )}
 
+            <div className="flex items-start gap-2 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+              <div>
+                <p className="font-semibold">Manual intervention is available before Apply.</p>
+                <p className="mt-0.5 text-blue-700">Use Change on any row to select a different existing Inventory Target for this upload. Quantity and business date stay locked to the source file.</p>
+              </div>
+            </div>
+
             <details defaultOpen={hasCrossStylePreview} className="overflow-hidden rounded-xl border border-slate-200">
               <summary className="cursor-pointer bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-700">
-                Review source → inventory targets ({deductionPreview.length.toLocaleString()} mappings)
+                Review source → inventory targets ({effectiveDeductionPreview.length.toLocaleString()} mappings)
+                {Object.keys(manualTargetEdits).length > 0 && (
+                  <span className="ml-2 text-blue-700">· {Object.keys(manualTargetEdits).length} manually changed</span>
+                )}
               </summary>
               <div className="max-h-80 overflow-auto">
                 <table className="w-full min-w-[760px] text-left text-xs">
@@ -993,12 +1106,13 @@ export default function AutoDeduct() {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
-                    {deductionPreview.map((item, index) => {
+                    {effectiveDeductionPreview.map((item, index) => {
                       const sourceStyle = normalizeStyleIdentity(item.sourceStyle)
                       const targetStyle = normalizeStyleIdentity(item.targetStyle)
                       const crossStyle = sourceStyle !== targetStyle
+                      const manuallyChanged = Object.hasOwn(manualTargetEdits, index)
                       return (
-                        <tr key={`${index}-${item.sourceStyle}-${item.sourceColor}-${item.sourceSize}`} className={crossStyle ? 'bg-red-50' : ''}>
+                        <tr key={`${index}-${item.sourceStyle}-${item.sourceColor}-${item.sourceSize}`} className={manuallyChanged ? 'bg-blue-50' : crossStyle ? 'bg-red-50' : ''}>
                           <td className="px-3 py-2 text-slate-600">
                             <span className="font-mono font-semibold text-slate-800">{item.sourceStyle || '—'}</span>
                             <span className="mx-1 text-slate-300">/</span>{item.sourceColor || '—'}
@@ -1009,6 +1123,31 @@ export default function AutoDeduct() {
                             <span className="mx-1 text-slate-300">/</span>{item.targetColor || '—'}
                             <span className="mx-1 text-slate-300">/</span>{item.targetSize || '—'}
                             {crossStyle && <span className="ml-2 rounded-full bg-red-100 px-2 py-0.5 font-bold text-red-700">Cross-style</span>}
+                            <div className="mt-1 flex items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => setManualEditIndex(index)}
+                                className="font-semibold text-blue-700 hover:text-blue-900"
+                              >
+                                Change
+                              </button>
+                              {manuallyChanged && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setManualTargetEdits((current) => {
+                                      const next = { ...current }
+                                      delete next[index]
+                                      return next
+                                    })
+                                    setPreviewConfirmed(false)
+                                  }}
+                                  className="text-slate-500 hover:text-slate-700"
+                                >
+                                  Undo
+                                </button>
+                              )}
+                            </div>
                           </td>
                           <td className="px-3 py-2 text-right font-bold tabular-nums text-slate-800">{Number(item.qty || 0).toLocaleString()}</td>
                           <td className="px-3 py-2 font-mono text-slate-600">{item.businessDay || '—'}</td>
@@ -1039,7 +1178,7 @@ export default function AutoDeduct() {
             </label>
 
             {hasReviewRows && !applied && (
-              <button onClick={() => { setEditingResolutions(true); setPreviewConfirmed(false) }} className="btn-secondary w-full justify-center py-2.5">
+              <button onClick={() => { setEditingResolutions(true); setPreviewConfirmed(false); setManualTargetEdits({}); setManualEditIndex(null) }} className="btn-secondary w-full justify-center py-2.5">
                 Review / Edit Resolutions
               </button>
             )}

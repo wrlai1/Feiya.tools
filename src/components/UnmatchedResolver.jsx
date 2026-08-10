@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useMemo } from 'react'
 import { Search, Plus, SkipForward, CheckCircle, X, Link2, ChevronDown, RotateCcw } from 'lucide-react'
 import { findAdditionalComboSizeMappings, findAdditionalSizeMappings } from '../utils/autoDeductRules.js'
+import { resolutionSourceContext } from '../utils/autoDeductMovements.js'
 
 const REVIEW_REASONS = {
   style_identity_mismatch: 'The style punctuation differs from inventory, so it was not matched automatically.',
@@ -258,16 +259,10 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
           components: r.entry.components,
           QTY: row.qty,
           _isCombo: true,
-          _source: {
-            style: row.style,
-            color: row.color,
-            size: row.size,
+          _source: resolutionSourceContext(row, {
             packCount: confirmedPackCount,
             originalPackCount: row.packCount,
-            sourceSignature: row.sourceSignature,
-            sourceIssue: row.sourceIssue,
-            parseIssue: row.parseIssue,
-          },
+          }),
           _learnAlias: true,
         })
         continue
@@ -278,14 +273,7 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
         SIZE:   r.entry.SIZE,
         QTY:    row.qty,
         _isNew: r.type === 'create',
-        _source: {
-          style: row.style,
-          color: row.color,
-          size: row.size,
-          sourceSignature: row.sourceSignature,
-          sourceIssue: row.sourceIssue,
-          parseIssue: row.parseIssue,
-        },
+        _source: resolutionSourceContext(row),
         _learnAlias: r.type === 'link' || r.type === 'create',
       })
     }

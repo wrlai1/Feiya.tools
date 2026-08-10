@@ -1407,22 +1407,30 @@ test('a confirmed style and color safely carries to sibling sizes during review'
     unmatchedRows: [
       { style: 'A-100', color: 'Black', size: 'S', packCount: 1, parseIssue: 'style_identity_mismatch' },
       { style: 'A-100', color: 'Black', size: 'M', packCount: 1, parseIssue: 'style_identity_mismatch' },
+      { style: 'A-100', color: 'Black', size: 'L', packCount: 1, parseIssue: 'style_identity_mismatch' },
       { style: 'A-100', color: 'Navy', size: 'M', packCount: 1, parseIssue: 'style_identity_mismatch' },
     ],
     templateRows: [
       { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S' },
       { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'M' },
+      { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'L' },
       { STYLE: 'A100', COLOR: 'NAVY', SIZE: 'M' },
     ],
-    resolved: [null, null, null],
+    resolved: [null, null, null, null],
     sourceIndex: 0,
     targetEntry: { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S' },
   })
 
-  assert.deepEqual(mappings, [{
-    index: 1,
-    entry: { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'M' },
-  }])
+  assert.deepEqual(mappings, [
+    {
+      index: 1,
+      entry: { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'M' },
+    },
+    {
+      index: 2,
+      entry: { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'L' },
+    },
+  ])
 })
 
 test('a source-data conflict is never propagated to sibling sizes through a generated review reason', () => {
