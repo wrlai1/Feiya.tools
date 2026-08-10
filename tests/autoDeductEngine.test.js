@@ -21,6 +21,7 @@ import {
   expandConfirmedProductSku,
   getReturnManifestOrderNumbers,
   getReturnManifestSkuIds,
+  getReturnManifestTrackingNumbers,
   mergeAnalyticsReturnStores,
   parseProductCatalogRows,
   parseReturnManifestRows,
@@ -1260,11 +1261,12 @@ test('one combined return manifest assigns each tracking to its SKU catalog stor
   )
 })
 
-test('one tracking containing SKUs from different stores fails closed for review', () => {
-  const result = parseSkuReturnManifestRows([
+test('one tracking containing SKUs from different stores requires an explicit store choice', () => {
+  const rows = [
     { 'SKU ID': 'GARDEN-SKU', '运单号 Tracking Number': 'TRACK-MIXED' },
     { 'SKU ID': 'HOUSE-SKU', '运单号 Tracking Number': 'TRACK-MIXED' },
-  ], [
+  ]
+  const catalog = [
     {
       store_name: 'Garden',
       store_key: 'garden',
@@ -1281,12 +1283,23 @@ test('one tracking containing SKUs from different stores fails closed for review
       status: 'ready',
       components: [{ style: 'B200', color: 'Navy', size: 'M', qty: 1 }],
     },
-  ])
+  ]
+  const result = parseSkuReturnManifestRows(rows, catalog)
 
   assert.equal(result.packages.length, 0)
-  assert.equal(result.reviewPackages.length, 1)
-  assert.equal(result.reviewPackages[0].storeName, 'Unresolved')
-  assert.ok(result.needsReview.some((row) => row.parse_issue === 'tracking_cross_store'))
+  assert.equal(result.reviewPackages.length, 0)
+  assert.equal(result.pendingUploadDecisions.length, 1)
+  assert.equal(result.pendingUploadDecisions[0].issue, 'store_unresolved')
+
+  const resolved = parseSkuReturnManifestRows(rows, catalog, [], {
+    storeByTracking: {
+      'TRACK-MIXED': { key: 'house', name: 'House' },
+    },
+  })
+
+  assert.equal(resolved.pendingUploadDecisions.length, 0)
+  assert.equal(resolved.packages.length, 1)
+  assert.equal(resolved.packages[0].storeKey, 'house')
 })
 
 test('a SKU ID found in more than one store is never assigned automatically', () => {
@@ -1312,8 +1325,129 @@ test('a SKU ID found in more than one store is never assigned automatically', ()
   ])
 
   assert.equal(result.packages.length, 0)
-  assert.equal(result.reviewPackages[0].storeName, 'Unresolved')
-  assert.equal(result.needsReview[0].parse_issue, 'sku_id_store_ambiguous')
+  assert.equal(result.reviewPackages.length, 0)
+  assert.equal(result.pendingUploadDecisions.length, 1)
+  assert.equal(result.pendingUploadDecisions[0].tracking, 'TRACK-AMBIGUOUS')
+  assert.equal(result.pendingUploadDecisions[0].issue, 'store_unresolved')
+})
+
+test('return manifest tracking lookup extracts unique non-empty tracking numbers', () => {
+  const rows = [
+    { '运单号 Tracking Number': ' TRACK-ONE ', 'SKU ID': 'SKU-A' },
+    { '运单号 Tracking Number': 'TRACK-ONE', 'SKU ID': 'SKU-B' },
+    { '运单号 Tracking Number': '', 'SKU ID': 'SKU-C' },
+    { '运单号 Tracking Number': 'track-two', 'SKU ID': 'SKU-D' },
+  ]
+
+  assert.deepEqual(
+    getReturnManifestTrackingNumbers(rows),
+    ['TRACK-ONE', 'TRACK-TWO'],
+  )
+})
+
+test('tracking and PO mismatches require an explicit PO choice before import', () => {
+  const rows = [{
+    '订单号 PO': 'PO-WRONG',
+    'SKU ID': 'SKU-A',
+    '运单号 Tracking Number': 'track-correct',
+  }]
+  const catalog = [{
+    store_name: 'House',
+    store_key: 'house',
+    sku_id: 'SKU-A',
+    sku_code: 'A100BlackS',
+    status: 'ready',
+    components: [{ style: 'A100', color: 'Black', size: 'S', qty: 1 }],
+  }]
+  const orders = [{
+    order_number: 'PO-WRONG',
+    store_name: 'House',
+    store_key: 'house',
+    items: [{ sku_id: 'SKU-A', quantity: 1, outbound_trackings: ['TRACK-WRONG'] }],
+  }, {
+    order_number: 'PO-CORRECT',
+    store_name: 'House',
+    store_key: 'house',
+    items: [{ sku_id: 'SKU-A', quantity: 1, outbound_trackings: [' TRACK-CORRECT '] }],
+  }]
+
+  const blocked = parseSkuReturnManifestRows(rows, catalog, orders)
+
+  assert.equal(blocked.packages.length, 0)
+  assert.equal(blocked.reviewPackages.length, 0)
+  assert.deepEqual(blocked.pendingUploadDecisions, [{
+    tracking: 'TRACK-CORRECT',
+    trackingNumber: 'track-correct',
+    issue: 'tracking_po_mismatch',
+    claimedOrders: ['PO-WRONG'],
+    candidateOrders: [{
+      orderNumber: 'PO-CORRECT',
+      storeName: 'House',
+      storeKey: 'house',
+    }],
+  }])
+
+  const resolved = parseSkuReturnManifestRows(rows, catalog, orders, {
+    poByTracking: { 'TRACK-CORRECT': 'PO-CORRECT' },
+  })
+
+  assert.equal(resolved.pendingUploadDecisions.length, 0)
+  assert.equal(resolved.packages.length, 1)
+  assert.deepEqual(resolved.packages[0].orders, ['PO-CORRECT'])
+})
+
+test('a worker may explicitly skip a tracking blocked during manifest upload', () => {
+  const result = parseSkuReturnManifestRows([{
+    '订单号 PO': 'PO-WRONG',
+    'SKU ID': 'SKU-A',
+    '运单号 Tracking Number': 'track-skip',
+  }], [{
+    store_name: 'House',
+    store_key: 'house',
+    sku_id: 'SKU-A',
+    sku_code: 'A100BlackS',
+    status: 'ready',
+    components: [{ style: 'A100', color: 'Black', size: 'S', qty: 1 }],
+  }], [{
+    order_number: 'PO-WRONG',
+    store_name: 'House',
+    store_key: 'house',
+    items: [{ sku_id: 'SKU-A', quantity: 1, outbound_trackings: ['TRACK-OTHER'] }],
+  }], {
+    skippedTrackings: [' TRACK-SKIP '],
+  })
+
+  assert.equal(result.packages.length, 0)
+  assert.equal(result.reviewPackages.length, 0)
+  assert.equal(result.pendingUploadDecisions.length, 0)
+  assert.deepEqual(result.skippedTrackings, ['TRACK-SKIP'])
+  assert.equal(result.stats.skippedPackages, 1)
+})
+
+test('an unresolved return store requires an explicit existing-store choice', () => {
+  const rows = [{
+    '订单号 PO': 'PO-NOT-UPLOADED',
+    'SKU ID': 'SKU-NOT-IN-CATALOG',
+    '运单号 Tracking Number': 'RETURN-STORE-CHOICE',
+  }]
+  const blocked = parseSkuReturnManifestRows(rows, [], [])
+
+  assert.equal(blocked.packages.length, 0)
+  assert.equal(blocked.reviewPackages.length, 0)
+  assert.equal(blocked.pendingUploadDecisions[0].issue, 'store_unresolved')
+
+  const resolved = parseSkuReturnManifestRows(rows, [], [], {
+    storeByTracking: {
+      'RETURN-STORE-CHOICE': { key: 'house', name: 'House' },
+    },
+  })
+
+  assert.equal(resolved.pendingUploadDecisions.length, 0)
+  assert.equal(resolved.packages.length, 0)
+  assert.equal(resolved.reviewPackages.length, 1)
+  assert.equal(resolved.reviewPackages[0].storeKey, 'house')
+  assert.equal(resolved.reviewPackages[0].storeName, 'House')
+  assert.equal(resolved.needsReview[0].parse_issue, 'sku_id_not_in_store_catalog')
 })
 
 test('daily house-return workbooks prefer the flat detail sheet', () => {
@@ -1370,8 +1504,10 @@ test('SKU return manifests isolate missing catalog data without blocking ready p
 
   assert.equal(result.packages.length, 1)
   assert.equal(result.packages[0].tracking, 'READY-1')
-  assert.equal(result.needsReview.length, 1)
-  assert.equal(result.needsReview[0].parse_issue, 'sku_id_missing')
+  assert.equal(result.needsReview.length, 0)
+  assert.equal(result.pendingUploadDecisions.length, 1)
+  assert.equal(result.pendingUploadDecisions[0].tracking, 'REVIEW-1')
+  assert.equal(result.pendingUploadDecisions[0].issue, 'store_unresolved')
   assert.equal(result.waitingForTracking.length, 1)
   assert.equal(result.waitingForTracking[0].parse_issue, 'tracking_pending')
   assert.equal(result.stats.waitingForTracking, 1)
@@ -1516,11 +1652,24 @@ test('a single-SKU order safely fills a missing return SKU without a selection',
 })
 
 test('missing return SKU stays in review when its order history is unavailable', () => {
-  const result = parseSkuReturnManifestRows([{
+  const rows = [{
     '订单号 PO': 'PO-NOT-UPLOADED',
     'SKU ID': '',
     '运单号 Tracking Number': 'RETURN-REVIEW-1',
-  }], [], [])
+  }]
+
+  const unresolved = parseSkuReturnManifestRows(rows, [], [])
+
+  assert.equal(unresolved.packages.length, 0)
+  assert.equal(unresolved.reviewPackages.length, 0)
+  assert.equal(unresolved.pendingUploadDecisions.length, 1)
+  assert.equal(unresolved.pendingUploadDecisions[0].issue, 'store_unresolved')
+
+  const result = parseSkuReturnManifestRows(rows, [], [], {
+    storeByTracking: {
+      'RETURN-REVIEW-1': { key: 'house', name: 'House' },
+    },
+  })
 
   assert.equal(result.packages.length, 0)
   assert.equal(result.needsReview[0].orderNumber, 'PO-NOT-UPLOADED')

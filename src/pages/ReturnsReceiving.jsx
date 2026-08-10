@@ -25,6 +25,7 @@ import {
   chooseReturnManifestSheetName,
   getReturnManifestOrderNumbers,
   getReturnManifestSkuIds,
+  getReturnManifestTrackingNumbers,
   mergeAnalyticsReturnStores,
   parseProductCatalogRows,
   parseSkuReturnManifestRows,
@@ -347,6 +348,13 @@ export default function ReturnsReceiving() {
   const [reviewPackages, setReviewPackages] = useState([])
   const [file, setFile] = useState(null)
   const [parsed, setParsed] = useState(null)
+  const [manifestContext, setManifestContext] = useState(null)
+  const [manifestDecisions, setManifestDecisions] = useState({
+    poByTracking: {},
+    storeByTracking: {},
+    skippedTrackings: [],
+  })
+  const [manifestChoiceDrafts, setManifestChoiceDrafts] = useState({})
   const [uploading, setUploading] = useState(false)
   const [stores, setStores] = useState([])
   const [storeLoadError, setStoreLoadError] = useState('')
@@ -799,7 +807,12 @@ export default function ReturnsReceiving() {
       setAdminSelections({})
       setAdminManualItems([{ style: '', color: '', size: '', qty: 1 }])
       setCounted(false)
-      toast.success('Returned products selected. Complete the inspection below.', 'Products Saved')
+      toast.success(
+        workerVerified
+          ? 'Mapping saved. Verify the listed styles and quantities; the worker already checked the package.'
+          : 'Returned products selected. Complete the inspection below.',
+        'Products Saved',
+      )
       await loadReviewPackages()
     } catch (error) {
       toast.error(error.message, 'Could Not Resolve Package')
@@ -811,6 +824,9 @@ export default function ReturnsReceiving() {
   const parseFile = async (nextFile) => {
     setFile(nextFile)
     setParsed(null)
+    setManifestContext(null)
+    setManifestDecisions({ poByTracking: {}, storeByTracking: {}, skippedTrackings: [] })
+    setManifestChoiceDrafts({})
     if (!nextFile) return
     try {
       const XLSX = await import('xlsx')
@@ -837,18 +853,35 @@ export default function ReturnsReceiving() {
       }
       const historicalOrders = []
       const orderNumbers = getReturnManifestOrderNumbers(rows)
-      for (let index = 0; index < orderNumbers.length; index += 500) {
+      const trackingNumbers = getReturnManifestTrackingNumbers(rows)
+      const lookupCount = Math.max(orderNumbers.length, trackingNumbers.length)
+      for (let index = 0; index < lookupCount; index += 500) {
         const orderRes = await fetch(`${BASE}/returns?action=orders-lookup-any`, {
           method: 'POST',
           headers: headers(getToken, true),
-          body: JSON.stringify({ orderNumbers: orderNumbers.slice(index, index + 500) }),
+          body: JSON.stringify({
+            orderNumbers: orderNumbers.slice(index, index + 500),
+            trackingNumbers: trackingNumbers.slice(index, index + 500),
+          }),
         })
         const orderData = await orderRes.json().catch(() => ({}))
         if (!orderRes.ok) throw new Error(orderData.error || 'Could not load matching order history')
         historicalOrders.push(...(orderData.orders || []))
       }
-      const result = parseSkuReturnManifestRows(rows, catalogRows, historicalOrders)
+      const uniqueOrders = [...new Map(historicalOrders.map((order) => [
+        `${order.store_key || order.storeKey || ''}\u241f${order.order_key || order.orderKey || order.order_number || order.orderNumber}`,
+        order,
+      ])).values()]
+      const context = { rows, catalogRows, historicalOrders: uniqueOrders }
+      setManifestContext(context)
+      const result = parseSkuReturnManifestRows(rows, catalogRows, uniqueOrders)
       setParsed(result)
+      if (result.pendingUploadDecisions.length) {
+        toast.warning(
+          `${result.pendingUploadDecisions.length} tracking package(s) require a PO or Store decision before upload`,
+          'Upload Decision Required',
+        )
+      }
       if (result.needsReview.length) {
         toast.warning(
           `${result.stats.reviewPackages} packages will be sent to Admin Review; ready packages can still upload`,
@@ -860,8 +893,55 @@ export default function ReturnsReceiving() {
     }
   }
 
+  const applyManifestDecisions = (nextDecisions) => {
+    if (!manifestContext) return
+    setManifestDecisions(nextDecisions)
+    setParsed(parseSkuReturnManifestRows(
+      manifestContext.rows,
+      manifestContext.catalogRows,
+      manifestContext.historicalOrders,
+      nextDecisions,
+    ))
+  }
+
+  const chooseManifestPo = (trackingKey) => {
+    const orderNumber = manifestChoiceDrafts[trackingKey]?.orderNumber
+    if (!orderNumber) return
+    applyManifestDecisions({
+      ...manifestDecisions,
+      poByTracking: { ...manifestDecisions.poByTracking, [trackingKey]: orderNumber },
+    })
+  }
+
+  const chooseManifestStore = (trackingKey) => {
+    const selectedKey = manifestChoiceDrafts[trackingKey]?.storeKey
+    const selectedStore = stores.find((store) => store.store_key === selectedKey)
+    if (!selectedStore) return
+    applyManifestDecisions({
+      ...manifestDecisions,
+      storeByTracking: {
+        ...manifestDecisions.storeByTracking,
+        [trackingKey]: { key: selectedStore.store_key, name: selectedStore.store_name },
+      },
+    })
+  }
+
+  const skipManifestTracking = (trackingKey) => {
+    applyManifestDecisions({
+      ...manifestDecisions,
+      skippedTrackings: [...new Set([
+        ...manifestDecisions.skippedTrackings,
+        trackingKey,
+      ])],
+    })
+  }
+
   const uploadManifest = async () => {
-    if ((!parsed?.packages?.length && !parsed?.reviewPackages?.length) || uploading) return
+    if (
+      (!parsed?.packages?.length && !parsed?.reviewPackages?.length)
+      || parsed?.pendingUploadDecisions?.length
+      || uploading
+    ) return
     setUploading(true)
     try {
       const res = await fetch(`${BASE}/returns?action=import`, {
@@ -876,11 +956,14 @@ export default function ReturnsReceiving() {
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || 'Could not upload return manifest')
       toast.success(
-        `${data.imported_packages} packages · ${Number(data.review_packages || 0)} sent to admin review`,
+        `${data.imported_packages} packages uploaded · ${Number(data.awaiting_worker_review || 0)} wait for worker verification`,
         'Return Manifest Uploaded',
       )
       setFile(null)
       setParsed(null)
+      setManifestContext(null)
+      setManifestDecisions({ poByTracking: {}, storeByTracking: {}, skippedTrackings: [] })
+      setManifestChoiceDrafts({})
       await loadRecent()
       setTab('receive')
       requestAnimationFrame(() => scannerRef.current?.focus())
@@ -1931,7 +2014,8 @@ export default function ReturnsReceiving() {
                 </div>
               )}
 
-              {!isAdmin && pkg.status === 'needs_review' && pkg.requires_item_resolution && (
+              {!isAdmin && ['pending', 'needs_review'].includes(pkg.status)
+                && pkg.requires_item_resolution && (
                 <div className="border-b border-amber-200 bg-amber-50 px-4 py-5 text-center sm:px-5">
                   <AlertTriangle className="mx-auto h-9 w-9 text-amber-600" />
                   <p className="mt-2 text-lg font-bold text-amber-900">
@@ -1945,38 +2029,57 @@ export default function ReturnsReceiving() {
               )}
 
               {!isAdmin ? (
-                <div className="divide-y divide-slate-100">
-                  {productGroups.length ? productGroups.map((product) => (
-                    <div key={product.key} className="px-4 py-5 sm:px-5">
-                      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                        <div className="min-w-0">
-                          <p className="break-words text-base font-bold text-slate-900">
-                            {product.skuCode || 'Product pending Admin / Producto pendiente'}
-                          </p>
-                          {product.skuId && (
-                            <p className="mt-1 text-xs text-slate-400">SKU ID {product.skuId}</p>
-                          )}
-                          <p className="mt-1 text-xs text-slate-500">
-                            {product.mappingPending
-                              ? 'Styles and pieces pending Admin / Estilos y piezas pendientes'
-                              : <>
-                                  {product.inventoryPieces} physical piece
-                                  {product.inventoryPieces === 1 ? '' : 's'} inside / piezas físicas
-                                </>}
-                          </p>
-                        </div>
-                        <div className="rounded-xl bg-blue-50 px-4 py-3 text-center text-blue-800">
-                          <p className="text-2xl font-black">{product.productQty}</p>
-                          <p className="text-xs font-semibold">PRODUCT / PRODUCTO</p>
+                <>
+                  <div className="divide-y divide-slate-100">
+                    {productGroups.length ? productGroups.map((product) => (
+                      <div key={product.key} className="px-4 py-5 sm:px-5">
+                        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                          <div className="min-w-0">
+                            <p className="break-words text-base font-bold text-slate-900">
+                              {product.skuCode || 'Product pending Admin / Producto pendiente'}
+                            </p>
+                            {product.skuId && (
+                              <p className="mt-1 text-xs text-slate-400">SKU ID {product.skuId}</p>
+                            )}
+                            <p className="mt-1 text-xs text-slate-500">
+                              {product.mappingPending
+                                ? 'Styles and pieces pending Admin / Estilos y piezas pendientes'
+                                : <>
+                                    {product.inventoryPieces} physical piece
+                                    {product.inventoryPieces === 1 ? '' : 's'} inside / piezas físicas
+                                  </>}
+                            </p>
+                          </div>
+                          <div className="rounded-xl bg-blue-50 px-4 py-3 text-center text-blue-800">
+                            <p className="text-2xl font-black">{product.productQty}</p>
+                            <p className="text-xs font-semibold">PRODUCT / PRODUCTO</p>
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  )) : (
-                    <div className="px-4 py-5 text-sm text-amber-800 sm:px-5">
-                      Admin will select the product and quantity / Admin seleccionará el producto y la cantidad.
+                    )) : (
+                      <div className="px-4 py-5 text-sm text-amber-800 sm:px-5">
+                        Admin will select the product and quantity / Admin seleccionará el producto y la cantidad.
+                      </div>
+                    )}
+                  </div>
+                  {pkg.items.length > 0 && (
+                    <div className="border-t border-slate-200 bg-slate-50 px-4 py-4 sm:px-5">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                        Verify styles and physical quantities / Verifique estilos y cantidades
+                      </p>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {pkg.items.map((item) => (
+                          <span
+                            key={item.id}
+                            className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700"
+                          >
+                            {item.style} / {item.color} / {item.size} × {item.expected_qty}
+                          </span>
+                        ))}
+                      </div>
                     </div>
                   )}
-                </div>
+                </>
               ) : (
               <div className="divide-y divide-slate-100">
                 {pkg.items.map((item) => {
@@ -2084,8 +2187,8 @@ export default function ReturnsReceiving() {
                               : `${expected - selected} missing / faltante`}
                           </p>
                         </>
-                      )}
-                    </div>
+                  )}
+                </div>
                   )
                 })}
               </div>
@@ -2153,24 +2256,52 @@ export default function ReturnsReceiving() {
 
               {!isAdmin && pkg.status === 'pending' && (
                 <div className="grid gap-3 border-t border-slate-200 bg-slate-50/70 p-4 sm:grid-cols-2 sm:p-5">
-                  <button
-                    type="button"
-                    onClick={() => confirmPackage({ allGood: true })}
-                    disabled={loading || !pkg.items.length}
-                    className="flex min-h-16 items-center justify-center gap-2 rounded-xl bg-emerald-600 px-5 text-lg font-bold text-white hover:bg-emerald-700 disabled:opacity-40"
-                  >
-                    {loading ? <RefreshCw className="h-5 w-5 animate-spin" /> : <CheckCircle2 className="h-6 w-6" />}
-                    ✅ All Good · Add {expectedUnits}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={flagForAdmin}
-                    disabled={loading}
-                    className="flex min-h-16 items-center justify-center gap-2 rounded-xl bg-amber-500 px-5 text-lg font-bold text-white hover:bg-amber-600 disabled:opacity-40"
-                  >
-                    <AlertTriangle className="h-6 w-6" />
-                    Any Problem · Send to Admin
-                  </button>
+                  {pkg.requires_item_resolution ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => flagForAdmin({
+                          workerChecked: true,
+                          reason: 'worker_checked_mapping_needed',
+                        })}
+                        disabled={loading}
+                        className="flex min-h-16 items-center justify-center gap-2 rounded-xl bg-emerald-600 px-5 text-lg font-bold text-white hover:bg-emerald-700 disabled:opacity-40"
+                      >
+                        {loading ? <RefreshCw className="h-5 w-5 animate-spin" /> : <CheckCircle2 className="h-6 w-6" />}
+                        ✅ Package & Qty Checked · Send Admin
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => flagForAdmin({ reason: 'worker_found_problem' })}
+                        disabled={loading}
+                        className="flex min-h-16 items-center justify-center gap-2 rounded-xl bg-amber-500 px-5 text-lg font-bold text-white hover:bg-amber-600 disabled:opacity-40"
+                      >
+                        <AlertTriangle className="h-6 w-6" />
+                        Problem · Send to Admin
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => confirmPackage({ allGood: true })}
+                        disabled={loading || !pkg.items.length}
+                        className="flex min-h-16 items-center justify-center gap-2 rounded-xl bg-emerald-600 px-5 text-lg font-bold text-white hover:bg-emerald-700 disabled:opacity-40"
+                      >
+                        {loading ? <RefreshCw className="h-5 w-5 animate-spin" /> : <CheckCircle2 className="h-6 w-6" />}
+                        ✅ All Good · Add {expectedUnits}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={flagForAdmin}
+                        disabled={loading}
+                        className="flex min-h-16 items-center justify-center gap-2 rounded-xl bg-amber-500 px-5 text-lg font-bold text-white hover:bg-amber-600 disabled:opacity-40"
+                      >
+                        <AlertTriangle className="h-6 w-6" />
+                        Any Problem · Send to Admin
+                      </button>
+                    </>
+                  )}
                 </div>
               )}
 
@@ -2247,7 +2378,7 @@ export default function ReturnsReceiving() {
             <div>
               <h3 className="font-semibold text-slate-900">Admin Review Queue</h3>
               <p className="mt-1 text-sm text-slate-500">
-                Damaged, mismatched, and unidentified packages wait here without changing inventory.
+                Only packages submitted by a worker appear here. Verify the recorded style and quantity; do not reopen a worker-checked package.
               </p>
             </div>
             <button type="button" onClick={loadReviewPackages} className="btn-secondary">
@@ -2277,7 +2408,11 @@ export default function ReturnsReceiving() {
                     <p className="mt-1 text-xs text-slate-500">
                       {item.store_name || 'Unassigned store'}
                       {' · '}
-                      {item.requires_item_resolution ? 'Product selection required' : 'Physical inspection required'}
+                      {item.requires_item_resolution
+                        ? 'Product mapping and quantity verification required'
+                        : item.review_data?.workerInspection
+                          ? 'Final style and quantity confirmation'
+                          : 'Worker-reported problem requires review'}
                     </p>
                     {item.review_reason && (
                       <p className="mt-1 text-xs text-amber-700">{item.review_reason}</p>
@@ -2303,13 +2438,14 @@ export default function ReturnsReceiving() {
               <h3 className="font-semibold text-slate-900">Upload daily return manifest</h3>
               <p className="mt-1 text-sm text-slate-500">
                 Upload one combined file with Tracking Number, SKU ID, PO, reason, buyer note, and carrier.
-                The fixed SKU ID identifies the store automatically.
+                The system identifies the store automatically only when the match is unambiguous.
               </p>
             </div>
           </div>
           <div className="mt-4 rounded-xl border border-blue-200 bg-blue-50 p-3 text-sm text-blue-800">
-            No store selection is needed. A tracking number containing unknown, duplicate-store,
-            or cross-store SKU IDs will be sent to Admin Review and will not enter inventory.
+            A PO/tracking mismatch or missing/conflicting Store blocks that tracking before upload.
+            Choose the correct PO or Store, or skip it. Review packages wait for a worker scan before
+            they appear in Admin Review.
           </div>
           <input
             type="file"
@@ -2333,7 +2469,7 @@ export default function ReturnsReceiving() {
                   <p className={`text-xl font-bold ${parsed.stats.reviewPackages ? 'text-amber-800' : 'text-emerald-700'}`}>
                     {parsed.stats.reviewPackages}
                   </p>
-                  <p className="text-xs text-slate-500">Packages needing review</p>
+                  <p className="text-xs text-slate-500">Need worker check</p>
                 </div>
                 <div className="rounded-xl bg-blue-50 p-3">
                   <p className="text-xl font-bold text-blue-800">
@@ -2348,6 +2484,118 @@ export default function ReturnsReceiving() {
                   <p className="text-xs text-slate-500">Stores detected</p>
                 </div>
               </div>
+
+              {(parsed.pendingUploadDecisions || []).length > 0 && (
+                <div className="space-y-3 rounded-xl border-2 border-red-300 bg-red-50 p-3 sm:p-4">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-red-700" />
+                    <div>
+                      <p className="font-semibold text-red-900">Action required before upload</p>
+                      <p className="mt-1 text-xs text-red-700">
+                        Choose the correct PO or Store, or explicitly skip that tracking. Unresolved rows cannot upload.
+                      </p>
+                    </div>
+                  </div>
+                  {parsed.pendingUploadDecisions.map((decision) => {
+                    const draft = manifestChoiceDrafts[decision.tracking] || {}
+                    return (
+                      <div key={decision.tracking} className="rounded-xl border border-red-200 bg-white p-3">
+                        <p className="font-semibold text-slate-900">Tracking {decision.trackingNumber}</p>
+                        {decision.issue === 'tracking_po_mismatch' ? (
+                          <>
+                            <p className="mt-1 text-xs text-red-700">
+                              Tracking does not match the uploaded PO: {decision.claimedOrders.join(', ') || 'No PO'}
+                            </p>
+                            {decision.candidateOrders.length ? (
+                              <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+                                <select
+                                  aria-label={`Correct PO for ${decision.trackingNumber}`}
+                                  value={draft.orderNumber || ''}
+                                  onChange={(event) => setManifestChoiceDrafts((current) => ({
+                                    ...current,
+                                    [decision.tracking]: {
+                                      ...current[decision.tracking],
+                                      orderNumber: event.target.value,
+                                    },
+                                  }))}
+                                  className="h-11 min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-3 text-sm"
+                                >
+                                  <option value="">Choose matching PO</option>
+                                  {decision.candidateOrders.map((order) => (
+                                    <option key={`${order.storeKey}-${order.orderNumber}`} value={order.orderNumber}>
+                                      {order.orderNumber}{order.storeName ? ` · ${order.storeName}` : ''}
+                                    </option>
+                                  ))}
+                                </select>
+                                <button
+                                  type="button"
+                                  disabled={!draft.orderNumber}
+                                  onClick={() => chooseManifestPo(decision.tracking)}
+                                  className="btn-primary min-h-11 justify-center disabled:opacity-40"
+                                >
+                                  Use selected PO
+                                </button>
+                              </div>
+                            ) : (
+                              <p className="mt-2 text-xs font-medium text-red-700">
+                                No matching PO was found in Order History. Skip this tracking and correct the source data before uploading it again.
+                              </p>
+                            )}
+                          </>
+                        ) : (
+                          <>
+                            <p className="mt-1 text-xs text-red-700">
+                              Store could not be identified for this tracking.
+                            </p>
+                            <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+                              <select
+                                aria-label={`Store for ${decision.trackingNumber}`}
+                                value={draft.storeKey || ''}
+                                onChange={(event) => setManifestChoiceDrafts((current) => ({
+                                  ...current,
+                                  [decision.tracking]: {
+                                    ...current[decision.tracking],
+                                    storeKey: event.target.value,
+                                  },
+                                }))}
+                                className="h-11 min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-3 text-sm"
+                              >
+                                <option value="">Choose Store</option>
+                                {stores.map((store) => (
+                                  <option key={store.store_key} value={store.store_key}>
+                                    {store.store_name}
+                                  </option>
+                                ))}
+                              </select>
+                              <button
+                                type="button"
+                                disabled={!draft.storeKey}
+                                onClick={() => chooseManifestStore(decision.tracking)}
+                                className="btn-primary min-h-11 justify-center disabled:opacity-40"
+                              >
+                                Use selected Store
+                              </button>
+                            </div>
+                          </>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => skipManifestTracking(decision.tracking)}
+                          className="mt-3 min-h-10 rounded-lg border border-red-300 px-3 text-sm font-semibold text-red-700 hover:bg-red-50"
+                        >
+                          Skip this tracking
+                        </button>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+
+              {(parsed.skippedTrackings || []).length > 0 && (
+                <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">
+                  Skipped {parsed.skippedTrackings.length} tracking package(s): {parsed.skippedTrackings.join(', ')}
+                </div>
+              )}
 
               {(parsed.pendingOrderMatches || []).length > 0 && (
                 <div className="rounded-xl border border-amber-200 bg-amber-50 p-3">
@@ -2408,6 +2656,7 @@ export default function ReturnsReceiving() {
                 type="button"
                 onClick={uploadManifest}
                 disabled={uploading
+                  || (parsed.pendingUploadDecisions || []).length > 0
                   || (!parsed.packages.length && !(parsed.reviewPackages || []).length)}
                 className="btn-primary w-full justify-center py-3 disabled:opacity-50 sm:w-auto"
               >

@@ -222,7 +222,9 @@ function normalizePackages(rawPackages, fallbackStore = null, {
     const rawStoreName = cleanText(rawPackage.storeName || rawPackage.store_name, 100)
     const store = rawStoreName ? normalizeStore(rawStoreName) : fallbackStore
     if (!trackingKey) throw new Error('Every package requires a tracking number')
-    if (!store) throw new Error(`Tracking ${trackingNumber || trackingKey} has no resolved store`)
+    if (!store || store.key === 'unresolved') {
+      throw new Error(`Tracking ${trackingNumber || trackingKey} has no resolved store`)
+    }
     if ((!Array.isArray(rawPackage.items) || !rawPackage.items.length) && !allowEmptyItems) {
       throw new Error(`Tracking ${trackingNumber || trackingKey} has no items`)
     }
@@ -705,6 +707,29 @@ async function loadOrdersWithCombinedFallback(sql, storeKey, orderNumbers) {
   if (!missing.length) return direct
   const combined = await loadOrdersByKeys(sql, COMBINED_ORDER_STORE_KEY, missing)
   return [...direct, ...combined]
+}
+
+async function loadOrdersByOutboundTrackings(sql, trackingNumbers) {
+  const normalized = [...new Set(
+    (trackingNumbers || []).map(normalizeTracking).filter(Boolean),
+  )]
+  if (!normalized.length) return []
+  const matchedOrders = await sql`
+    WITH wanted AS (
+      SELECT value #>> '{}' AS tracking_key
+      FROM jsonb_array_elements(${JSON.stringify(normalized)}::jsonb)
+    )
+    SELECT DISTINCT orders.order_number
+    FROM return_order_items items
+    JOIN return_orders orders ON orders.id = items.order_id
+    CROSS JOIN LATERAL jsonb_array_elements_text(
+      COALESCE(items.outbound_trackings, '[]'::jsonb)
+    ) tracking(value)
+    JOIN wanted
+      ON UPPER(REGEXP_REPLACE(BTRIM(tracking.value), '[[:space:]]+', '', 'g'))
+       = wanted.tracking_key
+  `
+  return loadOrdersByKeys(sql, '', matchedOrders.map((order) => order.order_number))
 }
 
 async function resolveInventoryRows(sql, rows) {
@@ -1333,12 +1358,21 @@ export default async function handler(req, res) {
       const orderNumbers = Array.isArray(req.body?.orderNumbers)
         ? [...new Set(req.body.orderNumbers.map((value) => cleanText(value, 100)).filter(Boolean))]
         : []
-      if (!orderNumbers.length) return res.status(400).json({ error: 'orderNumbers array required' })
-      if (orderNumbers.length > MAX_ORDER_LOOKUPS) {
-        return res.status(400).json({ error: `Lookup is limited to ${MAX_ORDER_LOOKUPS} orders per batch` })
+      const trackingNumbers = Array.isArray(req.body?.trackingNumbers)
+        ? [...new Set(req.body.trackingNumbers.map((value) => cleanText(value, 200)).filter(Boolean))]
+        : []
+      if (!orderNumbers.length && !trackingNumbers.length) {
+        return res.status(400).json({ error: 'orderNumbers or trackingNumbers array required' })
       }
-      const orders = await loadOrdersByKeys(sql, '', orderNumbers)
-      return res.json({ orders })
+      if (orderNumbers.length > MAX_ORDER_LOOKUPS || trackingNumbers.length > MAX_ORDER_LOOKUPS) {
+        return res.status(400).json({ error: `Lookup is limited to ${MAX_ORDER_LOOKUPS} values per batch` })
+      }
+      const [byOrder, byTracking] = await Promise.all([
+        loadOrdersByKeys(sql, '', orderNumbers),
+        loadOrdersByOutboundTrackings(sql, trackingNumbers),
+      ])
+      const uniqueOrders = new Map([...byOrder, ...byTracking].map((order) => [String(order.id), order]))
+      return res.json({ orders: [...uniqueOrders.values()] })
     }
 
     if (req.method === 'GET' && action === 'order-stats') {
@@ -1375,7 +1409,7 @@ export default async function handler(req, res) {
       const reviewPackages = reviewInput.length
         ? normalizePackages(reviewInput, fallbackStore, {
             allowEmptyItems: true,
-            status: 'needs_review',
+            status: 'pending',
           })
         : []
       const packages = [...readyPackages, ...reviewPackages]
@@ -1508,6 +1542,7 @@ export default async function handler(req, res) {
         ok: true,
         imported_packages: importable.length,
         review_packages: importable.filter((pkg) => pkg.status === 'needs_review').length,
+        awaiting_worker_review: importable.filter((pkg) => pkg.requires_item_resolution).length,
         imported_units: importable.reduce((sum, pkg) => sum + pkg.expected_units, 0),
         skipped_received: finalKeys.size,
       })
@@ -1527,7 +1562,7 @@ export default async function handler(req, res) {
         ? await sql`
             SELECT id, tracking_number, store_name, status, expected_units, actual_units,
                    restock_units, flagged_not_ours, review_reason, requires_item_resolution,
-                   escalated_by, escalated_at, uploaded_at, confirmed_at
+                   review_data, escalated_by, escalated_at, uploaded_at, confirmed_at
             FROM return_packages
             WHERE status = ${status}
             ORDER BY uploaded_at DESC
@@ -1536,7 +1571,7 @@ export default async function handler(req, res) {
         : await sql`
             SELECT id, tracking_number, store_name, status, expected_units, actual_units,
                    restock_units, flagged_not_ours, review_reason, requires_item_resolution,
-                   escalated_by, escalated_at, uploaded_at, confirmed_at
+                   review_data, escalated_by, escalated_at, uploaded_at, confirmed_at
             FROM return_packages
             ORDER BY CASE
               WHEN status = 'needs_review' THEN 0
@@ -1574,10 +1609,6 @@ export default async function handler(req, res) {
             review_reason = CASE
               WHEN status = 'pending' THEN ${reason}
               ELSE COALESCE(NULLIF(review_reason, ''), ${reason})
-            END,
-            requires_item_resolution = CASE
-              WHEN status = 'pending' THEN false
-              ELSE requires_item_resolution
             END,
             review_data = ${JSON.stringify(reviewData)}::jsonb,
             escalated_by = COALESCE(escalated_by, ${payload.username}),
