@@ -30,6 +30,7 @@ import {
   parseProductCatalogRows,
   parseSkuReturnManifestRows,
   resolveProductCatalogRows,
+  resolveStyleSearchValue,
   suggestProductCatalogSelections,
 } from '../utils/returnImportEngine.js'
 import { parseOrderHistoryRows } from '../utils/orderImportEngine.js'
@@ -163,6 +164,28 @@ function CountControl({ value, onChange, disabled, max = 9999, label = 'Actual q
         </button>
       </div>
       {error && <p role="alert" className="text-[11px] font-medium text-red-600">{error}</p>}
+    </div>
+  )
+}
+
+function SearchableStyleInput({ id, label, value, options, onChange, disabled = false }) {
+  return (
+    <div className="relative min-w-0">
+      <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+      <input
+        id={id}
+        list={`${id}-options`}
+        aria-label={label}
+        value={value || ''}
+        disabled={disabled}
+        autoComplete="off"
+        placeholder="Search Style / 搜索款式"
+        onChange={(event) => onChange(resolveStyleSearchValue(options, event.target.value))}
+        className="h-11 w-full min-w-0 rounded-lg border border-slate-300 bg-white pl-9 pr-2 text-sm disabled:bg-slate-100"
+      />
+      <datalist id={`${id}-options`}>
+        {(options || []).map((style) => <option key={style} value={style} />)}
+      </datalist>
     </div>
   )
 }
@@ -367,11 +390,14 @@ export default function ReturnsReceiving() {
   const [analyticsDays, setAnalyticsDays] = useState(30)
   const [orderOnly, setOrderOnly] = useState(null)
   const [orderChoices, setOrderChoices] = useState([])
+  const [manualTrackingCandidate, setManualTrackingCandidate] = useState('')
+  const [manualStoreKey, setManualStoreKey] = useState('')
   const [orderFile, setOrderFile] = useState(null)
   const [orderParsed, setOrderParsed] = useState(null)
   const [orderUploading, setOrderUploading] = useState(false)
   const [orderStats, setOrderStats] = useState([])
   const [adminSelections, setAdminSelections] = useState({})
+  const [adminOrderItemTargets, setAdminOrderItemTargets] = useState({})
   const [adminManualItems, setAdminManualItems] = useState([
     { style: '', color: '', size: '', qty: 1 },
   ])
@@ -400,6 +426,19 @@ export default function ReturnsReceiving() {
     && !pkg?.review_data?.unresolvedSkus?.length
     && !relatedOrderItems.length,
   )
+  const requiresOrderItemManualMappings = Boolean(
+    isAdmin
+    && pkg?.status === 'needs_review'
+    && pkg?.requires_item_resolution
+    && relatedOrderItems.some((item) => (
+      !String(item.sku_id || '').trim()
+      && (
+        item.catalog_status !== 'ready'
+        || !Array.isArray(item.catalog_components)
+        || !item.catalog_components.length
+      )
+    )),
+  )
 
   const loadRecent = useCallback(async () => {
     if (demoMode) {
@@ -412,7 +451,6 @@ export default function ReturnsReceiving() {
   }, [demoMode, getToken])
 
   const loadStores = useCallback(async () => {
-    if (!isAdmin) return
     if (demoMode) {
       setStores([{
         store_key: 'demo store',
@@ -425,16 +463,17 @@ export default function ReturnsReceiving() {
       return
     }
     try {
-      const [analyticsData, returnRes] = await Promise.all([
-        fetchAnalyticsStores(),
-        fetch(`${BASE}/returns?action=stores`, { headers: headers(getToken) }),
-      ])
+      const returnRes = await fetch(`${BASE}/returns?action=stores`, {
+        headers: headers(getToken),
+      })
       const returnData = await returnRes.json().catch(() => ({}))
       if (!returnRes.ok) throw new Error(returnData.error || 'Could not load return store data')
-      const nextStores = mergeAnalyticsReturnStores(
-        analyticsData.stores || [],
-        returnData.stores || [],
-      )
+      const nextStores = isAdmin
+        ? mergeAnalyticsReturnStores(
+            (await fetchAnalyticsStores()).stores || [],
+            returnData.stores || [],
+          )
+        : returnData.stores || []
       setStores(nextStores)
       setStoreLoadError('')
       setStoreName((current) => (
@@ -492,7 +531,10 @@ export default function ReturnsReceiving() {
     setPkg(null)
     setOrderOnly(null)
     setOrderChoices([])
+    setManualTrackingCandidate('')
+    setManualStoreKey('')
     setAdminSelections({})
+    setAdminOrderItemTargets({})
     setAdminManualItems([{ style: '', color: '', size: '', qty: 1 }])
     setCounted(false)
     setRemark('')
@@ -512,6 +554,11 @@ export default function ReturnsReceiving() {
         if (orderRes.status === 409 && Array.isArray(orderData.stores)) {
           setOrderChoices(orderData.stores)
           setTracking(query)
+          return
+        }
+        if (res.status === 404 && orderRes.status === 404) {
+          setTracking(query)
+          setManualTrackingCandidate(query)
           return
         }
         if (!orderRes.ok) throw new Error(orderData.error || data.error || 'Return package or order not found')
@@ -547,6 +594,40 @@ export default function ReturnsReceiving() {
     }
   }, [demoMode, getToken, toast, tracking])
 
+  const createManualReturn = async () => {
+    const selectedStore = stores.find((store) => store.store_key === manualStoreKey)
+    if (!manualTrackingCandidate || !selectedStore || loading) return
+    setLoading(true)
+    try {
+      const res = await fetch(`${BASE}/returns?action=manual-create`, {
+        method: 'POST',
+        headers: headers(getToken, true),
+        body: JSON.stringify({
+          tracking: manualTrackingCandidate,
+          storeName: selectedStore.store_name,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not create the manual return')
+      setPkg(data.package)
+      setTracking(data.package.tracking_number)
+      setManualTrackingCandidate('')
+      setManualStoreKey('')
+      setCounts({})
+      setCounted(false)
+      setRemark('')
+      toast.success(
+        'Manual Tracking created with the selected Store. Check the package, then send it to Admin for product mapping.',
+        'Manual Return Ready',
+      )
+      await loadRecent()
+    } catch (error) {
+      toast.error(error.message, 'Manual Return Failed')
+    } finally {
+      setLoading(false)
+    }
+  }
+
   const handleCameraScan = useCallback((value) => {
     setCameraOpen(false)
     setTracking(value)
@@ -558,6 +639,7 @@ export default function ReturnsReceiving() {
     setReviewManualTargets({})
     setReviewMappingModes({})
     setAdminManualItems([{ style: '', color: '', size: '', qty: 1 }])
+    setAdminOrderItemTargets({})
     if (!isAdmin || demoMode) {
       setReviewCatalogRows([])
       setReviewInventoryRows([])
@@ -566,7 +648,7 @@ export default function ReturnsReceiving() {
       return undefined
     }
 
-    if (requiresManualAdminItems) {
+    if (requiresManualAdminItems || requiresOrderItemManualMappings) {
       let active = true
       setReviewCatalogRows([])
       setReviewAliases({})
@@ -632,7 +714,16 @@ export default function ReturnsReceiving() {
       if (active) setReviewMappingLoading(false)
     })
     return () => { active = false }
-  }, [demoMode, getToken, isAdmin, pkg, requiresManualAdminItems, skuMappingCandidates, toast])
+  }, [
+    demoMode,
+    getToken,
+    isAdmin,
+    pkg,
+    requiresManualAdminItems,
+    requiresOrderItemManualMappings,
+    skuMappingCandidates,
+    toast,
+  ])
 
   const expectedUnits = Number(pkg?.expected_units || 0)
   const productGroups = useMemo(() => groupReturnProducts(
@@ -776,6 +867,32 @@ export default function ReturnsReceiving() {
       ...item,
       qty: Number(item.qty),
     }))
+    const manualOrderItems = []
+    for (const selection of selections) {
+      const orderItem = relatedOrderItems.find((item) => Number(item.id) === selection.orderItemId)
+      const hasCatalogMapping = orderItem?.catalog_status === 'ready'
+        && Array.isArray(orderItem.catalog_components)
+        && orderItem.catalog_components.length > 0
+      if (hasCatalogMapping) continue
+      const components = (adminOrderItemTargets[selection.orderItemId] || []).map((item) => ({
+        ...item,
+        qty: Number(item.qty),
+      }))
+      if (!components.length || components.some((item) => (
+        !item.style
+        || !item.color
+        || !item.size
+        || !Number.isSafeInteger(item.qty)
+        || item.qty <= 0
+      ))) {
+        toast.error(
+          `Choose a complete inventory match for ${orderItem?.sku_code || orderItem?.attributes || 'every selected product'}.`,
+          'Product Mapping Required',
+        )
+        return
+      }
+      manualOrderItems.push({ orderItemId: selection.orderItemId, components })
+    }
     if (!relatedOrderItems.length && manualItems.some((item) => (
       !item.style
       || !item.color
@@ -791,7 +908,12 @@ export default function ReturnsReceiving() {
       const res = await fetch(`${BASE}/returns?action=resolve-items`, {
         method: 'POST',
         headers: headers(getToken, true),
-        body: JSON.stringify({ tracking: pkg.tracking_number, selections, manualItems }),
+        body: JSON.stringify({
+          tracking: pkg.tracking_number,
+          selections,
+          manualItems,
+          manualOrderItems,
+        }),
       })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || 'Could not save selected products')
@@ -805,6 +927,7 @@ export default function ReturnsReceiving() {
           : { good: 0, damaged: 0, notOurs: 0 },
       ])))
       setAdminSelections({})
+      setAdminOrderItemTargets({})
       setAdminManualItems([{ style: '', color: '', size: '', qty: 1 }])
       setCounted(false)
       toast.success(
@@ -1408,6 +1531,48 @@ export default function ReturnsReceiving() {
             </div>
           )}
 
+          {manualTrackingCandidate && (
+            <div className="card border-2 border-blue-200 bg-blue-50/40 p-4 sm:p-5">
+              <div className="flex items-start gap-3">
+                <PackageOpen className="mt-0.5 h-5 w-5 shrink-0 text-blue-700" />
+                <div>
+                  <p className="font-semibold text-slate-900">Tracking not found — create it manually</p>
+                  <p className="mt-1 break-all text-sm text-slate-700">{manualTrackingCandidate}</p>
+                  <p className="mt-1 text-xs text-slate-500">
+                    Choose one Store. The system will not invent a PO or SKU; Admin will map the actual returned product after the worker checks it.
+                  </p>
+                </div>
+              </div>
+              <div className="mt-4 flex flex-col gap-2 sm:flex-row">
+                <select
+                  aria-label="Store for manual return"
+                  value={manualStoreKey}
+                  onChange={(event) => setManualStoreKey(event.target.value)}
+                  className="h-12 min-w-0 flex-1 rounded-xl border border-slate-300 bg-white px-3 text-sm"
+                >
+                  <option value="">Choose Store / 选择店铺</option>
+                  {stores.map((store) => (
+                    <option key={store.store_key} value={store.store_key}>{store.store_name}</option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={createManualReturn}
+                  disabled={loading || !manualStoreKey}
+                  className="btn-primary min-h-12 justify-center disabled:opacity-40"
+                >
+                  {loading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+                  Create Manual Return / 手工建立退货
+                </button>
+              </div>
+              {!stores.length && (
+                <p className="mt-2 text-xs font-medium text-red-700">
+                  No Store is available. Ask Admin to upload that Store’s Product Catalog or Order History first.
+                </p>
+              )}
+            </div>
+          )}
+
           {orderOnly && (
             <div className="card p-4 sm:p-5">
               <OrderDetails order={orderOnly} />
@@ -1605,22 +1770,19 @@ export default function ReturnsReceiving() {
                                         </div>
                                       )}
                                       <div className="mt-2 grid gap-2 sm:grid-cols-2">
-                                        <label className="text-xs font-medium text-slate-600">
-                                          Inventory style / Estilo
-                                          <select
+                                        <div className="text-xs font-medium text-slate-600">
+                                          <p className="mb-1">Inventory style / Estilo</p>
+                                          <SearchableStyleInput
+                                            id={`sku-${row.skuId}-source-${index}-style`}
+                                            label={`Inventory style for ${row.skuCode}`}
                                             value={selection.style || ''}
-                                            onChange={(event) => setReviewSkuSelections((current) => ({
+                                            options={styleOptions}
+                                            onChange={(style) => setReviewSkuSelections((current) => ({
                                               ...current,
-                                              [selectionKey]: { style: event.target.value, color: '' },
+                                              [selectionKey]: { style, color: '' },
                                             }))}
-                                            className="mt-1 h-11 w-full rounded-lg border border-slate-300 bg-white px-2 text-sm"
-                                          >
-                                            <option value="">Choose / Elegir</option>
-                                            {styleOptions.map((style) => (
-                                              <option key={style} value={style}>{style}</option>
-                                            ))}
-                                          </select>
-                                        </label>
+                                          />
+                                        </div>
                                         <label className="text-xs font-medium text-slate-600">
                                           Inventory color / Color
                                           <select
@@ -1705,21 +1867,17 @@ export default function ReturnsReceiving() {
                                       key={`${row.skuId}-manual-${index}`}
                                       className="grid gap-2 rounded-xl border border-slate-200 bg-slate-50 p-3 sm:grid-cols-4"
                                     >
-                                      <select
-                                        aria-label="Inventory style"
+                                      <SearchableStyleInput
+                                        id={`${row.skuId}-manual-style-${index}`}
+                                        label="Inventory style"
                                         value={target.style}
-                                        onChange={(event) => updateTarget({
-                                          style: event.target.value,
+                                        options={styleOptions}
+                                        onChange={(style) => updateTarget({
+                                          style,
                                           color: '',
                                           size: '',
                                         })}
-                                        className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm"
-                                      >
-                                        <option value="">Style / Estilo</option>
-                                        {styleOptions.map((style) => (
-                                          <option key={style} value={style}>{style}</option>
-                                        ))}
-                                      </select>
+                                      />
                                       <select
                                         aria-label="Inventory color"
                                         value={target.color}
@@ -1822,36 +1980,145 @@ export default function ReturnsReceiving() {
                         Select every returned product from the original order. This replaces any incomplete automatic match.
                       </p>
                       <div className="mt-3 space-y-3">
-                        {relatedOrderItems.map((item) => (
-                          <div key={item.id} className="rounded-xl border border-amber-200 bg-white p-3">
-                            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                              <div className="min-w-0">
-                                <p className="break-words text-sm font-semibold text-slate-800">
-                                  {item.sku_code || item.sku_id || 'Unknown SKU'}
-                                </p>
-                                <p className="mt-1 text-xs text-slate-500">{item.attributes}</p>
-                                <p className="mt-1 text-[11px] text-slate-400">
-                                  SKU ID {item.sku_id || '—'} · Ordered {item.quantity}
-                                </p>
-                                {item.catalog_status !== 'ready' && (
-                                  <p className="mt-1 text-xs font-medium text-red-700">
-                                    Product catalog mapping required before this item can be selected.
+                        {relatedOrderItems.map((item) => {
+                          const hasCatalogMapping = item.catalog_status === 'ready'
+                            && Array.isArray(item.catalog_components)
+                            && item.catalog_components.length > 0
+                          const manualTargets = adminOrderItemTargets[item.id]
+                            || [{ style: '', color: '', size: '', qty: 1 }]
+                          const updateTargets = (next) => setAdminOrderItemTargets((current) => ({
+                            ...current,
+                            [item.id]: next,
+                          }))
+                          return (
+                            <div key={item.id} className="rounded-xl border border-amber-200 bg-white p-3">
+                              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                                <div className="min-w-0">
+                                  <p className="break-words text-sm font-semibold text-slate-800">
+                                    {item.sku_code || item.sku_id || 'Unknown SKU'}
                                   </p>
-                                )}
+                                  <p className="mt-1 text-xs text-slate-500">{item.attributes}</p>
+                                  <p className="mt-1 text-[11px] text-slate-400">
+                                    SKU ID {item.sku_id || '—'} · Ordered {item.quantity}
+                                  </p>
+                                  {!hasCatalogMapping && (
+                                    <p className="mt-1 text-xs font-medium text-amber-700">
+                                      No usable catalog mapping. Choose the inventory match below for this return.
+                                    </p>
+                                  )}
+                                </div>
+                                <CountControl
+                                  label={`Returned quantity for ${item.sku_code || item.sku_id}`}
+                                  value={Number(adminSelections[item.id] || 0)}
+                                  max={Number(item.quantity || 0)}
+                                  onChange={(value) => setAdminSelections((current) => ({
+                                    ...current,
+                                    [item.id]: value,
+                                  }))}
+                                />
                               </div>
-                              <CountControl
-                                label={`Returned quantity for ${item.sku_code || item.sku_id}`}
-                                value={Number(adminSelections[item.id] || 0)}
-                                max={Number(item.quantity || 0)}
-                                disabled={item.catalog_status !== 'ready'}
-                                onChange={(value) => setAdminSelections((current) => ({
-                                  ...current,
-                                  [item.id]: value,
-                                }))}
-                              />
+                              {!hasCatalogMapping && (
+                                <div className="mt-3 space-y-2 border-t border-amber-100 pt-3">
+                                  {!reviewInventoryRows.length && !reviewMappingLoading && (
+                                    <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-800">
+                                      No inventory targets are available.{' '}
+                                      <a href="/stock" className="font-bold underline">Open Stock Management</a>
+                                      {' '}to upload or restore inventory, then return here.
+                                    </div>
+                                  )}
+                                  {manualTargets.map((target, targetIndex) => {
+                                    const styleOptions = [...new Set(
+                                      reviewInventoryRows.map((row) => row.STYLE),
+                                    )].sort()
+                                    const colorOptions = [...new Set(
+                                      reviewInventoryRows
+                                        .filter((row) => row.STYLE === target.style)
+                                        .map((row) => row.COLOR),
+                                    )].sort()
+                                    const sizeOptions = [...new Set(
+                                      reviewInventoryRows
+                                        .filter((row) => (
+                                          row.STYLE === target.style && row.COLOR === target.color
+                                        ))
+                                        .map((row) => row.SIZE),
+                                    )].sort()
+                                    const updateTarget = (changes) => updateTargets(
+                                      manualTargets.map((currentTarget, index) => (
+                                        index === targetIndex
+                                          ? { ...currentTarget, ...changes }
+                                          : currentTarget
+                                      )),
+                                    )
+                                    return (
+                                      <div
+                                        key={`${item.id}-manual-${targetIndex}`}
+                                        className="grid gap-2 rounded-lg bg-amber-50 p-2 sm:grid-cols-[1fr_1fr_1fr_7rem_auto]"
+                                      >
+                                        <SearchableStyleInput
+                                          id={`order-item-${item.id}-style-${targetIndex}`}
+                                          label={`Inventory style for ${item.sku_code || item.id}`}
+                                          value={target.style}
+                                          options={styleOptions}
+                                          onChange={(style) => updateTarget({ style, color: '', size: '' })}
+                                        />
+                                        <select
+                                          aria-label={`Inventory color for ${item.sku_code || item.id}`}
+                                          value={target.color}
+                                          disabled={!styleOptions.includes(target.style)}
+                                          onChange={(event) => updateTarget({ color: event.target.value, size: '' })}
+                                          className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm disabled:bg-slate-100"
+                                        >
+                                          <option value="">Color</option>
+                                          {colorOptions.map((color) => <option key={color} value={color}>{color}</option>)}
+                                        </select>
+                                        <select
+                                          aria-label={`Inventory size for ${item.sku_code || item.id}`}
+                                          value={target.size}
+                                          disabled={!target.color}
+                                          onChange={(event) => updateTarget({ size: event.target.value })}
+                                          className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm disabled:bg-slate-100"
+                                        >
+                                          <option value="">Size / Talla</option>
+                                          {sizeOptions.map((size) => <option key={size} value={size}>{size}</option>)}
+                                        </select>
+                                        <label className="text-[11px] font-semibold text-slate-600">
+                                          Pieces / product
+                                          <input
+                                            type="number"
+                                            min="1"
+                                            max="9999"
+                                            step="1"
+                                            value={target.qty}
+                                            onChange={(event) => updateTarget({ qty: event.target.value })}
+                                            className="mt-0.5 h-8 w-full rounded-lg border border-slate-300 bg-white px-2 text-sm"
+                                          />
+                                        </label>
+                                        <button
+                                          type="button"
+                                          disabled={manualTargets.length === 1}
+                                          onClick={() => updateTargets(manualTargets.filter((_, index) => index !== targetIndex))}
+                                          className="h-11 rounded-lg border border-red-200 px-3 text-xs font-semibold text-red-700 disabled:opacity-30"
+                                        >
+                                          Remove
+                                        </button>
+                                      </div>
+                                    )
+                                  })}
+                                  <button
+                                    type="button"
+                                    onClick={() => updateTargets([
+                                      ...manualTargets,
+                                      { style: '', color: '', size: '', qty: 1 },
+                                    ])}
+                                    className="btn-secondary min-h-10 text-xs"
+                                  >
+                                    <Plus className="h-4 w-4" /> Add set piece / 添加组合款式
+                                  </button>
+                                </div>
+                              )}
                             </div>
-                          </div>
-                        ))}
+                          )
+                        })}
                       </div>
                     </>
                   ) : (
@@ -1901,21 +2168,17 @@ export default function ReturnsReceiving() {
                                 key={`admin-manual-item-${index}`}
                                 className="grid gap-2 rounded-xl border border-amber-200 bg-white p-3 sm:grid-cols-[1fr_1fr_1fr_7rem_auto]"
                               >
-                                <select
-                                  aria-label={`Inventory style ${index + 1}`}
+                                <SearchableStyleInput
+                                  id={`admin-manual-style-${index}`}
+                                  label={`Inventory style ${index + 1}`}
                                   value={target.style}
-                                  onChange={(event) => updateTarget({
-                                    style: event.target.value,
+                                  options={styleOptions}
+                                  onChange={(style) => updateTarget({
+                                    style,
                                     color: '',
                                     size: '',
                                   })}
-                                  className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm"
-                                >
-                                  <option value="">Style / Estilo</option>
-                                  {styleOptions.map((style) => (
-                                    <option key={style} value={style}>{style}</option>
-                                  ))}
-                                </select>
+                                />
                                 <select
                                   aria-label={`Inventory color ${index + 1}`}
                                   value={target.color}
@@ -1972,7 +2235,9 @@ export default function ReturnsReceiving() {
                           })}
                           {!reviewInventoryRows.length && (
                             <p className="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800">
-                              No inventory targets are available. Upload or restore the inventory list before resolving this return.
+                              No inventory targets are available.{' '}
+                              <a href="/stock" className="font-bold underline">Open Stock Management</a>
+                              {' '}to upload or restore inventory, then return here.
                             </p>
                           )}
                           <button
@@ -2268,7 +2533,9 @@ export default function ReturnsReceiving() {
                         className="flex min-h-16 items-center justify-center gap-2 rounded-xl bg-emerald-600 px-5 text-lg font-bold text-white hover:bg-emerald-700 disabled:opacity-40"
                       >
                         {loading ? <RefreshCw className="h-5 w-5 animate-spin" /> : <CheckCircle2 className="h-6 w-6" />}
-                        ✅ Package & Qty Checked · Send Admin
+                        {pkg.items.length
+                          ? '✅ Package & Qty Checked · Send Admin'
+                          : '✅ Package Checked · Send Admin Mapping'}
                       </button>
                       <button
                         type="button"
@@ -2537,9 +2804,40 @@ export default function ReturnsReceiving() {
                                 </button>
                               </div>
                             ) : (
-                              <p className="mt-2 text-xs font-medium text-red-700">
-                                No matching PO was found in Order History. Skip this tracking and correct the source data before uploading it again.
-                              </p>
+                              <div className="mt-3 space-y-2">
+                                <p className="text-xs font-medium text-red-700">
+                                  No matching PO was found. Choose the correct Store to send this package through worker and Admin review, or skip it.
+                                </p>
+                                <div className="flex flex-col gap-2 sm:flex-row">
+                                  <select
+                                    aria-label={`Store for mismatched tracking ${decision.trackingNumber}`}
+                                    value={draft.storeKey || ''}
+                                    onChange={(event) => setManifestChoiceDrafts((current) => ({
+                                      ...current,
+                                      [decision.tracking]: {
+                                        ...current[decision.tracking],
+                                        storeKey: event.target.value,
+                                      },
+                                    }))}
+                                    className="h-11 min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-3 text-sm"
+                                  >
+                                    <option value="">Choose Store</option>
+                                    {stores.map((store) => (
+                                      <option key={store.store_key} value={store.store_key}>
+                                        {store.store_name}
+                                      </option>
+                                    ))}
+                                  </select>
+                                  <button
+                                    type="button"
+                                    disabled={!draft.storeKey}
+                                    onClick={() => chooseManifestStore(decision.tracking)}
+                                    className="btn-primary min-h-11 justify-center disabled:opacity-40"
+                                  >
+                                    Use Store & Review
+                                  </button>
+                                </div>
+                              </div>
                             )}
                           </>
                         ) : (
@@ -3070,8 +3368,10 @@ export default function ReturnsReceiving() {
               </div>
               <div className="card overflow-hidden">
                 <div className="border-b border-slate-200 px-4 py-3 sm:px-5">
-                  <h3 className="text-sm font-semibold text-slate-800">Physical inventory return rate</h3>
-                  <p className="mt-1 text-xs text-slate-400">Actual received units ÷ sold units in the selected period</p>
+                  <h3 className="text-sm font-semibold text-slate-800">SKU return rate (Style / Color / Size)</h3>
+                  <p className="mt-1 text-xs text-slate-400">
+                    Actual received inventory SKU units ÷ sold inventory SKU units in the selected period
+                  </p>
                 </div>
                 <div className="space-y-3 p-3 sm:hidden">
                   {(analytics.rows || []).map((row, index) => (

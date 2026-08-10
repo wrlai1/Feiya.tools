@@ -26,6 +26,7 @@ import {
   parseProductCatalogRows,
   parseReturnManifestRows,
   parseSkuReturnManifestRows,
+  resolveStyleSearchValue,
   resolveProductCatalogRows,
   resolveReturnManifestPackages,
   suggestProductCatalogSelections,
@@ -35,11 +36,111 @@ import returnPackageSafety from '../lib/returnPackageSafety.cjs'
 
 const { resolveInventoryTargets } = inventoryTargetResolution
 const {
+  buildReturnItemsForOrderSelection,
   findReturnSkuMappingTarget,
   mergeInventoryComponents,
   mergeReturnPackageItems,
+  normalizeManualReturnDraft,
   normalizeManualReturnPackageItems,
 } = returnPackageSafety
+
+test('manual return drafts preserve the typed tracking and require one validated store', () => {
+  assert.deepEqual(normalizeManualReturnDraft({
+    trackingNumber: ' 1z manual 123 ',
+    storeName: 'House',
+    storeKey: 'house',
+    username: 'worker1',
+  }), {
+    tracking_number: '1z manual 123',
+    tracking_key: '1ZMANUAL123',
+    store_name: 'House',
+    store_key: 'house',
+    source_file: 'Manual tracking entry',
+    status: 'pending',
+    expected_units: 0,
+    uploaded_by: 'worker1',
+    review_reason: 'manual_tracking_no_order',
+    requires_item_resolution: true,
+    review_data: {
+      unresolvedSkus: [],
+      blockingIssues: ['manual_tracking_no_order'],
+      workerInspection: null,
+    },
+  })
+  assert.throws(
+    () => normalizeManualReturnDraft({ trackingNumber: '', storeName: 'House', storeKey: 'house' }),
+    /tracking/i,
+  )
+  assert.throws(
+    () => normalizeManualReturnDraft({ trackingNumber: 'MANUAL-1', storeName: '', storeKey: '' }),
+    /store/i,
+  )
+  assert.throws(
+    () => normalizeManualReturnDraft({
+      trackingNumber: 'MANUAL-1', storeName: 'All Stores', storeKey: 'all stores',
+    }),
+    /store/i,
+  )
+})
+
+test('searchable style matching canonicalizes an exact typed style without guessing partial text', () => {
+  const options = ['5010015', 'A-100', 'M022']
+  assert.equal(resolveStyleSearchValue(options, '  a-100  '), 'A-100')
+  assert.equal(resolveStyleSearchValue(options, '501'), '501')
+  assert.equal(resolveStyleSearchValue(options, 'unknown'), 'unknown')
+})
+
+test('an order item without a SKU ID can use a validated per-package inventory mapping', () => {
+  const orderItem = {
+    id: 91,
+    sku_id: '',
+    sku_code: '5020066SkivvyPinkXL',
+    quantity: 1,
+    catalog_status: null,
+    catalog_components: [],
+  }
+
+  assert.deepEqual(buildReturnItemsForOrderSelection(orderItem, 1, [{
+    style: '5020066', color: 'SKIVVY PINK', size: 'XL', qty: 1,
+  }]), [{
+    sku_id: '',
+    sku_code: '5020066SkivvyPinkXL',
+    style: '5020066',
+    color: 'SKIVVY PINK',
+    size: 'XL',
+    expected_qty: 1,
+    source_qty: 1,
+  }])
+  assert.throws(
+    () => buildReturnItemsForOrderSelection(orderItem, 1, []),
+    /inventory mapping/i,
+  )
+})
+
+test('a ready order-item catalog mapping cannot be silently overridden per package', () => {
+  const orderItem = {
+    sku_id: 'READY-SKU',
+    sku_code: 'READY-CODE',
+    quantity: 2,
+    catalog_status: 'ready',
+    catalog_components: [{ style: 'A100', color: 'BLACK', size: 'M', qty: 1 }],
+  }
+  assert.deepEqual(buildReturnItemsForOrderSelection(orderItem, 2, []), [{
+    sku_id: 'READY-SKU',
+    sku_code: 'READY-CODE',
+    style: 'A100',
+    color: 'BLACK',
+    size: 'M',
+    expected_qty: 2,
+    source_qty: 2,
+  }])
+  assert.throws(
+    () => buildReturnItemsForOrderSelection(orderItem, 1, [
+      { style: 'B200', color: 'NAVY', size: 'M', qty: 1 },
+    ]),
+    /already has a catalog mapping/i,
+  )
+})
 
 test('returns store choices use Analytics as the canonical store list', () => {
   const stores = mergeAnalyticsReturnStores([
@@ -1422,6 +1523,44 @@ test('a worker may explicitly skip a tracking blocked during manifest upload', (
   assert.equal(result.pendingUploadDecisions.length, 0)
   assert.deepEqual(result.skippedTrackings, ['TRACK-SKIP'])
   assert.equal(result.stats.skippedPackages, 1)
+})
+
+test('a tracking and PO mismatch without a candidate PO can use a validated store for review', () => {
+  const rows = [{
+    '订单号 PO': 'PO-WRONG',
+    'SKU ID': 'SKU-A',
+    '运单号 Tracking Number': 'track-manual-store',
+  }]
+  const catalog = [{
+    store_name: 'House',
+    store_key: 'house',
+    sku_id: 'SKU-A',
+    sku_code: 'A100BlackS',
+    status: 'ready',
+    components: [{ style: 'A100', color: 'Black', size: 'S', qty: 1 }],
+  }]
+  const orders = [{
+    order_number: 'PO-WRONG',
+    store_name: 'House',
+    store_key: 'house',
+    items: [{ sku_id: 'SKU-A', quantity: 1, outbound_trackings: ['TRACK-OTHER'] }],
+  }]
+
+  const blocked = parseSkuReturnManifestRows(rows, catalog, orders)
+  assert.equal(blocked.pendingUploadDecisions[0].issue, 'tracking_po_mismatch')
+  assert.deepEqual(blocked.pendingUploadDecisions[0].candidateOrders, [])
+
+  const resolved = parseSkuReturnManifestRows(rows, catalog, orders, {
+    storeByTracking: {
+      'TRACK-MANUAL-STORE': { key: 'house', name: 'House' },
+    },
+  })
+
+  assert.equal(resolved.pendingUploadDecisions.length, 0)
+  assert.equal(resolved.packages.length, 0)
+  assert.equal(resolved.reviewPackages.length, 1)
+  assert.equal(resolved.reviewPackages[0].storeKey, 'house')
+  assert.equal(resolved.reviewPackages[0].reviewReason, 'tracking_po_mismatch_manual_store')
 })
 
 test('an unresolved return store requires an explicit existing-store choice', () => {

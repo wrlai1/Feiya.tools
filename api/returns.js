@@ -7,10 +7,12 @@ import { summarizeReturnInspection } from '../src/utils/returnInspection.js'
 const { resolveInventoryTargets } = inventoryTargetResolution
 const { authenticateUser } = authentication
 const {
+  buildReturnItemsForOrderSelection,
   findReturnSkuMappingTarget,
   itemIdentity,
   mergeInventoryComponents,
   mergeReturnPackageItems,
+  normalizeManualReturnDraft,
   normalizeManualReturnPackageItems,
 } = returnPackageSafety
 const MAX_PACKAGES_PER_IMPORT = 5000
@@ -447,6 +449,14 @@ async function ensureTables(sql) {
       uploaded_at TIMESTAMPTZ DEFAULT NOW(),
       confirmed_by TEXT,
       confirmed_at TIMESTAMPTZ
+    )
+  `
+  await sql`
+    CREATE TABLE IF NOT EXISTS analytics_stores (
+      username TEXT NOT NULL,
+      name TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (username, name)
     )
   `
   await sql`ALTER TABLE return_packages ADD COLUMN IF NOT EXISTS store_name TEXT`
@@ -1064,14 +1074,24 @@ export default async function handler(req, res) {
           FROM return_orders
           GROUP BY store_key
         ),
+        analytics_names AS (
+          SELECT
+            LOWER(REGEXP_REPLACE(BTRIM(name), '[[:space:]]+', ' ', 'g')) AS store_key,
+            MIN(REGEXP_REPLACE(BTRIM(name), '[[:space:]]+', ' ', 'g')) AS store_name
+          FROM analytics_stores
+          WHERE username = 'admin'
+          GROUP BY LOWER(REGEXP_REPLACE(BTRIM(name), '[[:space:]]+', ' ', 'g'))
+        ),
         keys AS (
           SELECT store_key FROM product_counts
           UNION
           SELECT store_key FROM order_counts
+          UNION
+          SELECT store_key FROM analytics_names
         )
         SELECT
           keys.store_key,
-          COALESCE(products.store_name, orders.store_name) AS store_name,
+          COALESCE(products.store_name, orders.store_name, analytics.store_name) AS store_name,
           COALESCE(products.product_count, 0)::int AS product_count,
           COALESCE(products.ready_count, 0)::int AS ready_count,
           COALESCE(orders.order_count, 0)::int AS order_count,
@@ -1079,9 +1099,73 @@ export default async function handler(req, res) {
         FROM keys
         LEFT JOIN product_counts products USING (store_key)
         LEFT JOIN order_counts orders USING (store_key)
+        LEFT JOIN analytics_names analytics USING (store_key)
+        WHERE keys.store_key <> ${COMBINED_ORDER_STORE_KEY}
         ORDER BY store_name
       `
       return res.json({ stores: rows })
+    }
+
+    if (req.method === 'POST' && action === 'manual-create') {
+      let requestedStore
+      try {
+        requestedStore = normalizeStore(req.body?.storeName)
+      } catch (error) {
+        return res.status(400).json({ error: error.message })
+      }
+      if (requestedStore.key === COMBINED_ORDER_STORE_KEY) {
+        return res.status(400).json({ error: 'Choose one specific Store' })
+      }
+      const [knownStore] = await sql`
+        WITH known_stores AS (
+          SELECT store_key, store_name FROM return_product_catalog
+          UNION ALL
+          SELECT store_key, store_name FROM return_orders
+          UNION ALL
+          SELECT
+            LOWER(REGEXP_REPLACE(BTRIM(name), '[[:space:]]+', ' ', 'g')) AS store_key,
+            REGEXP_REPLACE(BTRIM(name), '[[:space:]]+', ' ', 'g') AS store_name
+          FROM analytics_stores
+          WHERE username = 'admin'
+        )
+        SELECT store_key, MIN(store_name) AS store_name
+        FROM known_stores
+        WHERE store_key = ${requestedStore.key}
+          AND store_key <> ${COMBINED_ORDER_STORE_KEY}
+        GROUP BY store_key
+      `
+      if (!knownStore) {
+        return res.status(400).json({ error: 'Choose an existing Store from the list' })
+      }
+      let draft
+      try {
+        draft = normalizeManualReturnDraft({
+          trackingNumber: req.body?.tracking,
+          storeName: knownStore.store_name,
+          storeKey: knownStore.store_key,
+          username: payload.username,
+        })
+      } catch (error) {
+        return res.status(400).json({ error: error.message })
+      }
+      const [created] = await sql`
+        INSERT INTO return_packages (
+          tracking_number, tracking_key, source_file, status, store_name, store_key,
+          expected_units, uploaded_by, review_reason, requires_item_resolution, review_data
+        )
+        VALUES (
+          ${draft.tracking_number}, ${draft.tracking_key}, ${draft.source_file}, ${draft.status},
+          ${draft.store_name}, ${draft.store_key}, ${draft.expected_units}, ${draft.uploaded_by},
+          ${draft.review_reason}, ${draft.requires_item_resolution},
+          ${JSON.stringify(draft.review_data)}::jsonb
+        )
+        ON CONFLICT (tracking_key) DO NOTHING
+        RETURNING id
+      `
+      if (!created) {
+        return res.status(409).json({ error: 'This Tracking already exists; search for it again' })
+      }
+      return res.json({ ok: true, package: await loadPackage(sql, draft.tracking_key) })
     }
 
     if (req.method === 'POST' && action === 'orders-import') {
@@ -1838,14 +1922,33 @@ export default async function handler(req, res) {
 
       const selections = Array.isArray(req.body?.selections) ? req.body.selections : []
       const rawManualItems = Array.isArray(req.body?.manualItems) ? req.body.manualItems : []
+      const rawManualOrderItems = Array.isArray(req.body?.manualOrderItems)
+        ? req.body.manualOrderItems
+        : []
       if (selections.length && rawManualItems.length) {
         return res.status(400).json({ error: 'Choose products from the order or choose inventory items manually, not both' })
+      }
+      if (rawManualItems.length && rawManualOrderItems.length) {
+        return res.status(400).json({ error: 'Manual inventory rows cannot include order-item mappings' })
       }
       const orderItems = new Map(
         (pkg.related_orders || []).flatMap((order) => order.items || [])
           .map((item) => [Number(item.id), item]),
       )
+      if (rawManualOrderItems.length > orderItems.size) {
+        return res.status(400).json({ error: 'Too many manual product mappings were submitted' })
+      }
       const selectedIds = new Set()
+      const manualOrderItems = new Map()
+      for (const manualOrderItem of rawManualOrderItems) {
+        const orderItemId = Number(manualOrderItem?.orderItemId)
+        if (!Number.isSafeInteger(orderItemId) || manualOrderItems.has(orderItemId)) {
+          return res.status(400).json({ error: 'Every manual product mapping must identify one order item' })
+        }
+        manualOrderItems.set(orderItemId, Array.isArray(manualOrderItem.components)
+          ? manualOrderItem.components
+          : [])
+      }
       let resolvedItems = []
       if (rawManualItems.length) {
         if (orderItems.size) {
@@ -1891,6 +1994,7 @@ export default async function handler(req, res) {
           size: targetResolutions[index].matched_size,
         }))
       } else {
+        const manualResolvedIndexes = []
         for (const selection of selections) {
           const orderItemId = Number(selection.orderItemId)
           const quantity = Number(selection.quantity)
@@ -1905,38 +2009,79 @@ export default async function handler(req, res) {
           ) {
             return res.status(400).json({ error: 'Choose valid returned quantities from the original order' })
           }
-          if (
-            orderItem.catalog_status !== 'ready'
-            || !Array.isArray(orderItem.catalog_components)
-            || !orderItem.catalog_components.length
-          ) {
-            return res.status(409).json({
-              error: `Product mapping is required for ${orderItem.sku_code || orderItem.sku_id || 'this SKU'}`,
-            })
-          }
           selectedIds.add(orderItemId)
-          for (const component of orderItem.catalog_components) {
-            const componentQty = Number(component.qty || 1)
-            if (
-              !component.style
-              || !component.color
-              || !component.size
-              || !Number.isSafeInteger(componentQty)
-              || componentQty <= 0
-              || componentQty * quantity > 9999
-            ) {
-              return res.status(409).json({ error: 'The selected SKU has an invalid inventory mapping' })
-            }
-            resolvedItems.push({
-              sku_id: cleanText(orderItem.sku_id, 100),
-              sku_code: cleanText(orderItem.sku_code, 300),
-              style: cleanText(component.style, 300),
-              color: cleanText(component.color, 300),
-              size: cleanText(component.size, 100),
-              expected_qty: componentQty * quantity,
-              source_qty: quantity,
+          const hasCatalogMapping = orderItem.catalog_status === 'ready'
+            && Array.isArray(orderItem.catalog_components)
+            && orderItem.catalog_components.length > 0
+          const manualComponents = manualOrderItems.get(orderItemId) || []
+          let selectionItems
+          try {
+            selectionItems = buildReturnItemsForOrderSelection(
+              orderItem,
+              quantity,
+              manualComponents,
+            )
+          } catch (error) {
+            return res.status(409).json({
+              error: `${orderItem.sku_code || orderItem.sku_id || 'This product'}: ${error.message}`,
             })
           }
+          for (const item of selectionItems) {
+            const resolvedIndex = resolvedItems.length
+            resolvedItems.push(item)
+            if (!hasCatalogMapping) manualResolvedIndexes.push(resolvedIndex)
+          }
+        }
+        if ([...manualOrderItems.keys()].some((orderItemId) => !selectedIds.has(orderItemId))) {
+          return res.status(400).json({ error: 'Choose a returned quantity for every manually mapped product' })
+        }
+        if (manualResolvedIndexes.length) {
+          const manualTargets = manualResolvedIndexes.map((index) => resolvedItems[index])
+          const targetResolutions = await sql`
+            WITH targets AS (
+              SELECT
+                (target.ordinality - 1)::int AS target_index,
+                target.value->>'style' AS style,
+                target.value->>'color' AS color,
+                target.value->>'size' AS size
+              FROM jsonb_array_elements(${JSON.stringify(manualTargets)}::jsonb)
+                WITH ORDINALITY AS target(value, ordinality)
+            )
+            SELECT
+              targets.target_index,
+              COUNT(inventory.id)::int AS match_count,
+              MIN(inventory.style) AS matched_style,
+              MIN(inventory.color) AS matched_color,
+              MIN(inventory.size) AS matched_size
+            FROM targets
+            LEFT JOIN inventory_balance inventory
+              ON LOWER(BTRIM(inventory.style)) = LOWER(BTRIM(targets.style))
+             AND LOWER(BTRIM(inventory.color)) = LOWER(BTRIM(targets.color))
+             AND CASE UPPER(BTRIM(inventory.size))
+                   WHEN '1XL' THEN '1X' WHEN '2XL' THEN '2X' WHEN '3XL' THEN '3X'
+                   ELSE UPPER(BTRIM(inventory.size))
+                 END
+               = CASE UPPER(BTRIM(targets.size))
+                   WHEN '1XL' THEN '1X' WHEN '2XL' THEN '2X' WHEN '3XL' THEN '3X'
+                   ELSE UPPER(BTRIM(targets.size))
+                 END
+            GROUP BY targets.target_index
+            ORDER BY targets.target_index
+          `
+          const invalidTarget = targetResolutions.find((target) => Number(target.match_count) !== 1)
+          if (invalidTarget) {
+            return res.status(409).json({
+              error: 'A manually selected product style, color, or size is missing or ambiguous in inventory',
+            })
+          }
+          manualResolvedIndexes.forEach((resolvedIndex, targetIndex) => {
+            resolvedItems[resolvedIndex] = {
+              ...resolvedItems[resolvedIndex],
+              style: targetResolutions[targetIndex].matched_style,
+              color: targetResolutions[targetIndex].matched_color,
+              size: targetResolutions[targetIndex].matched_size,
+            }
+          })
         }
       }
       if (!resolvedItems.length) {

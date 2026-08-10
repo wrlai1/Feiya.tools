@@ -99,6 +99,16 @@ export function getReturnManifestTrackingNumbers(rows) {
     .filter(Boolean))]
 }
 
+export function resolveStyleSearchValue(options, rawValue) {
+  const value = String(rawValue ?? '')
+  const normalized = value.trim().toLowerCase()
+  if (!normalized) return ''
+  const exact = (options || []).find((option) => (
+    String(option || '').trim().toLowerCase() === normalized
+  ))
+  return exact || value.trim()
+}
+
 export function getReturnManifestSkuIds(rows) {
   if (!Array.isArray(rows) || !rows.length) return []
   const skuIdKey = findKey(rows[0], SKU_ID_ALIASES)
@@ -691,14 +701,23 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
           storeKey: store.key,
         }]
       })).values()]
-      pendingUploadDecisions.push({
-        tracking: group.tracking,
-        trackingNumber: group.trackingNumber,
-        issue: 'tracking_po_mismatch',
-        claimedOrders: [...group.orders],
-        candidateOrders: candidates,
+      if (candidates.length || !selectedStore?.key || !selectedStore?.name) {
+        pendingUploadDecisions.push({
+          tracking: group.tracking,
+          trackingNumber: group.trackingNumber,
+          issue: 'tracking_po_mismatch',
+          claimedOrders: [...group.orders],
+          candidateOrders: candidates,
+        })
+        continue
+      }
+      group.review.push({
+        tracking: group.trackingNumber,
+        excelRow: null,
+        orderNumber: [...group.orders].join(', '),
+        skuId: '',
+        parse_issue: 'tracking_po_mismatch_manual_store',
       })
-      continue
     }
 
     if (!group.stores.size) {
