@@ -97,3 +97,28 @@ export function groupReturnProducts(items = [], unresolvedSkus = []) {
     productQty: group.productQty || (group.inventoryPieces > 0 ? 1 : 0),
   }))
 }
+
+export function collectReturnSkuMappingCandidates(unresolvedSkus = [], relatedOrderItems = []) {
+  const candidates = new Map()
+  for (const item of unresolvedSkus || []) {
+    const skuId = String(item.skuId || item.sku_id || '').trim()
+    if (!skuId) continue
+    candidates.set(skuId, {
+      skuId,
+      skuCode: String(item.skuCode || item.sku_code || '').trim(),
+      returnQuantity: Number(item.quantity),
+      reviewIssue: item.issue || 'product_catalog_mapping_required',
+    })
+  }
+  for (const item of relatedOrderItems || []) {
+    const skuId = String(item.sku_id || item.skuId || '').trim()
+    if (!skuId || item.catalog_status === 'ready' || candidates.has(skuId)) continue
+    candidates.set(skuId, {
+      skuId,
+      skuCode: String(item.sku_code || item.skuCode || '').trim(),
+      returnQuantity: Number(item.quantity || 1),
+      reviewIssue: 'product_catalog_mapping_required',
+    })
+  }
+  return [...candidates.values()]
+}

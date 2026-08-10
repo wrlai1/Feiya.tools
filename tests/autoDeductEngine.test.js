@@ -8,7 +8,10 @@ import {
   fillTemplate,
   reviewAliasKey,
 } from '../src/utils/autoDeductEngine.js'
-import { summarizeReturnInspection } from '../src/utils/returnInspection.js'
+import {
+  collectReturnSkuMappingCandidates,
+  summarizeReturnInspection,
+} from '../src/utils/returnInspection.js'
 import { consolidateRows } from '../src/utils/consolidateEngine.js'
 import { findAdditionalComboSizeMappings, findAdditionalSizeMappings } from '../src/utils/autoDeductRules.js'
 import {
@@ -30,7 +33,12 @@ import inventoryTargetResolution from '../lib/inventoryTargetResolution.cjs'
 import returnPackageSafety from '../lib/returnPackageSafety.cjs'
 
 const { resolveInventoryTargets } = inventoryTargetResolution
-const { mergeInventoryComponents, mergeReturnPackageItems } = returnPackageSafety
+const {
+  findReturnSkuMappingTarget,
+  mergeInventoryComponents,
+  mergeReturnPackageItems,
+  normalizeManualReturnPackageItems,
+} = returnPackageSafety
 
 test('returns store choices use Analytics as the canonical store list', () => {
   const stores = mergeAnalyticsReturnStores([
@@ -116,6 +124,48 @@ test('return inspection supports mixed set outcomes and rejects over-counting', 
   )
 })
 
+test('an unmapped PO product becomes an Admin mapping choice before quantity selection', () => {
+  const candidates = collectReturnSkuMappingCandidates([], [{
+    sku_id: '49366961164',
+    sku_code: 'ER100SetM',
+    quantity: 2,
+    catalog_status: null,
+  }, {
+    sku_id: 'READY-SKU',
+    sku_code: 'READY-M',
+    quantity: 1,
+    catalog_status: 'ready',
+  }])
+
+  assert.deepEqual(candidates, [{
+    skuId: '49366961164',
+    skuCode: 'ER100SetM',
+    returnQuantity: 2,
+    reviewIssue: 'product_catalog_mapping_required',
+  }])
+})
+
+test('manifest SKU review takes precedence over a duplicate PO mapping candidate', () => {
+  const candidates = collectReturnSkuMappingCandidates([{
+    skuId: '49366961164',
+    skuCode: 'ER100SetM',
+    quantity: 1,
+    issue: 'inventory_target_missing',
+  }], [{
+    sku_id: '49366961164',
+    sku_code: 'OLD-CODE',
+    quantity: 2,
+    catalog_status: null,
+  }])
+
+  assert.deepEqual(candidates, [{
+    skuId: '49366961164',
+    skuCode: 'ER100SetM',
+    returnQuantity: 1,
+    reviewIssue: 'inventory_target_missing',
+  }])
+})
+
 test('Admin item resolution preserves already identified return items', () => {
   const items = mergeReturnPackageItems([
     {
@@ -186,6 +236,81 @@ test('admin return combinations keep multiple inventory targets and merge duplic
     { style: '62300SET', color: 'BLACK', size: '1X', qty: 3 },
     { style: '62300SET', color: 'DENIM', size: '1X', qty: 1 },
   ])
+})
+
+test('Admin missing-PO selections become audited return items and merge duplicate targets', () => {
+  const items = normalizeManualReturnPackageItems([
+    { style: 'A100', color: 'BLACK', size: 'S', qty: 1 },
+    { style: 'A100', color: 'black', size: 'S', qty: 2 },
+    { style: 'B200', color: 'NAVY', size: 'M', qty: 1 },
+  ])
+
+  assert.deepEqual(items, [
+    {
+      sku_id: '',
+      sku_code: 'Admin manual selection (PO not found)',
+      style: 'A100',
+      color: 'BLACK',
+      size: 'S',
+      expected_qty: 3,
+      source_qty: 3,
+    },
+    {
+      sku_id: '',
+      sku_code: 'Admin manual selection (PO not found)',
+      style: 'B200',
+      color: 'NAVY',
+      size: 'M',
+      expected_qty: 1,
+      source_qty: 1,
+    },
+  ])
+})
+
+test('Admin missing-PO selections reject incomplete or unsafe inventory quantities', () => {
+  assert.throws(
+    () => normalizeManualReturnPackageItems([
+      { style: 'A100', color: '', size: 'S', qty: 1 },
+    ]),
+    /Invalid inventory component/,
+  )
+  assert.throws(
+    () => normalizeManualReturnPackageItems([
+      { style: 'A100', color: 'BLACK', size: 'S', qty: 1.5 },
+    ]),
+    /Invalid inventory component/,
+  )
+})
+
+test('Admin can map an unmapped PO SKU without treating its ordered quantity as returned', () => {
+  const target = findReturnSkuMappingTarget([], [{
+    items: [{
+      sku_id: '49366961164',
+      sku_code: 'ER100SetM',
+      quantity: 2,
+      catalog_status: null,
+    }],
+  }], '49366961164')
+
+  assert.deepEqual(target, {
+    kind: 'unmapped_order_sku',
+    skuCode: 'ER100SetM',
+    quantity: null,
+    unresolvedSku: null,
+  })
+})
+
+test('Admin cannot remap a PO SKU that already has a ready catalog mapping', () => {
+  const target = findReturnSkuMappingTarget([], [{
+    items: [{
+      sku_id: '49366961164',
+      sku_code: 'ER100SetM',
+      quantity: 2,
+      catalog_status: 'ready',
+    }],
+  }], '49366961164')
+
+  assert.equal(target, null)
 })
 
 test('petite sales sizes are shifted exactly once', () => {
@@ -1400,6 +1525,11 @@ test('missing return SKU stays in review when its order history is unavailable',
   assert.equal(result.packages.length, 0)
   assert.equal(result.needsReview[0].orderNumber, 'PO-NOT-UPLOADED')
   assert.equal(result.needsReview[0].parse_issue, 'order_history_missing')
+  assert.equal(result.reviewPackages.length, 1)
+  assert.equal(result.reviewPackages[0].requiresItemResolution, true)
+  assert.ok(
+    result.reviewPackages[0].reviewData.blockingIssues.includes('order_history_missing'),
+  )
 })
 
 test('a confirmed style and color safely carries to sibling sizes during review', () => {

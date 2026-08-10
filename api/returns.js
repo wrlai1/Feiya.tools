@@ -6,7 +6,13 @@ import { summarizeReturnInspection } from '../src/utils/returnInspection.js'
 
 const { resolveInventoryTargets } = inventoryTargetResolution
 const { authenticateUser } = authentication
-const { itemIdentity, mergeInventoryComponents, mergeReturnPackageItems } = returnPackageSafety
+const {
+  findReturnSkuMappingTarget,
+  itemIdentity,
+  mergeInventoryComponents,
+  mergeReturnPackageItems,
+  normalizeManualReturnPackageItems,
+} = returnPackageSafety
 const MAX_PACKAGES_PER_IMPORT = 5000
 const MAX_ITEMS_PER_IMPORT = 50000
 const MAX_CATALOG_ROWS_PER_IMPORT = 20000
@@ -1599,13 +1605,19 @@ export default async function handler(req, res) {
       }
 
       const reviewData = normalizeReviewData(pkg.review_data)
-      const unresolvedSku = reviewData.unresolvedSkus.find((item) => item.skuId === skuId)
-      if (!unresolvedSku) {
+      const mappingTarget = findReturnSkuMappingTarget(
+        reviewData.unresolvedSkus,
+        pkg.related_orders,
+        skuId,
+      )
+      if (!mappingTarget) {
         return res.status(409).json({ error: 'This SKU mapping was already resolved or is no longer pending' })
       }
+      const unresolvedSku = mappingTarget.unresolvedSku
+      const mappingSkuCode = cleanText(mappingTarget.skuCode, 300)
       const [catalogRow] = normalizeCatalogRows([{
         skuId,
-        skuCode: unresolvedSku.skuCode,
+        skuCode: mappingSkuCode,
         status: 'ready',
         components: req.body?.components,
       }])
@@ -1624,15 +1636,17 @@ export default async function handler(req, res) {
         size: component.size,
         qty: component.qty,
       })))
-      const packageItems = components.map((component) => ({
-        sku_id: skuId,
-        sku_code: unresolvedSku.skuCode,
-        style: component.style,
-        color: component.color,
-        size: component.size,
-        expected_qty: component.qty * unresolvedSku.quantity,
-        source_qty: unresolvedSku.quantity,
-      }))
+      const packageItems = unresolvedSku
+        ? components.map((component) => ({
+            sku_id: skuId,
+            sku_code: mappingSkuCode,
+            style: component.style,
+            color: component.color,
+            size: component.size,
+            expected_qty: component.qty * unresolvedSku.quantity,
+            source_qty: unresolvedSku.quantity,
+          }))
+        : []
       if (packageItems.some((item) => item.expected_qty > 9999)) {
         return res.status(400).json({ error: 'Resolved return quantity is too large' })
       }
@@ -1665,13 +1679,13 @@ export default async function handler(req, res) {
       const componentData = JSON.stringify(components)
       const itemData = JSON.stringify(packageItems)
       const newMapping = JSON.stringify({
-        sku_code: unresolvedSku.skuCode,
+        sku_code: mappingSkuCode,
         components,
         status: 'ready',
       })
 
-      await sql.transaction((txn) => [
-        txn`
+      await sql.transaction((txn) => {
+        const statements = [txn`
           INSERT INTO return_product_catalog_history (
             store_name, store_key, sku_id, old_mapping, new_mapping,
             change_source, tracking_number, changed_by
@@ -1694,15 +1708,14 @@ export default async function handler(req, res) {
           LEFT JOIN return_product_catalog catalog
             ON catalog.store_key = ${pkg.store_key}
            AND catalog.sku_id = ${skuId}
-        `,
-        txn`
+        `, txn`
           INSERT INTO return_product_catalog (
             store_name, store_key, sku_id, sku_code, components, status, issue,
             source_file, updated_by, updated_at, mapping_source, mapping_version,
             mapping_confirmed_by, mapping_confirmed_at
           )
           VALUES (
-            ${pkg.store_name}, ${pkg.store_key}, ${skuId}, ${unresolvedSku.skuCode},
+            ${pkg.store_name}, ${pkg.store_key}, ${skuId}, ${mappingSkuCode},
             ${componentData}::jsonb, 'ready', NULL, 'Admin Review', ${payload.username}, NOW(),
             'admin', 1, ${payload.username}, NOW()
           )
@@ -1718,42 +1731,47 @@ export default async function handler(req, res) {
             mapping_confirmed_by = EXCLUDED.mapping_confirmed_by,
             mapping_confirmed_at = NOW(),
             updated_at = NOW()
-        `,
-        txn`
-          WITH incoming AS (
-            SELECT *
-            FROM jsonb_to_recordset(${itemData}::jsonb)
-              AS item(
-                sku_id TEXT, sku_code TEXT, style TEXT, color TEXT, size TEXT,
-                expected_qty INTEGER, source_qty INTEGER
+        `]
+        if (unresolvedSku) {
+          statements.push(
+            txn`
+              WITH incoming AS (
+                SELECT *
+                FROM jsonb_to_recordset(${itemData}::jsonb)
+                  AS item(
+                    sku_id TEXT, sku_code TEXT, style TEXT, color TEXT, size TEXT,
+                    expected_qty INTEGER, source_qty INTEGER
+                  )
               )
-          )
-          INSERT INTO return_package_items (
-            package_id, sku_id, sku_code, style, color, size,
-            expected_qty, source_qty, actual_qty, restock_qty, not_ours_qty
-          )
-          SELECT
-            ${pkg.id}, sku_id, sku_code, style, color, size,
-            expected_qty, source_qty, NULL, NULL, NULL
-          FROM incoming
-          ON CONFLICT (package_id, sku_id, style, color, size) DO UPDATE SET
-            sku_code = EXCLUDED.sku_code,
-            expected_qty = return_package_items.expected_qty + EXCLUDED.expected_qty,
-            source_qty = COALESCE(return_package_items.source_qty, 0) + EXCLUDED.source_qty
-        `,
-        txn`
-          UPDATE return_packages
-          SET review_data = ${JSON.stringify(nextReviewData)}::jsonb,
-              review_reason = ${reviewReason},
-              requires_item_resolution = ${requiresItemResolution},
-              expected_units = (
-                SELECT COALESCE(SUM(expected_qty), 0)::int
-                FROM return_package_items
-                WHERE package_id = ${pkg.id}
+              INSERT INTO return_package_items (
+                package_id, sku_id, sku_code, style, color, size,
+                expected_qty, source_qty, actual_qty, restock_qty, not_ours_qty
               )
-          WHERE id = ${pkg.id} AND status = 'needs_review'
-        `,
-      ], { isolationLevel: 'Serializable' })
+              SELECT
+                ${pkg.id}, sku_id, sku_code, style, color, size,
+                expected_qty, source_qty, NULL, NULL, NULL
+              FROM incoming
+              ON CONFLICT (package_id, sku_id, style, color, size) DO UPDATE SET
+                sku_code = EXCLUDED.sku_code,
+                expected_qty = return_package_items.expected_qty + EXCLUDED.expected_qty,
+                source_qty = COALESCE(return_package_items.source_qty, 0) + EXCLUDED.source_qty
+            `,
+            txn`
+              UPDATE return_packages
+              SET review_data = ${JSON.stringify(nextReviewData)}::jsonb,
+                  review_reason = ${reviewReason},
+                  requires_item_resolution = ${requiresItemResolution},
+                  expected_units = (
+                    SELECT COALESCE(SUM(expected_qty), 0)::int
+                    FROM return_package_items
+                    WHERE package_id = ${pkg.id}
+                  )
+              WHERE id = ${pkg.id} AND status = 'needs_review'
+            `,
+          )
+        }
+        return statements
+      }, { isolationLevel: 'Serializable' })
 
       let reusedPackages = 0
       let reuseWarning = ''
@@ -1761,7 +1779,7 @@ export default async function handler(req, res) {
         reusedPackages = await reuseSkuMappingForQueuedPackages(sql, {
           storeKey: pkg.store_key,
           skuId,
-          skuCode: unresolvedSku.skuCode,
+          skuCode: mappingSkuCode,
           components,
           excludePackageId: pkg.id,
         })
@@ -1788,57 +1806,106 @@ export default async function handler(req, res) {
       }
 
       const selections = Array.isArray(req.body?.selections) ? req.body.selections : []
+      const rawManualItems = Array.isArray(req.body?.manualItems) ? req.body.manualItems : []
+      if (selections.length && rawManualItems.length) {
+        return res.status(400).json({ error: 'Choose products from the order or choose inventory items manually, not both' })
+      }
       const orderItems = new Map(
         (pkg.related_orders || []).flatMap((order) => order.items || [])
           .map((item) => [Number(item.id), item]),
       )
       const selectedIds = new Set()
-      const resolvedItems = []
-      for (const selection of selections) {
-        const orderItemId = Number(selection.orderItemId)
-        const quantity = Number(selection.quantity)
-        const orderItem = orderItems.get(orderItemId)
-        if (
-          !Number.isSafeInteger(orderItemId)
-          || selectedIds.has(orderItemId)
-          || !Number.isSafeInteger(quantity)
-          || quantity <= 0
-          || !orderItem
-          || quantity > Number(orderItem.quantity)
-        ) {
-          return res.status(400).json({ error: 'Choose valid returned quantities from the original order' })
+      let resolvedItems = []
+      if (rawManualItems.length) {
+        if (orderItems.size) {
+          return res.status(409).json({ error: 'Use the original order items when matching PO history is available' })
         }
-        if (
-          orderItem.catalog_status !== 'ready'
-          || !Array.isArray(orderItem.catalog_components)
-          || !orderItem.catalog_components.length
-        ) {
-          return res.status(409).json({
-            error: `Product mapping is required for ${orderItem.sku_code || orderItem.sku_id || 'this SKU'}`,
-          })
+        try {
+          resolvedItems = normalizeManualReturnPackageItems(rawManualItems)
+        } catch {
+          return res.status(400).json({ error: 'Choose complete inventory items with positive whole-number quantities' })
         }
-        selectedIds.add(orderItemId)
-        for (const component of orderItem.catalog_components) {
-          const componentQty = Number(component.qty || 1)
+        const targetResolutions = await sql`
+          WITH targets AS (
+            SELECT
+              (target.ordinality - 1)::int AS target_index,
+              target.value->>'style' AS style,
+              target.value->>'color' AS color,
+              target.value->>'size' AS size
+            FROM jsonb_array_elements(${JSON.stringify(resolvedItems)}::jsonb)
+              WITH ORDINALITY AS target(value, ordinality)
+          )
+          SELECT
+            targets.target_index,
+            COUNT(inventory.id)::int AS match_count,
+            MIN(inventory.style) AS matched_style,
+            MIN(inventory.color) AS matched_color,
+            MIN(inventory.size) AS matched_size
+          FROM targets
+          LEFT JOIN inventory_balance inventory
+            ON LOWER(BTRIM(inventory.style)) = LOWER(BTRIM(targets.style))
+           AND LOWER(BTRIM(inventory.color)) = LOWER(BTRIM(targets.color))
+           AND LOWER(BTRIM(inventory.size)) = LOWER(BTRIM(targets.size))
+          GROUP BY targets.target_index
+          ORDER BY targets.target_index
+        `
+        const invalidTarget = targetResolutions.find((target) => Number(target.match_count) !== 1)
+        if (invalidTarget) {
+          return res.status(409).json({ error: 'A manually selected inventory target is missing or ambiguous' })
+        }
+        resolvedItems = resolvedItems.map((item, index) => ({
+          ...item,
+          style: targetResolutions[index].matched_style,
+          color: targetResolutions[index].matched_color,
+          size: targetResolutions[index].matched_size,
+        }))
+      } else {
+        for (const selection of selections) {
+          const orderItemId = Number(selection.orderItemId)
+          const quantity = Number(selection.quantity)
+          const orderItem = orderItems.get(orderItemId)
           if (
-            !component.style
-            || !component.color
-            || !component.size
-            || !Number.isSafeInteger(componentQty)
-            || componentQty <= 0
-            || componentQty * quantity > 9999
+            !Number.isSafeInteger(orderItemId)
+            || selectedIds.has(orderItemId)
+            || !Number.isSafeInteger(quantity)
+            || quantity <= 0
+            || !orderItem
+            || quantity > Number(orderItem.quantity)
           ) {
-            return res.status(409).json({ error: 'The selected SKU has an invalid inventory mapping' })
+            return res.status(400).json({ error: 'Choose valid returned quantities from the original order' })
           }
-          resolvedItems.push({
-            sku_id: cleanText(orderItem.sku_id, 100),
-            sku_code: cleanText(orderItem.sku_code, 300),
-            style: cleanText(component.style, 300),
-            color: cleanText(component.color, 300),
-            size: cleanText(component.size, 100),
-            expected_qty: componentQty * quantity,
-            source_qty: quantity,
-          })
+          if (
+            orderItem.catalog_status !== 'ready'
+            || !Array.isArray(orderItem.catalog_components)
+            || !orderItem.catalog_components.length
+          ) {
+            return res.status(409).json({
+              error: `Product mapping is required for ${orderItem.sku_code || orderItem.sku_id || 'this SKU'}`,
+            })
+          }
+          selectedIds.add(orderItemId)
+          for (const component of orderItem.catalog_components) {
+            const componentQty = Number(component.qty || 1)
+            if (
+              !component.style
+              || !component.color
+              || !component.size
+              || !Number.isSafeInteger(componentQty)
+              || componentQty <= 0
+              || componentQty * quantity > 9999
+            ) {
+              return res.status(409).json({ error: 'The selected SKU has an invalid inventory mapping' })
+            }
+            resolvedItems.push({
+              sku_id: cleanText(orderItem.sku_id, 100),
+              sku_code: cleanText(orderItem.sku_code, 300),
+              style: cleanText(component.style, 300),
+              color: cleanText(component.color, 300),
+              size: cleanText(component.size, 100),
+              expected_qty: componentQty * quantity,
+              source_qty: quantity,
+            })
+          }
         }
       }
       if (!resolvedItems.length) {
