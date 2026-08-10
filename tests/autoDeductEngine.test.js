@@ -6,6 +6,7 @@ import {
   calculateResolvedSourceUnits,
   countSkippedUnits,
   fillTemplate,
+  reviewAliasKey,
 } from '../src/utils/autoDeductEngine.js'
 import { summarizeReturnInspection } from '../src/utils/returnInspection.js'
 import { consolidateRows } from '../src/utils/consolidateEngine.js'
@@ -572,6 +573,7 @@ test('confirmed style and color rule stops when target size does not exist', () 
 
   assert.equal(result.filledRows.reduce((sum, row) => sum + row.QTY, 0), 0)
   assert.equal(result.unmatchedRows[0].parseIssue, 'confirmed_mapping_size_missing')
+  assert.equal(result.unmatchedRows[0].sourceIssue, undefined)
 })
 
 test('remembered new mapping reuses the unique normalized inventory target', () => {
@@ -692,6 +694,58 @@ test('learned mapping cannot bypass a source parsing warning', () => {
   assert.equal(result.filledRows.reduce((sum, row) => sum + row.QTY, 0), 0)
   assert.equal(result.unmatchedRows.length, 1)
   assert.equal(result.unmatchedRows[0].parseIssue, 'ambiguous_style')
+})
+
+test('an exact reviewed source conflict is remembered without weakening other rows', () => {
+  const firstSource = consolidateRows([{
+    SKU: 'A100BlackS',
+    'Product Attribute': 'Black / M',
+    Quantity: 2,
+  }]).consolidated[0]
+  assert.equal(firstSource.parse_issue, 'sku_attribute_size_conflict')
+  assert.ok(firstSource.source_signature)
+
+  const aliases = {
+    [reviewAliasKey(
+      firstSource.style,
+      firstSource.color,
+      firstSource.size,
+      firstSource.source_signature,
+      firstSource.parse_issue,
+    )]: {
+      STYLE: 'A100',
+      COLOR: 'BLACK',
+      SIZE: 'S',
+      _confirmed: true,
+      _sourceSignature: firstSource.source_signature,
+      _confirmedIssues: firstSource.parse_issue,
+    },
+  }
+  const remembered = fillTemplate([
+    { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S' },
+  ], [firstSource], aliases)
+
+  assert.deepEqual(
+    remembered.filledRows.filter((row) => row.QTY),
+    [{ STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S', QTY: 2 }],
+  )
+  assert.equal(remembered.unmatchedRows.length, 0)
+
+  const changedSource = consolidateRows([{
+    SKU: 'A100BlackS',
+    'Product Attribute': 'Black / L',
+    Quantity: 2,
+  }]).consolidated[0]
+  const blocked = fillTemplate([
+    { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S' },
+  ], [changedSource], aliases)
+
+  assert.equal(blocked.filledRows.reduce((sum, row) => sum + row.QTY, 0), 0)
+  assert.equal(blocked.unmatchedRows[0].parseIssue, 'sku_attribute_size_conflict')
+
+  const missingTarget = fillTemplate([], [firstSource], aliases)
+  assert.equal(missingTarget.unmatchedRows[0].parseIssue, 'confirmed_mapping_size_missing')
+  assert.equal(missingTarget.unmatchedRows[0].sourceIssue, 'sku_attribute_size_conflict')
 })
 
 test('invalid source quantities stop the run instead of being partially parsed', () => {
@@ -1369,6 +1423,32 @@ test('a confirmed style and color safely carries to sibling sizes during review'
     index: 1,
     entry: { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'M' },
   }])
+})
+
+test('a source-data conflict is never propagated to sibling sizes through a generated review reason', () => {
+  const mappings = findAdditionalSizeMappings({
+    unmatchedRows: [
+      {
+        style: 'A100', color: 'Black', size: 'S', packCount: 1,
+        parseIssue: 'confirmed_mapping_size_missing',
+        sourceIssue: 'sku_attribute_size_conflict',
+      },
+      {
+        style: 'A100', color: 'Black', size: 'M', packCount: 1,
+        parseIssue: 'confirmed_mapping_size_missing',
+        sourceIssue: 'sku_attribute_size_conflict',
+      },
+    ],
+    templateRows: [
+      { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S' },
+      { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'M' },
+    ],
+    resolved: [null, null],
+    sourceIndex: 0,
+    targetEntry: { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S' },
+  })
+
+  assert.deepEqual(mappings, [])
 })
 
 test('a confirmed combo selection carries all components to sibling sizes', () => {

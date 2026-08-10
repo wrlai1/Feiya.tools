@@ -264,6 +264,9 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
             size: row.size,
             packCount: confirmedPackCount,
             originalPackCount: row.packCount,
+            sourceSignature: row.sourceSignature,
+            sourceIssue: row.sourceIssue,
+            parseIssue: row.parseIssue,
           },
           _learnAlias: true,
         })
@@ -275,7 +278,14 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
         SIZE:   r.entry.SIZE,
         QTY:    row.qty,
         _isNew: r.type === 'create',
-        _source: { style: row.style, color: row.color, size: row.size },
+        _source: {
+          style: row.style,
+          color: row.color,
+          size: row.size,
+          sourceSignature: row.sourceSignature,
+          sourceIssue: row.sourceIssue,
+          parseIssue: row.parseIssue,
+        },
         _learnAlias: r.type === 'link' || r.type === 'create',
       })
     }

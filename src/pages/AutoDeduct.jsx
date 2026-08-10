@@ -17,7 +17,9 @@ import {
   normalizeSize,
   normalizeStyleIdentity,
   parseCSV,
+  reviewAliasKey,
 } from '../utils/autoDeductEngine.js'
+import { fetchAliases, patchAliasesAndVerify } from '../utils/autoDeductAliases.js'
 import ConsolidateStep from '../components/ConsolidateStep.jsx'
 import { consolidateRows } from '../utils/consolidateEngine.js'
 import { buildInventoryOrderClaims, parseOrderHistoryRows } from '../utils/orderImportEngine.js'
@@ -213,6 +215,9 @@ export default function AutoDeduct() {
   const [templateMissing, setTemplateMissing] = useState(false)
   const [showSettings,    setShowSettings]    = useState(false)
   const [aliases,         setAliases]         = useState({})
+  const [aliasesLoading,  setAliasesLoading]  = useState(true)
+  const [aliasesSaving,   setAliasesSaving]   = useState(false)
+  const [aliasesError,    setAliasesError]    = useState(null)
   const [sourceHash,      setSourceHash]      = useState('')
   const [sourceBusinessDay, setSourceBusinessDay] = useState('')
   const [businessDaySource, setBusinessDaySource] = useState('')
@@ -347,13 +352,29 @@ export default function AutoDeduct() {
       .catch(err => setConfigError(err.message))
   }, [getToken, isMock])
 
-  useEffect(() => {
-    if (isMock) return
-    fetch(`${BASE}/auto-deduct?action=aliases`, { headers: authHeaders(getToken()) })
-      .then(r => r.json())
-      .then(data => setAliases(data.aliases || {}))
-      .catch(() => setAliases({}))
+  const loadAliases = useCallback(async () => {
+    if (isMock) {
+      setAliasesLoading(false)
+      setAliasesError(null)
+      return
+    }
+    setAliasesLoading(true)
+    setAliasesError(null)
+    try {
+      const loaded = await fetchAliases(
+        fetch,
+        `${BASE}/auto-deduct?action=aliases`,
+        authHeaders(getToken()),
+      )
+      setAliases(loaded)
+    } catch (err) {
+      setAliasesError(err.message)
+    } finally {
+      setAliasesLoading(false)
+    }
   }, [getToken, isMock])
+
+  useEffect(() => { loadAliases() }, [loadAliases])
 
   const handleFile = useCallback((file) => {
     const parsedDay = businessDayFromFilename(file?.name)
@@ -374,6 +395,10 @@ export default function AutoDeduct() {
     if (!srcFile || processing) return
     if (!validBusinessDay(sourceBusinessDay)) {
       toast.error('The file date could not be read safely. Select the Auto Deduct business date before continuing.', 'Business Date Required')
+      return
+    }
+    if (aliasesLoading || aliasesSaving || aliasesError) {
+      toast.error('Saved Inventory Target matches must load successfully before Auto Deduct can run', 'Auto Deduct Blocked')
       return
     }
     setProcessing(true); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([]); setEditingResolutions(false); setResolutionAliasKeys([]); setPreviewConfirmed(false)
@@ -430,23 +455,29 @@ export default function AutoDeduct() {
     } finally {
       setProcessing(false)
     }
-  }, [srcFile, processing, getToken, toast, aliases, sourceBusinessDay])
+  }, [srcFile, processing, getToken, toast, aliases, sourceBusinessDay, aliasesLoading, aliasesSaving, aliasesError])
 
   // Called by UnmatchedResolver when user finishes reviewing.
   // Skipped rows are NOT deducted, but they must stay visible on the Unmatched
   // sheet — a skip is "leave for later", never "silently discard".
   const saveAliases = useCallback(async ({ upserts = {}, deleteKeys = [] }) => {
-    if (isMock) return
-    const res = await fetch(`${BASE}/auto-deduct?action=patch-aliases`, {
-      method: 'POST',
-      headers: authHeaders(getToken(), true),
-      body: JSON.stringify({ upserts, deleteKeys }),
-    })
-    const data = await res.json()
-    if (!res.ok) throw new Error(data.error || 'Could not save learned matches')
-  }, [getToken, isMock])
+    if (isMock) {
+      const next = { ...aliases }
+      for (const key of deleteKeys) delete next[key]
+      return Object.assign(next, upserts)
+    }
+    return patchAliasesAndVerify(
+      fetch,
+      {
+        patch: `${BASE}/auto-deduct?action=patch-aliases`,
+        read: `${BASE}/auto-deduct?action=aliases`,
+      },
+      authHeaders(getToken(), true),
+      { upserts, deleteKeys },
+    )
+  }, [aliases, getToken, isMock])
 
-  const handleResolve = useCallback((items, skipped = []) => {
+  const handleResolve = useCallback(async (items, skipped = []) => {
     setResolvedExtras(items)
     setSkippedRows(skipped)
     setEditingResolutions(false)
@@ -454,18 +485,34 @@ export default function AutoDeduct() {
     const learned = {}
     for (const item of items) {
       if (!item._learnAlias || !item._source) continue
+      const reviewIssues = String(item._source.sourceIssue || '').trim()
+      const sourceSignature = String(item._source.sourceSignature || '').trim()
+      const isExactReview = Boolean(reviewIssues && sourceSignature)
+      // A source warning without its raw-file signature cannot be remembered
+      // safely. It remains a one-run manual resolution.
+      if (reviewIssues && !sourceSignature) continue
       // A human-confirmed link is stable at style+color level. Future sizes
       // reuse it only when every exact target size exists in inventory.
       if (item._isCombo) {
         const sourceSize = normalizeSize(item._source.size)
-        if ((item.components || []).some((component) => normalizeSize(component.SIZE) !== sourceSize)) continue
-        learned[aliasKey(item._source.style, item._source.color)] = {
-          components: (item.components || []).map((component) => ({
+        const sourceComponents = item.components || []
+        if (!isExactReview && sourceComponents.some((component) => normalizeSize(component.SIZE) !== sourceSize)) continue
+        const components = sourceComponents.map((component) => ({
             STYLE: component.STYLE,
             COLOR: component.COLOR,
+            ...(isExactReview ? { SIZE: component.SIZE } : {}),
             multiplier: Math.max(1, parseInt(component.multiplier, 10) || 1),
-          })),
+          }))
+        const key = isExactReview
+          ? reviewAliasKey(item._source.style, item._source.color, item._source.size, sourceSignature, reviewIssues)
+          : aliasKey(item._source.style, item._source.color)
+        learned[key] = {
+          components,
           _confirmed: true,
+          ...(isExactReview ? {
+            _sourceSignature: sourceSignature,
+            _confirmedIssues: reviewIssues,
+          } : {}),
         }
         continue
       }
@@ -475,7 +522,20 @@ export default function AutoDeduct() {
           _isNew: !!item._isNew,
           _confirmed: true,
         }
-      if (item._isNew) {
+      if (isExactReview) {
+        learned[reviewAliasKey(
+          item._source.style,
+          item._source.color,
+          item._source.size,
+          sourceSignature,
+          reviewIssues,
+        )] = {
+          ...aliasValue,
+          SIZE: item.SIZE,
+          _sourceSignature: sourceSignature,
+          _confirmedIssues: reviewIssues,
+        }
+      } else if (item._isNew) {
         learned[aliasKey(item._source.style, item._source.color, item._source.size)] = {
           ...aliasValue,
           SIZE: item.SIZE,
@@ -498,17 +558,28 @@ export default function AutoDeduct() {
           }
         }
       }
-      Object.assign(nextAliases, learned)
-      setAliases(nextAliases)
-      setResolutionAliasKeys(Object.keys(learned))
-      saveAliases({ upserts: learned, deleteKeys: [...deleteKeys] })
-        .then(() => toast.success(
+      setAliasesSaving(true)
+      setAliasesError(null)
+      try {
+        const verifiedAliases = await saveAliases({ upserts: learned, deleteKeys: [...deleteKeys] })
+        setAliases(verifiedAliases)
+        setResolutionAliasKeys(Object.keys(learned))
+        toast.success(
           learnedCount
             ? `${learnedCount} match${learnedCount !== 1 ? 'es' : ''} remembered for next time`
             : 'Previous draft matches removed',
           'Matches Saved'
-        ))
-        .catch((err) => toast.error(err.message, 'Could Not Save Matches'))
+        )
+      } catch (err) {
+        setAliasesError(err.message)
+        setResolvedExtras(null)
+        setSkippedRows([])
+        setEditingResolutions(true)
+        toast.error(err.message, 'Could Not Verify Saved Matches')
+        return
+      } finally {
+        setAliasesSaving(false)
+      }
     }
     if (items.length > 0 || skipped.length > 0) {
       const parts = []
@@ -556,6 +627,13 @@ export default function AutoDeduct() {
 
   const handleApply = useCallback(async () => {
     if (!mergedFilledRows.length || applying) return
+    if (aliasesLoading || aliasesSaving || aliasesError) {
+      toast.error(
+        'Saved Inventory Target matches must be loaded and verified before inventory can be changed.',
+        'Inventory Update Blocked'
+      )
+      return
+    }
     if (skippedUnits > 0) {
       toast.error(
         `${skippedUnits.toLocaleString()} physical units are still skipped. Resolve every row before applying.`,
@@ -630,7 +708,7 @@ export default function AutoDeduct() {
     } finally {
       setApplying(false)
     }
-  }, [archiveDailyOrders, mergedFilledRows, businessMovementRows, txnType, srcFile, sourceHash, sourceBusinessDay, orderArchive, orderClaims, orderImportIssueCount, expectedSourceUnits, inventoryApplyUnits, reconciliationMismatch, skippedUnits, applying, getToken, previewConfirmed, toast])
+  }, [archiveDailyOrders, mergedFilledRows, businessMovementRows, txnType, srcFile, sourceHash, sourceBusinessDay, orderArchive, orderClaims, orderImportIssueCount, expectedSourceUnits, inventoryApplyUnits, reconciliationMismatch, skippedUnits, applying, getToken, previewConfirmed, toast, aliasesLoading, aliasesSaving, aliasesError])
 
   const stats            = result?.stats
   const hasUnresolved    = result?.unmatchedRows?.length > 0 && resolvedExtras === null
@@ -640,7 +718,11 @@ export default function AutoDeduct() {
     && allReviewRowsHandled
     && skippedUnits === 0
     && !reconciliationMismatch
-  const applyBlockReason = skippedUnits > 0
+  const applyBlockReason = aliasesLoading || aliasesSaving
+    ? 'Saved Inventory Target matches are still being verified.'
+    : aliasesError
+      ? 'Saved Inventory Target matches could not be verified. Retry before changing inventory.'
+    : skippedUnits > 0
     ? `Resolve the ${skippedUnits.toLocaleString()} skipped physical units before applying.`
     : reconciliationMismatch
       ? `Source total is ${expectedSourceUnits.toLocaleString()}, but ${inventoryApplyUnits.toLocaleString()} physical units are ready to apply.`
@@ -687,6 +769,19 @@ export default function AutoDeduct() {
         <div className="flex items-start gap-3 px-4 py-3 bg-red-50 border border-red-200 rounded-xl text-sm text-red-700">
           <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
           <p>{configError}</p>
+        </div>
+      )}
+
+      {aliasesError && (
+        <div className="flex items-start gap-3 px-4 py-3 bg-red-50 border border-red-200 rounded-xl text-sm text-red-700">
+          <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
+          <div className="flex-1">
+            <p className="font-medium">Saved Inventory Target matches are unavailable</p>
+            <p className="mt-0.5">{aliasesError}. Auto Deduct is blocked to prevent incorrect matching.</p>
+          </div>
+          <button onClick={loadAliases} className="btn-secondary shrink-0 text-sm">
+            Retry
+          </button>
         </div>
       )}
 
@@ -774,15 +869,44 @@ export default function AutoDeduct() {
           </div>
         )}
 
+        {!aliasesError && (
+          <div className={`flex items-center gap-2 rounded-lg px-3 py-2 text-xs ${
+            aliasesLoading || aliasesSaving
+              ? 'bg-amber-50 text-amber-700'
+              : 'bg-emerald-50 text-emerald-700'
+          }`}>
+            {aliasesLoading || aliasesSaving ? (
+              <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <CheckCircle className="h-3.5 w-3.5" />
+            )}
+            {aliasesLoading
+              ? 'Loading saved Inventory Target matches…'
+              : aliasesSaving
+                ? 'Saving and verifying Inventory Target matches…'
+                : `${Object.keys(aliases).length} saved Inventory Target matches loaded`}
+          </div>
+        )}
+
         {/* Run button */}
         <button
           onClick={handleRun}
-          disabled={!isMock && (!srcFile || processing || templateMissing || !validBusinessDay(sourceBusinessDay))}
+          disabled={!isMock && (
+            !srcFile
+            || processing
+            || templateMissing
+            || !validBusinessDay(sourceBusinessDay)
+            || aliasesLoading
+            || aliasesSaving
+            || Boolean(aliasesError)
+          )}
           className="btn-primary w-full justify-center py-3 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {processing
             ? <><RefreshCw className="w-4 h-4 animate-spin" /> Processing…</>
-            : <><RefreshCw className="w-4 h-4" /> Run Auto-Fill</>}
+            : aliasesLoading || aliasesSaving
+              ? <><RefreshCw className="w-4 h-4 animate-spin" /> Verifying Saved Matches…</>
+              : <><RefreshCw className="w-4 h-4" /> Run Auto-Fill</>}
         </button>
       </div>
 
