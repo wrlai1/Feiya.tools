@@ -48,6 +48,18 @@ function describeStoreDecision(decision) {
   const skuIds = decision.skuIds || []
   const skuLabel = skuIds.length ? `SKU ${skuIds.join(', ')}` : 'the original order items'
   const issues = new Set(decision.reviewIssues || [])
+  const poLabel = decision.claimedOrders?.length
+    ? `PO ${decision.claimedOrders.join(', ')}`
+    : 'The PO'
+  const candidateStores = [...new Set([
+    ...(decision.catalogStores || []),
+    ...(decision.historicalStores || []).filter((name) => (
+      String(name || '').trim().toLowerCase() !== 'all stores'
+    )),
+  ].filter(Boolean))]
+  const storeEvidence = candidateStores.length
+    ? ` Saved data contains these Store references: ${candidateStores.join(', ')}.`
+    : ' The saved PO and Product Catalog do not provide one unique Store.'
   if (!decision.orderHistoryFound && decision.claimedOrders?.length) {
     return `PO ${decision.claimedOrders.join(', ')} was not found in uploaded order history.`
   }
@@ -66,7 +78,7 @@ function describeStoreDecision(decision) {
     return 'The PO was found, but its saved order-item rows have no usable SKU ID. Choose the actual Store so Admin can review the products.'
   }
   if (issues.has('order_has_multiple_skus')) {
-    return 'The PO contains multiple possible products and the Store cannot be determined automatically. Choose the actual Store; Admin will confirm the returned products.'
+    return `${poLabel} contains multiple possible products.${storeEvidence} Choose the actual Store; Admin will confirm the returned products.`
   }
   if (issues.has('order_store_ambiguous')) {
     return 'The PO exists under more than one Store history. Choose the actual Store for this return.'
