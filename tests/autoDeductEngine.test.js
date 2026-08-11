@@ -20,6 +20,7 @@ import {
   chooseReturnManifestSheetName,
   expandConfirmedProductSku,
   getHistoricalOrderSkuIds,
+  getHistoricalOrderSkuCodes,
   getReturnManifestOrderNumbers,
   getReturnManifestSkuIds,
   mergeAnalyticsReturnStores,
@@ -1381,6 +1382,19 @@ test('catalog lookup includes SKU IDs recovered from uploaded PO history', () =>
   ]), ['RECOVERED-SKU', 'SECOND-SKU'])
 })
 
+test('catalog lookup includes exact SKU codes recovered from uploaded PO history', () => {
+  assert.deepEqual(getHistoricalOrderSkuCodes([
+    {
+      order_number: 'PO-1',
+      items: [
+        { sku_code: 'A100BlackS' },
+        { sku_code: 'A100BlackS' },
+        { skuCode: 'B200NavyM' },
+      ],
+    },
+  ]), ['A100BlackS', 'B200NavyM'])
+})
+
 test('one tracking containing SKUs from different stores requires an explicit store choice', () => {
   const rows = [
     { 'SKU ID': 'GARDEN-SKU', '运单号 Tracking Number': 'TRACK-MIXED' },
@@ -1563,6 +1577,123 @@ test('a current All Stores PO prevents a stale Store snapshot from rejecting its
   assert.equal(result.packages.length, 1)
   assert.equal(result.packages[0].storeKey, 'house')
   assert.equal(result.packages[0].items[0].skuId, 'SKU-CURRENT')
+})
+
+test('an exact SKU code accepts a current catalog SKU when PO history kept an old SKU ID', () => {
+  const result = parseSkuReturnManifestRows([{
+    '订单号 PO': 'PO-OLD-ID-D01',
+    'SKU ID': 'SKU-CURRENT',
+    '运单号 Tracking Number': 'RETURN-OLD-ID',
+  }], [{
+    store_name: 'House',
+    store_key: 'house',
+    sku_id: 'SKU-CURRENT',
+    sku_code: 'A100BlackS',
+    status: 'ready',
+    components: [{ style: 'A100', color: 'Black', size: 'S', qty: 1 }],
+  }], [{
+    order_number: 'PO-OLD-ID',
+    store_name: 'House',
+    store_key: 'house',
+    items: [{ sku_id: 'SKU-OLD', sku_code: ' A100 BlackS ', quantity: 1 }],
+  }])
+
+  assert.equal(result.pendingUploadDecisions.length, 0)
+  assert.equal(result.reviewPackages.length, 0)
+  assert.equal(result.packages.length, 1)
+  assert.equal(result.packages[0].items[0].skuId, 'SKU-CURRENT')
+})
+
+test('an exact SKU code recovers Store and current SKU from ambiguous PO histories', () => {
+  const result = parseSkuReturnManifestRows([{
+    '订单号 PO': 'PO-MULTI-STORE-D01',
+    'SKU ID': '',
+    '运单号 Tracking Number': 'RETURN-MULTI-STORE',
+  }], [{
+    store_name: 'House',
+    store_key: 'house',
+    sku_id: 'SKU-CURRENT',
+    sku_code: 'A100BlackS',
+    status: 'ready',
+    components: [{ style: 'A100', color: 'Black', size: 'S', qty: 1 }],
+  }], [{
+    order_number: 'PO-MULTI-STORE',
+    store_name: 'House',
+    store_key: 'house',
+    items: [{ sku_id: 'SKU-OLD', sku_code: 'A100BlackS', quantity: 1 }],
+  }, {
+    order_number: 'PO-MULTI-STORE',
+    store_name: 'Garden',
+    store_key: 'garden',
+    items: [{ sku_id: 'SKU-OTHER', sku_code: 'OTHERBlackS', quantity: 1 }],
+  }])
+
+  assert.equal(result.pendingUploadDecisions.length, 0)
+  assert.equal(result.reviewPackages.length, 0)
+  assert.equal(result.packages.length, 1)
+  assert.equal(result.packages[0].storeKey, 'house')
+  assert.equal(result.packages[0].items[0].skuId, 'SKU-CURRENT')
+})
+
+test('an exact SKU code uses the newest mapping when one Store retained an older SKU ID', () => {
+  const result = parseSkuReturnManifestRows([{
+    '订单号 PO': 'PO-SAME-CODE-D01',
+    'SKU ID': '',
+    '运单号 Tracking Number': 'RETURN-SAME-CODE',
+  }], [{
+    store_name: 'House',
+    store_key: 'house',
+    sku_id: 'SKU-OLDER',
+    sku_code: 'A100BlackS',
+    updated_at: '2026-08-01T00:00:00.000Z',
+    status: 'ready',
+    components: [{ style: 'A100', color: 'Black', size: 'S', qty: 1 }],
+  }, {
+    store_name: 'House',
+    store_key: 'house',
+    sku_id: 'SKU-NEWEST',
+    sku_code: 'A100BlackS',
+    updated_at: '2026-08-10T00:00:00.000Z',
+    status: 'ready',
+    components: [{ style: 'A100', color: 'Black', size: 'S', qty: 1 }],
+  }], [{
+    order_number: 'PO-SAME-CODE',
+    store_name: 'All Stores',
+    store_key: 'all stores',
+    items: [{ sku_id: 'SKU-NOT-IN-CATALOG', sku_code: 'A100BlackS', quantity: 1 }],
+  }])
+
+  assert.equal(result.pendingUploadDecisions.length, 0)
+  assert.equal(result.reviewPackages.length, 0)
+  assert.equal(result.packages.length, 1)
+  assert.equal(result.packages[0].storeKey, 'house')
+  assert.equal(result.packages[0].items[0].skuId, 'SKU-NEWEST')
+})
+
+test('a different SKU code cannot bypass a claimed PO SKU mismatch', () => {
+  const result = parseSkuReturnManifestRows([{
+    '订单号 PO': 'PO-DIFFERENT-CODE',
+    'SKU ID': 'SKU-CURRENT',
+    '运单号 Tracking Number': 'RETURN-DIFFERENT-CODE',
+  }], [{
+    store_name: 'House',
+    store_key: 'house',
+    sku_id: 'SKU-CURRENT',
+    sku_code: 'A100BlackS',
+    status: 'ready',
+    components: [{ style: 'A100', color: 'Black', size: 'S', qty: 1 }],
+  }], [{
+    order_number: 'PO-DIFFERENT-CODE',
+    store_name: 'House',
+    store_key: 'house',
+    items: [{ sku_id: 'SKU-OLD', sku_code: 'B200NavyM', quantity: 1 }],
+  }])
+
+  assert.equal(result.packages.length, 0)
+  assert.equal(result.reviewPackages.length, 1)
+  assert.deepEqual(result.reviewPackages[0].reviewData.blockingIssues, [
+    'sku_not_in_claimed_order',
+  ])
 })
 
 test('a blank manifest SKU recovers from current All Stores instead of a stale Store snapshot', () => {

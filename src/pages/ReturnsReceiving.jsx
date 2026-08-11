@@ -24,6 +24,7 @@ import {
   applyProductCatalogMapping,
   chooseReturnManifestSheetName,
   getHistoricalOrderSkuIds,
+  getHistoricalOrderSkuCodes,
   getReturnManifestOrderNumbers,
   getReturnManifestSkuIds,
   mergeAnalyticsReturnStores,
@@ -52,6 +53,9 @@ function describeStoreDecision(decision) {
   }
   if (issues.has('sku_id_store_ambiguous')) {
     return `${skuLabel} exists in more than one Store Product Catalog. Choose the actual Store for this return.`
+  }
+  if (issues.has('sku_code_store_ambiguous')) {
+    return 'The saved PO SKU ID is outdated, and its exact SKU code exists in more than one Store catalog. Choose the actual Store.'
   }
   if (issues.has('sku_id_not_in_store_catalog')) {
     return decision.orderHistoryFound
@@ -1022,19 +1026,28 @@ export default function ReturnsReceiving() {
         ...getReturnManifestSkuIds(rows),
         ...getHistoricalOrderSkuIds(uniqueOrders),
       ])]
-      for (let index = 0; index < skuIds.length; index += 500) {
+      const skuCodes = getHistoricalOrderSkuCodes(uniqueOrders)
+      const lookupCount = Math.max(skuIds.length, skuCodes.length)
+      for (let index = 0; index < lookupCount; index += 500) {
         const catalogRes = await fetch(`${BASE}/returns?action=catalogs-lookup`, {
           method: 'POST',
           headers: headers(getToken, true),
-          body: JSON.stringify({ skuIds: skuIds.slice(index, index + 500) }),
+          body: JSON.stringify({
+            skuIds: skuIds.slice(index, index + 500),
+            skuCodes: skuCodes.slice(index, index + 500),
+          }),
         })
         const catalogData = await catalogRes.json().catch(() => ({}))
         if (!catalogRes.ok) throw new Error(catalogData.error || 'Could not identify stores from SKU IDs')
         catalogRows.push(...(catalogData.rows || []))
       }
-      const context = { rows, catalogRows, historicalOrders: uniqueOrders }
+      const uniqueCatalogRows = [...new Map(catalogRows.map((row) => [
+        `${row.store_key || row.storeKey || ''}\u241f${row.sku_id || row.skuId || ''}`,
+        row,
+      ])).values()]
+      const context = { rows, catalogRows: uniqueCatalogRows, historicalOrders: uniqueOrders }
       setManifestContext(context)
-      const result = parseSkuReturnManifestRows(rows, catalogRows, uniqueOrders)
+      const result = parseSkuReturnManifestRows(rows, uniqueCatalogRows, uniqueOrders)
       setParsed(result)
       if (result.pendingUploadDecisions.length) {
         toast.warning(

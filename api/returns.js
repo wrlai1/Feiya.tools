@@ -1019,14 +1019,22 @@ export default async function handler(req, res) {
       const skuIds = Array.isArray(req.body?.skuIds)
         ? [...new Set(req.body.skuIds.map((value) => cleanText(value, 100)).filter(Boolean))]
         : []
-      if (!skuIds.length) return res.status(400).json({ error: 'skuIds array required' })
-      if (skuIds.length > MAX_CATALOG_LOOKUPS) {
-        return res.status(400).json({ error: `Lookup is limited to ${MAX_CATALOG_LOOKUPS} SKU IDs per batch` })
+      const skuCodes = Array.isArray(req.body?.skuCodes)
+        ? [...new Set(req.body.skuCodes.map((value) => cleanText(value, 200)).filter(Boolean))]
+        : []
+      if (!skuIds.length && !skuCodes.length) {
+        return res.status(400).json({ error: 'skuIds or skuCodes array required' })
+      }
+      if (skuIds.length > MAX_CATALOG_LOOKUPS || skuCodes.length > MAX_CATALOG_LOOKUPS) {
+        return res.status(400).json({ error: `Lookup is limited to ${MAX_CATALOG_LOOKUPS} SKU IDs or codes per batch` })
       }
       const rows = await sql`
-        WITH wanted AS (
+        WITH wanted_ids AS (
           SELECT value #>> '{}' AS sku_id
           FROM jsonb_array_elements(${JSON.stringify(skuIds)}::jsonb)
+        ), wanted_codes AS (
+          SELECT LOWER(REGEXP_REPLACE(BTRIM(value #>> '{}'), '[[:space:]]+', '', 'g')) AS sku_code
+          FROM jsonb_array_elements(${JSON.stringify(skuCodes)}::jsonb)
         )
         SELECT
           catalog.store_name, catalog.store_key, catalog.sku_id, catalog.sku_code,
@@ -1034,7 +1042,15 @@ export default async function handler(req, res) {
           catalog.updated_at, catalog.mapping_source, catalog.mapping_version,
           catalog.mapping_confirmed_by, catalog.mapping_confirmed_at
         FROM return_product_catalog catalog
-        JOIN wanted USING (sku_id)
+        WHERE EXISTS (
+          SELECT 1 FROM wanted_ids WHERE wanted_ids.sku_id = catalog.sku_id
+        ) OR EXISTS (
+          SELECT 1
+          FROM wanted_codes
+          WHERE wanted_codes.sku_code = LOWER(
+            REGEXP_REPLACE(BTRIM(catalog.sku_code), '[[:space:]]+', '', 'g')
+          )
+        )
         ORDER BY catalog.sku_id, catalog.store_name
       `
       return res.json({ rows })

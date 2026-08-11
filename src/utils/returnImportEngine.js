@@ -115,6 +115,14 @@ export function getHistoricalOrderSkuIds(historicalOrders) {
     .filter(Boolean))]
 }
 
+export function getHistoricalOrderSkuCodes(historicalOrders) {
+  if (!Array.isArray(historicalOrders) || !historicalOrders.length) return []
+  return [...new Set(historicalOrders
+    .flatMap((order) => Array.isArray(order?.items) ? order.items : [])
+    .map((item) => String(item?.sku_code || item?.skuCode || '').trim())
+    .filter(Boolean))]
+}
+
 export function expandConfirmedProductSku(value) {
   const skuCode = String(value || '').trim()
   for (const rule of CONFIRMED_SHORTHAND_COMBOS) {
@@ -227,6 +235,10 @@ function normalizedSize(value) {
 
 function normalizedIdentity(value) {
   return String(value || '').trim().toLowerCase()
+}
+
+function normalizedSkuCode(value) {
+  return String(value || '').trim().replace(/\s+/g, '').toLowerCase()
 }
 
 function splitSkuIds(value) {
@@ -360,6 +372,38 @@ function resolvedCatalogProduct(catalog, skuId, selectedStoreKey = '') {
   return { product: matches[0], issue: '' }
 }
 
+function resolvedCatalogProductForOrderItem(
+  catalog,
+  catalogBySkuCode,
+  skuId,
+  skuCode,
+  selectedStoreKey = '',
+) {
+  const byId = resolvedCatalogProduct(catalog, skuId, selectedStoreKey)
+  if (byId.product || !['sku_id_not_in_store_catalog', 'sku_id_not_in_selected_store_catalog'].includes(byId.issue)) {
+    return byId
+  }
+  const codeKey = normalizedSkuCode(skuCode)
+  const allMatches = catalogBySkuCode.get(codeKey) || []
+  const storeKey = normalizeStoreKey(selectedStoreKey)
+  const matches = storeKey
+    ? allMatches.filter((product) => catalogStore(product).key === storeKey)
+    : allMatches
+  if (!matches.length) return byId
+  const stores = new Set(matches.map((product) => catalogStore(product).key))
+  if (stores.size !== 1) {
+    return { product: null, issue: 'sku_code_store_ambiguous' }
+  }
+  const [product] = [...matches].sort((left, right) => {
+    const updatedDifference = Date.parse(right.updated_at || right.updatedAt || '')
+      - Date.parse(left.updated_at || left.updatedAt || '')
+    if (Number.isFinite(updatedDifference) && updatedDifference) return updatedDifference
+    return Number(right.mapping_version || right.mappingVersion || 0)
+      - Number(left.mapping_version || left.mappingVersion || 0)
+  })
+  return { product, issue: '' }
+}
+
 function resolvedGroupStore(group) {
   if (group.stores.size === 1) {
     const [[key, name]] = group.stores
@@ -448,10 +492,16 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
   const carrierKey = findKey(rows[0], CARRIER_ALIASES)
   const quantityKey = findKey(rows[0], QUANTITY_ALIASES)
   const catalog = new Map()
+  const catalogBySkuCode = new Map()
   for (const product of catalogRows || []) {
     const skuId = String(product.sku_id || product.skuId || '').trim()
     if (!catalog.has(skuId)) catalog.set(skuId, [])
     catalog.get(skuId).push(product)
+    const skuCode = normalizedSkuCode(product.sku_code || product.skuCode)
+    if (skuCode) {
+      if (!catalogBySkuCode.has(skuCode)) catalogBySkuCode.set(skuCode, [])
+      catalogBySkuCode.get(skuCode).push(product)
+    }
   }
   const orders = new Map()
   for (const order of historicalOrders || []) {
@@ -533,6 +583,30 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
 
     if (!skuId) {
       const orderKey = normalizeOrderNumber(orderNumber)
+      const orderMatches = orders.get(orderKey) || []
+      if (!group.stores.size) {
+        const inferredStores = new Map()
+        orderMatches.forEach((order) => {
+          usableOrderItems(order).forEach((orderItem) => {
+            const { product } = resolvedCatalogProductForOrderItem(
+              catalog,
+              catalogBySkuCode,
+              orderItem.sku_id || orderItem.skuId,
+              orderItem.sku_code || orderItem.skuCode,
+              selectedStoreKey,
+            )
+            if (product) {
+              const name = String(product.store_name || product.storeName || '').trim()
+              const key = normalizeStoreKey(product.store_key || product.storeKey || name)
+              if (key && name) inferredStores.set(key, name)
+            }
+          })
+        })
+        if (inferredStores.size === 1) {
+          const [[key, name]] = inferredStores
+          group.stores.set(key, name)
+        }
+      }
       const orderAlreadyHandled = group.recoveredOrders.has(orderKey)
         || group.candidateOrders.some((order) => order.orderKey === orderKey)
       const {
@@ -540,7 +614,7 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
         issue: historicalOrderIssue,
       } = orderAlreadyHandled
         ? { order: null, issue: '' }
-        : resolvedHistoricalOrder(orders.get(orderKey), group)
+        : resolvedHistoricalOrder(orderMatches, group)
       if (!orderKey) {
         group.review.push({
           tracking: trackingNumber,
@@ -570,10 +644,16 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
           const {
             product,
             issue: productIssue,
-          } = resolvedCatalogProduct(catalog, recoveredSkuId, selectedStoreKey)
+          } = resolvedCatalogProductForOrderItem(
+            catalog,
+            catalogBySkuCode,
+            recoveredSkuId,
+            orderItem.sku_code || orderItem.skuCode,
+            selectedStoreKey,
+          )
           if (explicitSkuIdsByTracking.get(tracking)?.has(recoveredSkuId)) return []
           let issue = ''
-          if (!recoveredSkuId) {
+          if (!recoveredSkuId && !product) {
             issue = 'order_item_sku_missing'
           } else if (!Number.isSafeInteger(recoveredQuantity) || recoveredQuantity <= 0) {
             issue = 'order_quantity_invalid'
@@ -588,7 +668,7 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
             candidateKey: `${orderKey}\u241f${
               orderItem.id || orderItem.item_key || orderItem.itemKey || itemIndex
             }`,
-            skuId: recoveredSkuId,
+            skuId: String(product?.sku_id || product?.skuId || recoveredSkuId).trim(),
             skuCode: String(
               orderItem.sku_code || orderItem.skuCode || product?.sku_code || product?.skuCode || '',
             ).trim(),
@@ -690,9 +770,13 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
             parse_issue: historicalOrderIssue || 'order_history_missing',
           })
         } else if (!(eligibleHistoricalOrders || [historicalOrder]).some((order) => (
-          usableOrderItems(order).some((item) => (
-            String(item.sku_id || item.skuId || '').trim() === skuId
-          ))
+          usableOrderItems(order).some((item) => {
+            const itemSkuId = String(item.sku_id || item.skuId || '').trim()
+            const sameCurrentSkuCode = product && normalizedSkuCode(
+              item.sku_code || item.skuCode,
+            ) === normalizedSkuCode(product.sku_code || product.skuCode)
+            return itemSkuId === skuId || sameCurrentSkuCode
+          })
         ))) {
           group.review.push({
             tracking: trackingNumber,
