@@ -315,6 +315,20 @@ function normalizePackages(rawPackages, fallbackStore = null, {
   })
 }
 
+export function normalizeReturnImportPackages(readyInput, reviewInput, fallbackStore = null) {
+  return {
+    readyPackages: readyInput.length
+      ? normalizePackages(readyInput, fallbackStore)
+      : [],
+    reviewPackages: reviewInput.length
+      ? normalizePackages(reviewInput, fallbackStore, {
+          allowEmptyItems: true,
+          status: 'needs_review',
+        })
+      : [],
+  }
+}
+
 function normalizeCatalogRows(rawRows) {
   if (!Array.isArray(rawRows) || !rawRows.length) throw new Error('Product rows are required')
   if (rawRows.length > MAX_CATALOG_ROWS_PER_IMPORT) {
@@ -493,6 +507,20 @@ async function ensureTables(sql) {
   await sql`
     CREATE UNIQUE INDEX IF NOT EXISTS return_package_items_source_sku_uq
     ON return_package_items (package_id, sku_id, style, color, size)
+  `
+  await sql`
+    UPDATE return_packages packages
+    SET status = 'needs_review'
+    WHERE packages.status = 'pending'
+      AND packages.requires_item_resolution = true
+      AND packages.expected_units = 0
+      AND COALESCE(packages.source_file, '') <> 'Manual tracking entry'
+      AND COALESCE(packages.review_reason, '') <> 'manual_tracking_no_order'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM return_package_items items
+        WHERE items.package_id = packages.id
+      )
   `
   await sql`
     CREATE TABLE IF NOT EXISTS return_product_catalog (
@@ -1503,15 +1531,11 @@ export default async function handler(req, res) {
       if (!readyInput.length && !reviewInput.length) {
         return res.status(400).json({ error: 'No return packages are ready to upload' })
       }
-      const readyPackages = readyInput.length
-        ? normalizePackages(readyInput, fallbackStore)
-        : []
-      const reviewPackages = reviewInput.length
-        ? normalizePackages(reviewInput, fallbackStore, {
-            allowEmptyItems: true,
-            status: 'pending',
-          })
-        : []
+      const { readyPackages, reviewPackages } = normalizeReturnImportPackages(
+        readyInput,
+        reviewInput,
+        fallbackStore,
+      )
       const packages = [...readyPackages, ...reviewPackages]
       if (packages.length > MAX_PACKAGES_PER_IMPORT) {
         return res.status(400).json({ error: `Import is limited to ${MAX_PACKAGES_PER_IMPORT} packages` })
@@ -1642,7 +1666,6 @@ export default async function handler(req, res) {
         ok: true,
         imported_packages: importable.length,
         review_packages: importable.filter((pkg) => pkg.status === 'needs_review').length,
-        awaiting_worker_review: importable.filter((pkg) => pkg.requires_item_resolution).length,
         imported_units: importable.reduce((sum, pkg) => sum + pkg.expected_units, 0),
         skipped_received: finalKeys.size,
       })

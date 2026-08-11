@@ -1173,7 +1173,7 @@ export default function ReturnsReceiving() {
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || 'Could not upload return manifest')
       toast.success(
-        `${data.imported_packages} packages uploaded · ${Number(data.awaiting_worker_review || 0)} wait for worker verification`,
+        `${data.imported_packages} packages uploaded · ${Number(data.review_packages || 0)} sent to Admin Review`,
         'Return Manifest Uploaded',
       )
       setFile(null)
@@ -2806,7 +2806,7 @@ export default function ReturnsReceiving() {
           <div className="mt-4 rounded-xl border border-blue-200 bg-blue-50 p-3 text-sm text-blue-800">
             Return Tracking is a new inbound label and is not compared with the original outbound Tracking.
             The uploaded PO identifies the original products. Only a missing/conflicting Store blocks upload;
-            review packages wait for a worker scan before they appear in Admin Review.
+            packages with unresolved products upload directly to Admin Review.
           </div>
           <input
             type="file"
@@ -2830,7 +2830,7 @@ export default function ReturnsReceiving() {
                   <p className={`text-xl font-bold ${parsed.stats.reviewPackages ? 'text-amber-800' : 'text-emerald-700'}`}>
                     {parsed.stats.reviewPackages}
                   </p>
-                  <p className="text-xs text-slate-500">Need worker check</p>
+                  <p className="text-xs text-slate-500">Need Admin review</p>
                 </div>
                 <div className="rounded-xl bg-blue-50 p-3">
                   <p className="text-xl font-bold text-blue-800">

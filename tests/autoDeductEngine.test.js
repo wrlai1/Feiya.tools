@@ -36,6 +36,7 @@ import {
 } from '../src/utils/returnImportEngine.js'
 import inventoryTargetResolution from '../lib/inventoryTargetResolution.cjs'
 import returnPackageSafety from '../lib/returnPackageSafety.cjs'
+import { normalizeReturnImportPackages } from '../api/returns.js'
 
 const { resolveInventoryTargets } = inventoryTargetResolution
 const {
@@ -84,6 +85,26 @@ test('manual return drafts preserve the typed tracking and require one validated
     }),
     /store/i,
   )
+})
+
+test('uploaded review packages enter Admin Review instead of becoming empty pending packages', () => {
+  const { reviewPackages } = normalizeReturnImportPackages([], [{
+    trackingNumber: '1Z0JA1729058278554',
+    storeName: 'Lyon',
+    orders: ['PO-211-14880365973110491-D01'],
+    items: [],
+    reviewReason: 'order_has_multiple_skus',
+    requiresItemResolution: true,
+    reviewData: {
+      blockingIssues: ['order_has_multiple_skus'],
+      unresolvedSkus: [],
+    },
+  }])
+
+  assert.equal(reviewPackages.length, 1)
+  assert.equal(reviewPackages[0].status, 'needs_review')
+  assert.equal(reviewPackages[0].expected_units, 0)
+  assert.equal(reviewPackages[0].requires_item_resolution, true)
 })
 
 test('searchable style matching canonicalizes an exact typed style without guessing partial text', () => {
