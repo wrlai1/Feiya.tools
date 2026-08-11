@@ -23,9 +23,11 @@ import { aliasKey } from '../utils/autoDeductEngine.js'
 import {
   applyProductCatalogMapping,
   chooseReturnManifestSheetName,
+  getHistoricalOrderSkuIds,
   getReturnManifestOrderNumbers,
   getReturnManifestSkuIds,
   mergeAnalyticsReturnStores,
+  normalizeTracking,
   parseProductCatalogRows,
   parseSkuReturnManifestRows,
   resolveProductCatalogRows,
@@ -40,6 +42,30 @@ import {
 } from '../utils/returnInspection.js'
 
 const BASE = '/api'
+
+function describeStoreDecision(decision) {
+  const skuIds = decision.skuIds || []
+  const skuLabel = skuIds.length ? `SKU ${skuIds.join(', ')}` : 'the original order items'
+  const issues = new Set(decision.reviewIssues || [])
+  if (!decision.orderHistoryFound && decision.claimedOrders?.length) {
+    return `PO ${decision.claimedOrders.join(', ')} was not found in uploaded order history.`
+  }
+  if (issues.has('sku_id_store_ambiguous')) {
+    return `${skuLabel} exists in more than one Store Product Catalog. Choose the actual Store for this return.`
+  }
+  if (issues.has('sku_id_not_in_store_catalog')) {
+    return decision.orderHistoryFound
+      ? `The PO was found and its products were loaded, but ${skuLabel} is not in a Store Product Catalog.`
+      : `${skuLabel} is not in a Store Product Catalog.`
+  }
+  if (decision.catalogStores?.length > 1) {
+    return `Products point to multiple Stores (${decision.catalogStores.join(', ')}). Choose the actual Store for this package.`
+  }
+  if (decision.allStoresHistory) {
+    return `The PO was found under All Stores, but ${skuLabel} did not identify one specific Store.`
+  }
+  return 'Store could not be identified for this tracking.'
+}
 
 const DEMO_PACKAGE = {
   id: 'demo-return',
@@ -374,6 +400,7 @@ export default function ReturnsReceiving() {
   const [manifestDecisions, setManifestDecisions] = useState({
     storeByTracking: {},
     skippedTrackings: [],
+    trackingByExcelRow: {},
   })
   const [manifestChoiceDrafts, setManifestChoiceDrafts] = useState({})
   const [uploading, setUploading] = useState(false)
@@ -946,7 +973,7 @@ export default function ReturnsReceiving() {
     setFile(nextFile)
     setParsed(null)
     setManifestContext(null)
-    setManifestDecisions({ storeByTracking: {}, skippedTrackings: [] })
+    setManifestDecisions({ storeByTracking: {}, skippedTrackings: [], trackingByExcelRow: {} })
     setManifestChoiceDrafts({})
     if (!nextFile) return
     try {
@@ -959,18 +986,6 @@ export default function ReturnsReceiving() {
       )
       if (!hasSkuId) {
         throw new Error('Combined daily return manifests require a SKU ID column')
-      }
-      const catalogRows = []
-      const skuIds = getReturnManifestSkuIds(rows)
-      for (let index = 0; index < skuIds.length; index += 500) {
-        const catalogRes = await fetch(`${BASE}/returns?action=catalogs-lookup`, {
-          method: 'POST',
-          headers: headers(getToken, true),
-          body: JSON.stringify({ skuIds: skuIds.slice(index, index + 500) }),
-        })
-        const catalogData = await catalogRes.json().catch(() => ({}))
-        if (!catalogRes.ok) throw new Error(catalogData.error || 'Could not identify stores from SKU IDs')
-        catalogRows.push(...(catalogData.rows || []))
       }
       const historicalOrders = []
       const orderNumbers = getReturnManifestOrderNumbers(rows)
@@ -990,6 +1005,21 @@ export default function ReturnsReceiving() {
         `${order.store_key || order.storeKey || ''}\u241f${order.order_key || order.orderKey || order.order_number || order.orderNumber}`,
         order,
       ])).values()]
+      const catalogRows = []
+      const skuIds = [...new Set([
+        ...getReturnManifestSkuIds(rows),
+        ...getHistoricalOrderSkuIds(uniqueOrders),
+      ])]
+      for (let index = 0; index < skuIds.length; index += 500) {
+        const catalogRes = await fetch(`${BASE}/returns?action=catalogs-lookup`, {
+          method: 'POST',
+          headers: headers(getToken, true),
+          body: JSON.stringify({ skuIds: skuIds.slice(index, index + 500) }),
+        })
+        const catalogData = await catalogRes.json().catch(() => ({}))
+        if (!catalogRes.ok) throw new Error(catalogData.error || 'Could not identify stores from SKU IDs')
+        catalogRows.push(...(catalogData.rows || []))
+      }
       const context = { rows, catalogRows, historicalOrders: uniqueOrders }
       setManifestContext(context)
       const result = parseSkuReturnManifestRows(rows, catalogRows, uniqueOrders)
@@ -1045,6 +1075,26 @@ export default function ReturnsReceiving() {
     })
   }
 
+  const fillManifestTracking = (excelRow) => {
+    const draftKey = `row:${excelRow}`
+    const draft = manifestChoiceDrafts[draftKey] || {}
+    const trackingNumber = String(draft.trackingNumber || '').trim()
+    const trackingKey = normalizeTracking(trackingNumber)
+    const selectedStore = stores.find((store) => store.store_key === draft.storeKey)
+    if (!trackingKey || !selectedStore) return
+    applyManifestDecisions({
+      ...manifestDecisions,
+      trackingByExcelRow: {
+        ...(manifestDecisions.trackingByExcelRow || {}),
+        [excelRow]: trackingNumber,
+      },
+      storeByTracking: {
+        ...manifestDecisions.storeByTracking,
+        [trackingKey]: { key: selectedStore.store_key, name: selectedStore.store_name },
+      },
+    })
+  }
+
   const uploadManifest = async () => {
     if (
       (!parsed?.packages?.length && !parsed?.reviewPackages?.length)
@@ -1071,7 +1121,7 @@ export default function ReturnsReceiving() {
       setFile(null)
       setParsed(null)
       setManifestContext(null)
-      setManifestDecisions({ storeByTracking: {}, skippedTrackings: [] })
+      setManifestDecisions({ storeByTracking: {}, skippedTrackings: [], trackingByExcelRow: {} })
       setManifestChoiceDrafts({})
       await loadRecent()
       setTab('receive')
@@ -2755,7 +2805,7 @@ export default function ReturnsReceiving() {
                       <div key={decision.tracking} className="rounded-xl border border-red-200 bg-white p-3">
                         <p className="font-semibold text-slate-900">Tracking {decision.trackingNumber}</p>
                         <p className="mt-1 text-xs text-red-700">
-                          Store could not be identified for this tracking.
+                          {describeStoreDecision(decision)}
                         </p>
                         <div className="mt-3 flex flex-col gap-2 sm:flex-row">
                           <select
@@ -2820,16 +2870,64 @@ export default function ReturnsReceiving() {
                 <div className="rounded-xl border border-blue-200 bg-blue-50 p-3">
                   <p className="text-sm font-semibold text-blue-800">Waiting for Tracking</p>
                   <p className="mt-1 text-xs text-blue-700">
-                    These rows are not errors. They will be skipped today and can be uploaded again after Tracking is updated.
+                    Enter the return Tracking and choose its Store to keep this row in the upload. Rows left blank will be skipped.
                   </p>
-                  <ul className="mt-2 space-y-1 text-xs text-blue-800">
-                    {parsed.waitingForTracking.slice(0, 10).map((row) => (
-                      <li key={`${row.excelRow}-${row.orderNumber}`}>
-                        Excel row {row.excelRow}: {row.skuId || 'Missing SKU'}
-                        {row.orderNumber ? ` · PO ${row.orderNumber}` : ''}
-                      </li>
-                    ))}
-                  </ul>
+                  <div className="mt-3 space-y-3">
+                    {parsed.waitingForTracking.map((row) => {
+                      const draftKey = `row:${row.excelRow}`
+                      const draft = manifestChoiceDrafts[draftKey] || {}
+                      return (
+                        <div key={draftKey} className="rounded-xl border border-blue-200 bg-white p-3">
+                          <p className="text-xs font-medium text-blue-900">
+                            Excel row {row.excelRow}: {row.skuId || 'Missing SKU'}
+                            {row.orderNumber ? ` · PO ${row.orderNumber}` : ''}
+                          </p>
+                          <div className="mt-2 grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
+                            <input
+                              value={draft.trackingNumber || ''}
+                              onChange={(event) => setManifestChoiceDrafts((current) => ({
+                                ...current,
+                                [draftKey]: {
+                                  ...current[draftKey],
+                                  trackingNumber: event.target.value,
+                                },
+                              }))}
+                              placeholder="Return Tracking Number"
+                              aria-label={`Tracking for Excel row ${row.excelRow}`}
+                              className="h-11 rounded-lg border border-slate-300 bg-white px-3 text-sm"
+                            />
+                            <select
+                              value={draft.storeKey || ''}
+                              onChange={(event) => setManifestChoiceDrafts((current) => ({
+                                ...current,
+                                [draftKey]: {
+                                  ...current[draftKey],
+                                  storeKey: event.target.value,
+                                },
+                              }))}
+                              aria-label={`Store for Excel row ${row.excelRow}`}
+                              className="h-11 rounded-lg border border-slate-300 bg-white px-3 text-sm"
+                            >
+                              <option value="">Choose Store</option>
+                              {stores.map((store) => (
+                                <option key={store.store_key} value={store.store_key}>
+                                  {store.store_name}
+                                </option>
+                              ))}
+                            </select>
+                            <button
+                              type="button"
+                              disabled={!normalizeTracking(draft.trackingNumber) || !draft.storeKey}
+                              onClick={() => fillManifestTracking(row.excelRow)}
+                              className="btn-primary min-h-11 justify-center disabled:opacity-40"
+                            >
+                              Add row
+                            </button>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
                 </div>
               )}
 
