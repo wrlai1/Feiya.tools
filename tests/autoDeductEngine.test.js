@@ -1534,6 +1534,69 @@ test('a manifest SKU outside the claimed PO is sent to Admin Review', () => {
   )
 })
 
+test('a current All Stores PO prevents a stale Store snapshot from rejecting its SKU', () => {
+  const result = parseSkuReturnManifestRows([{
+    '订单号 PO': 'PO-DUPLICATE-D01',
+    'SKU ID': 'SKU-CURRENT',
+    '运单号 Tracking Number': 'RETURN-DUPLICATE',
+  }], [{
+    store_name: 'House',
+    store_key: 'house',
+    sku_id: 'SKU-CURRENT',
+    sku_code: 'A100BlackS',
+    status: 'ready',
+    components: [{ style: 'A100', color: 'Black', size: 'S', qty: 1 }],
+  }], [{
+    order_number: 'PO-DUPLICATE',
+    store_name: 'House',
+    store_key: 'house',
+    items: [{ sku_id: 'SKU-STALE', quantity: 1 }],
+  }, {
+    order_number: 'PO-DUPLICATE',
+    store_name: 'All Stores',
+    store_key: 'all stores',
+    items: [{ sku_id: 'SKU-CURRENT', quantity: 1 }],
+  }])
+
+  assert.equal(result.pendingUploadDecisions.length, 0)
+  assert.equal(result.reviewPackages.length, 0)
+  assert.equal(result.packages.length, 1)
+  assert.equal(result.packages[0].storeKey, 'house')
+  assert.equal(result.packages[0].items[0].skuId, 'SKU-CURRENT')
+})
+
+test('a blank manifest SKU recovers from current All Stores instead of a stale Store snapshot', () => {
+  const result = parseSkuReturnManifestRows([{
+    '订单号 PO': 'PO-RECOVER-CURRENT-D01',
+    'SKU ID': '',
+    '运单号 Tracking Number': 'RETURN-RECOVER-CURRENT',
+  }], [{
+    store_name: 'House',
+    store_key: 'house',
+    sku_id: 'SKU-CURRENT',
+    sku_code: 'A100BlackS',
+    status: 'ready',
+    components: [{ style: 'A100', color: 'Black', size: 'S', qty: 1 }],
+  }], [{
+    order_number: 'PO-RECOVER-CURRENT',
+    store_name: 'House',
+    store_key: 'house',
+    items: [],
+  }, {
+    order_number: 'PO-RECOVER-CURRENT',
+    store_name: 'All Stores',
+    store_key: 'all stores',
+    items: [{ sku_id: 'SKU-CURRENT', quantity: 1 }],
+  }])
+
+  assert.equal(result.pendingUploadDecisions.length, 0)
+  assert.equal(result.reviewPackages.length, 0)
+  assert.equal(result.packages.length, 1)
+  assert.equal(result.packages[0].storeKey, 'house')
+  assert.equal(result.packages[0].items[0].skuId, 'SKU-CURRENT')
+  assert.deepEqual(result.packages[0].recoveredFromOrders, ['PO-RECOVER-CURRENT'])
+})
+
 test('a catalog Store match cannot bypass missing claimed PO history', () => {
   const result = parseSkuReturnManifestRows([{
     '订单号 PO': 'PO-NOT-UPLOADED',

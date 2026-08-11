@@ -58,6 +58,18 @@ function describeStoreDecision(decision) {
       ? `The PO was found and its products were loaded, but ${skuLabel} is not in a Store Product Catalog.`
       : `${skuLabel} is not in a Store Product Catalog.`
   }
+  if (issues.has('order_item_sku_missing')) {
+    return 'The PO was found, but its saved order-item rows have no usable SKU ID. Choose the actual Store so Admin can review the products.'
+  }
+  if (issues.has('order_has_multiple_skus')) {
+    return 'The PO contains multiple possible products and the Store cannot be determined automatically. Choose the actual Store; Admin will confirm the returned products.'
+  }
+  if (issues.has('order_store_ambiguous')) {
+    return 'The PO exists under more than one Store history. Choose the actual Store for this return.'
+  }
+  if (issues.has('order_store_mismatch')) {
+    return 'The PO was found, but not under the Store identified by its products. Choose the actual Store for Admin review.'
+  }
   if (decision.catalogStores?.length > 1) {
     return `Products point to multiple Stores (${decision.catalogStores.join(', ')}). Choose the actual Store for this package.`
   }

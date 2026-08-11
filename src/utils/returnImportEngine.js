@@ -374,24 +374,65 @@ function orderStore(order) {
   return { name, key }
 }
 
+function usableOrderItems(order) {
+  return Array.isArray(order?.items) ? order.items : []
+}
+
+function bestPopulatedOrder(orders) {
+  return [...(orders || [])].sort((left, right) => (
+    usableOrderItems(right).length - usableOrderItems(left).length
+  ))[0] || null
+}
+
 function resolvedHistoricalOrder(orderMatches, group) {
-  if (!orderMatches?.length) return { order: null, issue: 'order_history_missing' }
+  if (!orderMatches?.length) {
+    return { order: null, eligibleOrders: [], issue: 'order_history_missing' }
+  }
   const groupKeys = [...group.stores.keys()]
   if (groupKeys.length === 1) {
-    const exact = orderMatches.find((order) => orderStore(order).key === groupKeys[0])
-    if (exact) return { order: exact, issue: '' }
-    const combined = orderMatches.find((order) => orderStore(order).key === 'all stores')
-    return combined
-      ? { order: combined, issue: '' }
-      : { order: null, issue: 'order_store_mismatch' }
+    const exact = orderMatches.filter((order) => orderStore(order).key === groupKeys[0])
+    const combined = orderMatches.filter((order) => orderStore(order).key === 'all stores')
+    const eligibleOrders = [...combined, ...exact]
+    const populatedCombined = bestPopulatedOrder(
+      combined.filter((order) => usableOrderItems(order).length),
+    )
+    const order = populatedCombined || bestPopulatedOrder(exact) || bestPopulatedOrder(combined)
+    return order
+      ? { order, eligibleOrders, issue: '' }
+      : { order: null, eligibleOrders: [], issue: 'order_store_mismatch' }
   }
 
   const storeSpecific = orderMatches.filter((order) => orderStore(order).key !== 'all stores')
+  const combined = orderMatches.filter((order) => orderStore(order).key === 'all stores')
+  const populatedCombined = bestPopulatedOrder(
+    combined.filter((order) => usableOrderItems(order).length),
+  )
+  if (populatedCombined) {
+    return {
+      order: populatedCombined,
+      eligibleOrders: [...combined, ...storeSpecific],
+      issue: '',
+    }
+  }
   const storeKeys = new Set(storeSpecific.map((order) => orderStore(order).key))
-  if (storeKeys.size > 1) return { order: null, issue: 'order_store_ambiguous' }
-  if (storeSpecific.length === 1) return { order: storeSpecific[0], issue: '' }
-  if (!storeSpecific.length && orderMatches.length === 1) return { order: orderMatches[0], issue: '' }
-  return { order: null, issue: 'order_store_ambiguous' }
+  if (storeKeys.size > 1) {
+    return { order: null, eligibleOrders: [], issue: 'order_store_ambiguous' }
+  }
+  if (storeSpecific.length) {
+    return {
+      order: bestPopulatedOrder(storeSpecific),
+      eligibleOrders: storeSpecific,
+      issue: '',
+    }
+  }
+  if (combined.length) {
+    return {
+      order: bestPopulatedOrder(combined),
+      eligibleOrders: combined,
+      issue: '',
+    }
+  }
+  return { order: null, eligibleOrders: [], issue: 'order_store_ambiguous' }
 }
 
 export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders = [], decisions = {}) {
@@ -637,6 +678,7 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
         const orderKey = normalizeOrderNumber(orderNumber)
         const {
           order: historicalOrder,
+          eligibleOrders: eligibleHistoricalOrders,
           issue: historicalOrderIssue,
         } = resolvedHistoricalOrder(orders.get(orderKey), group)
         if (!historicalOrder) {
@@ -647,8 +689,10 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
             skuId,
             parse_issue: historicalOrderIssue || 'order_history_missing',
           })
-        } else if (!(historicalOrder.items || []).some((item) => (
-          String(item.sku_id || item.skuId || '').trim() === skuId
+        } else if (!(eligibleHistoricalOrders || [historicalOrder]).some((order) => (
+          usableOrderItems(order).some((item) => (
+            String(item.sku_id || item.skuId || '').trim() === skuId
+          ))
         ))) {
           group.review.push({
             tracking: trackingNumber,
