@@ -10,6 +10,8 @@ import {
 } from '../src/utils/autoDeductEngine.js'
 import {
   collectReturnSkuMappingCandidates,
+  manualReturnSkuMappingRows,
+  returnReviewMappingLoadMode,
   summarizeReturnInspection,
 } from '../src/utils/returnInspection.js'
 import { consolidateRows } from '../src/utils/consolidateEngine.js'
@@ -266,6 +268,36 @@ test('manifest SKU review takes precedence over a duplicate PO mapping candidate
     skuCode: 'ER100SetM',
     returnQuantity: 1,
     reviewIssue: 'inventory_target_missing',
+  }])
+})
+
+test('mixed missing-ID and SKU mapping review loads SKU controls instead of an empty panel', () => {
+  assert.equal(returnReviewMappingLoadMode({
+    skuMappingCandidateCount: 1,
+    requiresOrderItemManualMappings: true,
+  }), 'sku')
+  assert.equal(returnReviewMappingLoadMode({
+    skuMappingCandidateCount: 0,
+    requiresOrderItemManualMappings: true,
+  }), 'inventory')
+  assert.equal(returnReviewMappingLoadMode({}), 'none')
+})
+
+test('failed automatic SKU parsing always leaves a manual mapping row', () => {
+  assert.deepEqual(manualReturnSkuMappingRows([{
+    skuId: '90311037913',
+    skuCode: '0090surf+denim+pearl XL',
+    returnQuantity: 1,
+    reviewIssue: 'sku_not_in_claimed_order',
+  }]), [{
+    skuId: '90311037913',
+    skuCode: '0090surf+denim+pearl XL',
+    returnQuantity: 1,
+    reviewIssue: 'sku_not_in_claimed_order',
+    status: 'review',
+    issue: 'sku_not_in_claimed_order',
+    components: [],
+    sourceComponents: [],
   }])
 })
 

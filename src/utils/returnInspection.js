@@ -122,3 +122,23 @@ export function collectReturnSkuMappingCandidates(unresolvedSkus = [], relatedOr
   }
   return [...candidates.values()]
 }
+
+export function returnReviewMappingLoadMode({
+  skuMappingCandidateCount = 0,
+  requiresManualAdminItems = false,
+  requiresOrderItemManualMappings = false,
+} = {}) {
+  if (Number(skuMappingCandidateCount) > 0) return 'sku'
+  if (requiresManualAdminItems || requiresOrderItemManualMappings) return 'inventory'
+  return 'none'
+}
+
+export function manualReturnSkuMappingRows(candidates = []) {
+  return (candidates || []).map((candidate) => ({
+    ...candidate,
+    status: 'review',
+    issue: candidate.reviewIssue || 'product_catalog_mapping_required',
+    components: [],
+    sourceComponents: [],
+  }))
+}

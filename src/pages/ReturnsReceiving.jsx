@@ -39,6 +39,8 @@ import { parseOrderHistoryRows } from '../utils/orderImportEngine.js'
 import {
   collectReturnSkuMappingCandidates,
   groupReturnProducts,
+  manualReturnSkuMappingRows,
+  returnReviewMappingLoadMode,
   summarizeReturnInspection,
 } from '../utils/returnInspection.js'
 
@@ -492,6 +494,11 @@ export default function ReturnsReceiving() {
       )
     )),
   )
+  const reviewMappingLoadMode = returnReviewMappingLoadMode({
+    skuMappingCandidateCount: skuMappingCandidates.length,
+    requiresManualAdminItems,
+    requiresOrderItemManualMappings,
+  })
 
   const loadRecent = useCallback(async () => {
     if (demoMode) {
@@ -701,7 +708,7 @@ export default function ReturnsReceiving() {
       return undefined
     }
 
-    if (requiresManualAdminItems || requiresOrderItemManualMappings) {
+    if (reviewMappingLoadMode === 'inventory') {
       let active = true
       setReviewCatalogRows([])
       setReviewAliases({})
@@ -726,7 +733,7 @@ export default function ReturnsReceiving() {
       return () => { active = false }
     }
 
-    if (!skuMappingCandidates.length) {
+    if (reviewMappingLoadMode === 'none') {
       setReviewCatalogRows([])
       setReviewInventoryRows([])
       setReviewAliases({})
@@ -745,24 +752,39 @@ export default function ReturnsReceiving() {
         aliasesRes.json().catch(() => ({})),
       ])
       if (!inventoryRes.ok) throw new Error(inventoryData.error || 'Could not load inventory targets')
-      if (!aliasesRes.ok) throw new Error(aliasesData.error || 'Could not load confirmed SKU mappings')
       const inventoryRows = (inventoryData.rows || []).map((row) => ({
         STYLE: row.Style,
         COLOR: row.Color,
         SIZE: row.Size,
       }))
-      const aliases = aliasesData.aliases || {}
-      const resolved = resolveProductCatalogRows(
-        skuMappingCandidates,
-        inventoryRows,
-        aliases,
-      )
       if (!active) return
       setReviewInventoryRows(inventoryRows)
+      const aliases = aliasesRes.ok ? aliasesData.aliases || {} : {}
       setReviewAliases(aliases)
+      let resolved
+      try {
+        resolved = resolveProductCatalogRows(
+          skuMappingCandidates,
+          inventoryRows,
+          aliases,
+        )
+      } catch {
+        resolved = manualReturnSkuMappingRows(skuMappingCandidates)
+      }
+      if (!resolved.length) resolved = manualReturnSkuMappingRows(skuMappingCandidates)
       setReviewCatalogRows(resolved)
+      if (!aliasesRes.ok) {
+        toast.warning(
+          'Saved Auto Deduct matches could not be loaded. Manual inventory mapping is still available.',
+          'Manual Mapping Available',
+        )
+      }
     }).catch((error) => {
-      if (active) toast.error(error.message, 'Could Not Load SKU Review')
+      if (active) {
+        setReviewCatalogRows(manualReturnSkuMappingRows(skuMappingCandidates))
+        setReviewInventoryRows([])
+        toast.error(error.message, 'Could Not Load Inventory Choices')
+      }
     }).finally(() => {
       if (active) setReviewMappingLoading(false)
     })
@@ -772,8 +794,7 @@ export default function ReturnsReceiving() {
     getToken,
     isAdmin,
     pkg,
-    requiresManualAdminItems,
-    requiresOrderItemManualMappings,
+    reviewMappingLoadMode,
     skuMappingCandidates,
     toast,
   ])
