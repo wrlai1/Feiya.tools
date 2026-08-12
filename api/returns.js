@@ -3079,6 +3079,7 @@ export default async function handler(req, res) {
           COALESCE(SUM(restock_units), 0)::int AS restocked_units
         FROM return_packages
         WHERE status IN ('received', 'discrepancy')
+          AND confirmed_at IS NOT NULL
           AND confirmed_at >= ${from}
       `
       const salesSummaryPromise = sql`
@@ -3119,6 +3120,7 @@ export default async function handler(req, res) {
           FROM return_package_items items
           JOIN return_packages packages ON packages.id = items.package_id
           WHERE packages.status IN ('received', 'discrepancy')
+            AND packages.confirmed_at IS NOT NULL
             AND packages.confirmed_at >= ${from}
             AND NULLIF(BTRIM(items.sku_id), '') IS NOT NULL
           GROUP BY items.package_id, items.sku_id
@@ -3141,10 +3143,15 @@ export default async function handler(req, res) {
             COUNT(*) FILTER (WHERE flagged_not_ours = true)::int AS flagged_packages,
             COALESCE(SUM(expected_units) FILTER (WHERE status IN ('received', 'discrepancy')), 0)::int
               AS expected_units,
-            COALESCE(SUM(actual_units), 0)::int AS returned_units,
-            COALESCE(SUM(restock_units), 0)::int AS restocked_units
+            COALESCE(SUM(actual_units) FILTER (
+              WHERE status IN ('received', 'discrepancy')
+            ), 0)::int AS returned_units,
+            COALESCE(SUM(restock_units) FILTER (
+              WHERE status IN ('received', 'discrepancy')
+            ), 0)::int AS restocked_units
           FROM return_packages
           WHERE status IN ('received', 'discrepancy', 'rejected')
+            AND confirmed_at IS NOT NULL
             AND confirmed_at >= ${from}
           GROUP BY COALESCE(NULLIF(store_key, ''), 'unassigned')
         ),
@@ -3374,6 +3381,7 @@ export default async function handler(req, res) {
           JOIN return_packages reason_packages
             ON reason_packages.id = return_package_sku_reasons.package_id
           WHERE reason_packages.status IN ('received', 'discrepancy')
+            AND reason_packages.confirmed_at IS NOT NULL
             AND reason_packages.confirmed_at >= ${from}
           GROUP BY
             return_package_sku_reasons.package_id,
@@ -3407,6 +3415,7 @@ export default async function handler(req, res) {
             ON reasons.package_id = items.package_id
            AND reasons.sku_id = items.sku_id
           WHERE packages.status IN ('received', 'discrepancy')
+            AND packages.confirmed_at IS NOT NULL
             AND packages.confirmed_at >= ${from}
             AND NULLIF(BTRIM(items.sku_id), '') IS NOT NULL
           GROUP BY
@@ -3618,6 +3627,7 @@ export default async function handler(req, res) {
           FROM return_package_items items
           JOIN return_packages packages ON packages.id = items.package_id
           WHERE packages.status IN ('received', 'discrepancy')
+            AND packages.confirmed_at IS NOT NULL
             AND packages.confirmed_at >= ${from}
           GROUP BY 1, 2, 3
         ),
@@ -3807,6 +3817,12 @@ export default async function handler(req, res) {
       summary.product_return_rate = summary.sold_product_units > 0
         ? summary.returned_product_units * 100 / summary.sold_product_units
         : null
+      summary.return_counting_policy = {
+        basis: 'warehouse_confirmed_actual_quantity',
+        date_field: 'confirmed_at',
+        included_statuses: ['received', 'discrepancy'],
+        excluded_statuses: ['pending', 'needs_review', 'rejected'],
+      }
       return res.json({ days, summary, stores, rows, product_skus: productSkus, sizes })
     }
 

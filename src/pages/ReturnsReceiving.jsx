@@ -3440,19 +3440,27 @@ export default function ReturnsReceiving() {
                   </div>
                 </div>
               )}
+              <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
+                <p className="font-bold">Warehouse-confirmed returns only / 只统计仓库已收到的退货</p>
+                <p className="mt-1 text-xs leading-relaxed">
+                  Return rates use the actual quantity scanned and confirmed after the package arrives.
+                  Uploaded manifests, customer return requests, Pending, Admin Review, and Not Ours packages are excluded.
+                  Physically received damaged items count as returns, while sellable restocked quantity remains a separate number.
+                </p>
+              </div>
               <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
                 {[
                   ['Received Packages', analytics.summary.received_packages],
                   ['Discrepancy Packages', analytics.summary.discrepancy_packages],
-                  ['Not Ours / Flagged', analytics.summary.flagged_packages],
-                  ['Actual Returned Units', analytics.summary.returned_units],
-                  ['Restocked Units', analytics.summary.restocked_units],
+                  ['Not Ours / Flagged (Excluded)', analytics.summary.flagged_packages],
+                  ['Warehouse-Received Units', analytics.summary.returned_units],
+                  ['Good Units Added to Inventory', analytics.summary.restocked_units],
                   ['Physical Units Sold', analytics.summary.sold_units],
                   ['Physical Unit Return Rate', analytics.summary.total_return_rate == null
                     ? '—'
                     : `${Number(analytics.summary.total_return_rate).toFixed(2)}%`],
                   ['Product Units Sold', analytics.summary.sold_product_units],
-                  ['Complete Product Returns', analytics.summary.returned_product_units],
+                  ['Complete Products Received', analytics.summary.returned_product_units],
                   ['Product Unit Return Rate', analytics.summary.product_return_rate == null
                     ? '—'
                     : `${Number(analytics.summary.product_return_rate).toFixed(2)}%`],
@@ -3514,7 +3522,7 @@ export default function ReturnsReceiving() {
                       <p className="font-semibold text-slate-800">{store.store_name}</p>
                       <div className="mt-3 grid grid-cols-2 gap-3 text-xs">
                         <div><p className="text-slate-400">Physical sold</p><p className="font-semibold">{store.sold_units}</p></div>
-                        <div><p className="text-slate-400">Physical returned</p><p className="font-semibold text-blue-700">{store.returned_units}</p></div>
+                        <div><p className="text-slate-400">Physical received</p><p className="font-semibold text-blue-700">{store.returned_units}</p></div>
                         <div><p className="text-slate-400">Physical rate</p><p className="font-semibold">{store.physical_return_rate == null ? '—' : `${Number(store.physical_return_rate).toFixed(2)}%`}</p></div>
                         <div><p className="text-slate-400">Product rate</p><p className="font-semibold">{store.product_return_rate == null ? '—' : `${Number(store.product_return_rate).toFixed(2)}%`}</p></div>
                       </div>
@@ -3529,12 +3537,12 @@ export default function ReturnsReceiving() {
                         <th className="px-4 py-3 text-right">Packages</th>
                         <th className="px-4 py-3 text-right">Discrepancies</th>
                         <th className="px-4 py-3 text-right">Not Ours</th>
-                        <th className="px-4 py-3 text-right">Returned</th>
+                        <th className="px-4 py-3 text-right">Received returns</th>
                         <th className="px-4 py-3 text-right">Restocked</th>
                         <th className="px-4 py-3 text-right">Physical Sold</th>
                         <th className="px-4 py-3 text-right">Physical Rate</th>
                         <th className="px-4 py-3 text-right">Products Sold</th>
-                        <th className="px-4 py-3 text-right">Product Returns</th>
+                        <th className="px-4 py-3 text-right">Products Received</th>
                         <th className="px-4 py-3 text-right">Product Rate</th>
                       </tr>
                     </thead>
@@ -3601,15 +3609,15 @@ export default function ReturnsReceiving() {
                   </div>
                   <p className="mt-3 text-xs text-slate-500">
                     Showing {Math.min(visibleProductSkuRows.length, 200).toLocaleString()} of{' '}
-                    {visibleProductSkuRows.length.toLocaleString()} matching returned SKU IDs.
+                    {visibleProductSkuRows.length.toLocaleString()} matching warehouse-received SKU IDs.
                   </p>
                   <p className="mt-2 rounded-lg bg-blue-50 px-3 py-2 text-[11px] leading-relaxed text-blue-800">
-                    Reason percentages use returned product units with a safe SKU-level attribution. New uploads retain each Excel row's SKU ID, reason, note, and quantity. Older multi-SKU packages are excluded from reason percentages instead of being guessed; Reason coverage shows the usable share.
+                    Reason percentages use warehouse-received product units with safe SKU-level attribution. New uploads retain each Excel row's SKU ID, reason, note, and quantity. Older multi-SKU packages are excluded from reason percentages instead of being guessed; Reason coverage shows the usable share.
                   </p>
                 </div>
                 {!visibleProductSkuRows.length ? (
                   <p className="px-5 py-10 text-center text-sm text-slate-400">
-                    No returned SKU IDs match these filters.
+                    No warehouse-received SKU IDs match these filters.
                   </p>
                 ) : (
                   <div className="grid gap-3 p-3 lg:grid-cols-2">
@@ -3674,7 +3682,7 @@ export default function ReturnsReceiving() {
                             </div>
                             <div className="rounded-lg bg-blue-50 px-2 py-2">
                               <p className="text-lg font-bold text-blue-700">{Number(row.returned_qty || 0).toLocaleString()}</p>
-                              <p className="text-blue-500">Products returned</p>
+                              <p className="text-blue-500">Received returns</p>
                             </div>
                             <div className="rounded-lg bg-emerald-50 px-2 py-2">
                               <p className="text-lg font-bold text-emerald-700">
@@ -3736,7 +3744,7 @@ export default function ReturnsReceiving() {
                 <div className="border-b border-slate-200 px-4 py-3 sm:px-5">
                   <h3 className="text-sm font-semibold text-slate-800">Return rate by size / 按 Size 分析</h3>
                   <p className="mt-1 text-xs text-slate-400">
-                    Physical pieces returned ÷ physical pieces sold. Combination components are counted by their actual inventory quantities.
+                    Warehouse-received physical pieces ÷ physical pieces sold. Combination components are counted by their actual received inventory quantities.
                   </p>
                 </div>
                 <div className="overflow-x-auto">
@@ -3745,7 +3753,7 @@ export default function ReturnsReceiving() {
                       <tr>
                         <th className="px-4 py-3">Size</th>
                         <th className="px-4 py-3 text-right">Physical sold</th>
-                        <th className="px-4 py-3 text-right">Returned</th>
+                        <th className="px-4 py-3 text-right">Received returns</th>
                         <th className="px-4 py-3 text-right">Restocked</th>
                         <th className="px-4 py-3 text-right">Return rate</th>
                       </tr>
@@ -3785,7 +3793,7 @@ export default function ReturnsReceiving() {
                       </p>
                       <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
                         <div><p className="text-slate-400">Sold</p><p className="font-semibold">{row.sold_qty}</p></div>
-                        <div><p className="text-slate-400">Returned</p><p className="font-semibold text-blue-700">{row.returned_qty}</p></div>
+                        <div><p className="text-slate-400">Received return</p><p className="font-semibold text-blue-700">{row.returned_qty}</p></div>
                         <div><p className="text-slate-400">Rate</p><p className="font-semibold">{row.return_rate == null ? '—' : `${Number(row.return_rate).toFixed(2)}%`}</p></div>
                       </div>
                     </div>
@@ -3799,7 +3807,7 @@ export default function ReturnsReceiving() {
                         <th className="px-4 py-3">Color</th>
                         <th className="px-4 py-3">Size</th>
                         <th className="px-4 py-3 text-right">Sold</th>
-                        <th className="px-4 py-3 text-right">Returned</th>
+                        <th className="px-4 py-3 text-right">Received returns</th>
                         <th className="px-4 py-3 text-right">Return Rate</th>
                       </tr>
                     </thead>

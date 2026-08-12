@@ -1,10 +1,16 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import {
   categorizeReturnReason,
   enrichProductSkuReasonAnalytics,
   summarizeReturnReasonEvents,
 } from '../src/utils/returnAnalytics.js'
+
+const returnsApiSource = readFileSync(new URL('../api/returns.js', import.meta.url), 'utf8')
+const analyticsApiSource = returnsApiSource.slice(
+  returnsApiSource.indexOf("if (req.method === 'GET' && action === 'analytics')"),
+)
 
 test('categorizes common sizing reasons from Chinese return data', () => {
   assert.equal(categorizeReturnReason(['太大/太长'], ['腰部和腿部尺寸过大']), 'too_big_long')
@@ -55,4 +61,31 @@ test('uses exact line quantities when one package contains several SKU reasons',
     { category: 'too_big_long', quantity: 2, share: 66.67 },
     { category: 'too_small_short', quantity: 1, share: 33.33 },
   ])
+})
+
+test('return analytics counts warehouse-confirmed actual quantities only', () => {
+  assert.match(
+    analyticsApiSource,
+    /WHERE status IN \('received', 'discrepancy'\)\s+AND confirmed_at IS NOT NULL\s+AND confirmed_at >=/,
+  )
+  assert.match(
+    analyticsApiSource,
+    /WHERE packages\.status IN \('received', 'discrepancy'\)\s+AND packages\.confirmed_at IS NOT NULL\s+AND packages\.confirmed_at >=/,
+  )
+  assert.match(
+    analyticsApiSource,
+    /SUM\(actual_units\) FILTER \(\s+WHERE status IN \('received', 'discrepancy'\)/,
+  )
+  assert.match(
+    analyticsApiSource,
+    /basis: 'warehouse_confirmed_actual_quantity'/,
+  )
+  assert.doesNotMatch(
+    analyticsApiSource,
+    /WHERE packages\.status IN \('pending'/,
+  )
+  assert.doesNotMatch(
+    analyticsApiSource,
+    /WHERE packages\.status IN \('needs_review'/,
+  )
 })
