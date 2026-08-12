@@ -1382,6 +1382,14 @@ test('SKU return manifests group tracking and retain store-facing return details
   assert.deepEqual(result.packages[0].orders, ['PO-1'])
   assert.deepEqual(result.packages[0].reasons, ['太大'])
   assert.deepEqual(result.packages[0].buyerRemarks, ['需要小一码'])
+  assert.deepEqual(result.packages[0].skuReasonDetails, [{
+    skuId: '57081504942',
+    skuCode: '0015DenimDustyWhiteXL',
+    quantity: 1,
+    returnReason: '太大',
+    buyerRemark: '需要小一码',
+    excelRow: 2,
+  }])
   assert.equal(result.packages[0].carrier, 'UPS')
 })
 

@@ -549,6 +549,8 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
     const selectedStoreKey = storeByTracking[tracking]?.key
     const rawQty = quantityKey ? row[quantityKey] : 1
     const quantity = rawQty === '' || rawQty == null ? 1 : Number(rawQty)
+    const returnReason = String(reasonKey ? row[reasonKey] ?? '' : '').trim()
+    const buyerRemark = String(remarkKey ? row[remarkKey] ?? '' : '').trim()
     if (!tracking) {
       waitingForTracking.push({
         excelRow,
@@ -565,6 +567,7 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
       orders: new Set(),
       reasons: new Set(),
       buyerRemarks: new Set(),
+      skuReasonDetails: [],
       carriers: new Set(),
       recoveredOrders: new Set(),
       candidateOrders: [],
@@ -577,8 +580,8 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
       group.stores.set(String(selectedStore.key), String(selectedStore.name))
     }
     if (orderNumber) group.orders.add(orderNumber)
-    if (reasonKey && row[reasonKey]) group.reasons.add(String(row[reasonKey]).trim())
-    if (remarkKey && row[remarkKey]) group.buyerRemarks.add(String(row[remarkKey]).trim())
+    if (returnReason) group.reasons.add(returnReason)
+    if (buyerRemark) group.buyerRemarks.add(buyerRemark)
     if (carrierKey && row[carrierKey]) group.carriers.add(String(row[carrierKey]).trim())
 
     if (!skuId) {
@@ -692,6 +695,16 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
           })
         } else if (candidates.length === 1 && candidates[0].status === 'ready') {
           const candidate = candidates[0]
+          if (returnReason || buyerRemark) {
+            group.skuReasonDetails.push({
+              skuId: candidate.skuId,
+              skuCode: candidate.skuCode,
+              quantity: candidate.maxQuantity,
+              returnReason,
+              buyerRemark,
+              excelRow,
+            })
+          }
           candidate.components.forEach((component) => {
             group.items.push({
               skuId: candidate.skuId,
@@ -705,6 +718,16 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
           })
           group.recoveredOrders.add(orderKey)
         } else if (candidates.length === 1) {
+          if (returnReason || buyerRemark) {
+            group.skuReasonDetails.push({
+              skuId: candidates[0].skuId,
+              skuCode: candidates[0].skuCode,
+              quantity: candidates[0].maxQuantity,
+              returnReason,
+              buyerRemark,
+              excelRow,
+            })
+          }
           addUnresolvedSku(group, {
             skuId: candidates[0].skuId,
             skuCode: candidates[0].skuCode,
@@ -719,7 +742,14 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
             parse_issue: candidates[0].issue,
           })
         } else {
-          group.candidateOrders.push({ orderNumber, orderKey, candidates })
+          group.candidateOrders.push({
+            orderNumber,
+            orderKey,
+            candidates,
+            returnReason,
+            buyerRemark,
+            excelRow,
+          })
           group.review.push({
             tracking: trackingNumber,
             excelRow,
@@ -743,6 +773,16 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
         product,
         issue: productIssue,
       } = resolvedCatalogProduct(catalog, skuId, selectedStoreKey)
+      if (returnReason || buyerRemark) {
+        group.skuReasonDetails.push({
+          skuId,
+          skuCode: product?.sku_code || product?.skuCode || '',
+          quantity,
+          returnReason,
+          buyerRemark,
+          excelRow,
+        })
+      }
       if (!product) {
         group.review.push({
           tracking: trackingNumber,
@@ -894,6 +934,7 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
         orders: [...group.orders],
         reasons: [...group.reasons],
         buyerRemarks: [...group.buyerRemarks],
+        skuReasonDetails: group.skuReasonDetails,
         carrier: [...group.carriers].join(', '),
         items: group.items,
         expectedUnits: group.items.reduce((sum, item) => sum + item.expectedQty, 0),
@@ -912,6 +953,7 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
           orders: [...group.orders],
           reasons: [...group.reasons],
           buyerRemarks: [...group.buyerRemarks],
+          skuReasonDetails: group.skuReasonDetails,
           carrier: [...group.carriers].join(', '),
           baseItems: group.items,
           candidateOrders: group.candidateOrders,
@@ -926,6 +968,7 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
       orders: [...group.orders],
       reasons: [...group.reasons],
       buyerRemarks: [...group.buyerRemarks],
+      skuReasonDetails: group.skuReasonDetails,
       carrier: [...group.carriers].join(', '),
       items: group.items,
       expectedUnits: group.items.reduce((sum, item) => sum + item.expectedQty, 0),
@@ -965,6 +1008,7 @@ export function applyReturnOrderMatch(parsed, tracking, quantities) {
   if (!match) throw new Error('Order candidates are no longer available for this package')
 
   const selectedItems = []
+  const selectedReasonDetails = []
   const recoveredOrders = new Set()
   for (const order of match.candidateOrders) {
     for (const candidate of order.candidates) {
@@ -977,6 +1021,16 @@ export function applyReturnOrderMatch(parsed, tracking, quantities) {
         throw new Error(`${candidate.skuCode || candidate.skuId} still needs product mapping`)
       }
       recoveredOrders.add(order.orderKey)
+      if (order.returnReason || order.buyerRemark) {
+        selectedReasonDetails.push({
+          skuId: candidate.skuId,
+          skuCode: candidate.skuCode,
+          quantity,
+          returnReason: order.returnReason,
+          buyerRemark: order.buyerRemark,
+          excelRow: order.excelRow,
+        })
+      }
       candidate.components.forEach((component) => {
         selectedItems.push({
           skuId: candidate.skuId,
@@ -1013,6 +1067,7 @@ export function applyReturnOrderMatch(parsed, tracking, quantities) {
     orders: match.orders,
     reasons: match.reasons,
     buyerRemarks: match.buyerRemarks,
+    skuReasonDetails: [...(match.skuReasonDetails || []), ...selectedReasonDetails],
     carrier: match.carrier,
     items,
     expectedUnits: items.reduce((sum, item) => sum + item.expectedQty, 0),

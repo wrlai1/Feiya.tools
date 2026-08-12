@@ -13,6 +13,7 @@ import {
   RefreshCw,
   ScanLine,
   Search,
+  ShieldCheck,
   Upload,
   XCircle,
 } from 'lucide-react'
@@ -45,6 +46,7 @@ import {
 } from '../utils/returnInspection.js'
 
 const BASE = '/api'
+const ANALYTICS_CACHE_MS = 5 * 60 * 1000
 
 function describeStoreDecision(decision) {
   const skuIds = decision.skuIds || []
@@ -95,6 +97,50 @@ function describeStoreDecision(decision) {
     return `The PO was found under All Stores, but ${skuLabel} did not identify one specific Store.`
   }
   return 'Store could not be identified for this tracking.'
+}
+
+function productSkuSearchText(row) {
+  return [
+    row.sku_id,
+    row.sku_code,
+    ...(row.sku_codes || []),
+    ...(row.stores || []),
+    ...(row.components || []).flatMap((component) => [
+      component.style,
+      component.color,
+      component.size,
+    ]),
+    ...(row.reason_breakdown || []).flatMap((reason) => [
+      reason.label,
+      reason.label_zh,
+      ...(reason.examples || []),
+    ]),
+  ].join(' ').toLowerCase()
+}
+
+function sortProductSkuRows(rows, search, view, sort) {
+  const query = String(search || '').trim().toLowerCase()
+  return (Array.isArray(rows) ? rows : [])
+    .filter((row) => !query || productSkuSearchText(row).includes(query))
+    .filter((row) => view === 'all'
+      || (view === 'combos' ? Number(row.component_count || 0) > 1 : Number(row.component_count || 0) <= 1))
+    .sort((left, right) => {
+      if (sort === 'rate') {
+        return Number(right.return_rate ?? -1) - Number(left.return_rate ?? -1)
+          || Number(right.returned_qty || 0) - Number(left.returned_qty || 0)
+      }
+      if (sort === 'sku') {
+        return String(left.sku_code || left.sku_id).localeCompare(String(right.sku_code || right.sku_id))
+      }
+      return Number(right.returned_qty || 0) - Number(left.returned_qty || 0)
+        || Number(right.return_rate ?? -1) - Number(left.return_rate ?? -1)
+    })
+}
+
+function skuComponentLabel(component) {
+  return `${component.style || '—'} / ${component.color || '—'} / ${component.size || '—'}${
+    Number(component.qty || 1) > 1 ? ` ×${component.qty}` : ''
+  }`
 }
 
 const DEMO_PACKAGE = {
@@ -414,6 +460,7 @@ export default function ReturnsReceiving() {
   const isAdmin = user?.role === 'admin' || demoMode
   const scannerRef = useRef(null)
   const confirmationRef = useRef(null)
+  const analyticsRequestRef = useRef(0)
   const [tab, setTab] = useState('receive')
   const [tracking, setTracking] = useState('')
   const [loading, setLoading] = useState(false)
@@ -443,6 +490,12 @@ export default function ReturnsReceiving() {
   const [analytics, setAnalytics] = useState(null)
   const [integrity, setIntegrity] = useState(null)
   const [analyticsDays, setAnalyticsDays] = useState(30)
+  const [analyticsLoading, setAnalyticsLoading] = useState(false)
+  const [integrityLoading, setIntegrityLoading] = useState(false)
+  const [analyticsLoadedAt, setAnalyticsLoadedAt] = useState(null)
+  const [analyticsSkuSearch, setAnalyticsSkuSearch] = useState('')
+  const [analyticsSkuView, setAnalyticsSkuView] = useState('all')
+  const [analyticsSkuSort, setAnalyticsSkuSort] = useState('returns')
   const [orderOnly, setOrderOnly] = useState(null)
   const [orderChoices, setOrderChoices] = useState([])
   const [manualTrackingCandidate, setManualTrackingCandidate] = useState('')
@@ -464,6 +517,18 @@ export default function ReturnsReceiving() {
   const [reviewMappingModes, setReviewMappingModes] = useState({})
   const [reviewMappingLoading, setReviewMappingLoading] = useState(false)
   const [reviewSavingSku, setReviewSavingSku] = useState('')
+  const visibleProductSkuRows = useMemo(() => sortProductSkuRows(
+    analytics?.product_skus,
+    analyticsSkuSearch,
+    analyticsSkuView,
+    analyticsSkuSort,
+  ), [analytics?.product_skus, analyticsSkuSearch, analyticsSkuSort, analyticsSkuView])
+  const invalidateAnalytics = useCallback(() => {
+    analyticsRequestRef.current += 1
+    setAnalytics(null)
+    setAnalyticsLoadedAt(null)
+    setAnalyticsLoading(false)
+  }, [])
   const relatedOrderItems = useMemo(
     () => (pkg?.related_orders || []).flatMap((order) => order.items || []),
     [pkg],
@@ -878,6 +943,7 @@ export default function ReturnsReceiving() {
         ? 'Not ours / No es nuestro'
         : data.status === 'discrepancy' ? 'Saved / Guardado' : 'Received / Recibido'
       toast.success(`${Number(data.added_units || 0)} added to inventory / agregado al inventario`, title)
+      invalidateAnalytics()
       setPkg(null)
       setTracking('')
       setCounts({})
@@ -1010,6 +1076,7 @@ export default function ReturnsReceiving() {
           : 'Returned products selected. Complete the inspection below.',
         'Products Saved',
       )
+      invalidateAnalytics()
       await loadReviewPackages()
     } catch (error) {
       toast.error(error.message, 'Could Not Resolve Package')
@@ -1343,6 +1410,7 @@ export default function ReturnsReceiving() {
         'SKU Mapping Remembered',
       )
       if (data.reuse_warning) toast.info(data.reuse_warning, 'Older Reviews')
+      invalidateAnalytics()
       await Promise.all([loadReviewPackages(), loadStores()])
     } catch (error) {
       toast.error(error.message, 'Could Not Save SKU Mapping')
@@ -1375,6 +1443,7 @@ export default function ReturnsReceiving() {
       )
       setCatalogFile(null)
       setCatalogParsed(null)
+      invalidateAnalytics()
       await loadStores()
     } catch (error) {
       toast.error(error.message, 'Product Upload Failed')
@@ -1475,6 +1544,7 @@ export default function ReturnsReceiving() {
       }
       setOrderFile(null)
       setOrderParsed(null)
+      invalidateAnalytics()
       await Promise.all([loadOrderStats(), loadStores()])
     } catch (error) {
       toast.error(error.message, 'Order Upload Failed')
@@ -1485,36 +1555,64 @@ export default function ReturnsReceiving() {
 
   const loadAnalytics = useCallback(async () => {
     if (!isAdmin) return
-    setLoading(true)
+    const requestId = analyticsRequestRef.current + 1
+    analyticsRequestRef.current = requestId
+    setAnalytics((current) => Number(current?.days) === analyticsDays ? current : null)
+    setAnalyticsLoading(true)
     try {
-      const [analyticsRes, integrityRes] = await Promise.all([
-        fetch(`${BASE}/returns?action=analytics&days=${analyticsDays}`, {
-          headers: headers(getToken),
-        }),
-        fetch(`${BASE}/returns?action=integrity`, {
-          headers: headers(getToken),
-        }),
-      ])
-      const [analyticsData, integrityData] = await Promise.all([
-        analyticsRes.json().catch(() => ({})),
-        integrityRes.json().catch(() => ({})),
-      ])
+      const analyticsRes = await fetch(`${BASE}/returns?action=analytics&days=${analyticsDays}`, {
+        headers: headers(getToken),
+      })
+      const analyticsData = await analyticsRes.json().catch(() => ({}))
       if (!analyticsRes.ok) throw new Error(analyticsData.error || 'Could not load return analytics')
-      if (!integrityRes.ok) throw new Error(integrityData.error || 'Could not run data checks')
+      if (analyticsRequestRef.current !== requestId) return
       setAnalytics(analyticsData)
-      setIntegrity(integrityData)
+      setAnalyticsLoadedAt(new Date().toISOString())
     } catch (error) {
-      toast.error(error.message, 'Analytics Failed')
+      if (analyticsRequestRef.current === requestId) {
+        toast.error(error.message, 'Analytics Failed')
+      }
     } finally {
-      setLoading(false)
+      if (analyticsRequestRef.current === requestId) setAnalyticsLoading(false)
     }
   }, [analyticsDays, getToken, isAdmin, toast])
 
+  const loadIntegrity = useCallback(async () => {
+    if (!isAdmin || integrityLoading) return
+    setIntegrityLoading(true)
+    try {
+      const integrityRes = await fetch(`${BASE}/returns?action=integrity`, {
+        headers: headers(getToken),
+      })
+      const integrityData = await integrityRes.json().catch(() => ({}))
+      if (!integrityRes.ok) throw new Error(integrityData.error || 'Could not run data checks')
+      setIntegrity(integrityData)
+    } catch (error) {
+      toast.error(error.message, 'Data Checks Failed')
+    } finally {
+      setIntegrityLoading(false)
+    }
+  }, [getToken, integrityLoading, isAdmin, toast])
+
   useEffect(() => {
-    if (tab === 'analytics') loadAnalytics()
+    const analyticsAge = analyticsLoadedAt
+      ? Date.now() - new Date(analyticsLoadedAt).getTime()
+      : Number.POSITIVE_INFINITY
+    if (
+      tab === 'analytics'
+      && (Number(analytics?.days) !== analyticsDays || analyticsAge > ANALYTICS_CACHE_MS)
+    ) loadAnalytics()
     if (tab === 'orders') loadOrderStats()
     if (tab === 'review') loadReviewPackages()
-  }, [loadAnalytics, loadOrderStats, loadReviewPackages, tab])
+  }, [
+    analytics?.days,
+    analyticsDays,
+    analyticsLoadedAt,
+    loadAnalytics,
+    loadOrderStats,
+    loadReviewPackages,
+    tab,
+  ])
 
   const tabs = [
     { id: 'receive', label: 'Scan & Receive', shortLabel: 'Scan', icon: ScanLine },
@@ -3245,7 +3343,7 @@ export default function ReturnsReceiving() {
 
       {tab === 'analytics' && isAdmin && (
         <div className="space-y-4">
-          <div className="flex items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
             <select
               value={analyticsDays}
               onChange={(event) => setAnalyticsDays(Number(event.target.value))}
@@ -3255,10 +3353,38 @@ export default function ReturnsReceiving() {
               <option value={90}>Last 90 days</option>
               <option value={365}>Last 365 days</option>
             </select>
-            <button type="button" onClick={loadAnalytics} className="btn-secondary text-sm">
-              <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} /> Refresh
-            </button>
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              {analyticsLoadedAt && (
+                <span className="text-xs text-slate-400">
+                  Updated {new Date(analyticsLoadedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                </span>
+              )}
+              <button
+                type="button"
+                onClick={loadIntegrity}
+                disabled={integrityLoading}
+                className="btn-secondary text-sm disabled:opacity-50"
+              >
+                <ShieldCheck className={`h-4 w-4 ${integrityLoading ? 'animate-pulse' : ''}`} />
+                {integrityLoading ? 'Checking…' : 'Run Data Checks'}
+              </button>
+              <button
+                type="button"
+                onClick={loadAnalytics}
+                disabled={analyticsLoading}
+                className="btn-secondary text-sm disabled:opacity-50"
+              >
+                <RefreshCw className={`h-4 w-4 ${analyticsLoading ? 'animate-spin' : ''}`} /> Refresh
+              </button>
+            </div>
           </div>
+
+          {analyticsLoading && !analytics && (
+            <div className="card flex min-h-40 items-center justify-center text-sm text-slate-500">
+              <RefreshCw className="mr-2 h-5 w-5 animate-spin text-blue-600" />
+              Calculating return rates…
+            </div>
+          )}
 
           {analytics && (
             <>
@@ -3434,7 +3560,216 @@ export default function ReturnsReceiving() {
               </div>
               <div className="card overflow-hidden">
                 <div className="border-b border-slate-200 px-4 py-3 sm:px-5">
-                  <h3 className="text-sm font-semibold text-slate-800">SKU return rate (Style / Color / Size)</h3>
+                  <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+                    <div>
+                      <h3 className="text-sm font-semibold text-slate-800">
+                        Product SKU ID return analysis / 商品 SKU ID 退货分析
+                      </h3>
+                      <p className="mt-1 text-xs text-slate-400">
+                        One sold product stays one unit even when the SKU is a multi-piece combination.
+                      </p>
+                    </div>
+                    <div className="flex flex-col gap-2 sm:flex-row">
+                      <label className="relative min-w-64">
+                        <Search className="absolute left-3 top-2.5 h-4 w-4 text-slate-400" />
+                        <input
+                          value={analyticsSkuSearch}
+                          onChange={(event) => setAnalyticsSkuSearch(event.target.value)}
+                          placeholder="Search SKU ID, SKU code, style, size, reason…"
+                          className="w-full rounded-xl border border-slate-200 py-2 pl-9 pr-3 text-sm outline-none focus:border-blue-500"
+                        />
+                      </label>
+                      <select
+                        value={analyticsSkuView}
+                        onChange={(event) => setAnalyticsSkuView(event.target.value)}
+                        className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
+                      >
+                        <option value="all">All products</option>
+                        <option value="combos">Combinations only</option>
+                        <option value="single">Single-item only</option>
+                      </select>
+                      <select
+                        value={analyticsSkuSort}
+                        onChange={(event) => setAnalyticsSkuSort(event.target.value)}
+                        className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
+                      >
+                        <option value="returns">Most returns</option>
+                        <option value="rate">Highest return rate</option>
+                        <option value="sku">SKU code</option>
+                      </select>
+                    </div>
+                  </div>
+                  <p className="mt-3 text-xs text-slate-500">
+                    Showing {Math.min(visibleProductSkuRows.length, 200).toLocaleString()} of{' '}
+                    {visibleProductSkuRows.length.toLocaleString()} matching returned SKU IDs.
+                  </p>
+                  <p className="mt-2 rounded-lg bg-blue-50 px-3 py-2 text-[11px] leading-relaxed text-blue-800">
+                    Reason percentages use returned product units with a safe SKU-level attribution. New uploads retain each Excel row's SKU ID, reason, note, and quantity. Older multi-SKU packages are excluded from reason percentages instead of being guessed; Reason coverage shows the usable share.
+                  </p>
+                </div>
+                {!visibleProductSkuRows.length ? (
+                  <p className="px-5 py-10 text-center text-sm text-slate-400">
+                    No returned SKU IDs match these filters.
+                  </p>
+                ) : (
+                  <div className="grid gap-3 p-3 lg:grid-cols-2">
+                    {visibleProductSkuRows.slice(0, 200).map((row) => {
+                      const reasonCoverage = row.reason_coverage_pct == null
+                        ? null
+                        : Number(row.reason_coverage_pct)
+                      return (
+                        <div key={row.sku_id} className="rounded-xl border border-slate-200 bg-white p-4">
+                          <div className="flex flex-wrap items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <p className="break-all font-bold text-slate-900">{row.sku_code || '—'}</p>
+                                {Number(row.component_count || 0) > 1 && (
+                                  <span className="rounded-full bg-violet-100 px-2 py-0.5 text-[11px] font-bold text-violet-700">
+                                    Combination · {row.component_count} inventory lines
+                                  </span>
+                                )}
+                              </div>
+                              <p className="mt-1 break-all text-xs font-medium text-slate-500">
+                                SKU ID {row.sku_id}
+                              </p>
+                              {(row.sku_codes || []).filter((code) => code !== row.sku_code).length > 0 && (
+                                <p className="mt-1 break-all text-[11px] text-amber-600">
+                                  Historical SKU code(s):{' '}
+                                  {row.sku_codes.filter((code) => code !== row.sku_code).join(' · ')}
+                                </p>
+                              )}
+                              {(row.stores || []).length > 0 && (
+                                <p className="mt-1 text-xs text-slate-400">{row.stores.join(' · ')}</p>
+                              )}
+                            </div>
+                            <div className="rounded-xl bg-blue-50 px-3 py-2 text-right">
+                              <p className="text-xl font-black text-blue-800">
+                                {row.return_rate == null ? '—' : `${Number(row.return_rate).toFixed(2)}%`}
+                              </p>
+                              <p className="text-[10px] font-bold uppercase text-blue-500">Product return rate</p>
+                            </div>
+                          </div>
+
+                          {(row.components || []).length > 0 ? (
+                            <div className="mt-3 flex flex-wrap gap-1.5">
+                              {row.components.map((component, index) => (
+                                <span
+                                  key={`${row.sku_id}-${component.style}-${component.color}-${component.size}-${index}`}
+                                  className="rounded-lg bg-slate-100 px-2 py-1 text-[11px] font-medium text-slate-600"
+                                >
+                                  {skuComponentLabel(component)}
+                                </span>
+                              ))}
+                            </div>
+                          ) : (
+                            <p className="mt-3 text-xs text-amber-700">
+                              Physical style mapping is not unique, but the SKU ID product rate is still available.
+                            </p>
+                          )}
+
+                          <div className="mt-3 grid grid-cols-3 gap-2 text-center text-xs">
+                            <div className="rounded-lg bg-slate-50 px-2 py-2">
+                              <p className="text-lg font-bold text-slate-800">{Number(row.sold_qty || 0).toLocaleString()}</p>
+                              <p className="text-slate-400">Products sold</p>
+                            </div>
+                            <div className="rounded-lg bg-blue-50 px-2 py-2">
+                              <p className="text-lg font-bold text-blue-700">{Number(row.returned_qty || 0).toLocaleString()}</p>
+                              <p className="text-blue-500">Products returned</p>
+                            </div>
+                            <div className="rounded-lg bg-emerald-50 px-2 py-2">
+                              <p className="text-lg font-bold text-emerald-700">
+                                {reasonCoverage == null ? '—' : `${reasonCoverage.toFixed(0)}%`}
+                              </p>
+                              <p className="text-emerald-600">Reason coverage</p>
+                            </div>
+                          </div>
+
+                          <div className="mt-4 border-t border-slate-100 pt-3">
+                            <p className="text-xs font-bold uppercase tracking-wide text-slate-500">
+                              Return reasons / 退货原因
+                            </p>
+                            {(row.reason_breakdown || []).length ? (
+                              <div className="mt-2 space-y-2">
+                                {row.reason_breakdown.map((reason) => (
+                                  <details key={reason.category} className="group rounded-lg bg-slate-50 px-3 py-2">
+                                    <summary className="cursor-pointer list-none">
+                                      <div className="flex items-center justify-between gap-3 text-xs">
+                                        <span className="font-semibold text-slate-700">
+                                          {reason.label_zh} / {reason.label}
+                                        </span>
+                                        <span className="shrink-0 font-bold tabular-nums text-slate-900">
+                                          {Number(reason.quantity).toLocaleString()} · {Number(reason.share).toFixed(1)}%
+                                        </span>
+                                      </div>
+                                      <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-slate-200">
+                                        <div
+                                          className="h-full rounded-full bg-blue-500"
+                                          style={{ width: `${Math.min(Number(reason.share || 0), 100)}%` }}
+                                        />
+                                      </div>
+                                    </summary>
+                                    {(reason.examples || []).length > 0 && (
+                                      <div className="mt-2 space-y-1 border-t border-slate-200 pt-2 text-[11px] text-slate-500">
+                                        {reason.examples.map((example) => <p key={example}>• {example}</p>)}
+                                      </div>
+                                    )}
+                                  </details>
+                                ))}
+                              </div>
+                            ) : (
+                              <p className="mt-2 text-xs text-slate-400">No reason can be safely assigned to this SKU yet.</p>
+                            )}
+                            {Number(row.reason_unattributed_qty || 0) > 0 && (
+                              <p className="mt-2 text-[11px] leading-relaxed text-amber-700">
+                                {Number(row.reason_unattributed_qty).toLocaleString()} returned product(s) are excluded from reason percentages because an older package contained multiple SKU IDs or no reason. They are still included in the return rate.
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+
+              <div className="card overflow-hidden">
+                <div className="border-b border-slate-200 px-4 py-3 sm:px-5">
+                  <h3 className="text-sm font-semibold text-slate-800">Return rate by size / 按 Size 分析</h3>
+                  <p className="mt-1 text-xs text-slate-400">
+                    Physical pieces returned ÷ physical pieces sold. Combination components are counted by their actual inventory quantities.
+                  </p>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full min-w-[620px] text-sm">
+                    <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
+                      <tr>
+                        <th className="px-4 py-3">Size</th>
+                        <th className="px-4 py-3 text-right">Physical sold</th>
+                        <th className="px-4 py-3 text-right">Returned</th>
+                        <th className="px-4 py-3 text-right">Restocked</th>
+                        <th className="px-4 py-3 text-right">Return rate</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {(analytics.sizes || []).map((row) => (
+                        <tr key={row.size}>
+                          <td className="px-4 py-3 font-bold text-slate-800">{row.size}</td>
+                          <td className="px-4 py-3 text-right tabular-nums">{row.sold_qty}</td>
+                          <td className="px-4 py-3 text-right tabular-nums font-semibold text-blue-700">{row.returned_qty}</td>
+                          <td className="px-4 py-3 text-right tabular-nums font-semibold text-emerald-700">{row.restocked_qty}</td>
+                          <td className="px-4 py-3 text-right tabular-nums font-bold">
+                            {row.return_rate == null ? '—' : `${Number(row.return_rate).toFixed(2)}%`}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div className="card overflow-hidden">
+                <div className="border-b border-slate-200 px-4 py-3 sm:px-5">
+                  <h3 className="text-sm font-semibold text-slate-800">Physical inventory SKU return rate (Style / Color / Size)</h3>
                   <p className="mt-1 text-xs text-slate-400">
                     Actual received inventory SKU units ÷ sold inventory SKU units in the selected period
                   </p>

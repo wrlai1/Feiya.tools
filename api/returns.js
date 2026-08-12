@@ -3,6 +3,7 @@ import authentication from '../lib/authentication.cjs'
 import inventoryTargetResolution from '../lib/inventoryTargetResolution.cjs'
 import returnPackageSafety from '../lib/returnPackageSafety.cjs'
 import { summarizeReturnInspection } from '../src/utils/returnInspection.js'
+import { enrichProductSkuReasonAnalytics } from '../src/utils/returnAnalytics.js'
 
 const { resolveInventoryTargets } = inventoryTargetResolution
 const { authenticateUser } = authentication
@@ -55,6 +56,56 @@ function cleanText(value, maxLength = 500) {
 function cleanTextArray(value, maxLength = 200) {
   if (!Array.isArray(value)) return []
   return [...new Set(value.map((item) => cleanText(item, maxLength)).filter(Boolean))]
+}
+
+function normalizeSkuReasonDetails(value) {
+  if (!Array.isArray(value)) return []
+  const details = new Map()
+  for (const rawDetail of value) {
+    const skuId = cleanText(rawDetail.skuId || rawDetail.sku_id, 100)
+    const skuCode = cleanText(rawDetail.skuCode || rawDetail.sku_code, 300)
+    const quantity = Number(rawDetail.quantity)
+    const returnReason = cleanText(
+      rawDetail.returnReason || rawDetail.return_reason,
+      500,
+    )
+    const buyerRemark = cleanText(
+      rawDetail.buyerRemark || rawDetail.buyer_remark,
+      1000,
+    )
+    const rawExcelRow = rawDetail.excelRow ?? rawDetail.source_row
+    const excelRow = rawExcelRow === '' || rawExcelRow == null
+      ? Number.NaN
+      : Number(rawExcelRow)
+    if (
+      !skuId
+      || !Number.isSafeInteger(quantity)
+      || quantity <= 0
+      || quantity > 9999
+      || (!returnReason && !buyerRemark)
+      || (Number.isFinite(excelRow) && (!Number.isSafeInteger(excelRow) || excelRow <= 0))
+    ) {
+      throw new Error('Invalid SKU return reason detail')
+    }
+    const detail = {
+      sku_id: skuId,
+      sku_code: skuCode,
+      quantity,
+      return_reason: returnReason,
+      buyer_remark: buyerRemark,
+      source_row: Number.isFinite(excelRow) ? excelRow : null,
+    }
+    const key = [
+      detail.sku_id,
+      detail.sku_code,
+      detail.quantity,
+      detail.return_reason,
+      detail.buyer_remark,
+      detail.source_row ?? '',
+    ].join('\u241f')
+    details.set(key, detail)
+  }
+  return [...details.values()]
 }
 
 function cleanDate(value) {
@@ -217,6 +268,7 @@ function normalizePackages(rawPackages, fallbackStore = null, {
   if (rawPackages.length > MAX_PACKAGES_PER_IMPORT) throw new Error(`Import is limited to ${MAX_PACKAGES_PER_IMPORT} packages`)
 
   let itemCount = 0
+  let reasonDetailCount = 0
   const packages = new Map()
   for (const rawPackage of rawPackages) {
     const trackingKey = normalizeTracking(rawPackage.tracking || rawPackage.trackingNumber)
@@ -246,6 +298,7 @@ function normalizePackages(rawPackages, fallbackStore = null, {
         rawPackage.requiresItemResolution ?? rawPackage.requires_item_resolution,
       ),
       review_data: { unresolvedSkus: [], blockingIssues: [], workerInspection: null },
+      sku_reason_details: new Map(),
       items: new Map(),
     }
     if (pkg.store_key !== store.key) {
@@ -257,6 +310,23 @@ function normalizePackages(rawPackages, fallbackStore = null, {
     pkg.review_data.unresolvedSkus.push(...reviewData.unresolvedSkus)
     pkg.review_data.blockingIssues.push(...reviewData.blockingIssues)
     if (reviewData.workerInspection) pkg.review_data.workerInspection = reviewData.workerInspection
+    for (const detail of normalizeSkuReasonDetails(
+      rawPackage.skuReasonDetails || rawPackage.sku_reason_details,
+    )) {
+      reasonDetailCount += 1
+      if (reasonDetailCount > MAX_ITEMS_PER_IMPORT) {
+        throw new Error(`Import is limited to ${MAX_ITEMS_PER_IMPORT} SKU reason rows`)
+      }
+      const key = [
+        detail.sku_id,
+        detail.sku_code,
+        detail.quantity,
+        detail.return_reason,
+        detail.buyer_remark,
+        detail.source_row ?? '',
+      ].join('\u241f')
+      pkg.sku_reason_details.set(key, detail)
+    }
     for (const rawItem of rawPackage.items || []) {
       itemCount += 1
       if (itemCount > MAX_ITEMS_PER_IMPORT) throw new Error(`Import is limited to ${MAX_ITEMS_PER_IMPORT} item rows`)
@@ -309,6 +379,7 @@ function normalizePackages(rawPackages, fallbackStore = null, {
       review_reason: pkg.review_reason,
       requires_item_resolution: pkg.requires_item_resolution,
       review_data: normalizeReviewData(pkg.review_data),
+      sku_reason_details: [...pkg.sku_reason_details.values()],
       expected_units: items.reduce((sum, item) => sum + item.expected_qty, 0),
       items,
     }
@@ -356,7 +427,19 @@ function normalizeCatalogRows(rawRows) {
   })
 }
 
+let ensureTablesPromise = null
+
 async function ensureTables(sql) {
+  if (!ensureTablesPromise) {
+    ensureTablesPromise = ensureTablesOnce(sql).catch((error) => {
+      ensureTablesPromise = null
+      throw error
+    })
+  }
+  return ensureTablesPromise
+}
+
+async function ensureTablesOnce(sql) {
   await sql`
     CREATE TABLE IF NOT EXISTS inventory_balance (
       id SERIAL PRIMARY KEY,
@@ -509,6 +592,23 @@ async function ensureTables(sql) {
     ON return_package_items (package_id, sku_id, style, color, size)
   `
   await sql`
+    CREATE TABLE IF NOT EXISTS return_package_sku_reasons (
+      id BIGSERIAL PRIMARY KEY,
+      package_id BIGINT NOT NULL REFERENCES return_packages(id) ON DELETE CASCADE,
+      sku_id TEXT NOT NULL,
+      sku_code TEXT NOT NULL DEFAULT '',
+      quantity INTEGER NOT NULL CHECK (quantity > 0),
+      return_reason TEXT NOT NULL DEFAULT '',
+      buyer_remark TEXT NOT NULL DEFAULT '',
+      source_row INTEGER,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `
+  await sql`
+    CREATE INDEX IF NOT EXISTS return_package_sku_reasons_package_sku_idx
+    ON return_package_sku_reasons (package_id, sku_id)
+  `
+  await sql`
     UPDATE return_packages packages
     SET status = 'needs_review'
     WHERE packages.status = 'pending'
@@ -629,10 +729,15 @@ async function ensureTables(sql) {
   await sql`ALTER TABLE inventory_txn_rows ADD COLUMN IF NOT EXISTS store_key TEXT`
   await sql`CREATE INDEX IF NOT EXISTS return_packages_status_idx ON return_packages (status, uploaded_at DESC)`
   await sql`CREATE INDEX IF NOT EXISTS return_packages_confirmed_idx ON return_packages (confirmed_at DESC)`
+  await sql`CREATE INDEX IF NOT EXISTS return_packages_status_confirmed_idx ON return_packages (status, confirmed_at DESC)`
   await sql`CREATE INDEX IF NOT EXISTS return_packages_store_idx ON return_packages (store_key, uploaded_at DESC)`
   await sql`CREATE INDEX IF NOT EXISTS return_orders_number_idx ON return_orders (order_key)`
   await sql`CREATE INDEX IF NOT EXISTS return_orders_store_created_idx ON return_orders (store_key, order_created_at DESC)`
+  await sql`CREATE INDEX IF NOT EXISTS return_orders_created_idx ON return_orders (order_created_at DESC)`
   await sql`CREATE INDEX IF NOT EXISTS return_order_items_sku_id_idx ON return_order_items (sku_id)`
+  await sql`CREATE INDEX IF NOT EXISTS return_package_items_sku_package_idx ON return_package_items (sku_id, package_id)`
+  await sql`CREATE INDEX IF NOT EXISTS return_product_catalog_sku_id_idx ON return_product_catalog (sku_id)`
+  await sql`CREATE INDEX IF NOT EXISTS inventory_txn_rows_sales_day_idx ON inventory_txn_rows (txn_type, business_day)`
 }
 
 async function loadPackage(sql, trackingKey) {
@@ -1625,6 +1730,18 @@ export default async function handler(req, res) {
               AND packages.status IN ('pending', 'needs_review')
           `,
           txn`
+            WITH incoming AS (
+              SELECT tracking_key
+              FROM jsonb_to_recordset(${manifest}::jsonb)
+                AS item(tracking_key TEXT)
+            )
+            DELETE FROM return_package_sku_reasons reasons
+            USING return_packages packages, incoming
+            WHERE reasons.package_id = packages.id
+              AND packages.tracking_key = incoming.tracking_key
+              AND packages.status IN ('pending', 'needs_review')
+          `,
+          txn`
             WITH incoming_packages AS (
               SELECT tracking_key, items
               FROM jsonb_to_recordset(${manifest}::jsonb)
@@ -1658,6 +1775,40 @@ export default async function handler(req, res) {
               items.size, items.expected_qty, items.source_qty, NULL, NULL, NULL
             FROM incoming_items items
             JOIN return_packages packages ON packages.tracking_key = items.tracking_key
+            WHERE packages.status IN ('pending', 'needs_review')
+          `,
+          txn`
+            WITH incoming_packages AS (
+              SELECT tracking_key, sku_reason_details
+              FROM jsonb_to_recordset(${manifest}::jsonb)
+                AS item(tracking_key TEXT, sku_reason_details JSONB)
+            ),
+            incoming_reasons AS (
+              SELECT
+                packages.tracking_key,
+                detail.sku_id,
+                detail.sku_code,
+                detail.quantity,
+                detail.return_reason,
+                detail.buyer_remark,
+                detail.source_row
+              FROM incoming_packages packages
+              CROSS JOIN LATERAL jsonb_to_recordset(
+                COALESCE(packages.sku_reason_details, '[]'::jsonb)
+              ) AS detail(
+                sku_id TEXT, sku_code TEXT, quantity INTEGER,
+                return_reason TEXT, buyer_remark TEXT, source_row INTEGER
+              )
+            )
+            INSERT INTO return_package_sku_reasons (
+              package_id, sku_id, sku_code, quantity,
+              return_reason, buyer_remark, source_row
+            )
+            SELECT
+              packages.id, reasons.sku_id, reasons.sku_code, reasons.quantity,
+              reasons.return_reason, reasons.buyer_remark, reasons.source_row
+            FROM incoming_reasons reasons
+            JOIN return_packages packages ON packages.tracking_key = reasons.tracking_key
             WHERE packages.status IN ('pending', 'needs_review')
           `,
         ])
@@ -2917,7 +3068,7 @@ export default async function handler(req, res) {
       if (payload.role !== 'admin') return res.status(403).json({ error: 'Admin access required' })
       const days = Math.min(Math.max(Number(req.query.days) || 30, 1), 3650)
       const from = new Date(Date.now() - days * 86400000).toISOString()
-      const [summary] = await sql`
+      const summaryPromise = sql`
         SELECT
           COUNT(*)::int AS received_packages,
           COUNT(*) FILTER (WHERE status = 'discrepancy')::int AS discrepancy_packages,
@@ -2930,7 +3081,7 @@ export default async function handler(req, res) {
         WHERE status IN ('received', 'discrepancy')
           AND confirmed_at >= ${from}
       `
-      const [salesSummary] = await sql`
+      const salesSummaryPromise = sql`
         SELECT COALESCE(SUM(rows.qty), 0)::int AS sold_units
         FROM inventory_txn_rows rows
         WHERE rows.txn_type = 'sales'
@@ -2951,7 +3102,7 @@ export default async function handler(req, res) {
               )
           )
       `
-      const [productSummary] = await sql`
+      const productSummaryPromise = sql`
         WITH sku_return_groups AS (
           SELECT
             items.package_id,
@@ -2980,11 +3131,7 @@ export default async function handler(req, res) {
             AS covered_return_product_groups
         FROM sku_return_groups
       `
-      summary.inventory_physical_units = Number(salesSummary?.sold_units || 0)
-      summary.returned_product_units = Number(productSummary?.returned_product_units || 0)
-      summary.return_product_groups = Number(productSummary?.return_product_groups || 0)
-      summary.covered_return_product_groups = Number(productSummary?.covered_return_product_groups || 0)
-      const [analyticsBreakdown] = await sql`
+      const analyticsBreakdownPromise = sql`
         WITH package_returns AS (
           SELECT
             COALESCE(NULLIF(store_key, ''), 'unassigned') AS store_key,
@@ -3012,6 +3159,7 @@ export default async function handler(req, res) {
             orders.updated_at AS order_updated_at,
             items.item_key,
             items.sku_id,
+            items.sku_code,
             items.quantity,
             LOWER(BTRIM(items.item_key)) AS logical_item_key
           FROM return_orders orders
@@ -3121,6 +3269,8 @@ export default async function handler(req, res) {
         ),
         sales_items AS (
           SELECT
+            items.resolved_sku_id AS sku_id,
+            items.sku_code,
             items.quantity,
             items.inventory_reconciled,
             CASE
@@ -3175,6 +3325,23 @@ export default async function handler(req, res) {
           ) AS component(style TEXT, color TEXT, size TEXT, qty INTEGER)
           GROUP BY 1, 2, 3
         ),
+        product_sku_sales AS (
+          SELECT
+            items.sku_id,
+            MIN(NULLIF(BTRIM(items.sku_code), '')) AS sku_code,
+            COALESCE(SUM(items.quantity), 0)::int AS sold_qty,
+            jsonb_agg(DISTINCT items.store_name) AS stores,
+            CASE
+              WHEN COUNT(DISTINCT items.components::text)
+                FILTER (WHERE items.physical_mapping_ready) = 1
+              THEN (MIN(items.components::text)
+                FILTER (WHERE items.physical_mapping_ready))::jsonb
+              ELSE '[]'::jsonb
+            END AS components
+          FROM sales_items items
+          WHERE NULLIF(BTRIM(items.sku_id), '') IS NOT NULL
+          GROUP BY items.sku_id
+        ),
         product_sales AS (
           SELECT
             store_key,
@@ -3189,13 +3356,43 @@ export default async function handler(req, res) {
           FROM sales_items
           GROUP BY store_key
         ),
-        sku_product_returns AS (
+        sku_reason_claims AS (
+          SELECT
+            return_package_sku_reasons.package_id,
+            return_package_sku_reasons.sku_id,
+            COALESCE(SUM(return_package_sku_reasons.quantity), 0)::int
+              AS reason_claimed_qty,
+            jsonb_agg(jsonb_build_object(
+              'quantity', return_package_sku_reasons.quantity,
+              'return_reason', return_package_sku_reasons.return_reason,
+              'buyer_remark', return_package_sku_reasons.buyer_remark,
+              'source_row', return_package_sku_reasons.source_row
+            ) ORDER BY return_package_sku_reasons.source_row NULLS LAST,
+              return_package_sku_reasons.id)
+              AS reason_details
+          FROM return_package_sku_reasons
+          JOIN return_packages reason_packages
+            ON reason_packages.id = return_package_sku_reasons.package_id
+          WHERE reason_packages.status IN ('received', 'discrepancy')
+            AND reason_packages.confirmed_at >= ${from}
+          GROUP BY
+            return_package_sku_reasons.package_id,
+            return_package_sku_reasons.sku_id
+        ),
+        sku_product_return_groups AS (
           SELECT
             packages.store_key,
             MIN(packages.store_name) AS store_name,
             items.package_id,
             items.sku_id,
+            MIN(NULLIF(BTRIM(items.sku_code), '')) AS sku_code,
+            packages.return_reasons,
+            packages.buyer_remarks,
+            COALESCE(MAX(reasons.reason_claimed_qty), 0)::int AS reason_claimed_qty,
+            COALESCE(MAX(reasons.reason_details::text)::jsonb, '[]'::jsonb)
+              AS reason_details,
             BOOL_AND(items.source_qty IS NOT NULL AND items.source_qty > 0) AS has_source_qty,
+            MAX(COALESCE(items.source_qty, 0))::int AS source_product_units,
             LEAST(
               MAX(COALESCE(items.source_qty, 0)),
               MIN(FLOOR(
@@ -3206,10 +3403,32 @@ export default async function handler(req, res) {
             )::int AS returned_product_units
           FROM return_package_items items
           JOIN return_packages packages ON packages.id = items.package_id
+          LEFT JOIN sku_reason_claims reasons
+            ON reasons.package_id = items.package_id
+           AND reasons.sku_id = items.sku_id
           WHERE packages.status IN ('received', 'discrepancy')
             AND packages.confirmed_at >= ${from}
             AND NULLIF(BTRIM(items.sku_id), '') IS NOT NULL
-          GROUP BY packages.store_key, items.package_id, items.sku_id
+          GROUP BY
+            packages.store_key, items.package_id, items.sku_id,
+            packages.return_reasons, packages.buyer_remarks
+        ),
+        sku_product_returns AS (
+          SELECT
+            groups.*,
+            COUNT(*) OVER (PARTITION BY groups.package_id)::int AS package_sku_count,
+            EXISTS (
+              SELECT 1
+              FROM return_package_items unknown_items
+              WHERE unknown_items.package_id = groups.package_id
+                AND NULLIF(BTRIM(unknown_items.sku_id), '') IS NULL
+            ) AS package_has_unknown_sku,
+            groups.has_source_qty
+              AND groups.reason_claimed_qty > 0
+              AND groups.reason_claimed_qty = groups.source_product_units
+              AND groups.returned_product_units = groups.source_product_units
+              AS has_exact_line_reasons
+          FROM sku_product_return_groups groups
         ),
         product_returns AS (
           SELECT
@@ -3219,6 +3438,119 @@ export default async function handler(req, res) {
               AS returned_product_units
           FROM sku_product_returns
           GROUP BY store_key
+        ),
+        product_sku_returns AS (
+          SELECT
+            sku_id,
+            MIN(sku_code) AS sku_code,
+            COALESCE(SUM(returned_product_units) FILTER (WHERE has_source_qty), 0)::int
+              AS returned_qty,
+            jsonb_agg(DISTINCT store_name) AS stores,
+            COALESCE(SUM(returned_product_units) FILTER (
+              WHERE has_source_qty
+                AND (
+                  has_exact_line_reasons
+                  OR (
+                    reason_claimed_qty = 0
+                    AND package_sku_count = 1
+                    AND NOT package_has_unknown_sku
+                    AND (
+                      jsonb_array_length(COALESCE(return_reasons, '[]'::jsonb)) > 0
+                      OR jsonb_array_length(COALESCE(buyer_remarks, '[]'::jsonb)) > 0
+                    )
+                  )
+                )
+            ), 0)::int AS reason_attributed_qty,
+            COALESCE(jsonb_agg(
+              jsonb_build_object(
+                'returned_qty', returned_product_units,
+                'reason_details', CASE
+                  WHEN has_exact_line_reasons THEN reason_details
+                  ELSE '[]'::jsonb
+                END,
+                'return_reasons', CASE
+                  WHEN has_exact_line_reasons THEN '[]'::jsonb
+                  ELSE COALESCE(return_reasons, '[]'::jsonb)
+                END,
+                'buyer_remarks', CASE
+                  WHEN has_exact_line_reasons THEN '[]'::jsonb
+                  ELSE COALESCE(buyer_remarks, '[]'::jsonb)
+                END
+              ) ORDER BY package_id
+            ) FILTER (
+              WHERE has_source_qty
+                AND returned_product_units > 0
+                AND (
+                  has_exact_line_reasons
+                  OR (
+                    reason_claimed_qty = 0
+                    AND package_sku_count = 1
+                    AND NOT package_has_unknown_sku
+                    AND (
+                      jsonb_array_length(COALESCE(return_reasons, '[]'::jsonb)) > 0
+                      OR jsonb_array_length(COALESCE(buyer_remarks, '[]'::jsonb)) > 0
+                    )
+                  )
+                )
+            ), '[]'::jsonb) AS reason_events
+          FROM sku_product_returns
+          GROUP BY sku_id
+        ),
+        product_sku_code_values AS (
+          SELECT sku_id, NULLIF(BTRIM(sku_code), '') AS sku_code
+          FROM sales_items
+          WHERE NULLIF(BTRIM(sku_id), '') IS NOT NULL
+          UNION
+          SELECT sku_id, NULLIF(BTRIM(sku_code), '') AS sku_code
+          FROM sku_product_returns
+          WHERE NULLIF(BTRIM(sku_id), '') IS NOT NULL
+        ),
+        product_sku_codes AS (
+          SELECT
+            sku_id,
+            jsonb_agg(sku_code ORDER BY sku_code)
+              FILTER (WHERE sku_code IS NOT NULL) AS sku_codes
+          FROM product_sku_code_values
+          GROUP BY sku_id
+        ),
+        product_sku_keys AS (
+          SELECT sku_id FROM product_sku_sales
+          UNION
+          SELECT sku_id FROM product_sku_returns
+        ),
+        product_sku_output AS (
+          SELECT
+            keys.sku_id,
+            COALESCE(catalog.sku_code, sales.sku_code, returned.sku_code, '') AS sku_code,
+            COALESCE(codes.sku_codes, '[]'::jsonb) AS sku_codes,
+            COALESCE(sales.stores, returned.stores, '[]'::jsonb) AS stores,
+            CASE
+              WHEN catalog.physical_mapping_ready THEN catalog.components
+              ELSE COALESCE(sales.components, '[]'::jsonb)
+            END AS components,
+            CASE
+              WHEN catalog.physical_mapping_ready THEN jsonb_array_length(catalog.components)
+              WHEN jsonb_typeof(COALESCE(sales.components, '[]'::jsonb)) = 'array'
+              THEN jsonb_array_length(COALESCE(sales.components, '[]'::jsonb))
+              ELSE 0
+            END::int AS component_count,
+            COALESCE(sales.sold_qty, 0)::int AS sold_qty,
+            COALESCE(returned.returned_qty, 0)::int AS returned_qty,
+            COALESCE(returned.reason_attributed_qty, 0)::int AS reason_attributed_qty,
+            COALESCE(returned.reason_events, '[]'::jsonb) AS reason_events,
+            CASE WHEN COALESCE(sales.sold_qty, 0) > 0
+              THEN ROUND(
+                COALESCE(returned.returned_qty, 0)::numeric * 100 / sales.sold_qty,
+                2
+              )
+              ELSE NULL
+            END AS return_rate
+          FROM product_sku_keys keys
+          LEFT JOIN product_sku_sales sales USING (sku_id)
+          LEFT JOIN product_sku_returns returned USING (sku_id)
+          LEFT JOIN product_sku_codes codes USING (sku_id)
+          LEFT JOIN unique_catalog catalog USING (sku_id)
+          WHERE COALESCE(returned.returned_qty, 0) > 0
         ),
         store_keys AS (
           SELECT store_key FROM package_returns
@@ -3289,6 +3621,50 @@ export default async function handler(req, res) {
             AND packages.confirmed_at >= ${from}
           GROUP BY 1, 2, 3
         ),
+        physical_size_sales AS (
+          SELECT
+            size_key,
+            MIN(size) AS size,
+            COALESCE(SUM(sold_qty), 0)::int AS sold_qty
+          FROM physical_sku_sales
+          GROUP BY size_key
+        ),
+        physical_size_returns AS (
+          SELECT
+            size_key,
+            MIN(size) AS size,
+            COALESCE(SUM(returned_qty), 0)::int AS returned_qty,
+            COALESCE(SUM(restocked_qty), 0)::int AS restocked_qty
+          FROM physical_sku_returns
+          GROUP BY size_key
+        ),
+        physical_size_keys AS (
+          SELECT size_key FROM physical_size_sales
+          UNION
+          SELECT size_key FROM physical_size_returns
+        ),
+        physical_size_output AS (
+          SELECT
+            COALESCE(sales.size, returned.size) AS size,
+            COALESCE(sales.sold_qty, 0)::int AS sold_qty,
+            COALESCE(returned.returned_qty, 0)::int AS returned_qty,
+            COALESCE(returned.restocked_qty, 0)::int AS restocked_qty,
+            CASE
+              WHEN EXISTS (
+                SELECT 1 FROM product_sales WHERE uncovered_product_units > 0
+              ) THEN NULL
+              WHEN COALESCE(sales.sold_qty, 0) > 0
+              THEN ROUND(
+                COALESCE(returned.returned_qty, 0)::numeric * 100 / sales.sold_qty,
+                2
+              )
+              ELSE NULL
+            END AS return_rate
+          FROM physical_size_keys keys
+          LEFT JOIN physical_size_sales sales USING (size_key)
+          LEFT JOIN physical_size_returns returned USING (size_key)
+          WHERE COALESCE(returned.returned_qty, 0) > 0
+        ),
         physical_sku_keys AS (
           SELECT style_key, color_key, size_key FROM physical_sku_sales
           UNION
@@ -3339,13 +3715,50 @@ export default async function handler(req, res) {
               ORDER BY returned_qty DESC, style, color, size
               LIMIT 500
             ) physical_sku_output
-          ), '[]'::jsonb) AS rows
+          ), '[]'::jsonb) AS rows,
+          COALESCE((
+            SELECT jsonb_agg(to_jsonb(product_sku_output)
+              ORDER BY returned_qty DESC, return_rate DESC NULLS LAST, sku_id)
+            FROM (
+              SELECT * FROM product_sku_output
+              ORDER BY returned_qty DESC, return_rate DESC NULLS LAST, sku_id
+              LIMIT 500
+            ) product_sku_output
+          ), '[]'::jsonb) AS product_skus,
+          COALESCE((
+            SELECT jsonb_agg(to_jsonb(physical_size_output)
+              ORDER BY returned_qty DESC, size)
+            FROM physical_size_output
+          ), '[]'::jsonb) AS sizes
       `
+      const [
+        [summary],
+        [salesSummary],
+        [productSummary],
+        [analyticsBreakdown],
+      ] = await Promise.all([
+        summaryPromise,
+        salesSummaryPromise,
+        productSummaryPromise,
+        analyticsBreakdownPromise,
+      ])
+      summary.inventory_physical_units = Number(salesSummary?.sold_units || 0)
+      summary.returned_product_units = Number(productSummary?.returned_product_units || 0)
+      summary.return_product_groups = Number(productSummary?.return_product_groups || 0)
+      summary.covered_return_product_groups = Number(productSummary?.covered_return_product_groups || 0)
       const stores = Array.isArray(analyticsBreakdown?.stores)
         ? analyticsBreakdown.stores
         : []
       const rows = Array.isArray(analyticsBreakdown?.rows)
         ? analyticsBreakdown.rows
+        : []
+      const productSkus = enrichProductSkuReasonAnalytics(
+        Array.isArray(analyticsBreakdown?.product_skus)
+          ? analyticsBreakdown.product_skus
+          : [],
+      )
+      const sizes = Array.isArray(analyticsBreakdown?.sizes)
+        ? analyticsBreakdown.sizes
         : []
       const salesCoverage = stores.reduce((totals, store) => ({
         product_units: totals.product_units + Number(store.sold_product_units || 0),
@@ -3394,7 +3807,7 @@ export default async function handler(req, res) {
       summary.product_return_rate = summary.sold_product_units > 0
         ? summary.returned_product_units * 100 / summary.sold_product_units
         : null
-      return res.json({ days, summary, stores, rows })
+      return res.json({ days, summary, stores, rows, product_skus: productSkus, sizes })
     }
 
     return res.status(400).json({ error: `Unknown action: ${action}` })
