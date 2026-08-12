@@ -152,6 +152,7 @@ const DEMO_PACKAGE = {
   buyer_remarks: ['Demo four-piece return'],
   carrier: 'UPS',
   status: 'pending',
+  workflow_version: 1,
   expected_units: 4,
   actual_units: 0,
   items: [
@@ -195,14 +196,16 @@ function statusBadge(status) {
   if (status === 'discrepancy') return 'bg-amber-100 text-amber-800'
   if (status === 'needs_review') return 'bg-amber-100 text-amber-800'
   if (status === 'rejected') return 'bg-red-100 text-red-700'
+  if (status === 'cancelled') return 'bg-slate-100 text-slate-600'
   return 'bg-blue-100 text-blue-700'
 }
 
 function statusLabel(status) {
   if (status === 'received') return '✅ Received / Recibido'
-  if (status === 'discrepancy') return '⚠️ Review / Revisar'
+  if (status === 'discrepancy') return '⚠️ Received with discrepancy / Recibido con diferencia'
   if (status === 'needs_review') return '⚠️ Admin Review / Revisión'
   if (status === 'rejected') return '❌ Not ours / No es nuestro'
+  if (status === 'cancelled') return 'Cancelled / Cancelado'
   return 'Pending / Pendiente'
 }
 
@@ -461,6 +464,8 @@ export default function ReturnsReceiving() {
   const scannerRef = useRef(null)
   const confirmationRef = useRef(null)
   const analyticsRequestRef = useRef(0)
+  const lookupRequestRef = useRef({ id: 0, controller: null })
+  const reviewRequestRef = useRef({ loading: false, offset: 0, query: '' })
   const [tab, setTab] = useState('receive')
   const [tracking, setTracking] = useState('')
   const [loading, setLoading] = useState(false)
@@ -483,6 +488,8 @@ export default function ReturnsReceiving() {
   const [uploading, setUploading] = useState(false)
   const [stores, setStores] = useState([])
   const [storeLoadError, setStoreLoadError] = useState('')
+  const [storeStatsWarning, setStoreStatsWarning] = useState('')
+  const [storeLoading, setStoreLoading] = useState(false)
   const [storeName, setStoreName] = useState('')
   const [catalogFile, setCatalogFile] = useState(null)
   const [catalogParsed, setCatalogParsed] = useState(null)
@@ -517,6 +524,13 @@ export default function ReturnsReceiving() {
   const [reviewMappingModes, setReviewMappingModes] = useState({})
   const [reviewMappingLoading, setReviewMappingLoading] = useState(false)
   const [reviewSavingSku, setReviewSavingSku] = useState('')
+  const [reviewMappingError, setReviewMappingError] = useState('')
+  const [packageStoreKey, setPackageStoreKey] = useState('')
+  const [packageAction, setPackageAction] = useState('')
+  const [reviewSearch, setReviewSearch] = useState('')
+  const [reviewHasMore, setReviewHasMore] = useState(false)
+  const [reviewLoading, setReviewLoading] = useState(false)
+  const [remapSku, setRemapSku] = useState(null)
   const visibleProductSkuRows = useMemo(() => sortProductSkuRows(
     analytics?.product_skus,
     analyticsSkuSearch,
@@ -529,10 +543,17 @@ export default function ReturnsReceiving() {
     setAnalyticsLoadedAt(null)
     setAnalyticsLoading(false)
   }, [])
+  const isOpenReturn = ['pending', 'needs_review'].includes(pkg?.status)
   const relatedOrderItems = useMemo(
     () => (pkg?.related_orders || []).flatMap((order) => order.items || []),
     [pkg],
   )
+  const mappedPackageSkus = useMemo(() => [...new Map((pkg?.items || [])
+    .filter((item) => String(item.sku_id || '').trim())
+    .map((item) => [String(item.sku_id).trim(), {
+      skuId: String(item.sku_id).trim(),
+      skuCode: String(item.sku_code || '').trim(),
+    }])).values()], [pkg])
   const skuMappingCandidates = useMemo(() => {
     return collectReturnSkuMappingCandidates(
       pkg?.review_data?.unresolvedSkus || [],
@@ -541,14 +562,14 @@ export default function ReturnsReceiving() {
   }, [pkg, relatedOrderItems])
   const requiresManualAdminItems = Boolean(
     isAdmin
-    && pkg?.status === 'needs_review'
+    && isOpenReturn
     && pkg?.requires_item_resolution
     && !pkg?.review_data?.unresolvedSkus?.length
     && !relatedOrderItems.length,
   )
   const requiresOrderItemManualMappings = Boolean(
     isAdmin
-    && pkg?.status === 'needs_review'
+    && isOpenReturn
     && pkg?.requires_item_resolution
     && relatedOrderItems.some((item) => (
       !String(item.sku_id || '').trim()
@@ -587,45 +608,85 @@ export default function ReturnsReceiving() {
       setStoreName('Demo Store')
       return
     }
+    setStoreLoading(true)
     try {
-      const returnRes = await fetch(`${BASE}/returns?action=stores`, {
+      const returnRequest = fetch(`${BASE}/returns?action=stores`, {
         headers: headers(getToken),
-      })
-      const returnData = await returnRes.json().catch(() => ({}))
-      if (!returnRes.ok) throw new Error(returnData.error || 'Could not load return store data')
+      }).then(async (response) => ({
+        response,
+        data: await response.json().catch(() => ({})),
+      }))
+      const [analyticsResult, returnResult] = await Promise.allSettled([
+        isAdmin ? fetchAnalyticsStores() : Promise.resolve(null),
+        returnRequest,
+      ])
+      if (isAdmin && analyticsResult.status === 'rejected') throw analyticsResult.reason
+      const returnAvailable = returnResult.status === 'fulfilled' && returnResult.value.response.ok
+      if (!isAdmin && !returnAvailable) {
+        throw new Error(
+          returnResult.status === 'rejected'
+            ? returnResult.reason?.message
+            : returnResult.value.data.error || 'Could not load return Store data',
+        )
+      }
+      const returnStores = returnAvailable ? returnResult.value.data.stores || [] : []
       const nextStores = isAdmin
-        ? mergeAnalyticsReturnStores(
-            (await fetchAnalyticsStores()).stores || [],
-            returnData.stores || [],
-          )
-        : returnData.stores || []
+        ? mergeAnalyticsReturnStores(analyticsResult.value?.stores || [], returnStores)
+        : returnStores
       setStores(nextStores)
       setStoreLoadError('')
+      setStoreStatsWarning(returnAvailable
+        ? ''
+        : 'Canonical Stores loaded, but return counts could not refresh. Store choices remain safe to use.')
       setStoreName((current) => (
         nextStores.some((store) => store.store_name === current)
           ? current
           : nextStores[0]?.store_name || ''
       ))
     } catch (error) {
-      setStores([])
-      setStoreName('')
       setStoreLoadError(error.message || 'Could not load Analytics stores')
+      toast.error(
+        'Retry before making a new Store decision. Any previously validated Store list remains unchanged.',
+        'Stores Could Not Refresh',
+      )
+    } finally {
+      setStoreLoading(false)
     }
-  }, [demoMode, getToken, isAdmin])
+  }, [demoMode, getToken, isAdmin, toast])
 
-  const loadReviewPackages = useCallback(async () => {
+  const loadReviewPackages = useCallback(async ({ reset = true, query } = {}) => {
     if (!isAdmin || demoMode) return
-    const res = await fetch(`${BASE}/returns?action=list&status=needs_review`, {
-      headers: headers(getToken),
-    })
-    const data = await res.json().catch(() => ({}))
-    if (res.ok) setReviewPackages(data.packages || [])
-  }, [demoMode, getToken, isAdmin])
+    if (reviewRequestRef.current.loading) return
+    const search = query == null ? reviewRequestRef.current.query : String(query).trim()
+    const offset = reset ? 0 : reviewRequestRef.current.offset
+    reviewRequestRef.current = { loading: true, offset, query: search }
+    setReviewLoading(true)
+    try {
+      const params = new URLSearchParams({
+        action: 'list',
+        status: 'needs_review',
+        q: search,
+        limit: '50',
+        offset: String(offset),
+      })
+      const res = await fetch(`${BASE}/returns?${params}`, { headers: headers(getToken) })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not load Admin Review')
+      const rows = data.packages || []
+      setReviewPackages((current) => reset ? rows : [...current, ...rows])
+      setReviewHasMore(Boolean(data.has_more))
+      reviewRequestRef.current = { loading: false, offset: offset + rows.length, query: search }
+    } catch (error) {
+      reviewRequestRef.current.loading = false
+      toast.error(error.message, 'Admin Review Failed')
+    } finally {
+      setReviewLoading(false)
+    }
+  }, [demoMode, getToken, isAdmin, toast])
 
   useEffect(() => {
     loadRecent()
     loadStores()
-    loadReviewPackages()
     if (demoMode) {
       setPkg(DEMO_PACKAGE)
       setTracking(DEMO_PACKAGE.tracking_number)
@@ -636,7 +697,7 @@ export default function ReturnsReceiving() {
     }
     const frame = requestAnimationFrame(() => scannerRef.current?.focus())
     return () => cancelAnimationFrame(frame)
-  }, [demoMode, loadRecent, loadReviewPackages, loadStores])
+  }, [demoMode, loadRecent, loadStores])
 
   const lookup = useCallback(async (value = tracking, orderStore = '') => {
     const query = String(value || '').trim()
@@ -652,6 +713,10 @@ export default function ReturnsReceiving() {
       setRemark('')
       return
     }
+    lookupRequestRef.current.controller?.abort()
+    const controller = new AbortController()
+    const requestId = lookupRequestRef.current.id + 1
+    lookupRequestRef.current = { id: requestId, controller }
     setLoading(true)
     setPkg(null)
     setOrderOnly(null)
@@ -660,22 +725,26 @@ export default function ReturnsReceiving() {
     setManualStoreKey('')
     setAdminSelections({})
     setAdminOrderItemTargets({})
+    setRemapSku(null)
     setAdminManualItems([{ style: '', color: '', size: '', qty: 1 }])
     setCounted(false)
     setRemark('')
     try {
       const res = await fetch(`${BASE}/returns?action=lookup&tracking=${encodeURIComponent(query)}`, {
         headers: headers(getToken),
+        signal: controller.signal,
       })
       const data = await res.json().catch(() => ({}))
+      if (lookupRequestRef.current.id !== requestId) return
       if (!res.ok) {
         const orderRes = await fetch(
           `${BASE}/returns?action=order-lookup&order=${encodeURIComponent(query)}${
             orderStore ? `&store=${encodeURIComponent(orderStore)}` : ''
           }`,
-          { headers: headers(getToken) },
+          { headers: headers(getToken), signal: controller.signal },
         )
         const orderData = await orderRes.json().catch(() => ({}))
+        if (lookupRequestRef.current.id !== requestId) return
         if (orderRes.status === 409 && Array.isArray(orderData.stores)) {
           setOrderChoices(orderData.stores)
           setTracking(query)
@@ -693,6 +762,7 @@ export default function ReturnsReceiving() {
       }
       const next = data.package
       setPkg(next)
+      setPackageStoreKey('')
       setTracking(next.tracking_number)
       const workerVerified = next.review_data?.workerInspection?.status === 'all_good'
       setCounts(Object.fromEntries(
@@ -711,17 +781,27 @@ export default function ReturnsReceiving() {
       ))
       setRemark(next.remark || '')
     } catch (error) {
+      if (error.name === 'AbortError' || lookupRequestRef.current.id !== requestId) return
       toast.error(error.message, 'Tracking or Order Not Found')
       setTracking('')
       requestAnimationFrame(() => scannerRef.current?.focus())
     } finally {
-      setLoading(false)
+      if (lookupRequestRef.current.id === requestId) {
+        lookupRequestRef.current.controller = null
+        setLoading(false)
+      }
     }
   }, [demoMode, getToken, toast, tracking])
+
+  useEffect(() => () => lookupRequestRef.current.controller?.abort(), [])
 
   const createManualReturn = async () => {
     const selectedStore = stores.find((store) => store.store_key === manualStoreKey)
     if (!manualTrackingCandidate || !selectedStore || loading) return
+    if (!window.confirm(
+      `Create manual return ${manualTrackingCandidate} for Store ${selectedStore.store_name}?\n\n` +
+      'No PO or SKU will be invented. Admin must verify the physical products before inventory can be added.'
+    )) return
     setLoading(true)
     try {
       const res = await fetch(`${BASE}/returns?action=manual-create`, {
@@ -765,6 +845,7 @@ export default function ReturnsReceiving() {
     setReviewMappingModes({})
     setAdminManualItems([{ style: '', color: '', size: '', qty: 1 }])
     setAdminOrderItemTargets({})
+    setRemapSku(null)
     if (!isAdmin || demoMode) {
       setReviewCatalogRows([])
       setReviewInventoryRows([])
@@ -778,6 +859,7 @@ export default function ReturnsReceiving() {
       setReviewCatalogRows([])
       setReviewAliases({})
       setReviewMappingLoading(true)
+      setReviewMappingError('')
       fetch(`${BASE}/inventory-balance?action=list`, { headers: headers(getToken) })
         .then(async (inventoryRes) => {
           const inventoryData = await inventoryRes.json().catch(() => ({}))
@@ -791,7 +873,10 @@ export default function ReturnsReceiving() {
             SIZE: row.Size,
           })))
         }).catch((error) => {
-          if (active) toast.error(error.message, 'Could Not Load Inventory Choices')
+          if (active) {
+            setReviewMappingError(error.message || 'Could not load inventory choices')
+            toast.error(error.message, 'Could Not Load Inventory Choices')
+          }
         }).finally(() => {
           if (active) setReviewMappingLoading(false)
         })
@@ -808,6 +893,7 @@ export default function ReturnsReceiving() {
 
     let active = true
     setReviewMappingLoading(true)
+    setReviewMappingError('')
     Promise.all([
       fetch(`${BASE}/inventory-balance?action=list`, { headers: headers(getToken) }),
       fetch(`${BASE}/auto-deduct?action=aliases`, { headers: headers(getToken) }),
@@ -848,6 +934,7 @@ export default function ReturnsReceiving() {
       if (active) {
         setReviewCatalogRows(manualReturnSkuMappingRows(skuMappingCandidates))
         setReviewInventoryRows([])
+        setReviewMappingError(error.message || 'Could not load inventory choices')
         toast.error(error.message, 'Could Not Load Inventory Choices')
       }
     }).finally(() => {
@@ -863,6 +950,34 @@ export default function ReturnsReceiving() {
     skuMappingCandidates,
     toast,
   ])
+
+  const retryReviewMapping = () => {
+    setReviewMappingError('')
+    setReviewInventoryRows([])
+    lookup(pkg?.tracking_number)
+  }
+
+  const retrySkuRemapInventory = async () => {
+    if (!remapSku || reviewMappingLoading) return
+    setReviewInventoryRows([])
+    setReviewMappingError('')
+    setReviewMappingLoading(true)
+    try {
+      const res = await fetch(`${BASE}/inventory-balance?action=list`, { headers: headers(getToken) })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not load inventory targets')
+      setReviewInventoryRows((data.rows || []).map((row) => ({
+        STYLE: row.Style,
+        COLOR: row.Color,
+        SIZE: row.Size,
+      })))
+    } catch (error) {
+      setReviewMappingError(error.message || 'Could not load inventory choices')
+      toast.error(error.message, 'Could Not Load Inventory Choices')
+    } finally {
+      setReviewMappingLoading(false)
+    }
+  }
 
   const expectedUnits = Number(pkg?.expected_units || 0)
   const productGroups = useMemo(() => groupReturnProducts(
@@ -927,6 +1042,7 @@ export default function ReturnsReceiving() {
         headers: headers(getToken, true),
         body: JSON.stringify({
           tracking: pkg.tracking_number,
+          workflowVersion: pkg.workflow_version,
           items: pkg.items.map((item) => ({
             id: item.id,
             actualQty: Number(effectiveCounts[item.id]?.good || 0)
@@ -968,6 +1084,7 @@ export default function ReturnsReceiving() {
         headers: headers(getToken, true),
         body: JSON.stringify({
           tracking: pkg.tracking_number,
+          workflowVersion: pkg.workflow_version,
           reason: reason || (pkg.status === 'pending' ? 'worker_flagged' : pkg.review_reason),
           workerChecked,
         }),
@@ -995,15 +1112,137 @@ export default function ReturnsReceiving() {
     }
   }
 
-  const resolveAdminItems = async () => {
-    if (!isAdmin || !pkg?.requires_item_resolution || loading) return
-    const selections = Object.entries(adminSelections)
+  const reassignPackageStore = async () => {
+    const selectedStore = stores.find((store) => store.store_key === packageStoreKey)
+    if (!pkg || !isAdmin || !selectedStore || packageAction) return
+    if (!window.confirm(
+      `Change this return from ${pkg.store_name || 'Unassigned'} to ${selectedStore.store_name}?\n\n` +
+      'The package will return to Admin Review. Verify its PO and products again before receiving inventory.'
+    )) return
+    setPackageAction('store')
+    try {
+      const res = await fetch(`${BASE}/returns?action=reassign-store`, {
+        method: 'POST',
+        headers: headers(getToken, true),
+        body: JSON.stringify({
+          tracking: pkg.tracking_number,
+          workflowVersion: pkg.workflow_version,
+          storeName: selectedStore.store_name,
+          remark,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not change this return Store')
+      const next = data.package
+      setPkg(next)
+      setPackageStoreKey('')
+      setCounts(Object.fromEntries((next.items || []).map((item) => [
+        item.id,
+        { good: 0, damaged: 0, notOurs: 0 },
+      ])))
+      setCounted(false)
+      toast.success('Store changed. Verify the PO and returned products before receiving.', 'Store Updated')
+      await loadReviewPackages({ reset: true })
+    } catch (error) {
+      toast.error(error.message, 'Store Change Failed')
+    } finally {
+      setPackageAction('')
+    }
+  }
+
+  const closePackage = async (outcome) => {
+    if (!pkg || !isAdmin || packageAction) return
+    const notOurs = outcome === 'not_ours'
+    const confirmed = window.confirm(notOurs
+      ? 'Mark this entire package as Not Ours?\n\nNo inventory will be added. This closes the package and cannot be undone here.'
+      : 'Cancel this return package?\n\nNo inventory will be added. This closes the package and removes it from Admin Review.')
+    if (!confirmed) return
+    setPackageAction(outcome)
+    try {
+      const res = await fetch(`${BASE}/returns?action=close-package`, {
+        method: 'POST',
+        headers: headers(getToken, true),
+        body: JSON.stringify({
+          tracking: pkg.tracking_number,
+          workflowVersion: pkg.workflow_version,
+          outcome,
+          remark,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not close this return package')
+      toast.success(
+        notOurs ? 'Closed as Not Ours. No inventory was added.' : 'Return package cancelled.',
+        notOurs ? 'Not Ours' : 'Package Cancelled',
+      )
+      setPkg(null)
+      setTracking('')
+      setCounts({})
+      setCounted(false)
+      setRemark('')
+      await Promise.all([loadRecent(), loadReviewPackages({ reset: true })])
+      requestAnimationFrame(() => scannerRef.current?.focus())
+    } catch (error) {
+      toast.error(error.message, 'Could Not Close Package')
+    } finally {
+      setPackageAction('')
+    }
+  }
+
+  const reopenPackageItems = async () => {
+    if (!pkg || !isAdmin || packageAction) return
+    if (!window.confirm(
+      'Edit this package’s products or inventory mapping?\n\n' +
+      'The current items remain visible for audit until you explicitly keep or replace them.'
+    )) return
+    setPackageAction('reopen')
+    try {
+      const res = await fetch(`${BASE}/returns?action=reopen-items`, {
+        method: 'POST',
+        headers: headers(getToken, true),
+        body: JSON.stringify({
+          tracking: pkg.tracking_number,
+          workflowVersion: pkg.workflow_version,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not reopen product selection')
+      const next = data.package
+      setPkg(next)
+      setCounts(Object.fromEntries((next.items || []).map((item) => [
+        item.id,
+        { good: 0, damaged: 0, notOurs: 0 },
+      ])))
+      setAdminSelections({})
+      setAdminOrderItemTargets({})
+      setCounted(false)
+      toast.success('Choose whether to keep the identified products or replace them.', 'Product Editing Opened')
+      await loadReviewPackages({ reset: true })
+    } catch (error) {
+      toast.error(error.message, 'Could Not Edit Products')
+    } finally {
+      setPackageAction('')
+    }
+  }
+
+  const resolveAdminItems = async (mode = 'replace') => {
+    if (!isAdmin || !isOpenReturn || !pkg?.requires_item_resolution || loading) return
+    const keepExisting = mode === 'keep_existing'
+    if (keepExisting && !pkg.items?.length) {
+      toast.error('There are no identified products to keep.', 'Products Required')
+      return
+    }
+    if (keepExisting && !window.confirm(
+      'Keep the currently identified products and quantities?\n\n' +
+      'Confirm that the listed SKU/style/size rows belong to this physical return.'
+    )) return
+    const selections = keepExisting ? [] : Object.entries(adminSelections)
       .map(([orderItemId, quantity]) => ({
         orderItemId: Number(orderItemId),
         quantity: Number(quantity),
       }))
       .filter((selection) => selection.quantity > 0)
-    const manualItems = relatedOrderItems.length ? [] : adminManualItems.map((item) => ({
+    const manualItems = keepExisting || relatedOrderItems.length ? [] : adminManualItems.map((item) => ({
       ...item,
       qty: Number(item.qty),
     }))
@@ -1033,7 +1272,7 @@ export default function ReturnsReceiving() {
       }
       manualOrderItems.push({ orderItemId: selection.orderItemId, components })
     }
-    if (!relatedOrderItems.length && manualItems.some((item) => (
+    if (!keepExisting && !relatedOrderItems.length && manualItems.some((item) => (
       !item.style
       || !item.color
       || !item.size
@@ -1043,6 +1282,10 @@ export default function ReturnsReceiving() {
       toast.error('Choose a complete inventory item and a positive whole-number quantity for every row.', 'Check Manual Selection')
       return
     }
+    if (!keepExisting && pkg.items?.length && !window.confirm(
+      'Replace the currently identified products with this selection?\n\n' +
+      'The old rows will be removed from this package. Check every SKU, style, size, and quantity first.'
+    )) return
     setLoading(true)
     try {
       const res = await fetch(`${BASE}/returns?action=resolve-items`, {
@@ -1050,6 +1293,8 @@ export default function ReturnsReceiving() {
         headers: headers(getToken, true),
         body: JSON.stringify({
           tracking: pkg.tracking_number,
+          workflowVersion: pkg.workflow_version,
+          mode,
           selections,
           manualItems,
           manualOrderItems,
@@ -1177,10 +1422,37 @@ export default function ReturnsReceiving() {
     ))
   }
 
+  const undoManifestSkip = (trackingKey) => {
+    applyManifestDecisions({
+      ...manifestDecisions,
+      skippedTrackings: manifestDecisions.skippedTrackings.filter((item) => item !== trackingKey),
+    })
+  }
+
+  const editManifestStoreDecision = (trackingKey) => {
+    if (!window.confirm(`Edit the selected Store for ${trackingKey}? The package will become unresolved again until you choose one.`)) return
+    const storeByTracking = { ...manifestDecisions.storeByTracking }
+    delete storeByTracking[trackingKey]
+    applyManifestDecisions({ ...manifestDecisions, storeByTracking })
+  }
+
+  const editManifestTrackingDecision = (excelRow) => {
+    if (!window.confirm(`Edit the manual Tracking for Excel row ${excelRow}? Its current Store decision will also be removed.`)) return
+    const trackingByExcelRow = { ...(manifestDecisions.trackingByExcelRow || {}) }
+    const trackingKey = normalizeTracking(trackingByExcelRow[excelRow])
+    delete trackingByExcelRow[excelRow]
+    const storeByTracking = { ...manifestDecisions.storeByTracking }
+    if (trackingKey) delete storeByTracking[trackingKey]
+    applyManifestDecisions({ ...manifestDecisions, trackingByExcelRow, storeByTracking })
+  }
+
   const chooseManifestStore = (trackingKey) => {
     const selectedKey = manifestChoiceDrafts[trackingKey]?.storeKey
     const selectedStore = stores.find((store) => store.store_key === selectedKey)
     if (!selectedStore) return
+    if (!window.confirm(
+      `Use Store ${selectedStore.store_name} for return tracking ${trackingKey}?\n\nVerify this Store before upload; it controls PO lookup and inventory review.`
+    )) return
     applyManifestDecisions({
       ...manifestDecisions,
       storeByTracking: {
@@ -1191,6 +1463,9 @@ export default function ReturnsReceiving() {
   }
 
   const skipManifestTracking = (trackingKey) => {
+    if (!window.confirm(
+      `Skip return tracking ${trackingKey}?\n\nIt will not be uploaded. You can undo this decision before upload.`
+    )) return
     applyManifestDecisions({
       ...manifestDecisions,
       skippedTrackings: [...new Set([
@@ -1207,6 +1482,9 @@ export default function ReturnsReceiving() {
     const trackingKey = normalizeTracking(trackingNumber)
     const selectedStore = stores.find((store) => store.store_key === draft.storeKey)
     if (!trackingKey || !selectedStore) return
+    if (!window.confirm(
+      `Add Tracking ${trackingNumber} and Store ${selectedStore.store_name} to Excel row ${excelRow}?`
+    )) return
     applyManifestDecisions({
       ...manifestDecisions,
       trackingByExcelRow: {
@@ -1226,6 +1504,12 @@ export default function ReturnsReceiving() {
       || parsed?.pendingUploadDecisions?.length
       || uploading
     ) return
+    const uploadCount = Number(parsed.packages?.length || 0) + Number(parsed.reviewPackages?.length || 0)
+    if (!window.confirm(
+      `Upload ${uploadCount} return package(s)?\n\n` +
+      `${Number(parsed.reviewPackages?.length || 0)} will require Admin Review. ` +
+      'Only physically received and confirmed packages will later count as returns.'
+    )) return
     setUploading(true)
     try {
       const res = await fetch(`${BASE}/returns?action=import`, {
@@ -1364,6 +1648,7 @@ export default function ReturnsReceiving() {
         headers: headers(getToken, true),
         body: JSON.stringify({
           tracking: pkg.tracking_number,
+          workflowVersion: pkg.workflow_version,
           skuId: row.skuId,
           components,
         }),
@@ -1414,6 +1699,107 @@ export default function ReturnsReceiving() {
       await Promise.all([loadReviewPackages(), loadStores()])
     } catch (error) {
       toast.error(error.message, 'Could Not Save SKU Mapping')
+    } finally {
+      setReviewSavingSku('')
+    }
+  }
+
+  const startSkuRemap = async (sku) => {
+    if (!pkg || !isAdmin || reviewMappingLoading) return
+    const matchingItems = (pkg.items || []).filter((item) => item.sku_id === sku.skuId)
+    const initialTargets = matchingItems.map((item) => {
+      const sourceQty = Number(item.source_qty || 0)
+      const expectedQty = Number(item.expected_qty || 0)
+      return {
+        style: item.style,
+        color: item.color,
+        size: item.size,
+        qty: sourceQty > 0 && expectedQty % sourceQty === 0 ? expectedQty / sourceQty : 1,
+      }
+    })
+    setRemapSku(sku)
+    setReviewManualTargets((current) => ({
+      ...current,
+      [sku.skuId]: initialTargets.length
+        ? initialTargets
+        : [{ style: '', color: '', size: '', qty: 1 }],
+    }))
+    if (reviewInventoryRows.length) return
+    setReviewMappingLoading(true)
+    setReviewMappingError('')
+    try {
+      const res = await fetch(`${BASE}/inventory-balance?action=list`, { headers: headers(getToken) })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not load inventory targets')
+      setReviewInventoryRows((data.rows || []).map((row) => ({
+        STYLE: row.Style,
+        COLOR: row.Color,
+        SIZE: row.Size,
+      })))
+    } catch (error) {
+      setReviewMappingError(error.message || 'Could not load inventory choices')
+      toast.error(error.message, 'Could Not Load Inventory Choices')
+    } finally {
+      setReviewMappingLoading(false)
+    }
+  }
+
+  const saveRemappedSku = async () => {
+    if (!pkg || !remapSku || reviewSavingSku) return
+    const components = reviewManualTargets[remapSku.skuId] || []
+    if (!components.length || components.some((component) => (
+      !component.style
+      || !component.color
+      || !component.size
+      || !Number.isSafeInteger(Number(component.qty))
+      || Number(component.qty) <= 0
+    ))) {
+      toast.error('Choose complete style, color, size, and whole-number quantity for every piece.', 'Mapping Required')
+      return
+    }
+    if (!window.confirm(
+      `Replace the remembered inventory mapping for SKU ID ${remapSku.skuId}?\n\n` +
+      'This updates this open package and may update other waiting packages with the same SKU. Completed returns will not change.'
+    )) return
+    setReviewSavingSku(remapSku.skuId)
+    try {
+      const res = await fetch(`${BASE}/returns?action=remap-sku`, {
+        method: 'POST',
+        headers: headers(getToken, true),
+        body: JSON.stringify({
+          tracking: pkg.tracking_number,
+          workflowVersion: pkg.workflow_version,
+          skuId: remapSku.skuId,
+          skuCode: remapSku.skuCode,
+          components,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not replace this SKU mapping')
+      const next = data.package
+      setPkg(next)
+      const workerVerified = next.review_data?.workerInspection?.status === 'all_good'
+      setCounts(Object.fromEntries((next.items || []).map((item) => [
+        item.id,
+        workerVerified
+          ? { good: Number(item.expected_qty), damaged: 0, notOurs: 0 }
+          : { good: 0, damaged: 0, notOurs: 0 },
+      ])))
+      setRemapSku(null)
+      setReviewManualTargets((current) => {
+        const updated = { ...current }
+        delete updated[remapSku.skuId]
+        return updated
+      })
+      setCounted(false)
+      toast.success(
+        `Mapping replaced${data.reused_packages ? ` · ${data.reused_packages} waiting package(s) updated` : ''}.`,
+        'SKU Mapping Updated',
+      )
+      if (data.reuse_warning) toast.info(data.reuse_warning, 'Older Reviews')
+      await Promise.all([loadReviewPackages({ reset: true }), loadStores()])
+    } catch (error) {
+      toast.error(error.message, 'Could Not Replace SKU Mapping')
     } finally {
       setReviewSavingSku('')
     }
@@ -1653,6 +2039,36 @@ export default function ReturnsReceiving() {
         </div>
       </div>
 
+      {storeLoadError && (
+        <div className="flex flex-col gap-3 rounded-xl border-2 border-red-200 bg-red-50 p-4 text-sm text-red-900 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <p className="font-bold">Validated Analytics Stores could not refresh</p>
+            <p className="mt-1 text-xs text-red-700">
+              {storeLoadError}. {stores.length
+                ? 'The last successfully validated Store list is still available.'
+                : 'No Store decision can be made safely until this succeeds.'}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={loadStores}
+            disabled={storeLoading}
+            className="btn-secondary min-h-11 shrink-0 justify-center disabled:opacity-50"
+          >
+            <RefreshCw className={`h-4 w-4 ${storeLoading ? 'animate-spin' : ''}`} />
+            Retry Stores
+          </button>
+        </div>
+      )}
+      {storeStatsWarning && !storeLoadError && (
+        <div className="flex flex-col gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900 sm:flex-row sm:items-center sm:justify-between">
+          <p>{storeStatsWarning}</p>
+          <button type="button" onClick={loadStores} disabled={storeLoading} className="text-xs font-bold underline disabled:opacity-40">
+            Retry Store statistics
+          </button>
+        </div>
+      )}
+
       {tab === 'receive' && (
         <>
           <form
@@ -1823,6 +2239,164 @@ export default function ReturnsReceiving() {
                 )}
               </div>
 
+              {isAdmin && ['pending', 'needs_review'].includes(pkg.status) && (
+                <div className="border-b border-slate-200 bg-slate-50 px-4 py-4 sm:px-5">
+                  <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+                    <div className="min-w-0 flex-1">
+                      <p className="text-xs font-bold uppercase tracking-wide text-slate-500">Admin recovery actions</p>
+                      <div className="mt-2 flex flex-col gap-2 sm:flex-row">
+                        <select
+                          aria-label="New Store for this return"
+                          value={packageStoreKey}
+                          onChange={(event) => setPackageStoreKey(event.target.value)}
+                          disabled={storeLoading || !stores.length}
+                          className="h-11 min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-3 text-sm disabled:bg-slate-100 sm:max-w-xs"
+                        >
+                          <option value="">Change Store / 更改店铺</option>
+                          {stores.map((store) => (
+                            <option key={store.store_key} value={store.store_key}>{store.store_name}</option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          onClick={reassignPackageStore}
+                          disabled={
+                            !packageStoreKey
+                            || packageAction
+                            || stores.find((store) => store.store_key === packageStoreKey)?.store_name === pkg.store_name
+                          }
+                          className="btn-secondary min-h-11 justify-center disabled:opacity-40"
+                        >
+                          {packageAction === 'store' && <RefreshCw className="h-4 w-4 animate-spin" />}
+                          Use New Store
+                        </button>
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {pkg.status === 'pending' && pkg.requires_item_resolution && (
+                        <button
+                          type="button"
+                          onClick={() => flagForAdmin({ reason: 'admin_opened_mapping_review' })}
+                          disabled={loading || packageAction}
+                          className="min-h-11 rounded-lg border border-amber-300 bg-amber-50 px-3 text-sm font-bold text-amber-800 disabled:opacity-40"
+                        >
+                          Send to Admin Mapping
+                        </button>
+                      )}
+                      {!pkg.requires_item_resolution && (
+                        <button
+                          type="button"
+                          onClick={reopenPackageItems}
+                          disabled={Boolean(packageAction)}
+                          className="min-h-11 rounded-lg border border-blue-300 bg-blue-50 px-3 text-sm font-bold text-blue-800 disabled:opacity-40"
+                        >
+                          {packageAction === 'reopen' ? 'Opening…' : 'Edit products / inventory mapping'}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => closePackage('not_ours')}
+                        disabled={Boolean(packageAction)}
+                        className="min-h-11 rounded-lg border border-red-300 bg-red-50 px-3 text-sm font-bold text-red-800 disabled:opacity-40"
+                      >
+                        Mark entire package Not Ours
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => closePackage('cancelled')}
+                        disabled={Boolean(packageAction)}
+                        className="min-h-11 rounded-lg border border-slate-300 bg-white px-3 text-sm font-bold text-slate-700 disabled:opacity-40"
+                      >
+                        {packageAction === 'cancelled' ? 'Cancelling…' : 'Cancel package'}
+                      </button>
+                    </div>
+                  </div>
+                  {storeLoadError && !stores.length && (
+                    <p className="mt-2 text-xs font-semibold text-red-700">
+                      Store changes are blocked until “Retry Stores” succeeds. Product review and safe package closure remain available.
+                    </p>
+                  )}
+                  {mappedPackageSkus.length > 0 && (
+                    <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-slate-200 pt-3">
+                      <span className="text-xs font-semibold text-slate-500">Correct a remembered SKU mapping:</span>
+                      {mappedPackageSkus.map((sku) => (
+                        <button
+                          key={sku.skuId}
+                          type="button"
+                          onClick={() => startSkuRemap(sku)}
+                          disabled={reviewMappingLoading || Boolean(reviewSavingSku)}
+                          className="rounded-lg border border-violet-200 bg-white px-2.5 py-1.5 text-xs font-bold text-violet-700 disabled:opacity-40"
+                        >
+                          Remap {sku.skuCode || sku.skuId}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {isAdmin && remapSku && ['pending', 'needs_review'].includes(pkg.status) && (
+                <div className="border-b border-violet-200 bg-violet-50 px-4 py-4 sm:px-5">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="font-bold text-violet-950">Replace SKU mapping: {remapSku.skuCode || remapSku.skuId}</p>
+                      <p className="mt-1 text-xs text-violet-800">SKU ID {remapSku.skuId} · one row per physical inventory piece in one sold product.</p>
+                    </div>
+                    <button type="button" onClick={() => setRemapSku(null)} className="text-violet-700" aria-label="Close SKU remapping">
+                      <XCircle className="h-5 w-5" />
+                    </button>
+                  </div>
+                  {reviewMappingLoading ? (
+                    <p className="mt-3 flex items-center gap-2 text-sm text-violet-800"><RefreshCw className="h-4 w-4 animate-spin" /> Loading inventory choices</p>
+                  ) : reviewMappingError ? (
+                    <div className="mt-3 rounded-xl border border-red-200 bg-white p-3 text-sm text-red-800">
+                      <p>{reviewMappingError}</p>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        <button type="button" onClick={retrySkuRemapInventory} className="btn-secondary min-h-10 text-xs">Retry inventory choices</button>
+                        <a href="/stock" className="btn-secondary min-h-10 text-xs">Open Stock Management</a>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      {!reviewInventoryRows.length && (
+                        <div className="mt-3 rounded-xl border border-red-200 bg-white p-3 text-sm text-red-800">
+                          No inventory targets are available. <a href="/stock" className="font-bold underline">Open Stock Management</a>, then retry inventory choices.
+                          <button type="button" onClick={retrySkuRemapInventory} className="mt-2 block font-bold underline">Retry inventory choices</button>
+                        </div>
+                      )}
+                      <div className="mt-3 space-y-2">
+                        {(reviewManualTargets[remapSku.skuId] || []).map((target, index, targets) => {
+                          const styleOptions = [...new Set(reviewInventoryRows.map((item) => item.STYLE))].sort()
+                          const colorOptions = [...new Set(reviewInventoryRows.filter((item) => item.STYLE === target.style).map((item) => item.COLOR))].sort()
+                          const sizeOptions = [...new Set(reviewInventoryRows.filter((item) => item.STYLE === target.style && item.COLOR === target.color).map((item) => item.SIZE))].sort()
+                          const updateTarget = (changes) => setReviewManualTargets((current) => ({
+                            ...current,
+                            [remapSku.skuId]: targets.map((item, targetIndex) => targetIndex === index ? { ...item, ...changes } : item),
+                          }))
+                          return (
+                            <div key={`${remapSku.skuId}-remap-${index}`} className="grid gap-2 rounded-xl border border-violet-200 bg-white p-3 sm:grid-cols-[1fr_1fr_1fr_7rem_auto]">
+                              <SearchableStyleInput id={`${remapSku.skuId}-remap-style-${index}`} label="Inventory style" value={target.style} options={styleOptions} onChange={(style) => updateTarget({ style, color: '', size: '' })} />
+                              <select aria-label="Inventory color" value={target.color} disabled={!target.style} onChange={(event) => updateTarget({ color: event.target.value, size: '' })} className="h-11 rounded-lg border border-slate-300 bg-white px-2 text-sm disabled:bg-slate-100">
+                                <option value="">Color</option>{colorOptions.map((color) => <option key={color} value={color}>{color}</option>)}
+                              </select>
+                              <select aria-label="Inventory size" value={target.size} disabled={!target.color} onChange={(event) => updateTarget({ size: event.target.value })} className="h-11 rounded-lg border border-slate-300 bg-white px-2 text-sm disabled:bg-slate-100">
+                                <option value="">Size</option>{sizeOptions.map((size) => <option key={size} value={size}>{size}</option>)}
+                              </select>
+                              <input aria-label="Pieces per product" type="number" min="1" max="9999" step="1" value={target.qty} onChange={(event) => updateTarget({ qty: Number(event.target.value) })} className="h-11 rounded-lg border border-slate-300 bg-white px-2 text-sm" />
+                              <button type="button" disabled={targets.length === 1} onClick={() => setReviewManualTargets((current) => ({ ...current, [remapSku.skuId]: targets.filter((_, targetIndex) => targetIndex !== index) }))} className="h-11 rounded-lg border border-red-200 px-3 text-xs font-bold text-red-700 disabled:opacity-30">Remove</button>
+                            </div>
+                          )
+                        })}
+                      </div>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <button type="button" onClick={() => setReviewManualTargets((current) => ({ ...current, [remapSku.skuId]: [...(current[remapSku.skuId] || []), { style: '', color: '', size: '', qty: 1 }] }))} className="btn-secondary min-h-11"><Plus className="h-4 w-4" /> Add set piece</button>
+                        <button type="button" onClick={saveRemappedSku} disabled={Boolean(reviewSavingSku) || !reviewInventoryRows.length} className="btn-primary min-h-11 disabled:opacity-40">{reviewSavingSku ? <RefreshCw className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />} Confirm replacement</button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+
               {pkg.related_orders?.length > 0 && (
                 <div className="space-y-3 border-b border-slate-200 bg-white px-4 py-4 sm:px-5">
                   <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">
@@ -1844,7 +2418,7 @@ export default function ReturnsReceiving() {
                 </div>
               )}
 
-              {isAdmin && pkg.status === 'needs_review' && skuMappingCandidates.length > 0 && (
+              {isAdmin && isOpenReturn && skuMappingCandidates.length > 0 && (
                 <div className="border-b border-amber-200 bg-amber-50 px-4 py-4 sm:px-5">
                   <div className="flex items-start gap-2">
                     <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-700" />
@@ -1866,6 +2440,33 @@ export default function ReturnsReceiving() {
                     </div>
                   ) : (
                     <div className="mt-4 space-y-4">
+                      {reviewMappingError && (
+                        <div className="rounded-xl border-2 border-red-200 bg-red-50 p-3 text-sm text-red-800">
+                          <p className="font-bold">Inventory choices could not load</p>
+                          <p className="mt-1 text-xs">{reviewMappingError}</p>
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            <button type="button" onClick={retryReviewMapping} className="btn-secondary min-h-10 text-xs">
+                              <RefreshCw className="h-4 w-4" /> Retry inventory choices
+                            </button>
+                            <a href="/stock" className="btn-secondary min-h-10 text-xs">Open Stock Management</a>
+                          </div>
+                        </div>
+                      )}
+                      {!reviewMappingError && !reviewInventoryRows.length && (
+                        <div className="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+                          <p className="font-bold">No inventory targets are available for mapping.</p>
+                          <div className="mt-2 flex flex-wrap gap-2">
+                            <a href="/stock" className="btn-secondary min-h-10 text-xs">Open Stock Management</a>
+                            <button type="button" onClick={retryReviewMapping} className="btn-secondary min-h-10 text-xs">Retry inventory choices</button>
+                          </div>
+                        </div>
+                      )}
+                      {!reviewCatalogRows.length && (
+                        <div className="rounded-xl border border-red-200 bg-white p-3 text-sm text-red-800">
+                          Mapping choices could not be prepared. Retry, or cancel the package without changing inventory.
+                          <button type="button" onClick={retryReviewMapping} className="mt-2 block font-bold underline">Retry mapping</button>
+                        </div>
+                      )}
                       {reviewCatalogRows.map((row) => {
                         const canMapSources = row.sourceComponents?.length
                           && row.sourceComponents.every((source) => source.size)
@@ -2162,14 +2763,48 @@ export default function ReturnsReceiving() {
                 </div>
               )}
 
-              {isAdmin && pkg.status === 'needs_review' && pkg.requires_item_resolution
+              {isAdmin && isOpenReturn && pkg.requires_item_resolution
                 && !pkg.review_data?.unresolvedSkus?.length && (
                 <div className="border-b border-amber-200 bg-amber-50 px-4 py-4 sm:px-5">
+                  {reviewMappingError && (
+                    <div className="mb-3 rounded-xl border-2 border-red-200 bg-red-50 p-3 text-sm text-red-800">
+                      <p className="font-bold">Inventory choices could not load</p>
+                      <p className="mt-1 text-xs">{reviewMappingError}</p>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        <button type="button" onClick={retryReviewMapping} className="btn-secondary min-h-10 text-xs">
+                          <RefreshCw className="h-4 w-4" /> Retry inventory choices
+                        </button>
+                        <a href="/stock" className="btn-secondary min-h-10 text-xs">Open Stock Management</a>
+                      </div>
+                    </div>
+                  )}
+                  {pkg.items.length > 0 && (
+                    <div className="mb-4 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900">
+                      <p className="font-bold">Already identified in this return</p>
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        {pkg.items.map((item) => (
+                          <span key={item.id} className="rounded-md bg-white px-2 py-1 text-xs">
+                            {item.sku_code || item.sku_id || 'Manual'} · {item.style} / {item.color} / {item.size} ×{item.expected_qty}
+                          </span>
+                        ))}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => resolveAdminItems('keep_existing')}
+                        disabled={loading || reviewMappingLoading}
+                        className="mt-3 min-h-11 rounded-lg bg-emerald-700 px-4 text-sm font-bold text-white disabled:opacity-40"
+                      >
+                        Keep identified products / 保留已识别商品
+                      </button>
+                    </div>
+                  )}
                   {relatedOrderItems.length ? (
                     <>
-                      <p className="font-semibold text-amber-900">Choose the products actually returned</p>
+                      <p className="font-semibold text-amber-900">
+                        {pkg.items.length ? 'Replace from original PO' : 'Choose the products actually returned'}
+                      </p>
                       <p className="mt-1 text-sm text-amber-800">
-                        Select every returned product from the original order. This replaces any incomplete automatic match.
+                        Select every returned product from the original order. Saving will replace, never append to, the current package items.
                       </p>
                       <div className="mt-3 space-y-3">
                         {relatedOrderItems.map((item) => {
@@ -2449,7 +3084,7 @@ export default function ReturnsReceiving() {
                   )}
                   <button
                     type="button"
-                    onClick={resolveAdminItems}
+                    onClick={() => resolveAdminItems('replace')}
                     disabled={
                       loading
                       || reviewMappingLoading
@@ -2466,7 +3101,7 @@ export default function ReturnsReceiving() {
                     className="btn-primary mt-3 w-full justify-center py-3 disabled:opacity-50 sm:w-auto"
                   >
                     <CheckCircle2 className="h-4 w-4" />
-                    {relatedOrderItems.length ? 'Save Selected Products' : 'Save Manually Selected Products'}
+                    {relatedOrderItems.length ? 'Replace with Selected PO Products' : 'Replace with Manually Selected Products'}
                   </button>
                 </div>
               )}
@@ -2833,21 +3468,54 @@ export default function ReturnsReceiving() {
 
       {tab === 'review' && isAdmin && (
         <div className="card overflow-hidden">
-          <div className="flex items-center justify-between border-b border-slate-200 px-4 py-4 sm:px-5">
+          <div className="flex flex-col gap-3 border-b border-slate-200 px-4 py-4 sm:px-5 lg:flex-row lg:items-end lg:justify-between">
             <div>
               <h3 className="font-semibold text-slate-900">Admin Review Queue</h3>
               <p className="mt-1 text-sm text-slate-500">
-                Only packages submitted by a worker appear here. Verify the recorded style and quantity; do not reopen a worker-checked package.
+                Verify the recorded style and quantity. Worker-checked packages keep their inspection record; manual Admin packages can be completed here too.
               </p>
             </div>
-            <button type="button" onClick={loadReviewPackages} className="btn-secondary">
-              <RefreshCw className="h-4 w-4" />
-              Refresh
-            </button>
+            <form
+              onSubmit={(event) => {
+                event.preventDefault()
+                loadReviewPackages({ reset: true, query: reviewSearch })
+              }}
+              className="flex min-w-0 flex-col gap-2 sm:flex-row"
+            >
+              <div className="relative min-w-0 sm:w-72">
+                <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                <input
+                  value={reviewSearch}
+                  onChange={(event) => setReviewSearch(event.target.value)}
+                  placeholder="Search Admin Review"
+                  aria-label="Search Admin Review"
+                  className="h-11 w-full rounded-lg border border-slate-300 bg-white pl-9 pr-3 text-sm"
+                />
+              </div>
+              <button type="submit" disabled={reviewLoading} className="btn-secondary min-h-11 justify-center disabled:opacity-40">
+                {reviewLoading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
+                Search
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setReviewSearch('')
+                  loadReviewPackages({ reset: true, query: '' })
+                }}
+                disabled={reviewLoading}
+                className="btn-secondary min-h-11 justify-center disabled:opacity-40"
+              >
+                Refresh all
+              </button>
+            </form>
           </div>
-          {!reviewPackages.length ? (
+          {!reviewPackages.length && reviewLoading ? (
+            <p className="flex items-center justify-center gap-2 px-5 py-12 text-sm text-slate-500">
+              <RefreshCw className="h-4 w-4 animate-spin" /> Loading Admin Review
+            </p>
+          ) : !reviewPackages.length ? (
             <p className="px-5 py-12 text-center text-sm text-slate-400">
-              No packages are waiting for admin review.
+              {reviewSearch ? 'No Admin Review packages match this search.' : 'No packages are waiting for admin review.'}
             </p>
           ) : (
             <div className="divide-y divide-slate-100">
@@ -2882,6 +3550,19 @@ export default function ReturnsReceiving() {
                   </span>
                 </button>
               ))}
+              </div>
+            )}
+          {reviewHasMore && (
+            <div className="border-t border-slate-200 p-4 text-center">
+              <button
+                type="button"
+                onClick={() => loadReviewPackages({ reset: false })}
+                disabled={reviewLoading}
+                className="btn-secondary min-h-11 justify-center disabled:opacity-40"
+              >
+                {reviewLoading && <RefreshCw className="h-4 w-4 animate-spin" />}
+                Load more
+              </button>
             </div>
           )}
         </div>
@@ -2910,6 +3591,7 @@ export default function ReturnsReceiving() {
             type="file"
             accept=".xlsx,.xls,.csv"
             onChange={(event) => parseFile(event.target.files?.[0] || null)}
+            onClick={(event) => { event.currentTarget.value = '' }}
             className="mt-5 block w-full rounded-xl border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-sm text-slate-600 file:mr-4 file:rounded-lg file:border-0 file:bg-blue-600 file:px-4 file:py-2 file:text-sm file:font-semibold file:text-white"
           />
 
@@ -3007,7 +3689,41 @@ export default function ReturnsReceiving() {
 
               {(parsed.skippedTrackings || []).length > 0 && (
                 <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">
-                  Skipped {parsed.skippedTrackings.length} tracking package(s): {parsed.skippedTrackings.join(', ')}
+                  <p className="font-semibold">Skipped {parsed.skippedTrackings.length} tracking package(s)</p>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {parsed.skippedTrackings.map((trackingKey) => (
+                      <button
+                        key={trackingKey}
+                        type="button"
+                        onClick={() => undoManifestSkip(trackingKey)}
+                        className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-bold text-slate-700"
+                      >
+                        {trackingKey} · Undo skip
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {(Object.keys(manifestDecisions.storeByTracking).length > 0
+                || Object.keys(manifestDecisions.trackingByExcelRow || {}).length > 0) && (
+                <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900">
+                  <p className="font-semibold">Applied manual upload decisions</p>
+                  <p className="mt-1 text-xs text-emerald-700">Review or edit these choices before uploading.</p>
+                  <div className="mt-2 space-y-2">
+                    {Object.entries(manifestDecisions.trackingByExcelRow || {}).map(([excelRow, trackingNumber]) => (
+                      <div key={`tracking-decision-${excelRow}`} className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-white px-3 py-2 text-xs">
+                        <span>Excel row {excelRow} → Tracking {trackingNumber}</span>
+                        <button type="button" onClick={() => editManifestTrackingDecision(excelRow)} className="font-bold text-blue-700 underline">Edit Tracking</button>
+                      </div>
+                    ))}
+                    {Object.entries(manifestDecisions.storeByTracking).map(([trackingKey, store]) => (
+                      <div key={`store-decision-${trackingKey}`} className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-white px-3 py-2 text-xs">
+                        <span>{trackingKey} → Store {store.name}</span>
+                        <button type="button" onClick={() => editManifestStoreDecision(trackingKey)} className="font-bold text-blue-700 underline">Edit Store</button>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
 
