@@ -18,6 +18,9 @@ import AdminUsers from './pages/AdminUsers.jsx'
 import TimeClockPage from './pages/TimeClockPage.jsx'
 import AdminTimeReport from './pages/AdminTimeReport.jsx'
 import ReturnsReceiving from './pages/ReturnsReceiving.jsx'
+import userPermissions from '../lib/userPermissions.cjs'
+
+const { INVENTORY_CHECK_VIEW, userHasPermission } = userPermissions
 
 // Full-page spinner shown while verifying token on first load
 function SplashLoader() {
@@ -57,6 +60,14 @@ function RequireAdmin({ children }) {
   return children
 }
 
+function RequirePermission({ permission, children }) {
+  const { user } = useAuth()
+  const location = useLocation()
+  if (import.meta.env.DEV && new URLSearchParams(location.search).get('mock') === '1') return children
+  if (!userHasPermission(user, permission)) return <Navigate to="/tracking" replace />
+  return children
+}
+
 // Redirect already-logged-in users away from /login
 function GuestOnly({ children }) {
   const { user, loading } = useAuth()
@@ -74,7 +85,7 @@ function AppRoutes() {
       {/* Protected */}
       <Route path="/" element={<RequireAuth><Layout /></RequireAuth>}>
         <Route index element={<RequireAdmin><Dashboard /></RequireAdmin>} />
-        <Route path="inventory" element={<RequireAdmin><InventoryCheck /></RequireAdmin>} />
+        <Route path="inventory" element={<RequirePermission permission={INVENTORY_CHECK_VIEW}><InventoryCheck /></RequirePermission>} />
         <Route path="tracking" element={<TrackingPage />} />
         <Route path="notes" element={<NotesPage />} />
         <Route path="stock" element={<RequireAdmin><StockManagement /></RequireAdmin>} />

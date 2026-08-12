@@ -208,6 +208,11 @@ function hasSizeConflict(skuSize, attributeSize) {
   return missy.test(sku) && missy.test(attr) && sku !== attr
 }
 
+function sourceReviewSignature(rawStyle, rawAttribute) {
+  const clean = (value) => String(value || '').trim().toLowerCase().replace(/\s+/g, ' ')
+  return JSON.stringify([clean(rawStyle), clean(rawAttribute)])
+}
+
 /**
  * rows: 解析好的对象数组（须含 Style/SKU 列 + Quantity/Qty/数量 列）
  */
@@ -261,6 +266,7 @@ export function consolidateRows(rows, options = {}) {
     return {
       rawStyle,
       rawAttr,
+      sourceSignature: sourceReviewSignature(rawStyle, rawAttr),
       qty,
       attr,
       packCount: 1,
@@ -353,7 +359,7 @@ export function consolidateRows(rows, options = {}) {
   // 合并：按 (style,color,size) 汇总
   const groups = new Map()
   for (const p of parsed) {
-    const k = `${p.style}||${p.color}||${p.size}||${p.issue}||${p.packCount}||${p.businessDay}`
+    const k = `${p.style}||${p.color}||${p.size}||${p.issue}||${p.packCount}||${p.businessDay}||${p.issue ? p.sourceSignature : ''}`
     const g = groups.get(k) || {
       style: p.style,
       color: p.color,
@@ -362,6 +368,7 @@ export function consolidateRows(rows, options = {}) {
       pack_count: p.packCount || 1,
       parse_issue: p.issue || '',
       business_day: p.businessDay || '',
+      ...(p.issue ? { source_signature: p.sourceSignature } : {}),
     }
     g.QTY += p.qty
     groups.set(k, g)
@@ -376,7 +383,7 @@ export function consolidateRows(rows, options = {}) {
   const reviewMap = new Map()
   for (const p of parsed) {
     if (!p.issue) continue
-    const k = `${p.rawStyle}||${p.style}||${p.color}||${p.size}||${p.issue}||${p.businessDay}`
+    const k = `${p.rawStyle}||${p.style}||${p.color}||${p.size}||${p.issue}||${p.businessDay}||${p.sourceSignature}`
     const g = reviewMap.get(k) || {
       raw_style: p.rawStyle,
       style: p.style,

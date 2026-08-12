@@ -1,14 +1,14 @@
 import { neon } from '@neondatabase/serverless';
 import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
+import authentication from '../lib/authentication.cjs';
+import userPermissions from '../lib/userPermissions.cjs';
 
-function requireAdmin(authHeader, secret) {
-  if (!authHeader?.startsWith('Bearer ')) return null;
-  try {
-    const p = jwt.verify(authHeader.slice(7), secret);
-    return p.role === 'admin' ? p : null;
-  } catch { return null; }
-}
+const { authenticateUser } = authentication;
+const {
+  INVENTORY_CHECK_VIEW,
+  isValidUserPermissions,
+  normalizeUserPermissions,
+} = userPermissions;
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -20,34 +20,47 @@ export default async function handler(req, res) {
   const secret = process.env.JWT_SECRET;
   if (!dbUrl || !secret) return res.status(500).json({ error: 'Server not configured' });
 
-  const admin = requireAdmin(req.headers.authorization, secret);
-  if (!admin) return res.status(403).json({ error: 'Admin access required' });
-
   const sql = neon(dbUrl);
   const userId = req.query.id ? parseInt(req.query.id, 10) : null;
 
   try {
+    const admin = await authenticateUser(sql, req.headers.authorization, secret);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+
     // ── List all users ─────────────────────────────────────────────────────
     if (req.method === 'GET') {
       const rows = await sql`
-        SELECT id, username, role, created_by, created_at
+        SELECT id, username, role, permissions, created_by, created_at
         FROM users ORDER BY created_at ASC
       `;
-      return res.status(200).json(rows);
+      return res.status(200).json(rows.map((user) => ({
+        ...user,
+        permissions: normalizeUserPermissions(user.permissions),
+      })));
     }
 
     // ── Create user ────────────────────────────────────────────────────────
     if (req.method === 'POST') {
-      const { username, password, role = 'user' } = req.body || {};
+      const {
+        username,
+        password,
+        role = 'user',
+        permissions = [INVENTORY_CHECK_VIEW],
+      } = req.body || {};
       if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
       if (!['admin', 'user'].includes(role)) return res.status(400).json({ error: 'Role must be admin or user' });
+      if (!isValidUserPermissions(permissions)) return res.status(400).json({ error: 'Invalid permissions' });
       if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
 
       const hash = await bcrypt.hash(password, 10);
+      const normalizedPermissions = normalizeUserPermissions(permissions);
       const rows = await sql`
-        INSERT INTO users (username, password_hash, role, created_by)
-        VALUES (${username.trim().toLowerCase()}, ${hash}, ${role}, ${admin.username})
-        RETURNING id, username, role, created_by, created_at
+        INSERT INTO users (username, password_hash, role, permissions, created_by)
+        VALUES (
+          ${username.trim().toLowerCase()}, ${hash}, ${role},
+          ${JSON.stringify(normalizedPermissions)}::jsonb, ${admin.username}
+        )
+        RETURNING id, username, role, permissions, created_by, created_at
       `;
       return res.status(200).json(rows[0]);
     }
@@ -55,7 +68,8 @@ export default async function handler(req, res) {
     // ── Reset password or change role ──────────────────────────────────────
     if (req.method === 'PATCH') {
       if (!userId) return res.status(400).json({ error: 'User id required' });
-      const { password, role } = req.body || {};
+      const { password, role, permissions } = req.body || {};
+      const hasPermissions = Object.prototype.hasOwnProperty.call(req.body || {}, 'permissions');
 
       if (password) {
         if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
@@ -66,9 +80,25 @@ export default async function handler(req, res) {
         if (!['admin', 'user'].includes(role)) return res.status(400).json({ error: 'Invalid role' });
         await sql`UPDATE users SET role = ${role} WHERE id = ${userId}`;
       }
-      const rows = await sql`SELECT id, username, role, created_by, created_at FROM users WHERE id = ${userId}`;
+      if (hasPermissions) {
+        if (!isValidUserPermissions(permissions)) return res.status(400).json({ error: 'Invalid permissions' });
+        const normalizedPermissions = normalizeUserPermissions(permissions);
+        await sql`
+          UPDATE users
+          SET permissions = ${JSON.stringify(normalizedPermissions)}::jsonb
+          WHERE id = ${userId}
+        `;
+      }
+      const rows = await sql`
+        SELECT id, username, role, permissions, created_by, created_at
+        FROM users
+        WHERE id = ${userId}
+      `;
       if (!rows[0]) return res.status(404).json({ error: 'User not found' });
-      return res.status(200).json(rows[0]);
+      return res.status(200).json({
+        ...rows[0],
+        permissions: normalizeUserPermissions(rows[0].permissions),
+      });
     }
 
     // ── Delete user ────────────────────────────────────────────────────────

@@ -1,6 +1,9 @@
 import { neon } from '@neondatabase/serverless';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import userPermissions from '../lib/userPermissions.cjs';
+
+const { normalizeUserPermissions } = userPermissions;
 
 const DEFAULT_ADMIN = { username: 'admin', password: 'feiya2026', role: 'admin' };
 
@@ -14,6 +17,10 @@ async function ensureTable(sql) {
       created_by  TEXT,
       created_at  TIMESTAMPTZ DEFAULT NOW()
     )
+  `;
+  await sql`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '["inventory_check_view"]'::jsonb
   `;
 }
 
@@ -77,16 +84,26 @@ export default async function handler(req, res) {
         secret,
         { expiresIn: '7d' }
       );
-      return res.status(200).json({ token, user: { id: user.id, username: user.username, role: user.role } });
+      return res.status(200).json({
+        token,
+        user: {
+          id: user.id,
+          username: user.username,
+          role: user.role,
+          permissions: normalizeUserPermissions(user.permissions),
+        },
+      });
     }
 
     // ── Verify token ───────────────────────────────────────────────────────
     if (action === 'verify') {
       const payload = verifyToken(req.headers.authorization, secret);
       if (!payload) return res.status(401).json({ error: 'Invalid or expired token' });
-      const rows = await sql`SELECT id, username, role FROM users WHERE id = ${payload.userId}`;
+      const rows = await sql`SELECT id, username, role, permissions FROM users WHERE id = ${payload.userId}`;
       if (!rows[0]) return res.status(401).json({ error: 'User not found' });
-      return res.status(200).json({ user: rows[0] });
+      return res.status(200).json({
+        user: { ...rows[0], permissions: normalizeUserPermissions(rows[0].permissions) },
+      });
     }
 
     // ── Change own password ────────────────────────────────────────────────

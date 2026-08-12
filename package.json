@@ -8,6 +8,7 @@
     "build": "vite build",
     "test:auto-deduct": "node --test tests/autoDeductEngine.test.js",
     "test:orders": "node --test tests/orderImportEngine.test.js",
+    "test:permissions": "node --test tests/userPermissions.test.js",
     "test:replenishment": "node --test tests/replenishmentPlan.test.js",
     "preview": "vite preview"
   },

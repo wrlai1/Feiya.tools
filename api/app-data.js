@@ -1,4 +1,9 @@
 import { neon } from '@neondatabase/serverless';
+import authentication from '../lib/authentication.cjs';
+import userPermissions from '../lib/userPermissions.cjs';
+
+const { authenticateUser } = authentication;
+const { userCanAccessAppData } = userPermissions;
 
 async function ensureTable(sql) {
   await sql`
@@ -13,7 +18,7 @@ async function ensureTable(sql) {
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
   if (req.method === 'OPTIONS') return res.status(204).end();
 
@@ -28,6 +33,18 @@ export default async function handler(req, res) {
   }
 
   try {
+    if (type === 'inventory') {
+      const user = await authenticateUser(sql, req.headers.authorization, process.env.JWT_SECRET);
+      if (!user) return res.status(401).json({ error: 'Not authenticated' });
+      if (!userCanAccessAppData(user, type, req.method)) {
+        return res.status(403).json({
+          error: req.method === 'GET'
+            ? 'Inventory Check access required'
+            : 'Inventory Check edit access required',
+        });
+      }
+    }
+
     await ensureTable(sql);
 
     if (req.method === 'GET') {

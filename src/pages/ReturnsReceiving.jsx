@@ -13,6 +13,7 @@ import {
   RefreshCw,
   ScanLine,
   Search,
+  ShieldCheck,
   Upload,
   XCircle,
 } from 'lucide-react'
@@ -23,18 +24,124 @@ import { aliasKey } from '../utils/autoDeductEngine.js'
 import {
   applyProductCatalogMapping,
   chooseReturnManifestSheetName,
+  getHistoricalOrderSkuIds,
+  getHistoricalOrderSkuCodes,
   getReturnManifestOrderNumbers,
   getReturnManifestSkuIds,
   mergeAnalyticsReturnStores,
+  normalizeTracking,
   parseProductCatalogRows,
   parseSkuReturnManifestRows,
   resolveProductCatalogRows,
+  resolveStyleSearchValue,
   suggestProductCatalogSelections,
 } from '../utils/returnImportEngine.js'
 import { parseOrderHistoryRows } from '../utils/orderImportEngine.js'
-import { groupReturnProducts, summarizeReturnInspection } from '../utils/returnInspection.js'
+import {
+  collectReturnSkuMappingCandidates,
+  groupReturnProducts,
+  manualReturnSkuMappingRows,
+  returnReviewMappingLoadMode,
+  summarizeReturnInspection,
+} from '../utils/returnInspection.js'
 
 const BASE = '/api'
+const ANALYTICS_CACHE_MS = 5 * 60 * 1000
+
+function describeStoreDecision(decision) {
+  const skuIds = decision.skuIds || []
+  const skuLabel = skuIds.length ? `SKU ${skuIds.join(', ')}` : 'the original order items'
+  const issues = new Set(decision.reviewIssues || [])
+  const poLabel = decision.claimedOrders?.length
+    ? `PO ${decision.claimedOrders.join(', ')}`
+    : 'The PO'
+  const candidateStores = [...new Set([
+    ...(decision.catalogStores || []),
+    ...(decision.historicalStores || []).filter((name) => (
+      String(name || '').trim().toLowerCase() !== 'all stores'
+    )),
+  ].filter(Boolean))]
+  const storeEvidence = candidateStores.length
+    ? ` Saved data contains these Store references: ${candidateStores.join(', ')}.`
+    : ' The saved PO and Product Catalog do not provide one unique Store.'
+  if (!decision.orderHistoryFound && decision.claimedOrders?.length) {
+    return `PO ${decision.claimedOrders.join(', ')} was not found in uploaded order history.`
+  }
+  if (issues.has('sku_id_store_ambiguous')) {
+    return `${skuLabel} exists in more than one Store Product Catalog. Choose the actual Store for this return.`
+  }
+  if (issues.has('sku_code_store_ambiguous')) {
+    return 'The saved PO SKU ID is outdated, and its exact SKU code exists in more than one Store catalog. Choose the actual Store.'
+  }
+  if (issues.has('sku_id_not_in_store_catalog')) {
+    return decision.orderHistoryFound
+      ? `The PO was found and its products were loaded, but ${skuLabel} is not in a Store Product Catalog.`
+      : `${skuLabel} is not in a Store Product Catalog.`
+  }
+  if (issues.has('order_item_sku_missing')) {
+    return 'The PO was found, but its saved order-item rows have no usable SKU ID. Choose the actual Store so Admin can review the products.'
+  }
+  if (issues.has('order_has_multiple_skus')) {
+    return `${poLabel} contains multiple possible products.${storeEvidence} Choose the actual Store; Admin will confirm the returned products.`
+  }
+  if (issues.has('order_store_ambiguous')) {
+    return 'The PO exists under more than one Store history. Choose the actual Store for this return.'
+  }
+  if (issues.has('order_store_mismatch')) {
+    return 'The PO was found, but not under the Store identified by its products. Choose the actual Store for Admin review.'
+  }
+  if (decision.catalogStores?.length > 1) {
+    return `Products point to multiple Stores (${decision.catalogStores.join(', ')}). Choose the actual Store for this package.`
+  }
+  if (decision.allStoresHistory) {
+    return `The PO was found under All Stores, but ${skuLabel} did not identify one specific Store.`
+  }
+  return 'Store could not be identified for this tracking.'
+}
+
+function productSkuSearchText(row) {
+  return [
+    row.sku_id,
+    row.sku_code,
+    ...(row.sku_codes || []),
+    ...(row.stores || []),
+    ...(row.components || []).flatMap((component) => [
+      component.style,
+      component.color,
+      component.size,
+    ]),
+    ...(row.reason_breakdown || []).flatMap((reason) => [
+      reason.label,
+      reason.label_zh,
+      ...(reason.examples || []),
+    ]),
+  ].join(' ').toLowerCase()
+}
+
+function sortProductSkuRows(rows, search, view, sort) {
+  const query = String(search || '').trim().toLowerCase()
+  return (Array.isArray(rows) ? rows : [])
+    .filter((row) => !query || productSkuSearchText(row).includes(query))
+    .filter((row) => view === 'all'
+      || (view === 'combos' ? Number(row.component_count || 0) > 1 : Number(row.component_count || 0) <= 1))
+    .sort((left, right) => {
+      if (sort === 'rate') {
+        return Number(right.return_rate ?? -1) - Number(left.return_rate ?? -1)
+          || Number(right.returned_qty || 0) - Number(left.returned_qty || 0)
+      }
+      if (sort === 'sku') {
+        return String(left.sku_code || left.sku_id).localeCompare(String(right.sku_code || right.sku_id))
+      }
+      return Number(right.returned_qty || 0) - Number(left.returned_qty || 0)
+        || Number(right.return_rate ?? -1) - Number(left.return_rate ?? -1)
+    })
+}
+
+function skuComponentLabel(component) {
+  return `${component.style || '—'} / ${component.color || '—'} / ${component.size || '—'}${
+    Number(component.qty || 1) > 1 ? ` ×${component.qty}` : ''
+  }`
+}
 
 const DEMO_PACKAGE = {
   id: 'demo-return',
@@ -45,6 +152,7 @@ const DEMO_PACKAGE = {
   buyer_remarks: ['Demo four-piece return'],
   carrier: 'UPS',
   status: 'pending',
+  workflow_version: 1,
   expected_units: 4,
   actual_units: 0,
   items: [
@@ -88,14 +196,16 @@ function statusBadge(status) {
   if (status === 'discrepancy') return 'bg-amber-100 text-amber-800'
   if (status === 'needs_review') return 'bg-amber-100 text-amber-800'
   if (status === 'rejected') return 'bg-red-100 text-red-700'
+  if (status === 'cancelled') return 'bg-slate-100 text-slate-600'
   return 'bg-blue-100 text-blue-700'
 }
 
 function statusLabel(status) {
   if (status === 'received') return '✅ Received / Recibido'
-  if (status === 'discrepancy') return '⚠️ Review / Revisar'
+  if (status === 'discrepancy') return '⚠️ Received with discrepancy / Recibido con diferencia'
   if (status === 'needs_review') return '⚠️ Admin Review / Revisión'
   if (status === 'rejected') return '❌ Not ours / No es nuestro'
+  if (status === 'cancelled') return 'Cancelled / Cancelado'
   return 'Pending / Pendiente'
 }
 
@@ -158,6 +268,28 @@ function CountControl({ value, onChange, disabled, max = 9999, label = 'Actual q
         </button>
       </div>
       {error && <p role="alert" className="text-[11px] font-medium text-red-600">{error}</p>}
+    </div>
+  )
+}
+
+function SearchableStyleInput({ id, label, value, options, onChange, disabled = false }) {
+  return (
+    <div className="relative min-w-0">
+      <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+      <input
+        id={id}
+        list={`${id}-options`}
+        aria-label={label}
+        value={value || ''}
+        disabled={disabled}
+        autoComplete="off"
+        placeholder="Search Style / 搜索款式"
+        onChange={(event) => onChange(resolveStyleSearchValue(options, event.target.value))}
+        className="h-11 w-full min-w-0 rounded-lg border border-slate-300 bg-white pl-9 pr-2 text-sm disabled:bg-slate-100"
+      />
+      <datalist id={`${id}-options`}>
+        {(options || []).map((style) => <option key={style} value={style} />)}
+      </datalist>
     </div>
   )
 }
@@ -331,6 +463,9 @@ export default function ReturnsReceiving() {
   const isAdmin = user?.role === 'admin' || demoMode
   const scannerRef = useRef(null)
   const confirmationRef = useRef(null)
+  const analyticsRequestRef = useRef(0)
+  const lookupRequestRef = useRef({ id: 0, controller: null })
+  const reviewRequestRef = useRef({ loading: false, offset: 0, query: '' })
   const [tab, setTab] = useState('receive')
   const [tracking, setTracking] = useState('')
   const [loading, setLoading] = useState(false)
@@ -343,9 +478,18 @@ export default function ReturnsReceiving() {
   const [reviewPackages, setReviewPackages] = useState([])
   const [file, setFile] = useState(null)
   const [parsed, setParsed] = useState(null)
+  const [manifestContext, setManifestContext] = useState(null)
+  const [manifestDecisions, setManifestDecisions] = useState({
+    storeByTracking: {},
+    skippedTrackings: [],
+    trackingByExcelRow: {},
+  })
+  const [manifestChoiceDrafts, setManifestChoiceDrafts] = useState({})
   const [uploading, setUploading] = useState(false)
   const [stores, setStores] = useState([])
   const [storeLoadError, setStoreLoadError] = useState('')
+  const [storeStatsWarning, setStoreStatsWarning] = useState('')
+  const [storeLoading, setStoreLoading] = useState(false)
   const [storeName, setStoreName] = useState('')
   const [catalogFile, setCatalogFile] = useState(null)
   const [catalogParsed, setCatalogParsed] = useState(null)
@@ -353,13 +497,25 @@ export default function ReturnsReceiving() {
   const [analytics, setAnalytics] = useState(null)
   const [integrity, setIntegrity] = useState(null)
   const [analyticsDays, setAnalyticsDays] = useState(30)
+  const [analyticsLoading, setAnalyticsLoading] = useState(false)
+  const [integrityLoading, setIntegrityLoading] = useState(false)
+  const [analyticsLoadedAt, setAnalyticsLoadedAt] = useState(null)
+  const [analyticsSkuSearch, setAnalyticsSkuSearch] = useState('')
+  const [analyticsSkuView, setAnalyticsSkuView] = useState('all')
+  const [analyticsSkuSort, setAnalyticsSkuSort] = useState('returns')
   const [orderOnly, setOrderOnly] = useState(null)
   const [orderChoices, setOrderChoices] = useState([])
+  const [manualTrackingCandidate, setManualTrackingCandidate] = useState('')
+  const [manualStoreKey, setManualStoreKey] = useState('')
   const [orderFile, setOrderFile] = useState(null)
   const [orderParsed, setOrderParsed] = useState(null)
   const [orderUploading, setOrderUploading] = useState(false)
   const [orderStats, setOrderStats] = useState([])
   const [adminSelections, setAdminSelections] = useState({})
+  const [adminOrderItemTargets, setAdminOrderItemTargets] = useState({})
+  const [adminManualItems, setAdminManualItems] = useState([
+    { style: '', color: '', size: '', qty: 1 },
+  ])
   const [reviewCatalogRows, setReviewCatalogRows] = useState([])
   const [reviewInventoryRows, setReviewInventoryRows] = useState([])
   const [reviewAliases, setReviewAliases] = useState({})
@@ -368,6 +524,67 @@ export default function ReturnsReceiving() {
   const [reviewMappingModes, setReviewMappingModes] = useState({})
   const [reviewMappingLoading, setReviewMappingLoading] = useState(false)
   const [reviewSavingSku, setReviewSavingSku] = useState('')
+  const [reviewMappingError, setReviewMappingError] = useState('')
+  const [packageStoreKey, setPackageStoreKey] = useState('')
+  const [packageAction, setPackageAction] = useState('')
+  const [reviewSearch, setReviewSearch] = useState('')
+  const [reviewHasMore, setReviewHasMore] = useState(false)
+  const [reviewLoading, setReviewLoading] = useState(false)
+  const [remapSku, setRemapSku] = useState(null)
+  const visibleProductSkuRows = useMemo(() => sortProductSkuRows(
+    analytics?.product_skus,
+    analyticsSkuSearch,
+    analyticsSkuView,
+    analyticsSkuSort,
+  ), [analytics?.product_skus, analyticsSkuSearch, analyticsSkuSort, analyticsSkuView])
+  const invalidateAnalytics = useCallback(() => {
+    analyticsRequestRef.current += 1
+    setAnalytics(null)
+    setAnalyticsLoadedAt(null)
+    setAnalyticsLoading(false)
+  }, [])
+  const isOpenReturn = ['pending', 'needs_review'].includes(pkg?.status)
+  const relatedOrderItems = useMemo(
+    () => (pkg?.related_orders || []).flatMap((order) => order.items || []),
+    [pkg],
+  )
+  const mappedPackageSkus = useMemo(() => [...new Map((pkg?.items || [])
+    .filter((item) => String(item.sku_id || '').trim())
+    .map((item) => [String(item.sku_id).trim(), {
+      skuId: String(item.sku_id).trim(),
+      skuCode: String(item.sku_code || '').trim(),
+    }])).values()], [pkg])
+  const skuMappingCandidates = useMemo(() => {
+    return collectReturnSkuMappingCandidates(
+      pkg?.review_data?.unresolvedSkus || [],
+      relatedOrderItems,
+    )
+  }, [pkg, relatedOrderItems])
+  const requiresManualAdminItems = Boolean(
+    isAdmin
+    && isOpenReturn
+    && pkg?.requires_item_resolution
+    && !pkg?.review_data?.unresolvedSkus?.length
+    && !relatedOrderItems.length,
+  )
+  const requiresOrderItemManualMappings = Boolean(
+    isAdmin
+    && isOpenReturn
+    && pkg?.requires_item_resolution
+    && relatedOrderItems.some((item) => (
+      !String(item.sku_id || '').trim()
+      && (
+        item.catalog_status !== 'ready'
+        || !Array.isArray(item.catalog_components)
+        || !item.catalog_components.length
+      )
+    )),
+  )
+  const reviewMappingLoadMode = returnReviewMappingLoadMode({
+    skuMappingCandidateCount: skuMappingCandidates.length,
+    requiresManualAdminItems,
+    requiresOrderItemManualMappings,
+  })
 
   const loadRecent = useCallback(async () => {
     if (demoMode) {
@@ -380,7 +597,6 @@ export default function ReturnsReceiving() {
   }, [demoMode, getToken])
 
   const loadStores = useCallback(async () => {
-    if (!isAdmin) return
     if (demoMode) {
       setStores([{
         store_key: 'demo store',
@@ -392,44 +608,85 @@ export default function ReturnsReceiving() {
       setStoreName('Demo Store')
       return
     }
+    setStoreLoading(true)
     try {
-      const [analyticsData, returnRes] = await Promise.all([
-        fetchAnalyticsStores(),
-        fetch(`${BASE}/returns?action=stores`, { headers: headers(getToken) }),
+      const returnRequest = fetch(`${BASE}/returns?action=stores`, {
+        headers: headers(getToken),
+      }).then(async (response) => ({
+        response,
+        data: await response.json().catch(() => ({})),
+      }))
+      const [analyticsResult, returnResult] = await Promise.allSettled([
+        isAdmin ? fetchAnalyticsStores() : Promise.resolve(null),
+        returnRequest,
       ])
-      const returnData = await returnRes.json().catch(() => ({}))
-      if (!returnRes.ok) throw new Error(returnData.error || 'Could not load return store data')
-      const nextStores = mergeAnalyticsReturnStores(
-        analyticsData.stores || [],
-        returnData.stores || [],
-      )
+      if (isAdmin && analyticsResult.status === 'rejected') throw analyticsResult.reason
+      const returnAvailable = returnResult.status === 'fulfilled' && returnResult.value.response.ok
+      if (!isAdmin && !returnAvailable) {
+        throw new Error(
+          returnResult.status === 'rejected'
+            ? returnResult.reason?.message
+            : returnResult.value.data.error || 'Could not load return Store data',
+        )
+      }
+      const returnStores = returnAvailable ? returnResult.value.data.stores || [] : []
+      const nextStores = isAdmin
+        ? mergeAnalyticsReturnStores(analyticsResult.value?.stores || [], returnStores)
+        : returnStores
       setStores(nextStores)
       setStoreLoadError('')
+      setStoreStatsWarning(returnAvailable
+        ? ''
+        : 'Canonical Stores loaded, but return counts could not refresh. Store choices remain safe to use.')
       setStoreName((current) => (
         nextStores.some((store) => store.store_name === current)
           ? current
           : nextStores[0]?.store_name || ''
       ))
     } catch (error) {
-      setStores([])
-      setStoreName('')
       setStoreLoadError(error.message || 'Could not load Analytics stores')
+      toast.error(
+        'Retry before making a new Store decision. Any previously validated Store list remains unchanged.',
+        'Stores Could Not Refresh',
+      )
+    } finally {
+      setStoreLoading(false)
     }
-  }, [demoMode, getToken, isAdmin])
+  }, [demoMode, getToken, isAdmin, toast])
 
-  const loadReviewPackages = useCallback(async () => {
+  const loadReviewPackages = useCallback(async ({ reset = true, query } = {}) => {
     if (!isAdmin || demoMode) return
-    const res = await fetch(`${BASE}/returns?action=list&status=needs_review`, {
-      headers: headers(getToken),
-    })
-    const data = await res.json().catch(() => ({}))
-    if (res.ok) setReviewPackages(data.packages || [])
-  }, [demoMode, getToken, isAdmin])
+    if (reviewRequestRef.current.loading) return
+    const search = query == null ? reviewRequestRef.current.query : String(query).trim()
+    const offset = reset ? 0 : reviewRequestRef.current.offset
+    reviewRequestRef.current = { loading: true, offset, query: search }
+    setReviewLoading(true)
+    try {
+      const params = new URLSearchParams({
+        action: 'list',
+        status: 'needs_review',
+        q: search,
+        limit: '50',
+        offset: String(offset),
+      })
+      const res = await fetch(`${BASE}/returns?${params}`, { headers: headers(getToken) })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not load Admin Review')
+      const rows = data.packages || []
+      setReviewPackages((current) => reset ? rows : [...current, ...rows])
+      setReviewHasMore(Boolean(data.has_more))
+      reviewRequestRef.current = { loading: false, offset: offset + rows.length, query: search }
+    } catch (error) {
+      reviewRequestRef.current.loading = false
+      toast.error(error.message, 'Admin Review Failed')
+    } finally {
+      setReviewLoading(false)
+    }
+  }, [demoMode, getToken, isAdmin, toast])
 
   useEffect(() => {
     loadRecent()
     loadStores()
-    loadReviewPackages()
     if (demoMode) {
       setPkg(DEMO_PACKAGE)
       setTracking(DEMO_PACKAGE.tracking_number)
@@ -440,7 +697,7 @@ export default function ReturnsReceiving() {
     }
     const frame = requestAnimationFrame(() => scannerRef.current?.focus())
     return () => cancelAnimationFrame(frame)
-  }, [demoMode, loadRecent, loadReviewPackages, loadStores])
+  }, [demoMode, loadRecent, loadStores])
 
   const lookup = useCallback(async (value = tracking, orderStore = '') => {
     const query = String(value || '').trim()
@@ -456,29 +713,46 @@ export default function ReturnsReceiving() {
       setRemark('')
       return
     }
+    lookupRequestRef.current.controller?.abort()
+    const controller = new AbortController()
+    const requestId = lookupRequestRef.current.id + 1
+    lookupRequestRef.current = { id: requestId, controller }
     setLoading(true)
     setPkg(null)
     setOrderOnly(null)
     setOrderChoices([])
+    setManualTrackingCandidate('')
+    setManualStoreKey('')
     setAdminSelections({})
+    setAdminOrderItemTargets({})
+    setRemapSku(null)
+    setAdminManualItems([{ style: '', color: '', size: '', qty: 1 }])
     setCounted(false)
     setRemark('')
     try {
       const res = await fetch(`${BASE}/returns?action=lookup&tracking=${encodeURIComponent(query)}`, {
         headers: headers(getToken),
+        signal: controller.signal,
       })
       const data = await res.json().catch(() => ({}))
+      if (lookupRequestRef.current.id !== requestId) return
       if (!res.ok) {
         const orderRes = await fetch(
           `${BASE}/returns?action=order-lookup&order=${encodeURIComponent(query)}${
             orderStore ? `&store=${encodeURIComponent(orderStore)}` : ''
           }`,
-          { headers: headers(getToken) },
+          { headers: headers(getToken), signal: controller.signal },
         )
         const orderData = await orderRes.json().catch(() => ({}))
+        if (lookupRequestRef.current.id !== requestId) return
         if (orderRes.status === 409 && Array.isArray(orderData.stores)) {
           setOrderChoices(orderData.stores)
           setTracking(query)
+          return
+        }
+        if (res.status === 404 && orderRes.status === 404) {
+          setTracking(query)
+          setManualTrackingCandidate(query)
           return
         }
         if (!orderRes.ok) throw new Error(orderData.error || data.error || 'Return package or order not found')
@@ -488,6 +762,7 @@ export default function ReturnsReceiving() {
       }
       const next = data.package
       setPkg(next)
+      setPackageStoreKey('')
       setTracking(next.tracking_number)
       const workerVerified = next.review_data?.workerInspection?.status === 'all_good'
       setCounts(Object.fromEntries(
@@ -506,13 +781,57 @@ export default function ReturnsReceiving() {
       ))
       setRemark(next.remark || '')
     } catch (error) {
+      if (error.name === 'AbortError' || lookupRequestRef.current.id !== requestId) return
       toast.error(error.message, 'Tracking or Order Not Found')
       setTracking('')
       requestAnimationFrame(() => scannerRef.current?.focus())
     } finally {
-      setLoading(false)
+      if (lookupRequestRef.current.id === requestId) {
+        lookupRequestRef.current.controller = null
+        setLoading(false)
+      }
     }
   }, [demoMode, getToken, toast, tracking])
+
+  useEffect(() => () => lookupRequestRef.current.controller?.abort(), [])
+
+  const createManualReturn = async () => {
+    const selectedStore = stores.find((store) => store.store_key === manualStoreKey)
+    if (!manualTrackingCandidate || !selectedStore || loading) return
+    if (!window.confirm(
+      `Create manual return ${manualTrackingCandidate} for Store ${selectedStore.store_name}?\n\n` +
+      'No PO or SKU will be invented. Admin must verify the physical products before inventory can be added.'
+    )) return
+    setLoading(true)
+    try {
+      const res = await fetch(`${BASE}/returns?action=manual-create`, {
+        method: 'POST',
+        headers: headers(getToken, true),
+        body: JSON.stringify({
+          tracking: manualTrackingCandidate,
+          storeName: selectedStore.store_name,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not create the manual return')
+      setPkg(data.package)
+      setTracking(data.package.tracking_number)
+      setManualTrackingCandidate('')
+      setManualStoreKey('')
+      setCounts({})
+      setCounted(false)
+      setRemark('')
+      toast.success(
+        'Manual Tracking created with the selected Store. Check the package, then send it to Admin for product mapping.',
+        'Manual Return Ready',
+      )
+      await loadRecent()
+    } catch (error) {
+      toast.error(error.message, 'Manual Return Failed')
+    } finally {
+      setLoading(false)
+    }
+  }
 
   const handleCameraScan = useCallback((value) => {
     setCameraOpen(false)
@@ -521,11 +840,50 @@ export default function ReturnsReceiving() {
   }, [lookup])
 
   useEffect(() => {
-    const unresolvedSkus = pkg?.review_data?.unresolvedSkus || []
     setReviewSkuSelections({})
     setReviewManualTargets({})
     setReviewMappingModes({})
-    if (!isAdmin || !unresolvedSkus.length || demoMode) {
+    setAdminManualItems([{ style: '', color: '', size: '', qty: 1 }])
+    setAdminOrderItemTargets({})
+    setRemapSku(null)
+    if (!isAdmin || demoMode) {
+      setReviewCatalogRows([])
+      setReviewInventoryRows([])
+      setReviewAliases({})
+      setReviewMappingLoading(false)
+      return undefined
+    }
+
+    if (reviewMappingLoadMode === 'inventory') {
+      let active = true
+      setReviewCatalogRows([])
+      setReviewAliases({})
+      setReviewMappingLoading(true)
+      setReviewMappingError('')
+      fetch(`${BASE}/inventory-balance?action=list`, { headers: headers(getToken) })
+        .then(async (inventoryRes) => {
+          const inventoryData = await inventoryRes.json().catch(() => ({}))
+          if (!inventoryRes.ok) {
+            throw new Error(inventoryData.error || 'Could not load inventory targets')
+          }
+          if (!active) return
+          setReviewInventoryRows((inventoryData.rows || []).map((row) => ({
+            STYLE: row.Style,
+            COLOR: row.Color,
+            SIZE: row.Size,
+          })))
+        }).catch((error) => {
+          if (active) {
+            setReviewMappingError(error.message || 'Could not load inventory choices')
+            toast.error(error.message, 'Could Not Load Inventory Choices')
+          }
+        }).finally(() => {
+          if (active) setReviewMappingLoading(false)
+        })
+      return () => { active = false }
+    }
+
+    if (reviewMappingLoadMode === 'none') {
       setReviewCatalogRows([])
       setReviewInventoryRows([])
       setReviewAliases({})
@@ -535,6 +893,7 @@ export default function ReturnsReceiving() {
 
     let active = true
     setReviewMappingLoading(true)
+    setReviewMappingError('')
     Promise.all([
       fetch(`${BASE}/inventory-balance?action=list`, { headers: headers(getToken) }),
       fetch(`${BASE}/auto-deduct?action=aliases`, { headers: headers(getToken) }),
@@ -544,34 +903,81 @@ export default function ReturnsReceiving() {
         aliasesRes.json().catch(() => ({})),
       ])
       if (!inventoryRes.ok) throw new Error(inventoryData.error || 'Could not load inventory targets')
-      if (!aliasesRes.ok) throw new Error(aliasesData.error || 'Could not load confirmed SKU mappings')
       const inventoryRows = (inventoryData.rows || []).map((row) => ({
         STYLE: row.Style,
         COLOR: row.Color,
         SIZE: row.Size,
       }))
-      const aliases = aliasesData.aliases || {}
-      const resolved = resolveProductCatalogRows(
-        unresolvedSkus.map((item) => ({
-          skuId: item.skuId,
-          skuCode: item.skuCode,
-          returnQuantity: Number(item.quantity),
-          reviewIssue: item.issue,
-        })),
-        inventoryRows,
-        aliases,
-      )
       if (!active) return
       setReviewInventoryRows(inventoryRows)
+      const aliases = aliasesRes.ok ? aliasesData.aliases || {} : {}
       setReviewAliases(aliases)
+      let resolved
+      try {
+        resolved = resolveProductCatalogRows(
+          skuMappingCandidates,
+          inventoryRows,
+          aliases,
+        )
+      } catch {
+        resolved = manualReturnSkuMappingRows(skuMappingCandidates)
+      }
+      if (!resolved.length) resolved = manualReturnSkuMappingRows(skuMappingCandidates)
       setReviewCatalogRows(resolved)
+      if (!aliasesRes.ok) {
+        toast.warning(
+          'Saved Auto Deduct matches could not be loaded. Manual inventory mapping is still available.',
+          'Manual Mapping Available',
+        )
+      }
     }).catch((error) => {
-      if (active) toast.error(error.message, 'Could Not Load SKU Review')
+      if (active) {
+        setReviewCatalogRows(manualReturnSkuMappingRows(skuMappingCandidates))
+        setReviewInventoryRows([])
+        setReviewMappingError(error.message || 'Could not load inventory choices')
+        toast.error(error.message, 'Could Not Load Inventory Choices')
+      }
     }).finally(() => {
       if (active) setReviewMappingLoading(false)
     })
     return () => { active = false }
-  }, [demoMode, getToken, isAdmin, pkg, toast])
+  }, [
+    demoMode,
+    getToken,
+    isAdmin,
+    pkg,
+    reviewMappingLoadMode,
+    skuMappingCandidates,
+    toast,
+  ])
+
+  const retryReviewMapping = () => {
+    setReviewMappingError('')
+    setReviewInventoryRows([])
+    lookup(pkg?.tracking_number)
+  }
+
+  const retrySkuRemapInventory = async () => {
+    if (!remapSku || reviewMappingLoading) return
+    setReviewInventoryRows([])
+    setReviewMappingError('')
+    setReviewMappingLoading(true)
+    try {
+      const res = await fetch(`${BASE}/inventory-balance?action=list`, { headers: headers(getToken) })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not load inventory targets')
+      setReviewInventoryRows((data.rows || []).map((row) => ({
+        STYLE: row.Style,
+        COLOR: row.Color,
+        SIZE: row.Size,
+      })))
+    } catch (error) {
+      setReviewMappingError(error.message || 'Could not load inventory choices')
+      toast.error(error.message, 'Could Not Load Inventory Choices')
+    } finally {
+      setReviewMappingLoading(false)
+    }
+  }
 
   const expectedUnits = Number(pkg?.expected_units || 0)
   const productGroups = useMemo(() => groupReturnProducts(
@@ -636,6 +1042,7 @@ export default function ReturnsReceiving() {
         headers: headers(getToken, true),
         body: JSON.stringify({
           tracking: pkg.tracking_number,
+          workflowVersion: pkg.workflow_version,
           items: pkg.items.map((item) => ({
             id: item.id,
             actualQty: Number(effectiveCounts[item.id]?.good || 0)
@@ -652,6 +1059,7 @@ export default function ReturnsReceiving() {
         ? 'Not ours / No es nuestro'
         : data.status === 'discrepancy' ? 'Saved / Guardado' : 'Received / Recibido'
       toast.success(`${Number(data.added_units || 0)} added to inventory / agregado al inventario`, title)
+      invalidateAnalytics()
       setPkg(null)
       setTracking('')
       setCounts({})
@@ -676,6 +1084,7 @@ export default function ReturnsReceiving() {
         headers: headers(getToken, true),
         body: JSON.stringify({
           tracking: pkg.tracking_number,
+          workflowVersion: pkg.workflow_version,
           reason: reason || (pkg.status === 'pending' ? 'worker_flagged' : pkg.review_reason),
           workerChecked,
         }),
@@ -703,20 +1112,193 @@ export default function ReturnsReceiving() {
     }
   }
 
-  const resolveAdminItems = async () => {
-    if (!isAdmin || !pkg?.requires_item_resolution || loading) return
-    const selections = Object.entries(adminSelections)
+  const reassignPackageStore = async () => {
+    const selectedStore = stores.find((store) => store.store_key === packageStoreKey)
+    if (!pkg || !isAdmin || !selectedStore || packageAction) return
+    if (!window.confirm(
+      `Change this return from ${pkg.store_name || 'Unassigned'} to ${selectedStore.store_name}?\n\n` +
+      'The package will return to Admin Review. Verify its PO and products again before receiving inventory.'
+    )) return
+    setPackageAction('store')
+    try {
+      const res = await fetch(`${BASE}/returns?action=reassign-store`, {
+        method: 'POST',
+        headers: headers(getToken, true),
+        body: JSON.stringify({
+          tracking: pkg.tracking_number,
+          workflowVersion: pkg.workflow_version,
+          storeName: selectedStore.store_name,
+          remark,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not change this return Store')
+      const next = data.package
+      setPkg(next)
+      setPackageStoreKey('')
+      setCounts(Object.fromEntries((next.items || []).map((item) => [
+        item.id,
+        { good: 0, damaged: 0, notOurs: 0 },
+      ])))
+      setCounted(false)
+      toast.success('Store changed. Verify the PO and returned products before receiving.', 'Store Updated')
+      await loadReviewPackages({ reset: true })
+    } catch (error) {
+      toast.error(error.message, 'Store Change Failed')
+    } finally {
+      setPackageAction('')
+    }
+  }
+
+  const closePackage = async (outcome) => {
+    if (!pkg || !isAdmin || packageAction) return
+    const notOurs = outcome === 'not_ours'
+    const confirmed = window.confirm(notOurs
+      ? 'Mark this entire package as Not Ours?\n\nNo inventory will be added. This closes the package and cannot be undone here.'
+      : 'Cancel this return package?\n\nNo inventory will be added. This closes the package and removes it from Admin Review.')
+    if (!confirmed) return
+    setPackageAction(outcome)
+    try {
+      const res = await fetch(`${BASE}/returns?action=close-package`, {
+        method: 'POST',
+        headers: headers(getToken, true),
+        body: JSON.stringify({
+          tracking: pkg.tracking_number,
+          workflowVersion: pkg.workflow_version,
+          outcome,
+          remark,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not close this return package')
+      toast.success(
+        notOurs ? 'Closed as Not Ours. No inventory was added.' : 'Return package cancelled.',
+        notOurs ? 'Not Ours' : 'Package Cancelled',
+      )
+      setPkg(null)
+      setTracking('')
+      setCounts({})
+      setCounted(false)
+      setRemark('')
+      await Promise.all([loadRecent(), loadReviewPackages({ reset: true })])
+      requestAnimationFrame(() => scannerRef.current?.focus())
+    } catch (error) {
+      toast.error(error.message, 'Could Not Close Package')
+    } finally {
+      setPackageAction('')
+    }
+  }
+
+  const reopenPackageItems = async () => {
+    if (!pkg || !isAdmin || packageAction) return
+    if (!window.confirm(
+      'Edit this package’s products or inventory mapping?\n\n' +
+      'The current items remain visible for audit until you explicitly keep or replace them.'
+    )) return
+    setPackageAction('reopen')
+    try {
+      const res = await fetch(`${BASE}/returns?action=reopen-items`, {
+        method: 'POST',
+        headers: headers(getToken, true),
+        body: JSON.stringify({
+          tracking: pkg.tracking_number,
+          workflowVersion: pkg.workflow_version,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not reopen product selection')
+      const next = data.package
+      setPkg(next)
+      setCounts(Object.fromEntries((next.items || []).map((item) => [
+        item.id,
+        { good: 0, damaged: 0, notOurs: 0 },
+      ])))
+      setAdminSelections({})
+      setAdminOrderItemTargets({})
+      setCounted(false)
+      toast.success('Choose whether to keep the identified products or replace them.', 'Product Editing Opened')
+      await loadReviewPackages({ reset: true })
+    } catch (error) {
+      toast.error(error.message, 'Could Not Edit Products')
+    } finally {
+      setPackageAction('')
+    }
+  }
+
+  const resolveAdminItems = async (mode = 'replace') => {
+    if (!isAdmin || !isOpenReturn || !pkg?.requires_item_resolution || loading) return
+    const keepExisting = mode === 'keep_existing'
+    if (keepExisting && !pkg.items?.length) {
+      toast.error('There are no identified products to keep.', 'Products Required')
+      return
+    }
+    if (keepExisting && !window.confirm(
+      'Keep the currently identified products and quantities?\n\n' +
+      'Confirm that the listed SKU/style/size rows belong to this physical return.'
+    )) return
+    const selections = keepExisting ? [] : Object.entries(adminSelections)
       .map(([orderItemId, quantity]) => ({
         orderItemId: Number(orderItemId),
         quantity: Number(quantity),
       }))
       .filter((selection) => selection.quantity > 0)
+    const manualItems = keepExisting || relatedOrderItems.length ? [] : adminManualItems.map((item) => ({
+      ...item,
+      qty: Number(item.qty),
+    }))
+    const manualOrderItems = []
+    for (const selection of selections) {
+      const orderItem = relatedOrderItems.find((item) => Number(item.id) === selection.orderItemId)
+      const hasCatalogMapping = orderItem?.catalog_status === 'ready'
+        && Array.isArray(orderItem.catalog_components)
+        && orderItem.catalog_components.length > 0
+      if (hasCatalogMapping) continue
+      const components = (adminOrderItemTargets[selection.orderItemId] || []).map((item) => ({
+        ...item,
+        qty: Number(item.qty),
+      }))
+      if (!components.length || components.some((item) => (
+        !item.style
+        || !item.color
+        || !item.size
+        || !Number.isSafeInteger(item.qty)
+        || item.qty <= 0
+      ))) {
+        toast.error(
+          `Choose a complete inventory match for ${orderItem?.sku_code || orderItem?.attributes || 'every selected product'}.`,
+          'Product Mapping Required',
+        )
+        return
+      }
+      manualOrderItems.push({ orderItemId: selection.orderItemId, components })
+    }
+    if (!keepExisting && !relatedOrderItems.length && manualItems.some((item) => (
+      !item.style
+      || !item.color
+      || !item.size
+      || !Number.isSafeInteger(item.qty)
+      || item.qty <= 0
+    ))) {
+      toast.error('Choose a complete inventory item and a positive whole-number quantity for every row.', 'Check Manual Selection')
+      return
+    }
+    if (!keepExisting && pkg.items?.length && !window.confirm(
+      'Replace the currently identified products with this selection?\n\n' +
+      'The old rows will be removed from this package. Check every SKU, style, size, and quantity first.'
+    )) return
     setLoading(true)
     try {
       const res = await fetch(`${BASE}/returns?action=resolve-items`, {
         method: 'POST',
         headers: headers(getToken, true),
-        body: JSON.stringify({ tracking: pkg.tracking_number, selections }),
+        body: JSON.stringify({
+          tracking: pkg.tracking_number,
+          workflowVersion: pkg.workflow_version,
+          mode,
+          selections,
+          manualItems,
+          manualOrderItems,
+        }),
       })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || 'Could not save selected products')
@@ -730,8 +1312,16 @@ export default function ReturnsReceiving() {
           : { good: 0, damaged: 0, notOurs: 0 },
       ])))
       setAdminSelections({})
+      setAdminOrderItemTargets({})
+      setAdminManualItems([{ style: '', color: '', size: '', qty: 1 }])
       setCounted(false)
-      toast.success('Returned products selected. Complete the inspection below.', 'Products Saved')
+      toast.success(
+        workerVerified
+          ? 'Mapping saved. Verify the listed styles and quantities; the worker already checked the package.'
+          : 'Returned products selected. Complete the inspection below.',
+        'Products Saved',
+      )
+      invalidateAnalytics()
       await loadReviewPackages()
     } catch (error) {
       toast.error(error.message, 'Could Not Resolve Package')
@@ -743,6 +1333,9 @@ export default function ReturnsReceiving() {
   const parseFile = async (nextFile) => {
     setFile(nextFile)
     setParsed(null)
+    setManifestContext(null)
+    setManifestDecisions({ storeByTracking: {}, skippedTrackings: [], trackingByExcelRow: {} })
+    setManifestChoiceDrafts({})
     if (!nextFile) return
     try {
       const XLSX = await import('xlsx')
@@ -755,32 +1348,58 @@ export default function ReturnsReceiving() {
       if (!hasSkuId) {
         throw new Error('Combined daily return manifests require a SKU ID column')
       }
-      const catalogRows = []
-      const skuIds = getReturnManifestSkuIds(rows)
-      for (let index = 0; index < skuIds.length; index += 500) {
-        const catalogRes = await fetch(`${BASE}/returns?action=catalogs-lookup`, {
-          method: 'POST',
-          headers: headers(getToken, true),
-          body: JSON.stringify({ skuIds: skuIds.slice(index, index + 500) }),
-        })
-        const catalogData = await catalogRes.json().catch(() => ({}))
-        if (!catalogRes.ok) throw new Error(catalogData.error || 'Could not identify stores from SKU IDs')
-        catalogRows.push(...(catalogData.rows || []))
-      }
       const historicalOrders = []
       const orderNumbers = getReturnManifestOrderNumbers(rows)
       for (let index = 0; index < orderNumbers.length; index += 500) {
         const orderRes = await fetch(`${BASE}/returns?action=orders-lookup-any`, {
           method: 'POST',
           headers: headers(getToken, true),
-          body: JSON.stringify({ orderNumbers: orderNumbers.slice(index, index + 500) }),
+          body: JSON.stringify({
+            orderNumbers: orderNumbers.slice(index, index + 500),
+          }),
         })
         const orderData = await orderRes.json().catch(() => ({}))
         if (!orderRes.ok) throw new Error(orderData.error || 'Could not load matching order history')
         historicalOrders.push(...(orderData.orders || []))
       }
-      const result = parseSkuReturnManifestRows(rows, catalogRows, historicalOrders)
+      const uniqueOrders = [...new Map(historicalOrders.map((order) => [
+        `${order.store_key || order.storeKey || ''}\u241f${order.order_key || order.orderKey || order.order_number || order.orderNumber}`,
+        order,
+      ])).values()]
+      const catalogRows = []
+      const skuIds = [...new Set([
+        ...getReturnManifestSkuIds(rows),
+        ...getHistoricalOrderSkuIds(uniqueOrders),
+      ])]
+      const skuCodes = getHistoricalOrderSkuCodes(uniqueOrders)
+      const lookupCount = Math.max(skuIds.length, skuCodes.length)
+      for (let index = 0; index < lookupCount; index += 500) {
+        const catalogRes = await fetch(`${BASE}/returns?action=catalogs-lookup`, {
+          method: 'POST',
+          headers: headers(getToken, true),
+          body: JSON.stringify({
+            skuIds: skuIds.slice(index, index + 500),
+            skuCodes: skuCodes.slice(index, index + 500),
+          }),
+        })
+        const catalogData = await catalogRes.json().catch(() => ({}))
+        if (!catalogRes.ok) throw new Error(catalogData.error || 'Could not identify stores from SKU IDs')
+        catalogRows.push(...(catalogData.rows || []))
+      }
+      const uniqueCatalogRows = [...new Map(catalogRows.map((row) => [
+        `${row.store_key || row.storeKey || ''}\u241f${row.sku_id || row.skuId || ''}`,
+        row,
+      ])).values()]
+      const context = { rows, catalogRows: uniqueCatalogRows, historicalOrders: uniqueOrders }
+      setManifestContext(context)
+      const result = parseSkuReturnManifestRows(rows, uniqueCatalogRows, uniqueOrders)
       setParsed(result)
+      if (result.pendingUploadDecisions.length) {
+        toast.warning(
+          `${result.pendingUploadDecisions.length} tracking package(s) require a Store decision before upload`,
+          'Upload Decision Required',
+        )
+      }
       if (result.needsReview.length) {
         toast.warning(
           `${result.stats.reviewPackages} packages will be sent to Admin Review; ready packages can still upload`,
@@ -792,8 +1411,105 @@ export default function ReturnsReceiving() {
     }
   }
 
+  const applyManifestDecisions = (nextDecisions) => {
+    if (!manifestContext) return
+    setManifestDecisions(nextDecisions)
+    setParsed(parseSkuReturnManifestRows(
+      manifestContext.rows,
+      manifestContext.catalogRows,
+      manifestContext.historicalOrders,
+      nextDecisions,
+    ))
+  }
+
+  const undoManifestSkip = (trackingKey) => {
+    applyManifestDecisions({
+      ...manifestDecisions,
+      skippedTrackings: manifestDecisions.skippedTrackings.filter((item) => item !== trackingKey),
+    })
+  }
+
+  const editManifestStoreDecision = (trackingKey) => {
+    if (!window.confirm(`Edit the selected Store for ${trackingKey}? The package will become unresolved again until you choose one.`)) return
+    const storeByTracking = { ...manifestDecisions.storeByTracking }
+    delete storeByTracking[trackingKey]
+    applyManifestDecisions({ ...manifestDecisions, storeByTracking })
+  }
+
+  const editManifestTrackingDecision = (excelRow) => {
+    if (!window.confirm(`Edit the manual Tracking for Excel row ${excelRow}? Its current Store decision will also be removed.`)) return
+    const trackingByExcelRow = { ...(manifestDecisions.trackingByExcelRow || {}) }
+    const trackingKey = normalizeTracking(trackingByExcelRow[excelRow])
+    delete trackingByExcelRow[excelRow]
+    const storeByTracking = { ...manifestDecisions.storeByTracking }
+    if (trackingKey) delete storeByTracking[trackingKey]
+    applyManifestDecisions({ ...manifestDecisions, trackingByExcelRow, storeByTracking })
+  }
+
+  const chooseManifestStore = (trackingKey) => {
+    const selectedKey = manifestChoiceDrafts[trackingKey]?.storeKey
+    const selectedStore = stores.find((store) => store.store_key === selectedKey)
+    if (!selectedStore) return
+    if (!window.confirm(
+      `Use Store ${selectedStore.store_name} for return tracking ${trackingKey}?\n\nVerify this Store before upload; it controls PO lookup and inventory review.`
+    )) return
+    applyManifestDecisions({
+      ...manifestDecisions,
+      storeByTracking: {
+        ...manifestDecisions.storeByTracking,
+        [trackingKey]: { key: selectedStore.store_key, name: selectedStore.store_name },
+      },
+    })
+  }
+
+  const skipManifestTracking = (trackingKey) => {
+    if (!window.confirm(
+      `Skip return tracking ${trackingKey}?\n\nIt will not be uploaded. You can undo this decision before upload.`
+    )) return
+    applyManifestDecisions({
+      ...manifestDecisions,
+      skippedTrackings: [...new Set([
+        ...manifestDecisions.skippedTrackings,
+        trackingKey,
+      ])],
+    })
+  }
+
+  const fillManifestTracking = (excelRow) => {
+    const draftKey = `row:${excelRow}`
+    const draft = manifestChoiceDrafts[draftKey] || {}
+    const trackingNumber = String(draft.trackingNumber || '').trim()
+    const trackingKey = normalizeTracking(trackingNumber)
+    const selectedStore = stores.find((store) => store.store_key === draft.storeKey)
+    if (!trackingKey || !selectedStore) return
+    if (!window.confirm(
+      `Add Tracking ${trackingNumber} and Store ${selectedStore.store_name} to Excel row ${excelRow}?`
+    )) return
+    applyManifestDecisions({
+      ...manifestDecisions,
+      trackingByExcelRow: {
+        ...(manifestDecisions.trackingByExcelRow || {}),
+        [excelRow]: trackingNumber,
+      },
+      storeByTracking: {
+        ...manifestDecisions.storeByTracking,
+        [trackingKey]: { key: selectedStore.store_key, name: selectedStore.store_name },
+      },
+    })
+  }
+
   const uploadManifest = async () => {
-    if ((!parsed?.packages?.length && !parsed?.reviewPackages?.length) || uploading) return
+    if (
+      (!parsed?.packages?.length && !parsed?.reviewPackages?.length)
+      || parsed?.pendingUploadDecisions?.length
+      || uploading
+    ) return
+    const uploadCount = Number(parsed.packages?.length || 0) + Number(parsed.reviewPackages?.length || 0)
+    if (!window.confirm(
+      `Upload ${uploadCount} return package(s)?\n\n` +
+      `${Number(parsed.reviewPackages?.length || 0)} will require Admin Review. ` +
+      'Only physically received and confirmed packages will later count as returns.'
+    )) return
     setUploading(true)
     try {
       const res = await fetch(`${BASE}/returns?action=import`, {
@@ -808,11 +1524,14 @@ export default function ReturnsReceiving() {
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || 'Could not upload return manifest')
       toast.success(
-        `${data.imported_packages} packages · ${Number(data.review_packages || 0)} sent to admin review`,
+        `${data.imported_packages} packages uploaded · ${Number(data.review_packages || 0)} sent to Admin Review`,
         'Return Manifest Uploaded',
       )
       setFile(null)
       setParsed(null)
+      setManifestContext(null)
+      setManifestDecisions({ storeByTracking: {}, skippedTrackings: [], trackingByExcelRow: {} })
+      setManifestChoiceDrafts({})
       await loadRecent()
       setTab('receive')
       requestAnimationFrame(() => scannerRef.current?.focus())
@@ -929,6 +1648,7 @@ export default function ReturnsReceiving() {
         headers: headers(getToken, true),
         body: JSON.stringify({
           tracking: pkg.tracking_number,
+          workflowVersion: pkg.workflow_version,
           skuId: row.skuId,
           components,
         }),
@@ -975,9 +1695,111 @@ export default function ReturnsReceiving() {
         'SKU Mapping Remembered',
       )
       if (data.reuse_warning) toast.info(data.reuse_warning, 'Older Reviews')
+      invalidateAnalytics()
       await Promise.all([loadReviewPackages(), loadStores()])
     } catch (error) {
       toast.error(error.message, 'Could Not Save SKU Mapping')
+    } finally {
+      setReviewSavingSku('')
+    }
+  }
+
+  const startSkuRemap = async (sku) => {
+    if (!pkg || !isAdmin || reviewMappingLoading) return
+    const matchingItems = (pkg.items || []).filter((item) => item.sku_id === sku.skuId)
+    const initialTargets = matchingItems.map((item) => {
+      const sourceQty = Number(item.source_qty || 0)
+      const expectedQty = Number(item.expected_qty || 0)
+      return {
+        style: item.style,
+        color: item.color,
+        size: item.size,
+        qty: sourceQty > 0 && expectedQty % sourceQty === 0 ? expectedQty / sourceQty : 1,
+      }
+    })
+    setRemapSku(sku)
+    setReviewManualTargets((current) => ({
+      ...current,
+      [sku.skuId]: initialTargets.length
+        ? initialTargets
+        : [{ style: '', color: '', size: '', qty: 1 }],
+    }))
+    if (reviewInventoryRows.length) return
+    setReviewMappingLoading(true)
+    setReviewMappingError('')
+    try {
+      const res = await fetch(`${BASE}/inventory-balance?action=list`, { headers: headers(getToken) })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not load inventory targets')
+      setReviewInventoryRows((data.rows || []).map((row) => ({
+        STYLE: row.Style,
+        COLOR: row.Color,
+        SIZE: row.Size,
+      })))
+    } catch (error) {
+      setReviewMappingError(error.message || 'Could not load inventory choices')
+      toast.error(error.message, 'Could Not Load Inventory Choices')
+    } finally {
+      setReviewMappingLoading(false)
+    }
+  }
+
+  const saveRemappedSku = async () => {
+    if (!pkg || !remapSku || reviewSavingSku) return
+    const components = reviewManualTargets[remapSku.skuId] || []
+    if (!components.length || components.some((component) => (
+      !component.style
+      || !component.color
+      || !component.size
+      || !Number.isSafeInteger(Number(component.qty))
+      || Number(component.qty) <= 0
+    ))) {
+      toast.error('Choose complete style, color, size, and whole-number quantity for every piece.', 'Mapping Required')
+      return
+    }
+    if (!window.confirm(
+      `Replace the remembered inventory mapping for SKU ID ${remapSku.skuId}?\n\n` +
+      'This updates this open package and may update other waiting packages with the same SKU. Completed returns will not change.'
+    )) return
+    setReviewSavingSku(remapSku.skuId)
+    try {
+      const res = await fetch(`${BASE}/returns?action=remap-sku`, {
+        method: 'POST',
+        headers: headers(getToken, true),
+        body: JSON.stringify({
+          tracking: pkg.tracking_number,
+          workflowVersion: pkg.workflow_version,
+          skuId: remapSku.skuId,
+          skuCode: remapSku.skuCode,
+          components,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not replace this SKU mapping')
+      const next = data.package
+      setPkg(next)
+      const workerVerified = next.review_data?.workerInspection?.status === 'all_good'
+      setCounts(Object.fromEntries((next.items || []).map((item) => [
+        item.id,
+        workerVerified
+          ? { good: Number(item.expected_qty), damaged: 0, notOurs: 0 }
+          : { good: 0, damaged: 0, notOurs: 0 },
+      ])))
+      setRemapSku(null)
+      setReviewManualTargets((current) => {
+        const updated = { ...current }
+        delete updated[remapSku.skuId]
+        return updated
+      })
+      setCounted(false)
+      toast.success(
+        `Mapping replaced${data.reused_packages ? ` · ${data.reused_packages} waiting package(s) updated` : ''}.`,
+        'SKU Mapping Updated',
+      )
+      if (data.reuse_warning) toast.info(data.reuse_warning, 'Older Reviews')
+      await Promise.all([loadReviewPackages({ reset: true }), loadStores()])
+    } catch (error) {
+      toast.error(error.message, 'Could Not Replace SKU Mapping')
     } finally {
       setReviewSavingSku('')
     }
@@ -1007,6 +1829,7 @@ export default function ReturnsReceiving() {
       )
       setCatalogFile(null)
       setCatalogParsed(null)
+      invalidateAnalytics()
       await loadStores()
     } catch (error) {
       toast.error(error.message, 'Product Upload Failed')
@@ -1107,6 +1930,7 @@ export default function ReturnsReceiving() {
       }
       setOrderFile(null)
       setOrderParsed(null)
+      invalidateAnalytics()
       await Promise.all([loadOrderStats(), loadStores()])
     } catch (error) {
       toast.error(error.message, 'Order Upload Failed')
@@ -1117,36 +1941,64 @@ export default function ReturnsReceiving() {
 
   const loadAnalytics = useCallback(async () => {
     if (!isAdmin) return
-    setLoading(true)
+    const requestId = analyticsRequestRef.current + 1
+    analyticsRequestRef.current = requestId
+    setAnalytics((current) => Number(current?.days) === analyticsDays ? current : null)
+    setAnalyticsLoading(true)
     try {
-      const [analyticsRes, integrityRes] = await Promise.all([
-        fetch(`${BASE}/returns?action=analytics&days=${analyticsDays}`, {
-          headers: headers(getToken),
-        }),
-        fetch(`${BASE}/returns?action=integrity`, {
-          headers: headers(getToken),
-        }),
-      ])
-      const [analyticsData, integrityData] = await Promise.all([
-        analyticsRes.json().catch(() => ({})),
-        integrityRes.json().catch(() => ({})),
-      ])
+      const analyticsRes = await fetch(`${BASE}/returns?action=analytics&days=${analyticsDays}`, {
+        headers: headers(getToken),
+      })
+      const analyticsData = await analyticsRes.json().catch(() => ({}))
       if (!analyticsRes.ok) throw new Error(analyticsData.error || 'Could not load return analytics')
-      if (!integrityRes.ok) throw new Error(integrityData.error || 'Could not run data checks')
+      if (analyticsRequestRef.current !== requestId) return
       setAnalytics(analyticsData)
-      setIntegrity(integrityData)
+      setAnalyticsLoadedAt(new Date().toISOString())
     } catch (error) {
-      toast.error(error.message, 'Analytics Failed')
+      if (analyticsRequestRef.current === requestId) {
+        toast.error(error.message, 'Analytics Failed')
+      }
     } finally {
-      setLoading(false)
+      if (analyticsRequestRef.current === requestId) setAnalyticsLoading(false)
     }
   }, [analyticsDays, getToken, isAdmin, toast])
 
+  const loadIntegrity = useCallback(async () => {
+    if (!isAdmin || integrityLoading) return
+    setIntegrityLoading(true)
+    try {
+      const integrityRes = await fetch(`${BASE}/returns?action=integrity`, {
+        headers: headers(getToken),
+      })
+      const integrityData = await integrityRes.json().catch(() => ({}))
+      if (!integrityRes.ok) throw new Error(integrityData.error || 'Could not run data checks')
+      setIntegrity(integrityData)
+    } catch (error) {
+      toast.error(error.message, 'Data Checks Failed')
+    } finally {
+      setIntegrityLoading(false)
+    }
+  }, [getToken, integrityLoading, isAdmin, toast])
+
   useEffect(() => {
-    if (tab === 'analytics') loadAnalytics()
+    const analyticsAge = analyticsLoadedAt
+      ? Date.now() - new Date(analyticsLoadedAt).getTime()
+      : Number.POSITIVE_INFINITY
+    if (
+      tab === 'analytics'
+      && (Number(analytics?.days) !== analyticsDays || analyticsAge > ANALYTICS_CACHE_MS)
+    ) loadAnalytics()
     if (tab === 'orders') loadOrderStats()
     if (tab === 'review') loadReviewPackages()
-  }, [loadAnalytics, loadOrderStats, loadReviewPackages, tab])
+  }, [
+    analytics?.days,
+    analyticsDays,
+    analyticsLoadedAt,
+    loadAnalytics,
+    loadOrderStats,
+    loadReviewPackages,
+    tab,
+  ])
 
   const tabs = [
     { id: 'receive', label: 'Scan & Receive', shortLabel: 'Scan', icon: ScanLine },
@@ -1186,6 +2038,36 @@ export default function ReturnsReceiving() {
           ))}
         </div>
       </div>
+
+      {storeLoadError && (
+        <div className="flex flex-col gap-3 rounded-xl border-2 border-red-200 bg-red-50 p-4 text-sm text-red-900 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <p className="font-bold">Validated Analytics Stores could not refresh</p>
+            <p className="mt-1 text-xs text-red-700">
+              {storeLoadError}. {stores.length
+                ? 'The last successfully validated Store list is still available.'
+                : 'No Store decision can be made safely until this succeeds.'}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={loadStores}
+            disabled={storeLoading}
+            className="btn-secondary min-h-11 shrink-0 justify-center disabled:opacity-50"
+          >
+            <RefreshCw className={`h-4 w-4 ${storeLoading ? 'animate-spin' : ''}`} />
+            Retry Stores
+          </button>
+        </div>
+      )}
+      {storeStatsWarning && !storeLoadError && (
+        <div className="flex flex-col gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900 sm:flex-row sm:items-center sm:justify-between">
+          <p>{storeStatsWarning}</p>
+          <button type="button" onClick={loadStores} disabled={storeLoading} className="text-xs font-bold underline disabled:opacity-40">
+            Retry Store statistics
+          </button>
+        </div>
+      )}
 
       {tab === 'receive' && (
         <>
@@ -1257,6 +2139,48 @@ export default function ReturnsReceiving() {
             </div>
           )}
 
+          {manualTrackingCandidate && (
+            <div className="card border-2 border-blue-200 bg-blue-50/40 p-4 sm:p-5">
+              <div className="flex items-start gap-3">
+                <PackageOpen className="mt-0.5 h-5 w-5 shrink-0 text-blue-700" />
+                <div>
+                  <p className="font-semibold text-slate-900">Tracking not found — create it manually</p>
+                  <p className="mt-1 break-all text-sm text-slate-700">{manualTrackingCandidate}</p>
+                  <p className="mt-1 text-xs text-slate-500">
+                    Choose one Store. The system will not invent a PO or SKU; Admin will map the actual returned product after the worker checks it.
+                  </p>
+                </div>
+              </div>
+              <div className="mt-4 flex flex-col gap-2 sm:flex-row">
+                <select
+                  aria-label="Store for manual return"
+                  value={manualStoreKey}
+                  onChange={(event) => setManualStoreKey(event.target.value)}
+                  className="h-12 min-w-0 flex-1 rounded-xl border border-slate-300 bg-white px-3 text-sm"
+                >
+                  <option value="">Choose Store / 选择店铺</option>
+                  {stores.map((store) => (
+                    <option key={store.store_key} value={store.store_key}>{store.store_name}</option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={createManualReturn}
+                  disabled={loading || !manualStoreKey}
+                  className="btn-primary min-h-12 justify-center disabled:opacity-40"
+                >
+                  {loading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+                  Create Manual Return / 手工建立退货
+                </button>
+              </div>
+              {!stores.length && (
+                <p className="mt-2 text-xs font-medium text-red-700">
+                  No Store is available. Ask Admin to upload that Store’s Product Catalog or Order History first.
+                </p>
+              )}
+            </div>
+          )}
+
           {orderOnly && (
             <div className="card p-4 sm:p-5">
               <OrderDetails order={orderOnly} />
@@ -1315,6 +2239,164 @@ export default function ReturnsReceiving() {
                 )}
               </div>
 
+              {isAdmin && ['pending', 'needs_review'].includes(pkg.status) && (
+                <div className="border-b border-slate-200 bg-slate-50 px-4 py-4 sm:px-5">
+                  <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+                    <div className="min-w-0 flex-1">
+                      <p className="text-xs font-bold uppercase tracking-wide text-slate-500">Admin recovery actions</p>
+                      <div className="mt-2 flex flex-col gap-2 sm:flex-row">
+                        <select
+                          aria-label="New Store for this return"
+                          value={packageStoreKey}
+                          onChange={(event) => setPackageStoreKey(event.target.value)}
+                          disabled={storeLoading || !stores.length}
+                          className="h-11 min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-3 text-sm disabled:bg-slate-100 sm:max-w-xs"
+                        >
+                          <option value="">Change Store / 更改店铺</option>
+                          {stores.map((store) => (
+                            <option key={store.store_key} value={store.store_key}>{store.store_name}</option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          onClick={reassignPackageStore}
+                          disabled={
+                            !packageStoreKey
+                            || packageAction
+                            || stores.find((store) => store.store_key === packageStoreKey)?.store_name === pkg.store_name
+                          }
+                          className="btn-secondary min-h-11 justify-center disabled:opacity-40"
+                        >
+                          {packageAction === 'store' && <RefreshCw className="h-4 w-4 animate-spin" />}
+                          Use New Store
+                        </button>
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {pkg.status === 'pending' && pkg.requires_item_resolution && (
+                        <button
+                          type="button"
+                          onClick={() => flagForAdmin({ reason: 'admin_opened_mapping_review' })}
+                          disabled={loading || packageAction}
+                          className="min-h-11 rounded-lg border border-amber-300 bg-amber-50 px-3 text-sm font-bold text-amber-800 disabled:opacity-40"
+                        >
+                          Send to Admin Mapping
+                        </button>
+                      )}
+                      {!pkg.requires_item_resolution && (
+                        <button
+                          type="button"
+                          onClick={reopenPackageItems}
+                          disabled={Boolean(packageAction)}
+                          className="min-h-11 rounded-lg border border-blue-300 bg-blue-50 px-3 text-sm font-bold text-blue-800 disabled:opacity-40"
+                        >
+                          {packageAction === 'reopen' ? 'Opening…' : 'Edit products / inventory mapping'}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => closePackage('not_ours')}
+                        disabled={Boolean(packageAction)}
+                        className="min-h-11 rounded-lg border border-red-300 bg-red-50 px-3 text-sm font-bold text-red-800 disabled:opacity-40"
+                      >
+                        Mark entire package Not Ours
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => closePackage('cancelled')}
+                        disabled={Boolean(packageAction)}
+                        className="min-h-11 rounded-lg border border-slate-300 bg-white px-3 text-sm font-bold text-slate-700 disabled:opacity-40"
+                      >
+                        {packageAction === 'cancelled' ? 'Cancelling…' : 'Cancel package'}
+                      </button>
+                    </div>
+                  </div>
+                  {storeLoadError && !stores.length && (
+                    <p className="mt-2 text-xs font-semibold text-red-700">
+                      Store changes are blocked until “Retry Stores” succeeds. Product review and safe package closure remain available.
+                    </p>
+                  )}
+                  {mappedPackageSkus.length > 0 && (
+                    <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-slate-200 pt-3">
+                      <span className="text-xs font-semibold text-slate-500">Correct a remembered SKU mapping:</span>
+                      {mappedPackageSkus.map((sku) => (
+                        <button
+                          key={sku.skuId}
+                          type="button"
+                          onClick={() => startSkuRemap(sku)}
+                          disabled={reviewMappingLoading || Boolean(reviewSavingSku)}
+                          className="rounded-lg border border-violet-200 bg-white px-2.5 py-1.5 text-xs font-bold text-violet-700 disabled:opacity-40"
+                        >
+                          Remap {sku.skuCode || sku.skuId}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {isAdmin && remapSku && ['pending', 'needs_review'].includes(pkg.status) && (
+                <div className="border-b border-violet-200 bg-violet-50 px-4 py-4 sm:px-5">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="font-bold text-violet-950">Replace SKU mapping: {remapSku.skuCode || remapSku.skuId}</p>
+                      <p className="mt-1 text-xs text-violet-800">SKU ID {remapSku.skuId} · one row per physical inventory piece in one sold product.</p>
+                    </div>
+                    <button type="button" onClick={() => setRemapSku(null)} className="text-violet-700" aria-label="Close SKU remapping">
+                      <XCircle className="h-5 w-5" />
+                    </button>
+                  </div>
+                  {reviewMappingLoading ? (
+                    <p className="mt-3 flex items-center gap-2 text-sm text-violet-800"><RefreshCw className="h-4 w-4 animate-spin" /> Loading inventory choices</p>
+                  ) : reviewMappingError ? (
+                    <div className="mt-3 rounded-xl border border-red-200 bg-white p-3 text-sm text-red-800">
+                      <p>{reviewMappingError}</p>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        <button type="button" onClick={retrySkuRemapInventory} className="btn-secondary min-h-10 text-xs">Retry inventory choices</button>
+                        <a href="/stock" className="btn-secondary min-h-10 text-xs">Open Stock Management</a>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      {!reviewInventoryRows.length && (
+                        <div className="mt-3 rounded-xl border border-red-200 bg-white p-3 text-sm text-red-800">
+                          No inventory targets are available. <a href="/stock" className="font-bold underline">Open Stock Management</a>, then retry inventory choices.
+                          <button type="button" onClick={retrySkuRemapInventory} className="mt-2 block font-bold underline">Retry inventory choices</button>
+                        </div>
+                      )}
+                      <div className="mt-3 space-y-2">
+                        {(reviewManualTargets[remapSku.skuId] || []).map((target, index, targets) => {
+                          const styleOptions = [...new Set(reviewInventoryRows.map((item) => item.STYLE))].sort()
+                          const colorOptions = [...new Set(reviewInventoryRows.filter((item) => item.STYLE === target.style).map((item) => item.COLOR))].sort()
+                          const sizeOptions = [...new Set(reviewInventoryRows.filter((item) => item.STYLE === target.style && item.COLOR === target.color).map((item) => item.SIZE))].sort()
+                          const updateTarget = (changes) => setReviewManualTargets((current) => ({
+                            ...current,
+                            [remapSku.skuId]: targets.map((item, targetIndex) => targetIndex === index ? { ...item, ...changes } : item),
+                          }))
+                          return (
+                            <div key={`${remapSku.skuId}-remap-${index}`} className="grid gap-2 rounded-xl border border-violet-200 bg-white p-3 sm:grid-cols-[1fr_1fr_1fr_7rem_auto]">
+                              <SearchableStyleInput id={`${remapSku.skuId}-remap-style-${index}`} label="Inventory style" value={target.style} options={styleOptions} onChange={(style) => updateTarget({ style, color: '', size: '' })} />
+                              <select aria-label="Inventory color" value={target.color} disabled={!target.style} onChange={(event) => updateTarget({ color: event.target.value, size: '' })} className="h-11 rounded-lg border border-slate-300 bg-white px-2 text-sm disabled:bg-slate-100">
+                                <option value="">Color</option>{colorOptions.map((color) => <option key={color} value={color}>{color}</option>)}
+                              </select>
+                              <select aria-label="Inventory size" value={target.size} disabled={!target.color} onChange={(event) => updateTarget({ size: event.target.value })} className="h-11 rounded-lg border border-slate-300 bg-white px-2 text-sm disabled:bg-slate-100">
+                                <option value="">Size</option>{sizeOptions.map((size) => <option key={size} value={size}>{size}</option>)}
+                              </select>
+                              <input aria-label="Pieces per product" type="number" min="1" max="9999" step="1" value={target.qty} onChange={(event) => updateTarget({ qty: Number(event.target.value) })} className="h-11 rounded-lg border border-slate-300 bg-white px-2 text-sm" />
+                              <button type="button" disabled={targets.length === 1} onClick={() => setReviewManualTargets((current) => ({ ...current, [remapSku.skuId]: targets.filter((_, targetIndex) => targetIndex !== index) }))} className="h-11 rounded-lg border border-red-200 px-3 text-xs font-bold text-red-700 disabled:opacity-30">Remove</button>
+                            </div>
+                          )
+                        })}
+                      </div>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <button type="button" onClick={() => setReviewManualTargets((current) => ({ ...current, [remapSku.skuId]: [...(current[remapSku.skuId] || []), { style: '', color: '', size: '', qty: 1 }] }))} className="btn-secondary min-h-11"><Plus className="h-4 w-4" /> Add set piece</button>
+                        <button type="button" onClick={saveRemappedSku} disabled={Boolean(reviewSavingSku) || !reviewInventoryRows.length} className="btn-primary min-h-11 disabled:opacity-40">{reviewSavingSku ? <RefreshCw className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />} Confirm replacement</button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+
               {pkg.related_orders?.length > 0 && (
                 <div className="space-y-3 border-b border-slate-200 bg-white px-4 py-4 sm:px-5">
                   <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">
@@ -1336,8 +2418,7 @@ export default function ReturnsReceiving() {
                 </div>
               )}
 
-              {isAdmin && pkg.status === 'needs_review'
-                && pkg.review_data?.unresolvedSkus?.length > 0 && (
+              {isAdmin && isOpenReturn && skuMappingCandidates.length > 0 && (
                 <div className="border-b border-amber-200 bg-amber-50 px-4 py-4 sm:px-5">
                   <div className="flex items-start gap-2">
                     <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-700" />
@@ -1347,7 +2428,7 @@ export default function ReturnsReceiving() {
                       </p>
                       <p className="mt-1 text-sm text-amber-800">
                         Confirm the exact inventory items once. The same SKU ID will be remembered
-                        for future returns.
+                        for future returns, then you can choose the returned quantity below.
                       </p>
                     </div>
                   </div>
@@ -1359,6 +2440,33 @@ export default function ReturnsReceiving() {
                     </div>
                   ) : (
                     <div className="mt-4 space-y-4">
+                      {reviewMappingError && (
+                        <div className="rounded-xl border-2 border-red-200 bg-red-50 p-3 text-sm text-red-800">
+                          <p className="font-bold">Inventory choices could not load</p>
+                          <p className="mt-1 text-xs">{reviewMappingError}</p>
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            <button type="button" onClick={retryReviewMapping} className="btn-secondary min-h-10 text-xs">
+                              <RefreshCw className="h-4 w-4" /> Retry inventory choices
+                            </button>
+                            <a href="/stock" className="btn-secondary min-h-10 text-xs">Open Stock Management</a>
+                          </div>
+                        </div>
+                      )}
+                      {!reviewMappingError && !reviewInventoryRows.length && (
+                        <div className="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+                          <p className="font-bold">No inventory targets are available for mapping.</p>
+                          <div className="mt-2 flex flex-wrap gap-2">
+                            <a href="/stock" className="btn-secondary min-h-10 text-xs">Open Stock Management</a>
+                            <button type="button" onClick={retryReviewMapping} className="btn-secondary min-h-10 text-xs">Retry inventory choices</button>
+                          </div>
+                        </div>
+                      )}
+                      {!reviewCatalogRows.length && (
+                        <div className="rounded-xl border border-red-200 bg-white p-3 text-sm text-red-800">
+                          Mapping choices could not be prepared. Retry, or cancel the package without changing inventory.
+                          <button type="button" onClick={retryReviewMapping} className="mt-2 block font-bold underline">Retry mapping</button>
+                        </div>
+                      )}
                       {reviewCatalogRows.map((row) => {
                         const canMapSources = row.sourceComponents?.length
                           && row.sourceComponents.every((source) => source.size)
@@ -1455,22 +2563,19 @@ export default function ReturnsReceiving() {
                                         </div>
                                       )}
                                       <div className="mt-2 grid gap-2 sm:grid-cols-2">
-                                        <label className="text-xs font-medium text-slate-600">
-                                          Inventory style / Estilo
-                                          <select
+                                        <div className="text-xs font-medium text-slate-600">
+                                          <p className="mb-1">Inventory style / Estilo</p>
+                                          <SearchableStyleInput
+                                            id={`sku-${row.skuId}-source-${index}-style`}
+                                            label={`Inventory style for ${row.skuCode}`}
                                             value={selection.style || ''}
-                                            onChange={(event) => setReviewSkuSelections((current) => ({
+                                            options={styleOptions}
+                                            onChange={(style) => setReviewSkuSelections((current) => ({
                                               ...current,
-                                              [selectionKey]: { style: event.target.value, color: '' },
+                                              [selectionKey]: { style, color: '' },
                                             }))}
-                                            className="mt-1 h-11 w-full rounded-lg border border-slate-300 bg-white px-2 text-sm"
-                                          >
-                                            <option value="">Choose / Elegir</option>
-                                            {styleOptions.map((style) => (
-                                              <option key={style} value={style}>{style}</option>
-                                            ))}
-                                          </select>
-                                        </label>
+                                          />
+                                        </div>
                                         <label className="text-xs font-medium text-slate-600">
                                           Inventory color / Color
                                           <select
@@ -1555,21 +2660,17 @@ export default function ReturnsReceiving() {
                                       key={`${row.skuId}-manual-${index}`}
                                       className="grid gap-2 rounded-xl border border-slate-200 bg-slate-50 p-3 sm:grid-cols-4"
                                     >
-                                      <select
-                                        aria-label="Inventory style"
+                                      <SearchableStyleInput
+                                        id={`${row.skuId}-manual-style-${index}`}
+                                        label="Inventory style"
                                         value={target.style}
-                                        onChange={(event) => updateTarget({
-                                          style: event.target.value,
+                                        options={styleOptions}
+                                        onChange={(style) => updateTarget({
+                                          style,
                                           color: '',
                                           size: '',
                                         })}
-                                        className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm"
-                                      >
-                                        <option value="">Style / Estilo</option>
-                                        {styleOptions.map((style) => (
-                                          <option key={style} value={style}>{style}</option>
-                                        ))}
-                                      </select>
+                                      />
                                       <select
                                         aria-label="Inventory color"
                                         value={target.color}
@@ -1662,58 +2763,351 @@ export default function ReturnsReceiving() {
                 </div>
               )}
 
-              {isAdmin && pkg.status === 'needs_review' && pkg.requires_item_resolution
+              {isAdmin && isOpenReturn && pkg.requires_item_resolution
                 && !pkg.review_data?.unresolvedSkus?.length && (
                 <div className="border-b border-amber-200 bg-amber-50 px-4 py-4 sm:px-5">
-                  <p className="font-semibold text-amber-900">Choose the products actually returned</p>
-                  <p className="mt-1 text-sm text-amber-800">
-                    Select every returned product from the original order. This replaces any incomplete automatic match.
-                  </p>
-                  <div className="mt-3 space-y-3">
-                    {(pkg.related_orders || []).flatMap((order) => (order.items || []).map((item) => (
-                      <div key={item.id} className="rounded-xl border border-amber-200 bg-white p-3">
-                        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                          <div className="min-w-0">
-                            <p className="break-words text-sm font-semibold text-slate-800">
-                              {item.sku_code || item.sku_id || 'Unknown SKU'}
-                            </p>
-                            <p className="mt-1 text-xs text-slate-500">{item.attributes}</p>
-                            <p className="mt-1 text-[11px] text-slate-400">
-                              SKU ID {item.sku_id || '—'} · Ordered {item.quantity}
-                            </p>
-                            {item.catalog_status !== 'ready' && (
-                              <p className="mt-1 text-xs font-medium text-red-700">
-                                Product catalog mapping required before this item can be selected.
-                              </p>
-                            )}
-                          </div>
-                          <CountControl
-                            label={`Returned quantity for ${item.sku_code || item.sku_id}`}
-                            value={Number(adminSelections[item.id] || 0)}
-                            max={Number(item.quantity || 0)}
-                            disabled={item.catalog_status !== 'ready'}
-                            onChange={(value) => setAdminSelections((current) => ({
-                              ...current,
-                              [item.id]: value,
-                            }))}
-                          />
+                  {reviewMappingError && (
+                    <div className="mb-3 rounded-xl border-2 border-red-200 bg-red-50 p-3 text-sm text-red-800">
+                      <p className="font-bold">Inventory choices could not load</p>
+                      <p className="mt-1 text-xs">{reviewMappingError}</p>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        <button type="button" onClick={retryReviewMapping} className="btn-secondary min-h-10 text-xs">
+                          <RefreshCw className="h-4 w-4" /> Retry inventory choices
+                        </button>
+                        <a href="/stock" className="btn-secondary min-h-10 text-xs">Open Stock Management</a>
+                      </div>
+                    </div>
+                  )}
+                  {pkg.items.length > 0 && (
+                    <div className="mb-4 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900">
+                      <p className="font-bold">Already identified in this return</p>
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        {pkg.items.map((item) => (
+                          <span key={item.id} className="rounded-md bg-white px-2 py-1 text-xs">
+                            {item.sku_code || item.sku_id || 'Manual'} · {item.style} / {item.color} / {item.size} ×{item.expected_qty}
+                          </span>
+                        ))}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => resolveAdminItems('keep_existing')}
+                        disabled={loading || reviewMappingLoading}
+                        className="mt-3 min-h-11 rounded-lg bg-emerald-700 px-4 text-sm font-bold text-white disabled:opacity-40"
+                      >
+                        Keep identified products / 保留已识别商品
+                      </button>
+                    </div>
+                  )}
+                  {relatedOrderItems.length ? (
+                    <>
+                      <p className="font-semibold text-amber-900">
+                        {pkg.items.length ? 'Replace from original PO' : 'Choose the products actually returned'}
+                      </p>
+                      <p className="mt-1 text-sm text-amber-800">
+                        Select every returned product from the original order. Saving will replace, never append to, the current package items.
+                      </p>
+                      <div className="mt-3 space-y-3">
+                        {relatedOrderItems.map((item) => {
+                          const hasCatalogMapping = item.catalog_status === 'ready'
+                            && Array.isArray(item.catalog_components)
+                            && item.catalog_components.length > 0
+                          const manualTargets = adminOrderItemTargets[item.id]
+                            || [{ style: '', color: '', size: '', qty: 1 }]
+                          const updateTargets = (next) => setAdminOrderItemTargets((current) => ({
+                            ...current,
+                            [item.id]: next,
+                          }))
+                          return (
+                            <div key={item.id} className="rounded-xl border border-amber-200 bg-white p-3">
+                              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                                <div className="min-w-0">
+                                  <p className="break-words text-sm font-semibold text-slate-800">
+                                    {item.sku_code || item.sku_id || 'Unknown SKU'}
+                                  </p>
+                                  <p className="mt-1 text-xs text-slate-500">{item.attributes}</p>
+                                  <p className="mt-1 text-[11px] text-slate-400">
+                                    SKU ID {item.sku_id || '—'} · Ordered {item.quantity}
+                                  </p>
+                                  {!hasCatalogMapping && (
+                                    <p className="mt-1 text-xs font-medium text-amber-700">
+                                      No usable catalog mapping. Choose the inventory match below for this return.
+                                    </p>
+                                  )}
+                                </div>
+                                <CountControl
+                                  label={`Returned quantity for ${item.sku_code || item.sku_id}`}
+                                  value={Number(adminSelections[item.id] || 0)}
+                                  max={Number(item.quantity || 0)}
+                                  onChange={(value) => setAdminSelections((current) => ({
+                                    ...current,
+                                    [item.id]: value,
+                                  }))}
+                                />
+                              </div>
+                              {!hasCatalogMapping && (
+                                <div className="mt-3 space-y-2 border-t border-amber-100 pt-3">
+                                  {!reviewInventoryRows.length && !reviewMappingLoading && (
+                                    <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-800">
+                                      No inventory targets are available.{' '}
+                                      <a href="/stock" className="font-bold underline">Open Stock Management</a>
+                                      {' '}to upload or restore inventory, then return here.
+                                    </div>
+                                  )}
+                                  {manualTargets.map((target, targetIndex) => {
+                                    const styleOptions = [...new Set(
+                                      reviewInventoryRows.map((row) => row.STYLE),
+                                    )].sort()
+                                    const colorOptions = [...new Set(
+                                      reviewInventoryRows
+                                        .filter((row) => row.STYLE === target.style)
+                                        .map((row) => row.COLOR),
+                                    )].sort()
+                                    const sizeOptions = [...new Set(
+                                      reviewInventoryRows
+                                        .filter((row) => (
+                                          row.STYLE === target.style && row.COLOR === target.color
+                                        ))
+                                        .map((row) => row.SIZE),
+                                    )].sort()
+                                    const updateTarget = (changes) => updateTargets(
+                                      manualTargets.map((currentTarget, index) => (
+                                        index === targetIndex
+                                          ? { ...currentTarget, ...changes }
+                                          : currentTarget
+                                      )),
+                                    )
+                                    return (
+                                      <div
+                                        key={`${item.id}-manual-${targetIndex}`}
+                                        className="grid gap-2 rounded-lg bg-amber-50 p-2 sm:grid-cols-[1fr_1fr_1fr_7rem_auto]"
+                                      >
+                                        <SearchableStyleInput
+                                          id={`order-item-${item.id}-style-${targetIndex}`}
+                                          label={`Inventory style for ${item.sku_code || item.id}`}
+                                          value={target.style}
+                                          options={styleOptions}
+                                          onChange={(style) => updateTarget({ style, color: '', size: '' })}
+                                        />
+                                        <select
+                                          aria-label={`Inventory color for ${item.sku_code || item.id}`}
+                                          value={target.color}
+                                          disabled={!styleOptions.includes(target.style)}
+                                          onChange={(event) => updateTarget({ color: event.target.value, size: '' })}
+                                          className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm disabled:bg-slate-100"
+                                        >
+                                          <option value="">Color</option>
+                                          {colorOptions.map((color) => <option key={color} value={color}>{color}</option>)}
+                                        </select>
+                                        <select
+                                          aria-label={`Inventory size for ${item.sku_code || item.id}`}
+                                          value={target.size}
+                                          disabled={!target.color}
+                                          onChange={(event) => updateTarget({ size: event.target.value })}
+                                          className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm disabled:bg-slate-100"
+                                        >
+                                          <option value="">Size / Talla</option>
+                                          {sizeOptions.map((size) => <option key={size} value={size}>{size}</option>)}
+                                        </select>
+                                        <label className="text-[11px] font-semibold text-slate-600">
+                                          Pieces / product
+                                          <input
+                                            type="number"
+                                            min="1"
+                                            max="9999"
+                                            step="1"
+                                            value={target.qty}
+                                            onChange={(event) => updateTarget({ qty: event.target.value })}
+                                            className="mt-0.5 h-8 w-full rounded-lg border border-slate-300 bg-white px-2 text-sm"
+                                          />
+                                        </label>
+                                        <button
+                                          type="button"
+                                          disabled={manualTargets.length === 1}
+                                          onClick={() => updateTargets(manualTargets.filter((_, index) => index !== targetIndex))}
+                                          className="h-11 rounded-lg border border-red-200 px-3 text-xs font-semibold text-red-700 disabled:opacity-30"
+                                        >
+                                          Remove
+                                        </button>
+                                      </div>
+                                    )
+                                  })}
+                                  <button
+                                    type="button"
+                                    onClick={() => updateTargets([
+                                      ...manualTargets,
+                                      { style: '', color: '', size: '', qty: 1 },
+                                    ])}
+                                    className="btn-secondary min-h-10 text-xs"
+                                  >
+                                    <Plus className="h-4 w-4" /> Add set piece / 添加组合款式
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="flex items-start gap-2">
+                        <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-700" />
+                        <div>
+                          <p className="font-semibold text-amber-950">
+                            PO not found — Admin choose inventory products
+                          </p>
+                          <p className="mt-1 text-sm text-amber-800">
+                            The original PO is kept for audit. Choose one row for each physical
+                            inventory item in this return; the system will not guess or change the PO.
+                          </p>
                         </div>
                       </div>
-                    )))}
-                  </div>
+                      {reviewMappingLoading ? (
+                        <div className="mt-3 flex items-center gap-2 rounded-xl border border-amber-200 bg-white p-4 text-sm text-slate-600">
+                          <RefreshCw className="h-4 w-4 animate-spin" />
+                          Loading inventory choices
+                        </div>
+                      ) : (
+                        <div className="mt-3 space-y-3">
+                          {adminManualItems.map((target, index) => {
+                            const styleOptions = [...new Set(
+                              reviewInventoryRows.map((item) => item.STYLE),
+                            )].sort()
+                            const colorOptions = [...new Set(
+                              reviewInventoryRows
+                                .filter((item) => item.STYLE === target.style)
+                                .map((item) => item.COLOR),
+                            )].sort()
+                            const sizeOptions = [...new Set(
+                              reviewInventoryRows
+                                .filter((item) => (
+                                  item.STYLE === target.style && item.COLOR === target.color
+                                ))
+                                .map((item) => item.SIZE),
+                            )].sort()
+                            const updateTarget = (changes) => setAdminManualItems((current) => (
+                              current.map((item, itemIndex) => (
+                                itemIndex === index ? { ...item, ...changes } : item
+                              ))
+                            ))
+                            return (
+                              <div
+                                key={`admin-manual-item-${index}`}
+                                className="grid gap-2 rounded-xl border border-amber-200 bg-white p-3 sm:grid-cols-[1fr_1fr_1fr_7rem_auto]"
+                              >
+                                <SearchableStyleInput
+                                  id={`admin-manual-style-${index}`}
+                                  label={`Inventory style ${index + 1}`}
+                                  value={target.style}
+                                  options={styleOptions}
+                                  onChange={(style) => updateTarget({
+                                    style,
+                                    color: '',
+                                    size: '',
+                                  })}
+                                />
+                                <select
+                                  aria-label={`Inventory color ${index + 1}`}
+                                  value={target.color}
+                                  disabled={!target.style}
+                                  onChange={(event) => updateTarget({
+                                    color: event.target.value,
+                                    size: '',
+                                  })}
+                                  className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm disabled:bg-slate-100"
+                                >
+                                  <option value="">Color</option>
+                                  {colorOptions.map((color) => (
+                                    <option key={color} value={color}>{color}</option>
+                                  ))}
+                                </select>
+                                <select
+                                  aria-label={`Inventory size ${index + 1}`}
+                                  value={target.size}
+                                  disabled={!target.color}
+                                  onChange={(event) => updateTarget({ size: event.target.value })}
+                                  className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm disabled:bg-slate-100"
+                                >
+                                  <option value="">Size / Talla</option>
+                                  {sizeOptions.map((size) => (
+                                    <option key={size} value={size}>{size}</option>
+                                  ))}
+                                </select>
+                                <label className="text-xs font-medium text-slate-600">
+                                  Pieces
+                                  <input
+                                    aria-label={`Physical quantity ${index + 1}`}
+                                    type="number"
+                                    min="1"
+                                    max="9999"
+                                    step="1"
+                                    value={target.qty}
+                                    onChange={(event) => updateTarget({ qty: event.target.value })}
+                                    className="mt-0.5 h-8 w-full rounded-lg border border-slate-300 px-2 text-sm"
+                                  />
+                                </label>
+                                <button
+                                  type="button"
+                                  aria-label={`Remove inventory item ${index + 1}`}
+                                  disabled={adminManualItems.length === 1}
+                                  onClick={() => setAdminManualItems((current) => (
+                                    current.filter((_, itemIndex) => itemIndex !== index)
+                                  ))}
+                                  className="flex h-11 items-center justify-center rounded-lg border border-slate-300 px-3 text-slate-500 disabled:opacity-30"
+                                >
+                                  <XCircle className="h-4 w-4" />
+                                </button>
+                              </div>
+                            )
+                          })}
+                          {!reviewInventoryRows.length && (
+                            <p className="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+                              No inventory targets are available.{' '}
+                              <a href="/stock" className="font-bold underline">Open Stock Management</a>
+                              {' '}to upload or restore inventory, then return here.
+                            </p>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => setAdminManualItems((current) => [
+                              ...current,
+                              { style: '', color: '', size: '', qty: 1 },
+                            ])}
+                            className="btn-secondary min-h-11 w-full justify-center sm:w-auto"
+                          >
+                            <Plus className="h-4 w-4" />
+                            Add inventory item
+                          </button>
+                        </div>
+                      )}
+                    </>
+                  )}
                   <button
                     type="button"
-                    onClick={resolveAdminItems}
-                    disabled={loading || !Object.values(adminSelections).some((value) => Number(value) > 0)}
+                    onClick={() => resolveAdminItems('replace')}
+                    disabled={
+                      loading
+                      || reviewMappingLoading
+                      || (relatedOrderItems.length
+                        ? !Object.values(adminSelections).some((value) => Number(value) > 0)
+                        : !reviewInventoryRows.length || adminManualItems.some((item) => (
+                          !item.style
+                          || !item.color
+                          || !item.size
+                          || !Number.isSafeInteger(Number(item.qty))
+                          || Number(item.qty) <= 0
+                        )))
+                    }
                     className="btn-primary mt-3 w-full justify-center py-3 disabled:opacity-50 sm:w-auto"
                   >
                     <CheckCircle2 className="h-4 w-4" />
-                    Save Selected Products
+                    {relatedOrderItems.length ? 'Replace with Selected PO Products' : 'Replace with Manually Selected Products'}
                   </button>
                 </div>
               )}
 
-              {!isAdmin && pkg.status === 'needs_review' && pkg.requires_item_resolution && (
+              {!isAdmin && ['pending', 'needs_review'].includes(pkg.status)
+                && pkg.requires_item_resolution && (
                 <div className="border-b border-amber-200 bg-amber-50 px-4 py-5 text-center sm:px-5">
                   <AlertTriangle className="mx-auto h-9 w-9 text-amber-600" />
                   <p className="mt-2 text-lg font-bold text-amber-900">
@@ -1727,38 +3121,57 @@ export default function ReturnsReceiving() {
               )}
 
               {!isAdmin ? (
-                <div className="divide-y divide-slate-100">
-                  {productGroups.length ? productGroups.map((product) => (
-                    <div key={product.key} className="px-4 py-5 sm:px-5">
-                      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                        <div className="min-w-0">
-                          <p className="break-words text-base font-bold text-slate-900">
-                            {product.skuCode || 'Product pending Admin / Producto pendiente'}
-                          </p>
-                          {product.skuId && (
-                            <p className="mt-1 text-xs text-slate-400">SKU ID {product.skuId}</p>
-                          )}
-                          <p className="mt-1 text-xs text-slate-500">
-                            {product.mappingPending
-                              ? 'Styles and pieces pending Admin / Estilos y piezas pendientes'
-                              : <>
-                                  {product.inventoryPieces} physical piece
-                                  {product.inventoryPieces === 1 ? '' : 's'} inside / piezas físicas
-                                </>}
-                          </p>
-                        </div>
-                        <div className="rounded-xl bg-blue-50 px-4 py-3 text-center text-blue-800">
-                          <p className="text-2xl font-black">{product.productQty}</p>
-                          <p className="text-xs font-semibold">PRODUCT / PRODUCTO</p>
+                <>
+                  <div className="divide-y divide-slate-100">
+                    {productGroups.length ? productGroups.map((product) => (
+                      <div key={product.key} className="px-4 py-5 sm:px-5">
+                        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                          <div className="min-w-0">
+                            <p className="break-words text-base font-bold text-slate-900">
+                              {product.skuCode || 'Product pending Admin / Producto pendiente'}
+                            </p>
+                            {product.skuId && (
+                              <p className="mt-1 text-xs text-slate-400">SKU ID {product.skuId}</p>
+                            )}
+                            <p className="mt-1 text-xs text-slate-500">
+                              {product.mappingPending
+                                ? 'Styles and pieces pending Admin / Estilos y piezas pendientes'
+                                : <>
+                                    {product.inventoryPieces} physical piece
+                                    {product.inventoryPieces === 1 ? '' : 's'} inside / piezas físicas
+                                  </>}
+                            </p>
+                          </div>
+                          <div className="rounded-xl bg-blue-50 px-4 py-3 text-center text-blue-800">
+                            <p className="text-2xl font-black">{product.productQty}</p>
+                            <p className="text-xs font-semibold">PRODUCT / PRODUCTO</p>
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  )) : (
-                    <div className="px-4 py-5 text-sm text-amber-800 sm:px-5">
-                      Admin will select the product and quantity / Admin seleccionará el producto y la cantidad.
+                    )) : (
+                      <div className="px-4 py-5 text-sm text-amber-800 sm:px-5">
+                        Admin will select the product and quantity / Admin seleccionará el producto y la cantidad.
+                      </div>
+                    )}
+                  </div>
+                  {pkg.items.length > 0 && (
+                    <div className="border-t border-slate-200 bg-slate-50 px-4 py-4 sm:px-5">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                        Verify styles and physical quantities / Verifique estilos y cantidades
+                      </p>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {pkg.items.map((item) => (
+                          <span
+                            key={item.id}
+                            className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700"
+                          >
+                            {item.style} / {item.color} / {item.size} × {item.expected_qty}
+                          </span>
+                        ))}
+                      </div>
                     </div>
                   )}
-                </div>
+                </>
               ) : (
               <div className="divide-y divide-slate-100">
                 {pkg.items.map((item) => {
@@ -1866,8 +3279,8 @@ export default function ReturnsReceiving() {
                               : `${expected - selected} missing / faltante`}
                           </p>
                         </>
-                      )}
-                    </div>
+                  )}
+                </div>
                   )
                 })}
               </div>
@@ -1935,24 +3348,54 @@ export default function ReturnsReceiving() {
 
               {!isAdmin && pkg.status === 'pending' && (
                 <div className="grid gap-3 border-t border-slate-200 bg-slate-50/70 p-4 sm:grid-cols-2 sm:p-5">
-                  <button
-                    type="button"
-                    onClick={() => confirmPackage({ allGood: true })}
-                    disabled={loading || !pkg.items.length}
-                    className="flex min-h-16 items-center justify-center gap-2 rounded-xl bg-emerald-600 px-5 text-lg font-bold text-white hover:bg-emerald-700 disabled:opacity-40"
-                  >
-                    {loading ? <RefreshCw className="h-5 w-5 animate-spin" /> : <CheckCircle2 className="h-6 w-6" />}
-                    ✅ All Good · Add {expectedUnits}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={flagForAdmin}
-                    disabled={loading}
-                    className="flex min-h-16 items-center justify-center gap-2 rounded-xl bg-amber-500 px-5 text-lg font-bold text-white hover:bg-amber-600 disabled:opacity-40"
-                  >
-                    <AlertTriangle className="h-6 w-6" />
-                    Any Problem · Send to Admin
-                  </button>
+                  {pkg.requires_item_resolution ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => flagForAdmin({
+                          workerChecked: true,
+                          reason: 'worker_checked_mapping_needed',
+                        })}
+                        disabled={loading}
+                        className="flex min-h-16 items-center justify-center gap-2 rounded-xl bg-emerald-600 px-5 text-lg font-bold text-white hover:bg-emerald-700 disabled:opacity-40"
+                      >
+                        {loading ? <RefreshCw className="h-5 w-5 animate-spin" /> : <CheckCircle2 className="h-6 w-6" />}
+                        {pkg.items.length
+                          ? '✅ Package & Qty Checked · Send Admin'
+                          : '✅ Package Checked · Send Admin Mapping'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => flagForAdmin({ reason: 'worker_found_problem' })}
+                        disabled={loading}
+                        className="flex min-h-16 items-center justify-center gap-2 rounded-xl bg-amber-500 px-5 text-lg font-bold text-white hover:bg-amber-600 disabled:opacity-40"
+                      >
+                        <AlertTriangle className="h-6 w-6" />
+                        Problem · Send to Admin
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => confirmPackage({ allGood: true })}
+                        disabled={loading || !pkg.items.length}
+                        className="flex min-h-16 items-center justify-center gap-2 rounded-xl bg-emerald-600 px-5 text-lg font-bold text-white hover:bg-emerald-700 disabled:opacity-40"
+                      >
+                        {loading ? <RefreshCw className="h-5 w-5 animate-spin" /> : <CheckCircle2 className="h-6 w-6" />}
+                        ✅ All Good · Add {expectedUnits}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={flagForAdmin}
+                        disabled={loading}
+                        className="flex min-h-16 items-center justify-center gap-2 rounded-xl bg-amber-500 px-5 text-lg font-bold text-white hover:bg-amber-600 disabled:opacity-40"
+                      >
+                        <AlertTriangle className="h-6 w-6" />
+                        Any Problem · Send to Admin
+                      </button>
+                    </>
+                  )}
                 </div>
               )}
 
@@ -2025,21 +3468,54 @@ export default function ReturnsReceiving() {
 
       {tab === 'review' && isAdmin && (
         <div className="card overflow-hidden">
-          <div className="flex items-center justify-between border-b border-slate-200 px-4 py-4 sm:px-5">
+          <div className="flex flex-col gap-3 border-b border-slate-200 px-4 py-4 sm:px-5 lg:flex-row lg:items-end lg:justify-between">
             <div>
               <h3 className="font-semibold text-slate-900">Admin Review Queue</h3>
               <p className="mt-1 text-sm text-slate-500">
-                Damaged, mismatched, and unidentified packages wait here without changing inventory.
+                Verify the recorded style and quantity. Worker-checked packages keep their inspection record; manual Admin packages can be completed here too.
               </p>
             </div>
-            <button type="button" onClick={loadReviewPackages} className="btn-secondary">
-              <RefreshCw className="h-4 w-4" />
-              Refresh
-            </button>
+            <form
+              onSubmit={(event) => {
+                event.preventDefault()
+                loadReviewPackages({ reset: true, query: reviewSearch })
+              }}
+              className="flex min-w-0 flex-col gap-2 sm:flex-row"
+            >
+              <div className="relative min-w-0 sm:w-72">
+                <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                <input
+                  value={reviewSearch}
+                  onChange={(event) => setReviewSearch(event.target.value)}
+                  placeholder="Search Admin Review"
+                  aria-label="Search Admin Review"
+                  className="h-11 w-full rounded-lg border border-slate-300 bg-white pl-9 pr-3 text-sm"
+                />
+              </div>
+              <button type="submit" disabled={reviewLoading} className="btn-secondary min-h-11 justify-center disabled:opacity-40">
+                {reviewLoading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
+                Search
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setReviewSearch('')
+                  loadReviewPackages({ reset: true, query: '' })
+                }}
+                disabled={reviewLoading}
+                className="btn-secondary min-h-11 justify-center disabled:opacity-40"
+              >
+                Refresh all
+              </button>
+            </form>
           </div>
-          {!reviewPackages.length ? (
+          {!reviewPackages.length && reviewLoading ? (
+            <p className="flex items-center justify-center gap-2 px-5 py-12 text-sm text-slate-500">
+              <RefreshCw className="h-4 w-4 animate-spin" /> Loading Admin Review
+            </p>
+          ) : !reviewPackages.length ? (
             <p className="px-5 py-12 text-center text-sm text-slate-400">
-              No packages are waiting for admin review.
+              {reviewSearch ? 'No Admin Review packages match this search.' : 'No packages are waiting for admin review.'}
             </p>
           ) : (
             <div className="divide-y divide-slate-100">
@@ -2059,7 +3535,11 @@ export default function ReturnsReceiving() {
                     <p className="mt-1 text-xs text-slate-500">
                       {item.store_name || 'Unassigned store'}
                       {' · '}
-                      {item.requires_item_resolution ? 'Product selection required' : 'Physical inspection required'}
+                      {item.requires_item_resolution
+                        ? 'Product mapping and quantity verification required'
+                        : item.review_data?.workerInspection
+                          ? 'Final style and quantity confirmation'
+                          : 'Worker-reported problem requires review'}
                     </p>
                     {item.review_reason && (
                       <p className="mt-1 text-xs text-amber-700">{item.review_reason}</p>
@@ -2070,6 +3550,19 @@ export default function ReturnsReceiving() {
                   </span>
                 </button>
               ))}
+              </div>
+            )}
+          {reviewHasMore && (
+            <div className="border-t border-slate-200 p-4 text-center">
+              <button
+                type="button"
+                onClick={() => loadReviewPackages({ reset: false })}
+                disabled={reviewLoading}
+                className="btn-secondary min-h-11 justify-center disabled:opacity-40"
+              >
+                {reviewLoading && <RefreshCw className="h-4 w-4 animate-spin" />}
+                Load more
+              </button>
             </div>
           )}
         </div>
@@ -2085,18 +3578,20 @@ export default function ReturnsReceiving() {
               <h3 className="font-semibold text-slate-900">Upload daily return manifest</h3>
               <p className="mt-1 text-sm text-slate-500">
                 Upload one combined file with Tracking Number, SKU ID, PO, reason, buyer note, and carrier.
-                The fixed SKU ID identifies the store automatically.
+                The system identifies the store automatically only when the match is unambiguous.
               </p>
             </div>
           </div>
           <div className="mt-4 rounded-xl border border-blue-200 bg-blue-50 p-3 text-sm text-blue-800">
-            No store selection is needed. A tracking number containing unknown, duplicate-store,
-            or cross-store SKU IDs will be sent to Admin Review and will not enter inventory.
+            Return Tracking is a new inbound label and is not compared with the original outbound Tracking.
+            The uploaded PO identifies the original products. Only a missing/conflicting Store blocks upload;
+            packages with unresolved products upload directly to Admin Review.
           </div>
           <input
             type="file"
             accept=".xlsx,.xls,.csv"
             onChange={(event) => parseFile(event.target.files?.[0] || null)}
+            onClick={(event) => { event.currentTarget.value = '' }}
             className="mt-5 block w-full rounded-xl border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-sm text-slate-600 file:mr-4 file:rounded-lg file:border-0 file:bg-blue-600 file:px-4 file:py-2 file:text-sm file:font-semibold file:text-white"
           />
 
@@ -2115,7 +3610,7 @@ export default function ReturnsReceiving() {
                   <p className={`text-xl font-bold ${parsed.stats.reviewPackages ? 'text-amber-800' : 'text-emerald-700'}`}>
                     {parsed.stats.reviewPackages}
                   </p>
-                  <p className="text-xs text-slate-500">Packages needing review</p>
+                  <p className="text-xs text-slate-500">Need Admin review</p>
                 </div>
                 <div className="rounded-xl bg-blue-50 p-3">
                   <p className="text-xl font-bold text-blue-800">
@@ -2130,6 +3625,107 @@ export default function ReturnsReceiving() {
                   <p className="text-xs text-slate-500">Stores detected</p>
                 </div>
               </div>
+
+              {(parsed.pendingUploadDecisions || []).length > 0 && (
+                <div className="space-y-3 rounded-xl border-2 border-red-300 bg-red-50 p-3 sm:p-4">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-red-700" />
+                    <div>
+                      <p className="font-semibold text-red-900">Action required before upload</p>
+                      <p className="mt-1 text-xs text-red-700">
+                        Choose the correct Store or explicitly skip that tracking. Unresolved rows cannot upload.
+                      </p>
+                    </div>
+                  </div>
+                  {parsed.pendingUploadDecisions.map((decision) => {
+                    const draft = manifestChoiceDrafts[decision.tracking] || {}
+                    return (
+                      <div key={decision.tracking} className="rounded-xl border border-red-200 bg-white p-3">
+                        <p className="font-semibold text-slate-900">Tracking {decision.trackingNumber}</p>
+                        <p className="mt-1 text-xs text-red-700">
+                          {describeStoreDecision(decision)}
+                        </p>
+                        <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+                          <select
+                            aria-label={`Store for ${decision.trackingNumber}`}
+                            value={draft.storeKey || ''}
+                            onChange={(event) => setManifestChoiceDrafts((current) => ({
+                              ...current,
+                              [decision.tracking]: {
+                                ...current[decision.tracking],
+                                storeKey: event.target.value,
+                              },
+                            }))}
+                            className="h-11 min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-3 text-sm"
+                          >
+                            <option value="">Choose Store</option>
+                            {stores.map((store) => (
+                              <option key={store.store_key} value={store.store_key}>
+                                {store.store_name}
+                              </option>
+                            ))}
+                          </select>
+                          <button
+                            type="button"
+                            disabled={!draft.storeKey}
+                            onClick={() => chooseManifestStore(decision.tracking)}
+                            className="btn-primary min-h-11 justify-center disabled:opacity-40"
+                          >
+                            Use selected Store
+                          </button>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => skipManifestTracking(decision.tracking)}
+                          className="mt-3 min-h-10 rounded-lg border border-red-300 px-3 text-sm font-semibold text-red-700 hover:bg-red-50"
+                        >
+                          Skip this tracking
+                        </button>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+
+              {(parsed.skippedTrackings || []).length > 0 && (
+                <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">
+                  <p className="font-semibold">Skipped {parsed.skippedTrackings.length} tracking package(s)</p>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {parsed.skippedTrackings.map((trackingKey) => (
+                      <button
+                        key={trackingKey}
+                        type="button"
+                        onClick={() => undoManifestSkip(trackingKey)}
+                        className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-bold text-slate-700"
+                      >
+                        {trackingKey} · Undo skip
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {(Object.keys(manifestDecisions.storeByTracking).length > 0
+                || Object.keys(manifestDecisions.trackingByExcelRow || {}).length > 0) && (
+                <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900">
+                  <p className="font-semibold">Applied manual upload decisions</p>
+                  <p className="mt-1 text-xs text-emerald-700">Review or edit these choices before uploading.</p>
+                  <div className="mt-2 space-y-2">
+                    {Object.entries(manifestDecisions.trackingByExcelRow || {}).map(([excelRow, trackingNumber]) => (
+                      <div key={`tracking-decision-${excelRow}`} className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-white px-3 py-2 text-xs">
+                        <span>Excel row {excelRow} → Tracking {trackingNumber}</span>
+                        <button type="button" onClick={() => editManifestTrackingDecision(excelRow)} className="font-bold text-blue-700 underline">Edit Tracking</button>
+                      </div>
+                    ))}
+                    {Object.entries(manifestDecisions.storeByTracking).map(([trackingKey, store]) => (
+                      <div key={`store-decision-${trackingKey}`} className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-white px-3 py-2 text-xs">
+                        <span>{trackingKey} → Store {store.name}</span>
+                        <button type="button" onClick={() => editManifestStoreDecision(trackingKey)} className="font-bold text-blue-700 underline">Edit Store</button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {(parsed.pendingOrderMatches || []).length > 0 && (
                 <div className="rounded-xl border border-amber-200 bg-amber-50 p-3">
@@ -2146,16 +3742,64 @@ export default function ReturnsReceiving() {
                 <div className="rounded-xl border border-blue-200 bg-blue-50 p-3">
                   <p className="text-sm font-semibold text-blue-800">Waiting for Tracking</p>
                   <p className="mt-1 text-xs text-blue-700">
-                    These rows are not errors. They will be skipped today and can be uploaded again after Tracking is updated.
+                    Enter the return Tracking and choose its Store to keep this row in the upload. Rows left blank will be skipped.
                   </p>
-                  <ul className="mt-2 space-y-1 text-xs text-blue-800">
-                    {parsed.waitingForTracking.slice(0, 10).map((row) => (
-                      <li key={`${row.excelRow}-${row.orderNumber}`}>
-                        Excel row {row.excelRow}: {row.skuId || 'Missing SKU'}
-                        {row.orderNumber ? ` · PO ${row.orderNumber}` : ''}
-                      </li>
-                    ))}
-                  </ul>
+                  <div className="mt-3 space-y-3">
+                    {parsed.waitingForTracking.map((row) => {
+                      const draftKey = `row:${row.excelRow}`
+                      const draft = manifestChoiceDrafts[draftKey] || {}
+                      return (
+                        <div key={draftKey} className="rounded-xl border border-blue-200 bg-white p-3">
+                          <p className="text-xs font-medium text-blue-900">
+                            Excel row {row.excelRow}: {row.skuId || 'Missing SKU'}
+                            {row.orderNumber ? ` · PO ${row.orderNumber}` : ''}
+                          </p>
+                          <div className="mt-2 grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
+                            <input
+                              value={draft.trackingNumber || ''}
+                              onChange={(event) => setManifestChoiceDrafts((current) => ({
+                                ...current,
+                                [draftKey]: {
+                                  ...current[draftKey],
+                                  trackingNumber: event.target.value,
+                                },
+                              }))}
+                              placeholder="Return Tracking Number"
+                              aria-label={`Tracking for Excel row ${row.excelRow}`}
+                              className="h-11 rounded-lg border border-slate-300 bg-white px-3 text-sm"
+                            />
+                            <select
+                              value={draft.storeKey || ''}
+                              onChange={(event) => setManifestChoiceDrafts((current) => ({
+                                ...current,
+                                [draftKey]: {
+                                  ...current[draftKey],
+                                  storeKey: event.target.value,
+                                },
+                              }))}
+                              aria-label={`Store for Excel row ${row.excelRow}`}
+                              className="h-11 rounded-lg border border-slate-300 bg-white px-3 text-sm"
+                            >
+                              <option value="">Choose Store</option>
+                              {stores.map((store) => (
+                                <option key={store.store_key} value={store.store_key}>
+                                  {store.store_name}
+                                </option>
+                              ))}
+                            </select>
+                            <button
+                              type="button"
+                              disabled={!normalizeTracking(draft.trackingNumber) || !draft.storeKey}
+                              onClick={() => fillManifestTracking(row.excelRow)}
+                              className="btn-primary min-h-11 justify-center disabled:opacity-40"
+                            >
+                              Add row
+                            </button>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
                 </div>
               )}
 
@@ -2190,6 +3834,7 @@ export default function ReturnsReceiving() {
                 type="button"
                 onClick={uploadManifest}
                 disabled={uploading
+                  || (parsed.pendingUploadDecisions || []).length > 0
                   || (!parsed.packages.length && !(parsed.reviewPackages || []).length)}
                 className="btn-primary w-full justify-center py-3 disabled:opacity-50 sm:w-auto"
               >
@@ -2414,7 +4059,7 @@ export default function ReturnsReceiving() {
 
       {tab === 'analytics' && isAdmin && (
         <div className="space-y-4">
-          <div className="flex items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
             <select
               value={analyticsDays}
               onChange={(event) => setAnalyticsDays(Number(event.target.value))}
@@ -2424,10 +4069,38 @@ export default function ReturnsReceiving() {
               <option value={90}>Last 90 days</option>
               <option value={365}>Last 365 days</option>
             </select>
-            <button type="button" onClick={loadAnalytics} className="btn-secondary text-sm">
-              <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} /> Refresh
-            </button>
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              {analyticsLoadedAt && (
+                <span className="text-xs text-slate-400">
+                  Updated {new Date(analyticsLoadedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                </span>
+              )}
+              <button
+                type="button"
+                onClick={loadIntegrity}
+                disabled={integrityLoading}
+                className="btn-secondary text-sm disabled:opacity-50"
+              >
+                <ShieldCheck className={`h-4 w-4 ${integrityLoading ? 'animate-pulse' : ''}`} />
+                {integrityLoading ? 'Checking…' : 'Run Data Checks'}
+              </button>
+              <button
+                type="button"
+                onClick={loadAnalytics}
+                disabled={analyticsLoading}
+                className="btn-secondary text-sm disabled:opacity-50"
+              >
+                <RefreshCw className={`h-4 w-4 ${analyticsLoading ? 'animate-spin' : ''}`} /> Refresh
+              </button>
+            </div>
           </div>
+
+          {analyticsLoading && !analytics && (
+            <div className="card flex min-h-40 items-center justify-center text-sm text-slate-500">
+              <RefreshCw className="mr-2 h-5 w-5 animate-spin text-blue-600" />
+              Calculating return rates…
+            </div>
+          )}
 
           {analytics && (
             <>
@@ -2483,19 +4156,27 @@ export default function ReturnsReceiving() {
                   </div>
                 </div>
               )}
+              <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
+                <p className="font-bold">Warehouse-confirmed returns only / 只统计仓库已收到的退货</p>
+                <p className="mt-1 text-xs leading-relaxed">
+                  Return rates use the actual quantity scanned and confirmed after the package arrives.
+                  Uploaded manifests, customer return requests, Pending, Admin Review, and Not Ours packages are excluded.
+                  Physically received damaged items count as returns, while sellable restocked quantity remains a separate number.
+                </p>
+              </div>
               <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
                 {[
                   ['Received Packages', analytics.summary.received_packages],
                   ['Discrepancy Packages', analytics.summary.discrepancy_packages],
-                  ['Not Ours / Flagged', analytics.summary.flagged_packages],
-                  ['Actual Returned Units', analytics.summary.returned_units],
-                  ['Restocked Units', analytics.summary.restocked_units],
+                  ['Not Ours / Flagged (Excluded)', analytics.summary.flagged_packages],
+                  ['Warehouse-Received Units', analytics.summary.returned_units],
+                  ['Good Units Added to Inventory', analytics.summary.restocked_units],
                   ['Physical Units Sold', analytics.summary.sold_units],
                   ['Physical Unit Return Rate', analytics.summary.total_return_rate == null
                     ? '—'
                     : `${Number(analytics.summary.total_return_rate).toFixed(2)}%`],
                   ['Product Units Sold', analytics.summary.sold_product_units],
-                  ['Complete Product Returns', analytics.summary.returned_product_units],
+                  ['Complete Products Received', analytics.summary.returned_product_units],
                   ['Product Unit Return Rate', analytics.summary.product_return_rate == null
                     ? '—'
                     : `${Number(analytics.summary.product_return_rate).toFixed(2)}%`],
@@ -2557,7 +4238,7 @@ export default function ReturnsReceiving() {
                       <p className="font-semibold text-slate-800">{store.store_name}</p>
                       <div className="mt-3 grid grid-cols-2 gap-3 text-xs">
                         <div><p className="text-slate-400">Physical sold</p><p className="font-semibold">{store.sold_units}</p></div>
-                        <div><p className="text-slate-400">Physical returned</p><p className="font-semibold text-blue-700">{store.returned_units}</p></div>
+                        <div><p className="text-slate-400">Physical received</p><p className="font-semibold text-blue-700">{store.returned_units}</p></div>
                         <div><p className="text-slate-400">Physical rate</p><p className="font-semibold">{store.physical_return_rate == null ? '—' : `${Number(store.physical_return_rate).toFixed(2)}%`}</p></div>
                         <div><p className="text-slate-400">Product rate</p><p className="font-semibold">{store.product_return_rate == null ? '—' : `${Number(store.product_return_rate).toFixed(2)}%`}</p></div>
                       </div>
@@ -2572,12 +4253,12 @@ export default function ReturnsReceiving() {
                         <th className="px-4 py-3 text-right">Packages</th>
                         <th className="px-4 py-3 text-right">Discrepancies</th>
                         <th className="px-4 py-3 text-right">Not Ours</th>
-                        <th className="px-4 py-3 text-right">Returned</th>
+                        <th className="px-4 py-3 text-right">Received returns</th>
                         <th className="px-4 py-3 text-right">Restocked</th>
                         <th className="px-4 py-3 text-right">Physical Sold</th>
                         <th className="px-4 py-3 text-right">Physical Rate</th>
                         <th className="px-4 py-3 text-right">Products Sold</th>
-                        <th className="px-4 py-3 text-right">Product Returns</th>
+                        <th className="px-4 py-3 text-right">Products Received</th>
                         <th className="px-4 py-3 text-right">Product Rate</th>
                       </tr>
                     </thead>
@@ -2603,8 +4284,219 @@ export default function ReturnsReceiving() {
               </div>
               <div className="card overflow-hidden">
                 <div className="border-b border-slate-200 px-4 py-3 sm:px-5">
-                  <h3 className="text-sm font-semibold text-slate-800">Physical inventory return rate</h3>
-                  <p className="mt-1 text-xs text-slate-400">Actual received units ÷ sold units in the selected period</p>
+                  <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+                    <div>
+                      <h3 className="text-sm font-semibold text-slate-800">
+                        Product SKU ID return analysis / 商品 SKU ID 退货分析
+                      </h3>
+                      <p className="mt-1 text-xs text-slate-400">
+                        One sold product stays one unit even when the SKU is a multi-piece combination.
+                      </p>
+                    </div>
+                    <div className="flex flex-col gap-2 sm:flex-row">
+                      <label className="relative min-w-64">
+                        <Search className="absolute left-3 top-2.5 h-4 w-4 text-slate-400" />
+                        <input
+                          value={analyticsSkuSearch}
+                          onChange={(event) => setAnalyticsSkuSearch(event.target.value)}
+                          placeholder="Search SKU ID, SKU code, style, size, reason…"
+                          className="w-full rounded-xl border border-slate-200 py-2 pl-9 pr-3 text-sm outline-none focus:border-blue-500"
+                        />
+                      </label>
+                      <select
+                        value={analyticsSkuView}
+                        onChange={(event) => setAnalyticsSkuView(event.target.value)}
+                        className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
+                      >
+                        <option value="all">All products</option>
+                        <option value="combos">Combinations only</option>
+                        <option value="single">Single-item only</option>
+                      </select>
+                      <select
+                        value={analyticsSkuSort}
+                        onChange={(event) => setAnalyticsSkuSort(event.target.value)}
+                        className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
+                      >
+                        <option value="returns">Most returns</option>
+                        <option value="rate">Highest return rate</option>
+                        <option value="sku">SKU code</option>
+                      </select>
+                    </div>
+                  </div>
+                  <p className="mt-3 text-xs text-slate-500">
+                    Showing {Math.min(visibleProductSkuRows.length, 200).toLocaleString()} of{' '}
+                    {visibleProductSkuRows.length.toLocaleString()} matching warehouse-received SKU IDs.
+                  </p>
+                  <p className="mt-2 rounded-lg bg-blue-50 px-3 py-2 text-[11px] leading-relaxed text-blue-800">
+                    Reason percentages use warehouse-received product units with safe SKU-level attribution. New uploads retain each Excel row's SKU ID, reason, note, and quantity. Older multi-SKU packages are excluded from reason percentages instead of being guessed; Reason coverage shows the usable share.
+                  </p>
+                </div>
+                {!visibleProductSkuRows.length ? (
+                  <p className="px-5 py-10 text-center text-sm text-slate-400">
+                    No warehouse-received SKU IDs match these filters.
+                  </p>
+                ) : (
+                  <div className="grid gap-3 p-3 lg:grid-cols-2">
+                    {visibleProductSkuRows.slice(0, 200).map((row) => {
+                      const reasonCoverage = row.reason_coverage_pct == null
+                        ? null
+                        : Number(row.reason_coverage_pct)
+                      return (
+                        <div key={row.sku_id} className="rounded-xl border border-slate-200 bg-white p-4">
+                          <div className="flex flex-wrap items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <p className="break-all font-bold text-slate-900">{row.sku_code || '—'}</p>
+                                {Number(row.component_count || 0) > 1 && (
+                                  <span className="rounded-full bg-violet-100 px-2 py-0.5 text-[11px] font-bold text-violet-700">
+                                    Combination · {row.component_count} inventory lines
+                                  </span>
+                                )}
+                              </div>
+                              <p className="mt-1 break-all text-xs font-medium text-slate-500">
+                                SKU ID {row.sku_id}
+                              </p>
+                              {(row.sku_codes || []).filter((code) => code !== row.sku_code).length > 0 && (
+                                <p className="mt-1 break-all text-[11px] text-amber-600">
+                                  Historical SKU code(s):{' '}
+                                  {row.sku_codes.filter((code) => code !== row.sku_code).join(' · ')}
+                                </p>
+                              )}
+                              {(row.stores || []).length > 0 && (
+                                <p className="mt-1 text-xs text-slate-400">{row.stores.join(' · ')}</p>
+                              )}
+                            </div>
+                            <div className="rounded-xl bg-blue-50 px-3 py-2 text-right">
+                              <p className="text-xl font-black text-blue-800">
+                                {row.return_rate == null ? '—' : `${Number(row.return_rate).toFixed(2)}%`}
+                              </p>
+                              <p className="text-[10px] font-bold uppercase text-blue-500">Product return rate</p>
+                            </div>
+                          </div>
+
+                          {(row.components || []).length > 0 ? (
+                            <div className="mt-3 flex flex-wrap gap-1.5">
+                              {row.components.map((component, index) => (
+                                <span
+                                  key={`${row.sku_id}-${component.style}-${component.color}-${component.size}-${index}`}
+                                  className="rounded-lg bg-slate-100 px-2 py-1 text-[11px] font-medium text-slate-600"
+                                >
+                                  {skuComponentLabel(component)}
+                                </span>
+                              ))}
+                            </div>
+                          ) : (
+                            <p className="mt-3 text-xs text-amber-700">
+                              Physical style mapping is not unique, but the SKU ID product rate is still available.
+                            </p>
+                          )}
+
+                          <div className="mt-3 grid grid-cols-3 gap-2 text-center text-xs">
+                            <div className="rounded-lg bg-slate-50 px-2 py-2">
+                              <p className="text-lg font-bold text-slate-800">{Number(row.sold_qty || 0).toLocaleString()}</p>
+                              <p className="text-slate-400">Products sold</p>
+                            </div>
+                            <div className="rounded-lg bg-blue-50 px-2 py-2">
+                              <p className="text-lg font-bold text-blue-700">{Number(row.returned_qty || 0).toLocaleString()}</p>
+                              <p className="text-blue-500">Received returns</p>
+                            </div>
+                            <div className="rounded-lg bg-emerald-50 px-2 py-2">
+                              <p className="text-lg font-bold text-emerald-700">
+                                {reasonCoverage == null ? '—' : `${reasonCoverage.toFixed(0)}%`}
+                              </p>
+                              <p className="text-emerald-600">Reason coverage</p>
+                            </div>
+                          </div>
+
+                          <div className="mt-4 border-t border-slate-100 pt-3">
+                            <p className="text-xs font-bold uppercase tracking-wide text-slate-500">
+                              Return reasons / 退货原因
+                            </p>
+                            {(row.reason_breakdown || []).length ? (
+                              <div className="mt-2 space-y-2">
+                                {row.reason_breakdown.map((reason) => (
+                                  <details key={reason.category} className="group rounded-lg bg-slate-50 px-3 py-2">
+                                    <summary className="cursor-pointer list-none">
+                                      <div className="flex items-center justify-between gap-3 text-xs">
+                                        <span className="font-semibold text-slate-700">
+                                          {reason.label_zh} / {reason.label}
+                                        </span>
+                                        <span className="shrink-0 font-bold tabular-nums text-slate-900">
+                                          {Number(reason.quantity).toLocaleString()} · {Number(reason.share).toFixed(1)}%
+                                        </span>
+                                      </div>
+                                      <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-slate-200">
+                                        <div
+                                          className="h-full rounded-full bg-blue-500"
+                                          style={{ width: `${Math.min(Number(reason.share || 0), 100)}%` }}
+                                        />
+                                      </div>
+                                    </summary>
+                                    {(reason.examples || []).length > 0 && (
+                                      <div className="mt-2 space-y-1 border-t border-slate-200 pt-2 text-[11px] text-slate-500">
+                                        {reason.examples.map((example) => <p key={example}>• {example}</p>)}
+                                      </div>
+                                    )}
+                                  </details>
+                                ))}
+                              </div>
+                            ) : (
+                              <p className="mt-2 text-xs text-slate-400">No reason can be safely assigned to this SKU yet.</p>
+                            )}
+                            {Number(row.reason_unattributed_qty || 0) > 0 && (
+                              <p className="mt-2 text-[11px] leading-relaxed text-amber-700">
+                                {Number(row.reason_unattributed_qty).toLocaleString()} returned product(s) are excluded from reason percentages because an older package contained multiple SKU IDs or no reason. They are still included in the return rate.
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+
+              <div className="card overflow-hidden">
+                <div className="border-b border-slate-200 px-4 py-3 sm:px-5">
+                  <h3 className="text-sm font-semibold text-slate-800">Return rate by size / 按 Size 分析</h3>
+                  <p className="mt-1 text-xs text-slate-400">
+                    Warehouse-received physical pieces ÷ physical pieces sold. Combination components are counted by their actual received inventory quantities.
+                  </p>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full min-w-[620px] text-sm">
+                    <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
+                      <tr>
+                        <th className="px-4 py-3">Size</th>
+                        <th className="px-4 py-3 text-right">Physical sold</th>
+                        <th className="px-4 py-3 text-right">Received returns</th>
+                        <th className="px-4 py-3 text-right">Restocked</th>
+                        <th className="px-4 py-3 text-right">Return rate</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {(analytics.sizes || []).map((row) => (
+                        <tr key={row.size}>
+                          <td className="px-4 py-3 font-bold text-slate-800">{row.size}</td>
+                          <td className="px-4 py-3 text-right tabular-nums">{row.sold_qty}</td>
+                          <td className="px-4 py-3 text-right tabular-nums font-semibold text-blue-700">{row.returned_qty}</td>
+                          <td className="px-4 py-3 text-right tabular-nums font-semibold text-emerald-700">{row.restocked_qty}</td>
+                          <td className="px-4 py-3 text-right tabular-nums font-bold">
+                            {row.return_rate == null ? '—' : `${Number(row.return_rate).toFixed(2)}%`}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div className="card overflow-hidden">
+                <div className="border-b border-slate-200 px-4 py-3 sm:px-5">
+                  <h3 className="text-sm font-semibold text-slate-800">Physical inventory SKU return rate (Style / Color / Size)</h3>
+                  <p className="mt-1 text-xs text-slate-400">
+                    Actual received inventory SKU units ÷ sold inventory SKU units in the selected period
+                  </p>
                 </div>
                 <div className="space-y-3 p-3 sm:hidden">
                   {(analytics.rows || []).map((row, index) => (
@@ -2617,7 +4509,7 @@ export default function ReturnsReceiving() {
                       </p>
                       <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
                         <div><p className="text-slate-400">Sold</p><p className="font-semibold">{row.sold_qty}</p></div>
-                        <div><p className="text-slate-400">Returned</p><p className="font-semibold text-blue-700">{row.returned_qty}</p></div>
+                        <div><p className="text-slate-400">Received return</p><p className="font-semibold text-blue-700">{row.returned_qty}</p></div>
                         <div><p className="text-slate-400">Rate</p><p className="font-semibold">{row.return_rate == null ? '—' : `${Number(row.return_rate).toFixed(2)}%`}</p></div>
                       </div>
                     </div>
@@ -2631,7 +4523,7 @@ export default function ReturnsReceiving() {
                         <th className="px-4 py-3">Color</th>
                         <th className="px-4 py-3">Size</th>
                         <th className="px-4 py-3 text-right">Sold</th>
-                        <th className="px-4 py-3 text-right">Returned</th>
+                        <th className="px-4 py-3 text-right">Received returns</th>
                         <th className="px-4 py-3 text-right">Return Rate</th>
                       </tr>
                     </thead>

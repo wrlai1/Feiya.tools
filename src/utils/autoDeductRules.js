@@ -33,7 +33,12 @@ export function findAdditionalSizeMappings({
   targetEntry,
 }) {
   const source = unmatchedRows[sourceIndex]
-  if (!source || source.packCount > 1 || !canReuseAcrossSizes(source.parseIssue)) return []
+  if (
+    !source
+    || source.packCount > 1
+    || !canReuseAcrossSizes(source.parseIssue)
+    || !canReuseAcrossSizes(source.sourceIssue)
+  ) return []
 
   const sourceStyle = normalizeStyleIdentity(source.style)
   const sourceColor = sourceColorKey(source.color)
@@ -47,7 +52,9 @@ export function findAdditionalSizeMappings({
       || resolved[index]
       || row.packCount > 1
       || row.parseIssue !== source.parseIssue
+      || row.sourceIssue !== source.sourceIssue
       || !canReuseAcrossSizes(row.parseIssue)
+      || !canReuseAcrossSizes(row.sourceIssue)
     ) return []
     if (normalizeStyleIdentity(row.style) !== sourceStyle || sourceColorKey(row.color) !== sourceColor) return []
 
@@ -71,7 +78,12 @@ export function findAdditionalComboSizeMappings({
   components,
 }) {
   const source = unmatchedRows[sourceIndex]
-  if (!source || !components?.length || !canReuseComboAcrossSizes(source.parseIssue)) return []
+  if (
+    !source
+    || !components?.length
+    || !canReuseComboAcrossSizes(source.parseIssue)
+    || !canReuseComboAcrossSizes(source.sourceIssue)
+  ) return []
 
   const sourceSize = normalizeSize(source.size)
   if (!sourceSize || components.some((component) => normalizeSize(component.SIZE) !== sourceSize)) return []
@@ -84,7 +96,9 @@ export function findAdditionalComboSizeMappings({
       index === sourceIndex
       || resolved[index]
       || row.parseIssue !== source.parseIssue
+      || row.sourceIssue !== source.sourceIssue
       || !canReuseComboAcrossSizes(row.parseIssue)
+      || !canReuseComboAcrossSizes(row.sourceIssue)
       || normalizeStyleIdentity(row.style) !== sourceStyle
       || sourceColorKey(row.color) !== sourceColor
     ) return []

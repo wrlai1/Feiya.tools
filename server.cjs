@@ -34,6 +34,24 @@ app.all('/api/inventory-balance', async (req, res) => {
   return (await inventoryBalanceHandlerPromise)(req, res);
 });
 
+let authHandlerPromise;
+app.all('/api/auth', async (req, res) => {
+  authHandlerPromise ||= import('./api/auth.js').then((module) => module.default);
+  return (await authHandlerPromise)(req, res);
+});
+
+let usersHandlerPromise;
+app.all('/api/users', async (req, res) => {
+  usersHandlerPromise ||= import('./api/users.js').then((module) => module.default);
+  return (await usersHandlerPromise)(req, res);
+});
+
+let appDataHandlerPromise;
+app.all('/api/app-data', async (req, res) => {
+  appDataHandlerPromise ||= import('./api/app-data.js').then((module) => module.default);
+  return (await appDataHandlerPromise)(req, res);
+});
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function getDB() {
