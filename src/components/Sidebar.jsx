@@ -9,6 +9,9 @@ import {
 import { useAuth } from '../context/AuthContext.jsx'
 import ChangePasswordModal from './ChangePasswordModal.jsx'
 import { SECTION_THEMES } from '../utils/sectionTheme.js'
+import userPermissions from '../../lib/userPermissions.cjs'
+
+const { INVENTORY_CHECK_VIEW, userHasPermission } = userPermissions
 
 const ADMIN_GROUPS = [
   {
@@ -52,6 +55,7 @@ const USER_GROUPS = [
     label: 'Operations',
     theme: 'operations',
     items: [
+      { label: 'Inventory Check', to: '/inventory', icon: Package, permission: INVENTORY_CHECK_VIEW },
       { label: 'Tracking', to: '/tracking', icon: Truck },
       { label: 'Returns Receiving', to: '/returns', icon: ScanLine },
       { label: 'Low Inventory Notes', to: '/notes', icon: MessageSquare },
@@ -98,7 +102,14 @@ export default function Sidebar({ open, collapsed, onClose }) {
   const location = useLocation()
   const [showChangePw, setShowChangePw] = useState(false)
   const isAdmin = user?.role === 'admin'
-  const groups = isAdmin ? ADMIN_GROUPS : USER_GROUPS
+  const groups = (isAdmin ? ADMIN_GROUPS : USER_GROUPS)
+    .map((group) => ({
+      ...group,
+      items: group.items.filter((item) =>
+        !item.permission || userHasPermission(user, item.permission),
+      ),
+    }))
+    .filter((group) => group.items.length)
 
   return (
     <>
