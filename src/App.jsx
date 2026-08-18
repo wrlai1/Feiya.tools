@@ -18,6 +18,7 @@ import AdminUsers from './pages/AdminUsers.jsx'
 import TimeClockPage from './pages/TimeClockPage.jsx'
 import AdminTimeReport from './pages/AdminTimeReport.jsx'
 import ReturnsReceiving from './pages/ReturnsReceiving.jsx'
+import FactoryAttendance from './pages/FactoryAttendance.jsx'
 
 // Full-page spinner shown while verifying token on first load
 function SplashLoader() {
@@ -57,11 +58,27 @@ function RequireAdmin({ children }) {
   return children
 }
 
+function RequireAttendance({ children }) {
+  const { user } = useAuth()
+  const location = useLocation()
+  if (import.meta.env.DEV && new URLSearchParams(location.search).get('mock') === '1') return children
+  if (user?.role !== 'admin' && !user?.attendanceAccess) return <Navigate to="/tracking" replace />
+  return children
+}
+
+function RequireGeneralAccess({ children }) {
+  const { user } = useAuth()
+  const location = useLocation()
+  if (import.meta.env.DEV && new URLSearchParams(location.search).get('mock') === '1') return children
+  if (user?.role !== 'admin' && user?.attendanceAccess) return <Navigate to="/attendance" replace />
+  return children
+}
+
 // Redirect already-logged-in users away from /login
 function GuestOnly({ children }) {
   const { user, loading } = useAuth()
   if (loading) return <SplashLoader />
-  if (user) return <Navigate to={user.role === 'admin' ? '/' : '/tracking'} replace />
+  if (user) return <Navigate to={user.role === 'admin' ? '/' : user.attendanceAccess ? '/attendance' : '/tracking'} replace />
   return children
 }
 
@@ -75,18 +92,19 @@ function AppRoutes() {
       <Route path="/" element={<RequireAuth><Layout /></RequireAuth>}>
         <Route index element={<RequireAdmin><Dashboard /></RequireAdmin>} />
         <Route path="inventory" element={<RequireAdmin><InventoryCheck /></RequireAdmin>} />
-        <Route path="tracking" element={<TrackingPage />} />
-        <Route path="notes" element={<NotesPage />} />
+        <Route path="tracking" element={<RequireGeneralAccess><TrackingPage /></RequireGeneralAccess>} />
+        <Route path="notes" element={<RequireGeneralAccess><NotesPage /></RequireGeneralAccess>} />
         <Route path="stock" element={<RequireAdmin><StockManagement /></RequireAdmin>} />
         <Route path="auto-deduct" element={<RequireAdmin><AutoDeduct /></RequireAdmin>} />
         <Route path="auto-deduct/history" element={<RequireAdmin><AutoDeductHistory /></RequireAdmin>} />
-        <Route path="returns" element={<ReturnsReceiving />} />
+        <Route path="returns" element={<RequireGeneralAccess><ReturnsReceiving /></RequireGeneralAccess>} />
         <Route path="analytics" element={<RequireAdmin><MetricsAnalytics /></RequireAdmin>} />
         <Route path="new-products" element={<RequireAdmin><NewProductTracker /></RequireAdmin>} />
         <Route path="auto-generate" element={<RequireAdmin><AutoGenerate /></RequireAdmin>} />
         <Route path="users" element={<RequireAdmin><AdminUsers /></RequireAdmin>} />
-        <Route path="timeclock" element={<TimeClockPage />} />
+        <Route path="timeclock" element={<RequireGeneralAccess><TimeClockPage /></RequireGeneralAccess>} />
         <Route path="time-report" element={<RequireAdmin><AdminTimeReport /></RequireAdmin>} />
+        <Route path="attendance" element={<RequireAttendance><FactoryAttendance /></RequireAttendance>} />
       </Route>
 
       {/* Fallback */}

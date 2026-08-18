@@ -4,6 +4,7 @@ import {
   BarChart3,
   Boxes,
   ClipboardList,
+  CalendarCheck,
   Clock,
   Command,
   LayoutDashboard,
@@ -32,6 +33,7 @@ const ROUTES = [
   { label: 'Time Clock', path: '/timeclock', icon: Clock },
   { label: 'User Management', path: '/users', icon: Users, adminOnly: true },
   { label: 'Time Report', path: '/time-report', icon: ClipboardList, adminOnly: true },
+  { label: 'Factory Attendance', path: '/attendance', icon: CalendarCheck, attendance: true },
 ]
 
 export default function CommandPalette() {
@@ -46,8 +48,12 @@ export default function CommandPalette() {
   const [selectedIndex, setSelectedIndex] = useState(0)
 
   const availableRoutes = useMemo(
-    () => ROUTES.filter((route) => !route.adminOnly || user?.role === 'admin'),
-    [user?.role],
+    () => ROUTES.filter((route) => {
+      if (user?.role === 'admin') return true
+      if (user?.attendanceAccess) return route.attendance
+      return !route.adminOnly && !route.attendance
+    }),
+    [user?.attendanceAccess, user?.role],
   )
 
   const filteredRoutes = useMemo(() => {

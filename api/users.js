@@ -27,10 +27,11 @@ export default async function handler(req, res) {
   const userId = req.query.id ? parseInt(req.query.id, 10) : null;
 
   try {
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS attendance_access BOOLEAN NOT NULL DEFAULT FALSE`;
     // ── List all users ─────────────────────────────────────────────────────
     if (req.method === 'GET') {
       const rows = await sql`
-        SELECT id, username, role, created_by, created_at
+        SELECT id, username, role, attendance_access, created_by, created_at
         FROM users ORDER BY created_at ASC
       `;
       return res.status(200).json(rows);
@@ -38,16 +39,16 @@ export default async function handler(req, res) {
 
     // ── Create user ────────────────────────────────────────────────────────
     if (req.method === 'POST') {
-      const { username, password, role = 'user' } = req.body || {};
+      const { username, password, role = 'user', attendanceAccess = false } = req.body || {};
       if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
       if (!['admin', 'user'].includes(role)) return res.status(400).json({ error: 'Role must be admin or user' });
       if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
 
       const hash = await bcrypt.hash(password, 10);
       const rows = await sql`
-        INSERT INTO users (username, password_hash, role, created_by)
-        VALUES (${username.trim().toLowerCase()}, ${hash}, ${role}, ${admin.username})
-        RETURNING id, username, role, created_by, created_at
+        INSERT INTO users (username, password_hash, role, attendance_access, created_by)
+        VALUES (${username.trim().toLowerCase()}, ${hash}, ${role}, ${Boolean(attendanceAccess)}, ${admin.username})
+        RETURNING id, username, role, attendance_access, created_by, created_at
       `;
       return res.status(200).json(rows[0]);
     }
@@ -55,7 +56,7 @@ export default async function handler(req, res) {
     // ── Reset password or change role ──────────────────────────────────────
     if (req.method === 'PATCH') {
       if (!userId) return res.status(400).json({ error: 'User id required' });
-      const { password, role } = req.body || {};
+      const { password, role, attendanceAccess } = req.body || {};
 
       if (password) {
         if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
@@ -66,7 +67,10 @@ export default async function handler(req, res) {
         if (!['admin', 'user'].includes(role)) return res.status(400).json({ error: 'Invalid role' });
         await sql`UPDATE users SET role = ${role} WHERE id = ${userId}`;
       }
-      const rows = await sql`SELECT id, username, role, created_by, created_at FROM users WHERE id = ${userId}`;
+      if (typeof attendanceAccess === 'boolean') {
+        await sql`UPDATE users SET attendance_access = ${attendanceAccess} WHERE id = ${userId}`;
+      }
+      const rows = await sql`SELECT id, username, role, attendance_access, created_by, created_at FROM users WHERE id = ${userId}`;
       if (!rows[0]) return res.status(404).json({ error: 'User not found' });
       return res.status(200).json(rows[0]);
     }

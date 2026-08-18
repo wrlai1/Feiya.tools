@@ -19,6 +19,7 @@ const PAGE_TITLES = {
   '/users':        'User Management',
   '/timeclock':    'Time Clock',
   '/time-report':  'Time Report',
+  '/attendance':   'Factory Attendance',
 }
 
 const PAGE_DESCRIPTIONS = {
@@ -35,6 +36,7 @@ const PAGE_DESCRIPTIONS = {
   '/users': 'Manage team access and permissions',
   '/timeclock': 'Clock in, clock out, and review today',
   '/time-report': 'Review team attendance and hours',
+  '/attendance': 'Import factory punches and prepare payroll summaries',
 }
 
 export default function Header({ onMenuClick, onSidebarToggle, sidebarCollapsed, sectionTheme }) {

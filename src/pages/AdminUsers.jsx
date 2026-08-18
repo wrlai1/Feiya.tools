@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react'
 import {
   Users, Plus, KeyRound, Trash2, ShieldCheck, User,
   AlertCircle, RefreshCw, Eye, EyeOff, X, Check,
+  CalendarCheck,
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import { useToast } from '../hooks/useToast.js'
@@ -83,6 +84,7 @@ export default function AdminUsers() {
   const [newUsername, setNewUsername]     = useState('')
   const [newPassword, setNewPassword]     = useState('')
   const [newRole, setNewRole]             = useState('user')
+  const [newAttendanceAccess, setNewAttendanceAccess] = useState(false)
   const [resetPassword, setResetPassword] = useState('')
 
   const loadUsers = useCallback(() => {
@@ -101,6 +103,7 @@ export default function AdminUsers() {
     setNewUsername('')
     setNewPassword('')
     setNewRole('user')
+    setNewAttendanceAccess(false)
     setResetPassword('')
   }
 
@@ -111,7 +114,7 @@ export default function AdminUsers() {
     try {
       await apiFetch('/users', {
         method: 'POST',
-        body: JSON.stringify({ username: newUsername, password: newPassword, role: newRole }),
+        body: JSON.stringify({ username: newUsername, password: newPassword, role: newRole, attendanceAccess: newAttendanceAccess }),
       }, getToken)
       toast.success(`User "${newUsername}" created`)
       closeModal()
@@ -169,6 +172,19 @@ export default function AdminUsers() {
     }
   }
 
+  async function handleAttendanceToggle(u) {
+    try {
+      await apiFetch(`/users?id=${u.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ attendanceAccess: !u.attendance_access }),
+      }, getToken)
+      toast.success(`${u.username} attendance-only access ${u.attendance_access ? 'disabled' : 'enabled'}`)
+      loadUsers()
+    } catch (err) {
+      toast.error(err.message)
+    }
+  }
+
   return (
     <div className="space-y-6 max-w-4xl">
       {/* Header */}
@@ -194,6 +210,7 @@ export default function AdminUsers() {
             <thead>
               <tr className="bg-slate-50 border-b border-slate-200">
                 <th className="px-4 py-3 text-left font-semibold text-slate-500 uppercase tracking-wide text-xs">Username</th>
+                <th className="px-4 py-3 text-left font-semibold text-slate-500 uppercase tracking-wide text-xs">Factory Attendance</th>
                 <th className="px-4 py-3 text-left font-semibold text-slate-500 uppercase tracking-wide text-xs">Role</th>
                 <th className="px-4 py-3 text-left font-semibold text-slate-500 uppercase tracking-wide text-xs hidden sm:table-cell">Created by</th>
                 <th className="px-4 py-3 text-left font-semibold text-slate-500 uppercase tracking-wide text-xs hidden md:table-cell">Joined</th>
@@ -211,6 +228,15 @@ export default function AdminUsers() {
                       <span className="font-medium text-slate-800">{u.username}</span>
                       {u.id === me?.id && <span className="text-xs text-slate-400">(you)</span>}
                     </div>
+                  </td>
+                  <td className="px-4 py-3">
+                    {u.role === 'admin' ? (
+                      <span className="text-xs text-slate-400">Included</span>
+                    ) : (
+                      <button onClick={() => handleAttendanceToggle(u)} className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-xs font-semibold ${u.attendance_access ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>
+                        <CalendarCheck className="h-3 w-3" /> {u.attendance_access ? 'Attendance only' : 'Off'}
+                      </button>
+                    )}
                   </td>
                   <td className="px-4 py-3">
                     <button
@@ -283,6 +309,12 @@ export default function AdminUsers() {
                 ))}
               </div>
             </div>
+            {newRole === 'user' && (
+              <label className={`flex cursor-pointer items-start gap-3 rounded-lg border-2 p-3 transition-colors ${newAttendanceAccess ? 'border-emerald-500 bg-emerald-50' : 'border-slate-200'}`}>
+                <input type="checkbox" checked={newAttendanceAccess} onChange={(event) => setNewAttendanceAccess(event.target.checked)} className="mt-0.5" />
+                <span><span className="block text-sm font-medium text-slate-700">Factory attendance only</span><span className="block text-xs text-slate-500">This account will only see TXT upload, attendance review, and payroll summaries.</span></span>
+              </label>
+            )}
             <div className="flex gap-3 pt-2">
               <button type="button" onClick={closeModal} className="btn-secondary flex-1 justify-center">Cancel</button>
               <button type="submit" disabled={saving} className="btn-primary flex-1 justify-center disabled:opacity-50">

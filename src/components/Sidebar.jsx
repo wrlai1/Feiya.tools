@@ -4,7 +4,7 @@ import {
   LayoutDashboard, Package, Truck, MessageSquare,
   Boxes, Minus, X, Users, LogOut, KeyRound, ShieldCheck, User, Clock,
   ClipboardList, BarChart3, Rocket,
-  ScanLine,
+  ScanLine, CalendarCheck,
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import ChangePasswordModal from './ChangePasswordModal.jsx'
@@ -43,6 +43,7 @@ const ADMIN_GROUPS = [
       { label: 'Time Clock', to: '/timeclock', icon: Clock },
       { label: 'User Management', to: '/users', icon: Users },
       { label: 'Time Report', to: '/time-report', icon: ClipboardList },
+      { label: 'Factory Attendance', to: '/attendance', icon: CalendarCheck },
     ],
   },
 ]
@@ -61,6 +62,14 @@ const USER_GROUPS = [
     label: 'Team',
     theme: 'team',
     items: [{ label: 'Time Clock', to: '/timeclock', icon: Clock }],
+  },
+]
+
+const ATTENDANCE_GROUPS = [
+  {
+    label: 'Payroll',
+    theme: 'team',
+    items: [{ label: 'Factory Attendance', to: '/attendance', icon: CalendarCheck }],
   },
 ]
 
@@ -98,7 +107,7 @@ export default function Sidebar({ open, collapsed, onClose }) {
   const location = useLocation()
   const [showChangePw, setShowChangePw] = useState(false)
   const isAdmin = user?.role === 'admin'
-  const groups = isAdmin ? ADMIN_GROUPS : USER_GROUPS
+  const groups = isAdmin ? ADMIN_GROUPS : user?.attendanceAccess ? ATTENDANCE_GROUPS : USER_GROUPS
 
   return (
     <>
@@ -163,7 +172,7 @@ export default function Sidebar({ open, collapsed, onClose }) {
               <div className="flex items-center gap-1">
                 {isAdmin
                   ? <><ShieldCheck className="w-3 h-3 text-[#0071e3]" /><span className="text-[#0071e3] text-xs">Admin</span></>
-                  : <><User className="w-3 h-3 text-slate-400" /><span className="text-slate-400 text-xs">User</span></>
+                  : <><User className="w-3 h-3 text-slate-400" /><span className="text-slate-400 text-xs">{user?.attendanceAccess ? 'Attendance' : 'User'}</span></>
                 }
               </div>
             </div>

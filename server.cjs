@@ -28,6 +28,12 @@ app.all('/api/returns', async (req, res) => {
   return (await returnsHandlerPromise)(req, res);
 });
 
+let attendanceHandlerPromise;
+app.all('/api/attendance', async (req, res) => {
+  attendanceHandlerPromise ||= import('./api/attendance.js').then((module) => module.default);
+  return (await attendanceHandlerPromise)(req, res);
+});
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function getDB() {

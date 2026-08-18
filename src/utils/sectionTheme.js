@@ -58,7 +58,7 @@ export function sectionThemeForPath(pathname) {
   if (pathname.startsWith('/analytics') || pathname.startsWith('/new-products')) {
     return SECTION_THEMES.insights
   }
-  if (pathname.startsWith('/timeclock') || pathname.startsWith('/users') || pathname.startsWith('/time-report')) {
+  if (pathname.startsWith('/timeclock') || pathname.startsWith('/users') || pathname.startsWith('/time-report') || pathname.startsWith('/attendance')) {
     return SECTION_THEMES.team
   }
   return SECTION_THEMES.operations

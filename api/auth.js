@@ -11,10 +11,12 @@ async function ensureTable(sql) {
       username    TEXT UNIQUE NOT NULL,
       password_hash TEXT NOT NULL,
       role        TEXT NOT NULL DEFAULT 'user',
+      attendance_access BOOLEAN NOT NULL DEFAULT FALSE,
       created_by  TEXT,
       created_at  TIMESTAMPTZ DEFAULT NOW()
     )
   `;
+  await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS attendance_access BOOLEAN NOT NULL DEFAULT FALSE`;
 }
 
 async function seedAdminIfNeeded(sql) {
@@ -77,16 +79,31 @@ export default async function handler(req, res) {
         secret,
         { expiresIn: '7d' }
       );
-      return res.status(200).json({ token, user: { id: user.id, username: user.username, role: user.role } });
+      return res.status(200).json({
+        token,
+        user: {
+          id: user.id,
+          username: user.username,
+          role: user.role,
+          attendanceAccess: Boolean(user.attendance_access),
+        },
+      });
     }
 
     // ── Verify token ───────────────────────────────────────────────────────
     if (action === 'verify') {
       const payload = verifyToken(req.headers.authorization, secret);
       if (!payload) return res.status(401).json({ error: 'Invalid or expired token' });
-      const rows = await sql`SELECT id, username, role FROM users WHERE id = ${payload.userId}`;
+      const rows = await sql`SELECT id, username, role, attendance_access FROM users WHERE id = ${payload.userId}`;
       if (!rows[0]) return res.status(401).json({ error: 'User not found' });
-      return res.status(200).json({ user: rows[0] });
+      return res.status(200).json({
+        user: {
+          id: rows[0].id,
+          username: rows[0].username,
+          role: rows[0].role,
+          attendanceAccess: Boolean(rows[0].attendance_access),
+        },
+      });
     }
 
     // ── Change own password ────────────────────────────────────────────────
