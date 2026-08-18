@@ -276,46 +276,43 @@ export function buildDailyStyleWorkbookData(report) {
   const { sizes } = report
   const inventoryStart = 1
   const inventoryTotal = inventoryStart + sizes.length
-  const latestStart = inventoryTotal + 1
-  const latestTotal = latestStart + sizes.length
-  const comparisonStart = latestTotal + 1
-  const tableLastColumn = comparisonStart + 4
-  const lastColumn = Math.max(tableLastColumn, 11)
+  const salesStart = inventoryTotal + 1
+  const salesEnd = salesStart + 4
+  const forecastColumn = salesEnd + 1
+  const lastColumn = forecastColumn
   const mainWidths = Array(lastColumn + 1).fill(12)
-  mainWidths[0] = 26
-  for (const column of [2, 4, 6, 8, 10]) {
-    if (column <= lastColumn) mainWidths[column] = 18
-  }
-  ;[14, 16, 14, 14, 18].forEach((width, index) => {
-    mainWidths[comparisonStart + index] = width
-  })
+  mainWidths[0] = 25
+  mainWidths[inventoryTotal] = 15
+  ;[14, 14, 14, 14, 15].forEach((width, index) => { mainWidths[salesStart + index] = width })
+  mainWidths[forecastColumn] = 20
+
+  const summaryRow = Array(lastColumn + 1).fill('')
+  summaryRow[inventoryStart] = `CURRENT INVENTORY / 当前库存\n${rounded(report.totals.currentInventory)}`
+  summaryRow[salesStart] = `RECENT SALES / 近7天销量\n${rounded(report.totals.last7Sales)}`
+  summaryRow[forecastColumn] = `EST. DAYS LEFT / 预计可售天数\n${displayDays(report.totals.daysLeft)}`
 
   const mainRows = [
-    [`${report.style} Daily Inventory & Sales Report`],
-    ['Generated', report.generatedDay, 'Sales data through', report.dataThroughDay,
-      'Current inventory already includes applied Auto Deduct sales; sales history is not deducted again.'],
+    [`${report.style} Daily Style Report / 每日款式报告`],
+    ['Generated / 生成日期', report.generatedDay, 'Sales through / 销量截止', report.dataThroughDay],
     [],
-    ['Current Inventory', report.totals.currentInventory, 'Latest Day Sales', report.totals.latestDaySales,
-      'Last 7 Days', report.totals.last7Sales, 'Previous 7 Days', report.totals.previous7Sales,
-      '28D Avg / Day', rounded(report.totals.dailyAverage, 2), 'Est. Days Left', displayDays(report.totals.daysLeft)],
+    summaryRow,
     [],
     [
       'Color',
-      'Current Inventory', ...Array(sizes.length).fill(''),
-      `Latest Sales Day (${report.dataThroughDay})`, ...Array(sizes.length).fill(''),
-      'Sales Comparison', '', '', '', '',
+      'CURRENT INVENTORY / 当前库存', ...Array(sizes.length).fill(''),
+      'RECENT SALES / 近期销量', ...Array(salesEnd - salesStart).fill(''),
+      'FORECAST / 预测',
     ],
     [
-      'Color',
+      'Color / 颜色',
       ...sizes, 'Total',
-      ...sizes, 'Total',
-      'Last 7 Days', 'Previous 7 Days', 'Last 28 Days', '28D Avg / Day', 'Est. Days Left',
+      `Latest Day\n${report.dataThroughDay}`, 'Last 7 Days', 'Previous 7 Days', 'Last 28 Days', '28D Avg / Day',
+      'Est. Days Left\n预计可售天数',
     ],
     ...report.colorRows.map((row) => [
       row.color,
       ...sizes.map((size) => row.inventoryBySize[size] || 0), row.onHand,
-      ...sizes.map((size) => row.latestSalesBySize[size] || 0), row.latestDaySales,
-      row.last7Sales, row.previous7Sales, row.last28Sales,
+      row.latestDaySales, row.last7Sales, row.previous7Sales, row.last28Sales,
       rounded(row.dailyAverage, 2), displayDays(row.daysLeft),
     ]),
     [
@@ -324,9 +321,6 @@ export function buildDailyStyleWorkbookData(report) {
         .filter((row) => row.size === size)
         .reduce((sum, row) => sum + row.onHand, 0)),
       report.totals.currentInventory,
-      ...sizes.map((size) => report.sizeRows
-        .filter((row) => row.size === size)
-        .reduce((sum, row) => sum + row.latestDaySales, 0)),
       report.totals.latestDaySales,
       report.totals.last7Sales,
       report.totals.previous7Sales,
@@ -339,94 +333,32 @@ export function buildDailyStyleWorkbookData(report) {
   const mainHeaderRow = 6
   const mainDataStartRow = 7
   const mainDataEndRow = mainDataStartRow + report.colorRows.length
-  const sizeDetailRows = [
-    [`${report.style} Size Detail`],
-    ['Color', 'Size', 'Current Inventory', `Sales ${report.dataThroughDay}`, 'Last 7 Days',
-      'Previous 7 Days', 'Last 28 Days', '28D Avg / Day', 'Est. Days Left', 'History Days'],
-    ...report.sizeRows.map((row) => [
-      row.color,
-      row.size,
-      row.onHand,
-      row.latestDaySales,
-      row.last7Sales,
-      row.previous7Sales,
-      row.last28Sales,
-      rounded(row.dailyAverage, 2),
-      displayDays(row.daysLeft),
-      row.historyDays,
-    ]),
-  ]
-
-  const salesTrendRows = [
-    [`${report.style} Weekly and Daily Sales`],
-    [],
-    ['Weekly comparison', 'Start', 'End', ...sizes, 'Total'],
-    ...report.weeklyRows.map((row) => [
-      row.label, row.startDay, row.endDay, ...sizes.map((size) => row.bySize[size] || 0), row.total,
-    ]),
-    [],
-    ['Daily sales', ...sizes, 'Total'],
-    ...report.dailyRows.map((row) => [
-      row.day, ...sizes.map((size) => row.bySize[size] || 0), row.total,
-    ]),
-  ]
-
-  const sourceRows = [
-    ['Current Inventory Source'],
-    ['Style', 'Color', 'Size', 'Quantity'],
-    ...report.sourceInventoryRows.map((row) => [row.style, row.color, row.size, row.quantity]),
-    [],
-    ['Applied Movement Source'],
-    ['Order Date', 'Type', 'Style', 'Color', 'Size', 'Quantity'],
-    ...report.sourceMovements.map((row) => [
-      row.day, row.type, row.style, row.color, row.size, row.quantity,
-    ]),
-  ]
 
   return {
     sheets: [
       {
-        name: 'Daily Inventory',
+        name: report.style,
         rows: mainRows,
         merges: [
           { s: { r: 0, c: 0 }, e: { r: 0, c: lastColumn } },
-          { s: { r: 1, c: 4 }, e: { r: 1, c: lastColumn } },
+          { s: { r: 3, c: inventoryStart }, e: { r: 3, c: inventoryTotal } },
+          { s: { r: 3, c: salesStart }, e: { r: 3, c: salesEnd } },
           { s: { r: 5, c: inventoryStart }, e: { r: 5, c: inventoryTotal } },
-          { s: { r: 5, c: latestStart }, e: { r: 5, c: latestTotal } },
-          { s: { r: 5, c: comparisonStart }, e: { r: 5, c: tableLastColumn } },
+          { s: { r: 5, c: salesStart }, e: { r: 5, c: salesEnd } },
         ],
         widths: mainWidths,
         headerRows: [0, 5, 6],
         totalRows: [mainDataEndRow],
+        summaryRow: 3,
+        groups: { inventoryStart, inventoryTotal, salesStart, salesEnd, forecastColumn },
         numberRows: {
           start: mainDataStartRow,
           end: mainDataEndRow,
           startColumn: 1,
-          endColumn: tableLastColumn,
-          decimalColumns: [tableLastColumn - 1],
+          endColumn: lastColumn,
+          decimalColumns: [salesEnd],
         },
-        autoFilter: { s: { r: mainHeaderRow, c: 0 }, e: { r: mainDataEndRow, c: tableLastColumn } },
-      },
-      {
-        name: 'Size Detail',
-        rows: sizeDetailRows,
-        merges: [{ s: { r: 0, c: 0 }, e: { r: 0, c: 9 } }],
-        widths: [22, 10, 16, 16, 13, 16, 14, 14, 16, 13],
-        headerRows: [0, 1],
-        autoFilter: { s: { r: 1, c: 0 }, e: { r: Math.max(1, sizeDetailRows.length - 1), c: 9 } },
-      },
-      {
-        name: 'Sales Trend',
-        rows: salesTrendRows,
-        merges: [{ s: { r: 0, c: 0 }, e: { r: 0, c: Math.max(5, sizes.length + 1) } }],
-        widths: [22, 13, 13, ...Array(sizes.length).fill(11), 12],
-        headerRows: [0, 2, report.weeklyRows.length + 4],
-      },
-      {
-        name: 'Data Source',
-        rows: sourceRows,
-        widths: [18, 16, 22, 22, 12, 12],
-        headerRows: [0, 1, report.sourceInventoryRows.length + 3, report.sourceInventoryRows.length + 4],
+        autoFilter: { s: { r: mainHeaderRow, c: 0 }, e: { r: mainDataEndRow, c: lastColumn } },
       },
     ],
   }
@@ -450,6 +382,11 @@ function styleSheetCells(sheet, config, XLSX) {
     fill: { fgColor: { rgb: 'DBEAFE' } },
     border: { top: { style: 'medium', color: { rgb: '2563EB' } } },
   }
+  const groupStyles = {
+    inventory: { font: { bold: true, color: { rgb: '1E3A8A' } }, fill: { fgColor: { rgb: 'DBEAFE' } } },
+    sales: { font: { bold: true, color: { rgb: '166534' } }, fill: { fgColor: { rgb: 'DCFCE7' } } },
+    forecast: { font: { bold: true, color: { rgb: '9A3412' } }, fill: { fgColor: { rgb: 'FFEDD5' } } },
+  }
 
   for (const rowIndex of config.headerRows || []) {
     for (let column = range.s.c; column <= range.e.c; column += 1) {
@@ -463,6 +400,21 @@ function styleSheetCells(sheet, config, XLSX) {
       if (cell) cell.s = totalStyle
     }
   }
+  if (config.groups) {
+    const { inventoryStart, inventoryTotal, salesStart, salesEnd, forecastColumn } = config.groups
+    const applyGroup = (start, end, style) => {
+      for (let row = 3; row <= range.e.r; row += 1) {
+        if (row === 4) continue
+        for (let column = start; column <= end; column += 1) {
+          const cell = sheet[XLSX.utils.encode_cell({ r: row, c: column })]
+          if (cell) cell.s = { ...cell.s, ...style, alignment: { horizontal: 'center', vertical: 'center', wrapText: true } }
+        }
+      }
+    }
+    applyGroup(inventoryStart, inventoryTotal, groupStyles.inventory)
+    applyGroup(salesStart, salesEnd, groupStyles.sales)
+    applyGroup(forecastColumn, forecastColumn, groupStyles.forecast)
+  }
   if (config.numberRows) {
     const decimalColumns = new Set(config.numberRows.decimalColumns || [])
     for (let row = config.numberRows.start; row <= config.numberRows.end; row += 1) {
@@ -474,22 +426,42 @@ function styleSheetCells(sheet, config, XLSX) {
   }
 }
 
-export function createDailyStyleWorkbook(XLSX, report) {
-  const data = buildDailyStyleWorkbookData(report)
-  if (!data) throw new Error('A style report is required')
+function safeSheetName(value, usedNames) {
+  const base = String(value || 'Style').replace(/[\\/?*[\]:]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 31) || 'Style'
+  let name = base
+  let suffix = 2
+  while (usedNames.has(name.toLocaleLowerCase())) {
+    const ending = ` (${suffix++})`
+    name = `${base.slice(0, 31 - ending.length)}${ending}`
+  }
+  usedNames.add(name.toLocaleLowerCase())
+  return name
+}
+
+export function createDailyStyleWorkbook(XLSX, reports) {
+  const reportList = (Array.isArray(reports) ? reports : [reports]).filter(Boolean)
+  if (!reportList.length) throw new Error('At least one style report is required')
   const workbook = XLSX.utils.book_new()
-  for (const config of data.sheets) {
+  const usedNames = new Set()
+  for (const report of reportList) {
+    const config = buildDailyStyleWorkbookData(report).sheets[0]
     const sheet = XLSX.utils.aoa_to_sheet(config.rows)
     sheet['!merges'] = config.merges || []
     sheet['!cols'] = (config.widths || []).map((wch) => ({ wch }))
     if (config.autoFilter) sheet['!autofilter'] = { ref: XLSX.utils.encode_range(config.autoFilter) }
+    sheet['!freeze'] = { xSplit: 1, ySplit: 7, topLeftCell: 'B8', activePane: 'bottomRight', state: 'frozen' }
+    sheet['!rows'] = [{ hpt: 26 }, { hpt: 20 }, {}, { hpt: 28 }, {}, { hpt: 24 }, { hpt: 34 }]
     styleSheetCells(sheet, config, XLSX)
-    XLSX.utils.book_append_sheet(workbook, sheet, config.name)
+    XLSX.utils.book_append_sheet(workbook, sheet, safeSheetName(config.name, usedNames))
   }
   return workbook
 }
 
-export function dailyStyleReportFileName(report) {
-  const style = String(report?.style || 'style').replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '')
-  return `daily_inventory_${style || 'style'}_${report?.generatedDay || dateKey()}.xlsx`
+export function dailyStyleReportFileName(reports) {
+  const reportList = (Array.isArray(reports) ? reports : [reports]).filter(Boolean)
+  const first = reportList[0]
+  const style = reportList.length === 1
+    ? String(first?.style || 'style').replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '')
+    : `${reportList.length}_styles`
+  return `daily_style_report_${style || 'style'}_${first?.generatedDay || dateKey()}.xlsx`
 }

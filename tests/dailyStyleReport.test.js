@@ -64,6 +64,28 @@ test('sales windows end on the latest available order date instead of upload tim
   assert.equal(report.dailyRows.at(-1).day, '2026-08-02')
 })
 
+test('5010015 report keeps August 3 sales on the original order date', () => {
+  const report = buildDailyStyleReport({
+    inventoryRows: [
+      { Style: '5010015', Color: 'BLACK', Size: 'S', Quantity: 58 },
+      { Style: '5010015', Color: 'BLACK', Size: 'M', Quantity: 88 },
+    ],
+    movements: [
+      { txn_type: 'sales', style: '5010015', color: 'BLACK', size: 'S', qty: 13, day: '2026-08-03' },
+      { txn_type: 'sales', style: '5010015', color: 'BLACK', size: 'M', qty: 15, day: '2026-08-03' },
+      { txn_type: 'sales', style: '5010015', color: 'BLACK', size: 'S', qty: 13, day: '2026-08-04' },
+    ],
+    style: '5010015',
+    today: '2026-08-04',
+  })
+  const august3 = report.dailyRows.find((row) => row.day === '2026-08-03')
+  const august4 = report.dailyRows.find((row) => row.day === '2026-08-04')
+
+  assert.deepEqual(august3, { day: '2026-08-03', bySize: { S: 13, M: 15 }, total: 28 })
+  assert.deepEqual(august4, { day: '2026-08-04', bySize: { S: 13, M: 0 }, total: 13 })
+  assert.ok(report.sourceMovements.some((row) => row.day === '2026-08-03' && row.quantity === 15))
+})
+
 test('gross sales drive sales comparison while returns do not reduce reported demand', () => {
   const report = buildDailyStyleReport({
     inventoryRows,
@@ -78,7 +100,7 @@ test('gross sales drive sales comparison while returns do not reduce reported de
   assert.equal(report.sourceMovements.filter((row) => row.type === 'return').length, 1)
 })
 
-test('workbook mirrors the single-style inventory matrix and exports auditable detail sheets', () => {
+test('workbook exports one focused, color-grouped sheet for a style', () => {
   const report = buildDailyStyleReport({
     inventoryRows,
     movements,
@@ -89,15 +111,32 @@ test('workbook mirrors the single-style inventory matrix and exports auditable d
   const workbook = createDailyStyleWorkbook(XLSX, report)
   const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx', cellStyles: true })
   const reopened = XLSX.read(buffer, { type: 'buffer' })
-  const mainRows = XLSX.utils.sheet_to_json(reopened.Sheets['Daily Inventory'], {
+  const mainRows = XLSX.utils.sheet_to_json(reopened.Sheets['M022 Missy'], {
     header: 1,
     defval: '',
   })
 
-  assert.deepEqual(reopened.SheetNames, ['Daily Inventory', 'Size Detail', 'Sales Trend', 'Data Source'])
-  assert.equal(data.sheets[0].rows[0][0], 'M022 Missy Daily Inventory & Sales Report')
+  assert.deepEqual(reopened.SheetNames, ['M022 Missy'])
+  assert.equal(data.sheets[0].rows[0][0], 'M022 Missy Daily Style Report / 每日款式报告')
+  assert.deepEqual(data.sheets[0].groups, {
+    inventoryStart: 1,
+    inventoryTotal: 3,
+    salesStart: 4,
+    salesEnd: 8,
+    forecastColumn: 9,
+  })
   assert.ok(mainRows.some((row) => row[0] === 'HERRINGBONE JQD TAUPE'))
   assert.ok(mainRows.some((row) => row[0] === 'TOTAL' && row.includes(432)))
+})
+
+test('multi-style workbook creates one safely named sheet per selected style', () => {
+  const missy = buildDailyStyleReport({ inventoryRows, movements, style: 'M022 Missy', today: '2026-08-03' })
+  const petite = buildDailyStyleReport({ inventoryRows, movements, style: 'M022 Petite', today: '2026-08-03' })
+  const workbook = createDailyStyleWorkbook(XLSX, [missy, petite])
+
+  assert.deepEqual(workbook.SheetNames, ['M022 Missy', 'M022 Petite'])
+  assert.ok(workbook.Sheets['M022 Missy']['!freeze'])
+  assert.ok(workbook.Sheets['M022 Petite']['!autofilter'])
 })
 
 test('report remains usable when the selected style has no sales history', () => {
