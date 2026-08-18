@@ -5,7 +5,9 @@ import {
   buildPayrollSummary,
   calculateAttendanceDays,
   parseAttendanceText,
+  partitionAttendanceDuplicates,
   payrollRangeForDate,
+  payrollRangesBetween,
 } from '../src/utils/factoryAttendance.js'
 
 test('parses both attendance machine date formats', () => {
@@ -17,6 +19,45 @@ test('parses both attendance machine date formats', () => {
   const records = parseAttendanceText(text)
   assert.equal(records[0].punchedAt, '2026-08-06T06:54:32')
   assert.equal(records[1].punchedAt, '2026-08-14T18:06:03')
+})
+
+test('reads a multi-day file and identifies exact duplicate punches', () => {
+  const text = [
+    'ID.\tNombre\tDepart.\tTiempo\tID del dispositivo',
+    '5\tAngelica\tINSPECTION\t 06-08-2026     06:54:32\t7',
+    '5\tAngelica\tINSPECTION\t 07-08-2026     06:55:00\t7',
+    '5\tAngelica\tINSPECTION\t 07-08-2026     06:55:00\t7',
+  ].join('\r\n')
+  const records = parseAttendanceText(text)
+  const { accepted, duplicates } = partitionAttendanceDuplicates(records)
+  assert.equal(new Set(records.map((record) => record.punchedAt.slice(0, 10))).size, 2)
+  assert.equal(accepted.length, 2)
+  assert.deepEqual(duplicates, [{
+    employeeCode: 5,
+    name: 'Angelica',
+    punchedAt: '2026-08-07T06:55:00',
+    deviceId: 7,
+    reason: 'repeated_in_file',
+  }])
+
+  const existing = new Set(['5|2026-08-06T06:54:32'])
+  const partitionedAgainstHistory = partitionAttendanceDuplicates(records, existing)
+  assert.equal(partitionedAgainstHistory.accepted.length, 1)
+  assert.deepEqual(partitionedAgainstHistory.duplicates.map((item) => item.reason), [
+    'already_uploaded',
+    'repeated_in_file',
+  ])
+})
+
+test('treats two Saturday punches as a complete half day', () => {
+  const [saturday] = calculateAttendanceDays([
+    { employeeCode: 5, name: 'Angelica', punchedAt: '2026-08-15T07:00:00' },
+    { employeeCode: 5, name: 'Angelica', punchedAt: '2026-08-15T12:00:00' },
+  ])
+  assert.equal(saturday.workedMinutes, 300)
+  assert.equal(saturday.workday, true)
+  assert.equal(saturday.needsReview, false)
+  assert.deepEqual(saturday.flags, [])
 })
 
 test('calculates four punches and flags late, early, and short days', () => {
@@ -50,6 +91,10 @@ test('uses the two fixed payroll periods', () => {
   assert.deepEqual(payrollRangeForDate('2026-08-18'), { start: '2026-08-06', end: '2026-08-20' })
   assert.deepEqual(payrollRangeForDate('2026-08-03'), { start: '2026-07-21', end: '2026-08-05' })
   assert.deepEqual(payrollRangeForDate('2026-08-25'), { start: '2026-08-21', end: '2026-09-05' })
+  assert.deepEqual(payrollRangesBetween('2026-08-06', '2026-08-25'), [
+    { start: '2026-08-06', end: '2026-08-20', payrollStart: '2026-08-06', payrollEnd: '2026-08-20', provisional: false },
+    { start: '2026-08-21', end: '2026-08-25', payrollStart: '2026-08-21', payrollEnd: '2026-09-05', provisional: true },
+  ])
 })
 
 test('payroll summary keeps overtime and shortfall separate while paying the signed variance', () => {

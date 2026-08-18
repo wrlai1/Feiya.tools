@@ -6,6 +6,7 @@ import {
   buildPayrollSummary,
   calculateAttendanceDays,
   parseAttendanceText,
+  partitionAttendanceDuplicates,
 } from '../src/utils/factoryAttendance.js';
 
 const { authenticateUser } = authentication;
@@ -91,7 +92,12 @@ async function ensureTables(sql) {
       record_count INTEGER NOT NULL,
       inserted_count INTEGER NOT NULL DEFAULT 0,
       uploaded_by TEXT NOT NULL,
-      uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      date_from DATE,
+      date_to DATE,
+      duplicate_details JSONB NOT NULL DEFAULT '[]'::jsonb,
+      reverted_by TEXT,
+      reverted_at TIMESTAMPTZ
     )
   `;
   await sql`
@@ -104,6 +110,7 @@ async function ensureTables(sql) {
       raw_timestamp TEXT,
       device_id INTEGER NOT NULL DEFAULT 0,
       import_id BIGINT NOT NULL REFERENCES attendance_imports(id),
+      active BOOLEAN NOT NULL DEFAULT TRUE,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       UNIQUE (employee_code, punched_at, device_id)
     )
@@ -124,6 +131,25 @@ async function ensureTables(sql) {
   `;
   await sql`ALTER TABLE attendance_day_reviews ADD COLUMN IF NOT EXISTS late BOOLEAN NOT NULL DEFAULT FALSE`;
   await sql`ALTER TABLE attendance_day_reviews ADD COLUMN IF NOT EXISTS early BOOLEAN NOT NULL DEFAULT FALSE`;
+  await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS reverted_by TEXT`;
+  await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS reverted_at TIMESTAMPTZ`;
+  await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS date_from DATE`;
+  await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS date_to DATE`;
+  await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS duplicate_details JSONB NOT NULL DEFAULT '[]'::jsonb`;
+  await sql`ALTER TABLE attendance_punches ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE`;
+  await sql`ALTER TABLE attendance_imports DROP CONSTRAINT IF EXISTS attendance_imports_file_hash_key`;
+  await sql`ALTER TABLE attendance_punches DROP CONSTRAINT IF EXISTS attendance_punches_employee_code_punched_at_device_id_key`;
+  await sql`CREATE UNIQUE INDEX IF NOT EXISTS attendance_imports_active_hash_idx ON attendance_imports (file_hash) WHERE reverted_at IS NULL`;
+  await sql`CREATE UNIQUE INDEX IF NOT EXISTS attendance_punches_active_key_idx ON attendance_punches (employee_code, punched_at, device_id) WHERE active`;
+  await sql`
+    WITH ranked AS (
+      SELECT id, ROW_NUMBER() OVER (PARTITION BY employee_code, punched_at ORDER BY id) AS position
+      FROM attendance_punches WHERE active
+    )
+    UPDATE attendance_punches SET active = FALSE
+    WHERE id IN (SELECT id FROM ranked WHERE position > 1)
+  `;
+  await sql`CREATE UNIQUE INDEX IF NOT EXISTS attendance_punches_active_time_idx ON attendance_punches (employee_code, punched_at) WHERE active`;
 }
 
 async function loadDashboard(sql, from, to) {
@@ -134,7 +160,8 @@ async function loadDashboard(sql, from, to) {
              TO_CHAR(punched_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS punched_at,
              raw_timestamp, device_id, import_id
       FROM attendance_punches
-      WHERE punched_at >= CAST(${from} AS date)
+      WHERE active
+        AND punched_at >= CAST(${from} AS date)
         AND punched_at < CAST(${to} AS date) + INTERVAL '1 day'
       ORDER BY punched_at ASC, employee_code ASC
     `,
@@ -168,8 +195,9 @@ async function loadDashboard(sql, from, to) {
       ORDER BY e.employee_code
     `,
     sql`
-      SELECT id, file_name, record_count, inserted_count, uploaded_by, uploaded_at
-      FROM attendance_imports ORDER BY uploaded_at DESC LIMIT 20
+      SELECT id, file_name, record_count, inserted_count, uploaded_by, uploaded_at,
+             date_from::text, date_to::text, duplicate_details, reverted_by, reverted_at
+      FROM attendance_imports ORDER BY uploaded_at DESC LIMIT 50
     `,
   ]);
 
@@ -241,10 +269,40 @@ export default async function handler(req, res) {
       if (!fileName || !content) return res.status(400).json({ error: 'TXT file required' });
       if (content.length > 4_000_000) return res.status(413).json({ error: 'Attendance file is too large' });
       const hash = createHash('sha256').update(content).digest('hex');
-      const existing = await sql`SELECT id, file_name, uploaded_at FROM attendance_imports WHERE file_hash = ${hash}`;
-      if (existing[0]) return res.status(409).json({ error: 'This exact file was already uploaded', existing: existing[0] });
-
       const records = parseAttendanceText(content);
+      const recordDates = records.map((record) => record.punchedAt.slice(0, 10)).sort();
+      const dateFrom = recordDates[0];
+      const dateTo = recordDates.at(-1);
+      const preliminary = partitionAttendanceDuplicates(records);
+      const lookupJson = JSON.stringify(preliminary.accepted.map((record) => ({
+        employee_code: record.employeeCode,
+        punched_at: record.punchedAt,
+        device_id: record.deviceId,
+      })));
+      const existingPunches = await sql`
+        SELECT p.employee_code, TO_CHAR(p.punched_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS punched_at, p.device_id
+        FROM attendance_punches p
+        JOIN jsonb_to_recordset(${lookupJson}::jsonb)
+         AS x(employee_code INTEGER, punched_at TEXT, device_id INTEGER)
+          ON p.employee_code = x.employee_code
+         AND p.punched_at = CAST(x.punched_at AS timestamp)
+        WHERE p.active
+      `;
+      const existingKeys = new Set(existingPunches.map((record) => (
+        `${Number(record.employee_code)}|${record.punched_at}`
+      )));
+      const { accepted: newRecords, duplicates: duplicateDetails } = partitionAttendanceDuplicates(records, existingKeys);
+      const activeFile = await sql`
+        SELECT id, file_name, uploaded_at FROM attendance_imports
+        WHERE file_hash = ${hash} AND reverted_at IS NULL
+      `;
+      if (activeFile[0]) {
+        return res.status(200).json({
+          importId: Number(activeFile[0].id), records: records.length, inserted: 0,
+          duplicates: records.length, duplicateDetails, exactFileDuplicate: true,
+          existing: activeFile[0], dateFrom, dateTo,
+        });
+      }
       const employeeMap = new Map();
       for (const record of records) {
         const current = employeeMap.get(record.employeeCode);
@@ -271,12 +329,17 @@ export default async function handler(req, res) {
       `;
 
       const imports = await sql`
-        INSERT INTO attendance_imports (file_name, file_hash, record_count, uploaded_by)
-        VALUES (${fileName}, ${hash}, ${records.length}, ${user.username})
+        INSERT INTO attendance_imports (
+          file_name, file_hash, record_count, uploaded_by, date_from, date_to, duplicate_details
+        )
+        VALUES (
+          ${fileName}, ${hash}, ${records.length}, ${user.username}, ${dateFrom}, ${dateTo},
+          ${JSON.stringify(duplicateDetails)}::jsonb
+        )
         RETURNING id
       `;
       const importId = Number(imports[0].id);
-      const punchJson = JSON.stringify(records.map((record) => ({
+      const punchJson = JSON.stringify(newRecords.map((record) => ({
         employee_code: record.employeeCode,
         name: record.name,
         department: record.department,
@@ -291,11 +354,42 @@ export default async function handler(req, res) {
         SELECT employee_code, name, department, CAST(punched_at AS timestamp), raw_timestamp, device_id, ${importId}
         FROM jsonb_to_recordset(${punchJson}::jsonb)
           AS x(employee_code INTEGER, name TEXT, department TEXT, punched_at TEXT, raw_timestamp TEXT, device_id INTEGER)
-        ON CONFLICT (employee_code, punched_at, device_id) DO NOTHING
+        ON CONFLICT (employee_code, punched_at) WHERE active DO NOTHING
         RETURNING id
       `;
       await sql`UPDATE attendance_imports SET inserted_count = ${inserted.length} WHERE id = ${importId}`;
-      return res.status(200).json({ importId, records: records.length, inserted: inserted.length, duplicates: records.length - inserted.length });
+      return res.status(200).json({
+        importId, records: records.length, inserted: inserted.length,
+        duplicates: records.length - inserted.length, duplicateDetails, dateFrom, dateTo,
+      });
+    }
+
+    if (req.method === 'PATCH' && action === 'rollback-import') {
+      const importId = Number(req.body?.importId);
+      if (!Number.isSafeInteger(importId)) return res.status(400).json({ error: 'Import version required' });
+      const reverted = await sql`
+        WITH reverted AS (
+          UPDATE attendance_imports
+          SET reverted_by = ${user.username}, reverted_at = NOW()
+          WHERE id = ${importId} AND reverted_at IS NULL
+            AND id = (
+              SELECT id FROM attendance_imports
+              WHERE reverted_at IS NULL
+              ORDER BY uploaded_at DESC, id DESC
+              LIMIT 1
+            )
+          RETURNING id
+        ), deactivated AS (
+          UPDATE attendance_punches
+          SET active = FALSE
+          WHERE import_id IN (SELECT id FROM reverted) AND active
+          RETURNING id
+        )
+        SELECT (SELECT id FROM reverted) AS import_id,
+               (SELECT COUNT(*)::int FROM deactivated) AS removed_count
+      `;
+      if (!reverted[0]?.import_id) return res.status(409).json({ error: 'Only the latest active import can be rolled back' });
+      return res.status(200).json({ ok: true, removedPunches: Number(reverted[0].removed_count) });
     }
 
     if (req.method === 'PATCH' && action === 'review') {

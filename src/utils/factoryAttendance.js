@@ -74,6 +74,37 @@ export function parseAttendanceText(text) {
   return records
 }
 
+export function attendanceRecordKey(record) {
+  return [
+    Number(record.employeeCode ?? record.employee_code),
+    String(record.punchedAt ?? record.punched_at ?? '').replace(' ', 'T').slice(0, 19),
+  ].join('|')
+}
+
+export function partitionAttendanceDuplicates(records, existingKeys = new Set()) {
+  const accepted = []
+  const duplicates = []
+  const seen = new Set()
+
+  for (const record of records || []) {
+    const key = attendanceRecordKey(record)
+    const reason = existingKeys.has(key) ? 'already_uploaded' : seen.has(key) ? 'repeated_in_file' : null
+    if (reason) {
+      duplicates.push({
+        employeeCode: Number(record.employeeCode ?? record.employee_code),
+        name: record.name || '',
+        punchedAt: String(record.punchedAt ?? record.punched_at ?? '').replace(' ', 'T').slice(0, 19),
+        deviceId: Number(record.deviceId ?? record.device_id ?? 0),
+        reason,
+      })
+    } else {
+      accepted.push(record)
+      seen.add(key)
+    }
+  }
+  return { accepted, duplicates }
+}
+
 export function payrollRangeForDate(dateText) {
   const match = String(dateText || '').match(/^(\d{4})-(\d{2})-(\d{2})$/)
   if (!match) throw new Error('Date must use YYYY-MM-DD')
@@ -98,6 +129,23 @@ export function payrollRangeForDate(dateText) {
     start: format(new Date(Date.UTC(year, monthIndex - 1, 21))),
     end: format(new Date(Date.UTC(year, monthIndex, 5))),
   }
+}
+
+export function payrollRangesBetween(from, to) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(from)) || !/^\d{4}-\d{2}-\d{2}$/.test(String(to)) || from > to) {
+    throw new Error('Valid date range required')
+  }
+  const ranges = []
+  let cursor = from
+  while (cursor <= to) {
+    const payroll = payrollRangeForDate(cursor)
+    const end = payroll.end < to ? payroll.end : to
+    ranges.push({ start: cursor, end, payrollStart: payroll.start, payrollEnd: payroll.end, provisional: cursor > payroll.start || end < payroll.end })
+    const next = new Date(`${end}T00:00:00Z`)
+    next.setUTCDate(next.getUTCDate() + 1)
+    cursor = `${next.getUTCFullYear()}-${pad(next.getUTCMonth() + 1)}-${pad(next.getUTCDate())}`
+  }
+  return ranges
 }
 
 function timeToSeconds(value) {
@@ -154,20 +202,21 @@ export function calculateAttendanceDays(punches, settingsInput = {}, reviews = [
     day.punches.sort()
     const review = reviewMap.get(`${day.employeeCode}|${day.workDate}`)
     const punchCount = day.punches.length
-    const automaticallyValid = punchCount === 4
+    const schedule = daySchedule(day.workDate, settings)
+    const isSaturday = new Date(`${day.workDate}T00:00:00Z`).getUTCDay() === 6
+    const automaticallyValid = punchCount === 4 || (isSaturday && punchCount === 2)
     const manuallyConfirmed = Boolean(review?.confirmed) && Number(review?.adjustedMinutes) >= 0
     let workedMinutes = null
 
     if (automaticallyValid) {
-      workedMinutes = (
-        timestampSeconds(day.punches[1]) - timestampSeconds(day.punches[0])
-        + timestampSeconds(day.punches[3]) - timestampSeconds(day.punches[2])
-      ) / 60
+      workedMinutes = 0
+      for (let index = 0; index < day.punches.length; index += 2) {
+        workedMinutes += (timestampSeconds(day.punches[index + 1]) - timestampSeconds(day.punches[index])) / 60
+      }
     } else if (manuallyConfirmed) {
       workedMinutes = Number(review.adjustedMinutes)
     }
 
-    const schedule = daySchedule(day.workDate, settings)
     const firstSeconds = timestampSeconds(day.punches[0])
     const lastSeconds = timestampSeconds(day.punches.at(-1))
     const possibleLate = schedule.start != null && firstSeconds > timeToSeconds(schedule.start)
@@ -196,6 +245,9 @@ export function calculateAttendanceDays(punches, settingsInput = {}, reviews = [
       belowStandard,
       needsReview: !automaticallyValid && !manuallyConfirmed,
       reviewNote: review?.note || '',
+      manuallyConfirmed,
+      reviewedBy: review?.updatedBy || '',
+      reviewedAt: review?.updatedAt || null,
       flags,
     }
   }).sort((a, b) => a.workDate.localeCompare(b.workDate) || a.employeeCode - b.employeeCode)
