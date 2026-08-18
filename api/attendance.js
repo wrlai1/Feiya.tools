@@ -5,7 +5,7 @@ import {
   DEFAULT_ATTENDANCE_SETTINGS,
   buildPayrollSummary,
   calculateAttendanceDays,
-  parseAttendanceText,
+  parseAttendanceFiles,
   partitionAttendanceDuplicates,
 } from '../src/utils/factoryAttendance.js';
 
@@ -95,6 +95,7 @@ async function ensureTables(sql) {
       uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       date_from DATE,
       date_to DATE,
+      source_files JSONB NOT NULL DEFAULT '[]'::jsonb,
       duplicate_details JSONB NOT NULL DEFAULT '[]'::jsonb,
       reverted_by TEXT,
       reverted_at TIMESTAMPTZ
@@ -135,6 +136,7 @@ async function ensureTables(sql) {
   await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS reverted_at TIMESTAMPTZ`;
   await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS date_from DATE`;
   await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS date_to DATE`;
+  await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS source_files JSONB NOT NULL DEFAULT '[]'::jsonb`;
   await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS duplicate_details JSONB NOT NULL DEFAULT '[]'::jsonb`;
   await sql`ALTER TABLE attendance_punches ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE`;
   await sql`ALTER TABLE attendance_imports DROP CONSTRAINT IF EXISTS attendance_imports_file_hash_key`;
@@ -196,7 +198,7 @@ async function loadDashboard(sql, from, to) {
     `,
     sql`
       SELECT id, file_name, record_count, inserted_count, uploaded_by, uploaded_at,
-             date_from::text, date_to::text, duplicate_details, reverted_by, reverted_at
+             date_from::text, date_to::text, source_files, duplicate_details, reverted_by, reverted_at
       FROM attendance_imports ORDER BY uploaded_at DESC LIMIT 50
     `,
   ]);
@@ -264,12 +266,24 @@ export default async function handler(req, res) {
     }
 
     if (req.method === 'POST' && action === 'import') {
-      const fileName = String(req.body?.fileName || '').trim();
-      const content = String(req.body?.content || '');
-      if (!fileName || !content) return res.status(400).json({ error: 'TXT file required' });
-      if (content.length > 4_000_000) return res.status(413).json({ error: 'Attendance file is too large' });
-      const hash = createHash('sha256').update(content).digest('hex');
-      const records = parseAttendanceText(content);
+      const submittedFiles = Array.isArray(req.body?.files)
+        ? req.body.files
+        : [{ fileName: req.body?.fileName, content: req.body?.content }];
+      const files = submittedFiles.map((file) => ({
+        fileName: String(file?.fileName || '').trim(),
+        content: String(file?.content || ''),
+      }));
+      if (!files.length || files.length > 3 || files.some((file) => !file.fileName || !file.content)) {
+        return res.status(400).json({ error: 'Select between one and three attendance TXT files' });
+      }
+      if (files.some((file) => file.content.length > 4_000_000) || files.reduce((sum, file) => sum + file.content.length, 0) > 12_000_000) {
+        return res.status(413).json({ error: 'One or more attendance files are too large' });
+      }
+      const sourceFiles = files.map((file) => file.fileName);
+      const fileName = sourceFiles.length === 1 ? sourceFiles[0] : `${sourceFiles.length} files: ${sourceFiles.join(', ')}`;
+      const contentHashes = files.map((file) => createHash('sha256').update(file.content).digest('hex')).sort();
+      const hash = createHash('sha256').update(contentHashes.join('|')).digest('hex');
+      const records = parseAttendanceFiles(files);
       const recordDates = records.map((record) => record.punchedAt.slice(0, 10)).sort();
       const dateFrom = recordDates[0];
       const dateTo = recordDates.at(-1);
@@ -300,7 +314,7 @@ export default async function handler(req, res) {
         return res.status(200).json({
           importId: Number(activeFile[0].id), records: records.length, inserted: 0,
           duplicates: records.length, duplicateDetails, exactFileDuplicate: true,
-          existing: activeFile[0], dateFrom, dateTo,
+          existing: activeFile[0], dateFrom, dateTo, sourceFiles,
         });
       }
       const employeeMap = new Map();
@@ -330,10 +344,11 @@ export default async function handler(req, res) {
 
       const imports = await sql`
         INSERT INTO attendance_imports (
-          file_name, file_hash, record_count, uploaded_by, date_from, date_to, duplicate_details
+          file_name, file_hash, record_count, uploaded_by, date_from, date_to, source_files, duplicate_details
         )
         VALUES (
           ${fileName}, ${hash}, ${records.length}, ${user.username}, ${dateFrom}, ${dateTo},
+          ${JSON.stringify(sourceFiles)}::jsonb,
           ${JSON.stringify(duplicateDetails)}::jsonb
         )
         RETURNING id
@@ -360,7 +375,7 @@ export default async function handler(req, res) {
       await sql`UPDATE attendance_imports SET inserted_count = ${inserted.length} WHERE id = ${importId}`;
       return res.status(200).json({
         importId, records: records.length, inserted: inserted.length,
-        duplicates: records.length - inserted.length, duplicateDetails, dateFrom, dateTo,
+        duplicates: records.length - inserted.length, duplicateDetails, dateFrom, dateTo, sourceFiles,
       });
     }
 

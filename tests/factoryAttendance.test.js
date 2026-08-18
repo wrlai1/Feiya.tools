@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import {
   buildPayrollSummary,
   calculateAttendanceDays,
+  parseAttendanceFiles,
   parseAttendanceText,
   partitionAttendanceDuplicates,
   payrollRangeForDate,
@@ -37,6 +38,7 @@ test('reads a multi-day file and identifies exact duplicate punches', () => {
     name: 'Angelica',
     punchedAt: '2026-08-07T06:55:00',
     deviceId: 7,
+    sourceFile: '',
     reason: 'repeated_in_file',
   }])
 
@@ -47,6 +49,30 @@ test('reads a multi-day file and identifies exact duplicate punches', () => {
     'already_uploaded',
     'repeated_in_file',
   ])
+})
+
+test('combines one employee punches across different attendance machines', () => {
+  const [day] = calculateAttendanceDays([
+    { employeeCode: 5, name: 'Angelica', deviceId: 1, punchedAt: '2026-08-14T07:00:00' },
+    { employeeCode: 5, name: 'Angelica', deviceId: 2, punchedAt: '2026-08-14T12:00:00' },
+    { employeeCode: 5, name: 'Angelica', deviceId: 3, punchedAt: '2026-08-14T13:00:00' },
+    { employeeCode: 5, name: 'Angelica', deviceId: 2, punchedAt: '2026-08-14T18:00:00' },
+  ])
+  assert.equal(day.punchCount, 4)
+  assert.equal(day.workedMinutes, 600)
+  assert.equal(day.needsReview, false)
+})
+
+test('merges up to three machine files into one attendance batch', () => {
+  const header = 'ID.\tNombre\tDepart.\tTiempo\tID del dispositivo'
+  const records = parseAttendanceFiles([
+    { fileName: 'machine-1.txt', content: `${header}\n5\tAngelica\tINSPECTION\t14-08-2026 07:00:00\t1` },
+    { fileName: 'machine-2.txt', content: `${header}\n5\tAngelica\tINSPECTION\t14-08-2026 12:00:00\t2` },
+    { fileName: 'machine-3.txt', content: `${header}\n5\tAngelica\tINSPECTION\t14-08-2026 13:00:00\t3` },
+  ])
+  assert.deepEqual(records.map((record) => record.sourceFile), ['machine-1.txt', 'machine-2.txt', 'machine-3.txt'])
+  assert.equal(records.length, 3)
+  assert.throws(() => parseAttendanceFiles([]), /one and three/)
 })
 
 test('treats two Saturday punches as a complete half day', () => {

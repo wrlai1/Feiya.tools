@@ -208,14 +208,16 @@ export default function FactoryAttendance() {
   useEffect(() => { load() }, [from, to])
 
   const upload = async (event) => {
-    const file = event.target.files?.[0]
+    const files = [...(event.target.files || [])]
     event.target.value = ''
-    if (!file) return
-    if (!file.name.toLowerCase().endsWith('.txt')) return toast.error('Please select a TXT attendance file')
+    if (!files.length) return
+    if (files.length > 3) return toast.error('Please select no more than three attendance TXT files')
+    if (files.some((file) => !file.name.toLowerCase().endsWith('.txt'))) return toast.error('Please select TXT attendance files only')
     setUploading(true)
     try {
+      const payloadFiles = await Promise.all(files.map(async (file) => ({ fileName: file.name, content: await file.text() })))
       const result = await apiFetch('?action=import', {
-        method: 'POST', body: JSON.stringify({ fileName: file.name, content: await file.text() }),
+        method: 'POST', body: JSON.stringify({ files: payloadFiles }),
       }, getToken)
       setDuplicateReport(result.duplicates ? result : null)
       const reportFrom = payrollRangeForDate(result.dateFrom).start
@@ -372,13 +374,13 @@ export default function FactoryAttendance() {
       styleWorksheet(exceptionSheet, exceptionHeader, (values) => values[6] === 'Needs Review' ? EXCEL_COLORS.red : values[6] === 'Manually Confirmed' ? EXCEL_COLORS.blue : EXCEL_COLORS.yellow)
 
       const importSheet = workbook.addWorksheet('Import Report')
-      const importHeader = importSheet.addRow(['File', 'Date From', 'Date To', 'Records', 'Inserted', 'Duplicates', 'Status'])
+      const importHeader = importSheet.addRow(['Files', 'Date From', 'Date To', 'Records', 'Inserted', 'Duplicates', 'Status'])
       const relevantImports = (data.imports || []).filter((item) => !item.reverted_at && item.date_to >= from && item.date_from <= to)
-      for (const item of relevantImports) importSheet.addRow([item.file_name, item.date_from, item.date_to, item.record_count, item.inserted_count, item.record_count - item.inserted_count, 'Active'])
+      for (const item of relevantImports) importSheet.addRow([(item.source_files || []).join(', ') || item.file_name, item.date_from, item.date_to, item.record_count, item.inserted_count, item.record_count - item.inserted_count, 'Active'])
       importSheet.addRow([])
-      const duplicateHeader = importSheet.addRow(['Duplicate Employee ID', 'Employee', 'Timestamp', 'Reason'])
-      for (const item of relevantImports.flatMap((entry) => entry.duplicate_details || [])) importSheet.addRow([item.employeeCode, item.name, item.punchedAt?.replace('T', ' '), item.reason === 'repeated_in_file' ? 'Repeated inside file' : 'Already uploaded'])
-      importSheet.columns = [30, 16, 22, 14, 14, 14, 18].map((width) => ({ width }))
+      const duplicateHeader = importSheet.addRow(['Duplicate Employee ID', 'Employee', 'Timestamp', 'Source File', 'Reason'])
+      for (const item of relevantImports.flatMap((entry) => entry.duplicate_details || [])) importSheet.addRow([item.employeeCode, item.name, item.punchedAt?.replace('T', ' '), item.sourceFile, item.reason === 'repeated_in_file' ? 'Repeated inside batch' : 'Already uploaded'])
+      importSheet.columns = [38, 16, 22, 28, 18, 14, 18].map((width) => ({ width }))
       styleWorksheet(importSheet, importHeader)
       duplicateHeader.eachCell((cell) => { cell.font = { bold: true }; cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: EXCEL_COLORS.yellow } } })
 
@@ -418,22 +420,22 @@ export default function FactoryAttendance() {
       <div className="card flex flex-col gap-4 p-4 md:flex-row md:items-center md:justify-between">
         <div className="flex items-center gap-3">
           <span className="rounded-xl bg-blue-50 p-3 text-blue-600"><Upload className="h-5 w-5" /></span>
-          <div><p className="font-semibold text-slate-800">Upload attendance TXT</p><p className="text-xs text-slate-500">Daily or multi-day files are supported. Duplicate punches are skipped and listed below.</p></div>
+          <div><p className="font-semibold text-slate-800">Upload attendance TXT files</p><p className="text-xs text-slate-500">Select files from one, two, or all three machines. Punches are merged by employee and time.</p></div>
         </div>
-        <input ref={fileRef} type="file" accept=".txt,text/plain" onChange={upload} className="hidden" />
+        <input ref={fileRef} type="file" accept=".txt,text/plain" multiple onChange={upload} className="hidden" />
         <button onClick={() => fileRef.current?.click()} disabled={uploading} className="btn-primary justify-center disabled:opacity-50">
-          <FileText className="h-4 w-4" /> {uploading ? 'Importing…' : 'Choose TXT'}
+          <FileText className="h-4 w-4" /> {uploading ? 'Merging…' : 'Choose TXT Files'}
         </button>
       </div>
 
       {duplicateReport && <details className="rounded-xl border border-amber-200 bg-amber-50 p-4">
         <summary className="cursor-pointer font-semibold text-amber-900">{duplicateReport.duplicates} duplicate punch{duplicateReport.duplicates === 1 ? '' : 'es'} skipped · View details</summary>
         <div className="flex items-start justify-between gap-3"><div><p className="font-semibold text-amber-900">{duplicateReport.duplicates} duplicate punch{duplicateReport.duplicates === 1 ? '' : 'es'} found</p><p className="text-xs text-amber-700">Nothing below was added twice. Check the employee and exact timestamp.</p></div><button onClick={() => setDuplicateReport(null)} className="text-xs font-medium text-amber-700">Dismiss</button></div>
-        <div className="mt-3 max-h-48 overflow-auto rounded-lg border border-amber-200 bg-white"><table className="w-full text-xs"><thead className="sticky top-0 bg-amber-50 text-left text-amber-800"><tr><th className="px-3 py-2">Employee</th><th className="px-3 py-2">Timestamp</th><th className="px-3 py-2">Reason</th></tr></thead><tbody className="divide-y divide-amber-100">{(duplicateReport.duplicateDetails || []).map((item, index) => <tr key={`${item.employeeCode}-${item.punchedAt}-${item.deviceId}-${index}`}><td className="px-3 py-2">{item.name || `ID ${item.employeeCode}`}</td><td className="px-3 py-2 font-mono">{item.punchedAt.replace('T', ' ')}</td><td className="px-3 py-2">{item.reason === 'repeated_in_file' ? 'Repeated inside this file' : 'Already uploaded earlier'}</td></tr>)}</tbody></table></div>
+        <div className="mt-3 max-h-48 overflow-auto rounded-lg border border-amber-200 bg-white"><table className="w-full text-xs"><thead className="sticky top-0 bg-amber-50 text-left text-amber-800"><tr><th className="px-3 py-2">Employee</th><th className="px-3 py-2">Timestamp</th><th className="px-3 py-2">Source</th><th className="px-3 py-2">Reason</th></tr></thead><tbody className="divide-y divide-amber-100">{(duplicateReport.duplicateDetails || []).map((item, index) => <tr key={`${item.employeeCode}-${item.punchedAt}-${item.deviceId}-${index}`}><td className="px-3 py-2">{item.name || `ID ${item.employeeCode}`}</td><td className="px-3 py-2 font-mono">{item.punchedAt.replace('T', ' ')}</td><td className="px-3 py-2">{item.sourceFile || '—'}</td><td className="px-3 py-2">{item.reason === 'repeated_in_file' ? 'Repeated inside this batch' : 'Already uploaded earlier'}</td></tr>)}</tbody></table></div>
       </details>}
 
       {lastUpload && !showManagement && <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-5">
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between"><div><p className="text-lg font-bold text-emerald-900">Attendance is ready</p><p className="mt-1 text-sm text-emerald-800">{lastUpload.reportFrom}—{lastUpload.reportTo} · {data?.summary?.length || 0} employees · {lastUpload.inserted} new punches · {lastUpload.duplicates} duplicates · {pending} need review</p><p className="mt-1 text-xs text-emerald-700">The Excel will include payroll summaries, daily attendance, color-coded exceptions, and the import report.</p></div><div className="flex flex-wrap gap-2"><button onClick={exportWorkbook} disabled={exporting || loading} className="btn-primary disabled:opacity-50"><Download className="h-4 w-4" /> {exporting ? 'Preparing…' : 'Download Excel'}</button>{pending > 0 && <button onClick={() => { setShowManagement(true); setTab('daily'); setDailyFlag('needs_review') }} className="btn-secondary text-red-600"><AlertTriangle className="h-4 w-4" /> Review exceptions</button>}</div></div>
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between"><div><p className="text-lg font-bold text-emerald-900">Attendance is ready</p><p className="mt-1 text-sm text-emerald-800">{lastUpload.reportFrom}—{lastUpload.reportTo} · {lastUpload.sourceFiles?.length || 1} machine file(s) · {data?.summary?.length || 0} employees · {lastUpload.inserted} new punches · {lastUpload.duplicates} duplicates · {pending} need review</p><p className="mt-1 text-xs text-emerald-700">The Excel will include payroll summaries, daily attendance, color-coded exceptions, and the import report.</p></div><div className="flex flex-wrap gap-2"><button onClick={exportWorkbook} disabled={exporting || loading} className="btn-primary disabled:opacity-50"><Download className="h-4 w-4" /> {exporting ? 'Preparing…' : 'Download Excel'}</button>{pending > 0 && <button onClick={() => { setShowManagement(true); setTab('daily'); setDailyFlag('needs_review') }} className="btn-secondary text-red-600"><AlertTriangle className="h-4 w-4" /> Review exceptions</button>}</div></div>
       </div>}
 
       {showManagement && <>

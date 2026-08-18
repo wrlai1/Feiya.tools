@@ -74,6 +74,16 @@ export function parseAttendanceText(text) {
   return records
 }
 
+export function parseAttendanceFiles(files) {
+  if (!Array.isArray(files) || files.length < 1 || files.length > 3) {
+    throw new Error('Select between one and three attendance TXT files')
+  }
+  return files.flatMap((file) => parseAttendanceText(file.content).map((record) => ({
+    ...record,
+    sourceFile: file.fileName,
+  })))
+}
+
 export function attendanceRecordKey(record) {
   return [
     Number(record.employeeCode ?? record.employee_code),
@@ -95,6 +105,7 @@ export function partitionAttendanceDuplicates(records, existingKeys = new Set())
         name: record.name || '',
         punchedAt: String(record.punchedAt ?? record.punched_at ?? '').replace(' ', 'T').slice(0, 19),
         deviceId: Number(record.deviceId ?? record.device_id ?? 0),
+        sourceFile: record.sourceFile || '',
         reason,
       })
     } else {
