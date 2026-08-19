@@ -5,7 +5,8 @@ import {
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import { useToast } from '../hooks/useToast.js'
-import { formatMinutes, payrollRangeForDate, payrollRangesBetween } from '../utils/factoryAttendance.js'
+import { formatMinutes, payrollRangeForDate } from '../utils/factoryAttendance.js'
+import { buildDailyAttendanceWorkbook, buildPayrollToDateWorkbook } from '../utils/factoryAttendanceExcel.js'
 
 const BASE = '/api/attendance'
 
@@ -44,10 +45,6 @@ function compareText(left, right) {
   return String(left || '').localeCompare(String(right || ''), undefined, { sensitivity: 'base' })
 }
 
-const EXCEL_COLORS = {
-  header: 'FF1E3A5F', red: 'FFFFC7CE', yellow: 'FFFFEB9C', blue: 'FFDDEBF7', white: 'FFFFFFFF',
-}
-
 function downloadBuffer(buffer, fileName) {
   const url = URL.createObjectURL(new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }))
   const link = document.createElement('a')
@@ -55,20 +52,6 @@ function downloadBuffer(buffer, fileName) {
   link.download = fileName
   link.click()
   URL.revokeObjectURL(url)
-}
-
-function styleWorksheet(sheet, headerRow, rowColor) {
-  headerRow.eachCell((cell) => {
-    cell.font = { bold: true, color: { argb: EXCEL_COLORS.white } }
-    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: EXCEL_COLORS.header } }
-  })
-  sheet.views = [{ state: 'frozen', ySplit: headerRow.number }]
-  sheet.autoFilter = { from: headerRow.getCell(1).address, to: headerRow.getCell(headerRow.cellCount).address }
-  sheet.eachRow((row) => {
-    if (row.number <= headerRow.number) return
-    const color = rowColor?.(row.values)
-    if (color) row.eachCell((cell) => { cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: color } } })
-  })
 }
 
 function Flag({ type }) {
@@ -192,7 +175,7 @@ export default function FactoryAttendance() {
   const [rollingBack, setRollingBack] = useState(false)
   const [showManagement, setShowManagement] = useState(false)
   const [lastUpload, setLastUpload] = useState(null)
-  const [exporting, setExporting] = useState(false)
+  const [exporting, setExporting] = useState('')
 
   const load = useCallback(async (rangeFrom = from, rangeTo = to) => {
     setLoading(true)
@@ -316,78 +299,36 @@ export default function FactoryAttendance() {
     finally { setRollingBack(false) }
   }
 
-  const exportWorkbook = async () => {
+  const exportDailyReport = async () => {
     if (!data) return
-    setExporting(true)
+    const workDate = lastUpload?.reportTo || to
+    setExporting('daily')
     try {
       const { default: ExcelJS } = await import('exceljs')
-      const workbook = new ExcelJS.Workbook()
-      workbook.creator = 'Feiya Factory Attendance'
-      const periods = payrollRangesBetween(from, to)
-      for (const period of periods) {
-        const periodData = await apiFetch(`?action=dashboard&from=${period.start}&to=${period.end}`, {}, getToken)
-        const sheet = workbook.addWorksheet(`Summary ${period.payrollStart.slice(5)}-${period.payrollEnd.slice(5)}`.slice(0, 31))
-        if (period.provisional) {
-          const notice = sheet.addRow([`PROVISIONAL — payroll period ends ${period.payrollEnd}`])
-          sheet.mergeCells(notice.number, 1, notice.number, 16)
-          notice.getCell(1).font = { bold: true, color: { argb: 'FF9C5700' } }
-          notice.getCell(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: EXCEL_COLORS.yellow } }
-        }
-        const header = sheet.addRow(['Code', 'Employee ID', 'Name', 'Department', 'Work Days', 'Total Hours', 'Overtime Hours', 'Shortfall Hours', 'Late', 'Early', 'Needs Review', 'Daily Payment', 'Basic Salary', 'Hours Adjustment', 'Bonus', 'Attendance Pay'])
-        for (const row of periodData.summary) sheet.addRow([
-          payrollCode(row.employeeCode), row.employeeCode, row.name, row.department, row.workdays,
-          Number((row.totalMinutes / 60).toFixed(2)), Number((row.overtimeMinutes / 60).toFixed(2)),
-          Number((row.shortfallMinutes / 60).toFixed(2)), row.lateDays, row.earlyDays, row.reviewDays,
-          row.dailyPayment, row.basicSalary, Number(row.hoursAdjustment.toFixed(2)), row.bonus,
-          row.estimatedPay == null ? null : Number(row.estimatedPay.toFixed(2)),
-        ])
-        sheet.columns = [12, 12, 24, 18, 11, 12, 14, 14, 8, 8, 14, 14, 14, 16, 12, 16].map((width) => ({ width }))
-        styleWorksheet(sheet, header, (values) => Number(values[11]) > 0 || values[12] == null ? EXCEL_COLORS.red : null)
-      }
-
-      const dailySheet = workbook.addWorksheet('Daily Attendance')
-      const dailyHeader = dailySheet.addRow(['Date', 'Code', 'Employee ID', 'Name', 'Department', 'First Punch', 'Last Punch', 'Punches', 'Worked Hours', 'Status', 'Flags', 'Note', 'Reviewed By', 'Reviewed At'])
-      for (const day of data.days) dailySheet.addRow([
-        day.workDate, payrollCode(day.employeeCode), day.employeeCode, day.name, day.department,
-        timeOnly(day.firstPunch), timeOnly(day.lastPunch), day.punchCount,
-        day.workedMinutes == null ? null : Number((day.workedMinutes / 60).toFixed(2)),
-        day.manuallyConfirmed ? 'Manually Confirmed' : day.needsReview ? 'Needs Review' : 'Automatic',
-        day.flags.join(', '), day.reviewNote, day.reviewedBy, day.reviewedAt ? new Date(day.reviewedAt).toLocaleString() : '',
-      ])
-      dailySheet.columns = [12, 12, 12, 24, 18, 12, 12, 10, 14, 20, 24, 28, 18, 22].map((width) => ({ width }))
-      styleWorksheet(dailySheet, dailyHeader, (values) => {
-        if (values[10] === 'Needs Review') return EXCEL_COLORS.red
-        if (values[10] === 'Manually Confirmed') return EXCEL_COLORS.blue
-        if (values[11]) return EXCEL_COLORS.yellow
-        return null
-      })
-
-      const exceptionSheet = workbook.addWorksheet('Exceptions')
-      const exceptionHeader = exceptionSheet.addRow(['Date', 'Code', 'Employee', 'Punches', 'Worked Hours', 'Status', 'Flags', 'Reason / Note'])
-      for (const day of data.days.filter((item) => item.flags.length || item.manuallyConfirmed)) exceptionSheet.addRow([
-        day.workDate, payrollCode(day.employeeCode), day.name, day.punchCount,
-        day.workedMinutes == null ? null : Number((day.workedMinutes / 60).toFixed(2)),
-        day.manuallyConfirmed ? 'Manually Confirmed' : day.needsReview ? 'Needs Review' : 'Warning',
-        day.flags.join(', '), day.reviewNote,
-      ])
-      exceptionSheet.columns = [12, 12, 26, 10, 14, 20, 26, 32].map((width) => ({ width }))
-      styleWorksheet(exceptionSheet, exceptionHeader, (values) => values[6] === 'Needs Review' ? EXCEL_COLORS.red : values[6] === 'Manually Confirmed' ? EXCEL_COLORS.blue : EXCEL_COLORS.yellow)
-
-      const importSheet = workbook.addWorksheet('Import Report')
-      const importHeader = importSheet.addRow(['Files', 'Date From', 'Date To', 'Records', 'Inserted', 'Duplicates', 'Status'])
-      const relevantImports = (data.imports || []).filter((item) => !item.reverted_at && item.date_to >= from && item.date_from <= to)
-      for (const item of relevantImports) importSheet.addRow([(item.source_files || []).join(', ') || item.file_name, item.date_from, item.date_to, item.record_count, item.inserted_count, item.record_count - item.inserted_count, 'Active'])
-      importSheet.addRow([])
-      const duplicateHeader = importSheet.addRow(['Duplicate Employee ID', 'Employee', 'Timestamp', 'Source File', 'Reason'])
-      for (const item of relevantImports.flatMap((entry) => entry.duplicate_details || [])) importSheet.addRow([item.employeeCode, item.name, item.punchedAt?.replace('T', ' '), item.sourceFile, item.reason === 'repeated_in_file' ? 'Repeated inside batch' : 'Already uploaded'])
-      importSheet.columns = [38, 16, 22, 28, 18, 14, 18].map((width) => ({ width }))
-      styleWorksheet(importSheet, importHeader)
-      duplicateHeader.eachCell((cell) => { cell.font = { bold: true }; cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: EXCEL_COLORS.yellow } } })
-
-      downloadBuffer(await workbook.xlsx.writeBuffer(), `factory-attendance-${from}-to-${to}.xlsx`)
-      toast.success('Excel downloaded')
+      const workbook = buildDailyAttendanceWorkbook(ExcelJS, { days: data.days, employees: data.employees, workDate })
+      downloadBuffer(await workbook.xlsx.writeBuffer(), `daily-attendance-${workDate}.xlsx`)
+      toast.success('Daily report downloaded')
     } catch (error) { toast.error(error.message) }
-    finally { setExporting(false) }
+    finally { setExporting('') }
+  }
+
+  const exportPayrollReport = async () => {
+    if (!data) return
+    setExporting('payroll')
+    try {
+      const { default: ExcelJS } = await import('exceljs')
+      const reportTo = lastUpload?.reportTo || to
+      const reportFrom = payrollRangeForDate(reportTo).start
+      const reportData = reportFrom === from && reportTo === to
+        ? data
+        : await apiFetch(`?action=dashboard&from=${reportFrom}&to=${reportTo}`, {}, getToken)
+      const workbook = buildPayrollToDateWorkbook(ExcelJS, {
+        summary: reportData.summary, settings: reportData.settings, from: reportFrom, to: reportTo,
+      })
+      downloadBuffer(await workbook.xlsx.writeBuffer(), `payroll-to-date-${reportFrom}-to-${reportTo}.xlsx`)
+      toast.success('Payroll-to-date report downloaded')
+    } catch (error) { toast.error(error.message) }
+    finally { setExporting('') }
   }
 
   const totalMinutes = (data?.summary || []).reduce((sum, row) => sum + row.totalMinutes, 0)
@@ -413,7 +354,8 @@ export default function FactoryAttendance() {
           <button onClick={() => { setFrom(initialRange.start); setTo(today < initialRange.end ? today : initialRange.end) }} className="btn-secondary"><CalendarDays className="h-4 w-4" /> Current payroll</button>
           <button onClick={load} disabled={loading} className="btn-secondary"><RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} /> Refresh</button>
           <button onClick={() => setShowManagement(false)} className="btn-secondary">Simple Upload</button>
-          <button onClick={exportWorkbook} disabled={!data || exporting} className="btn-primary"><Download className="h-4 w-4" /> {exporting ? 'Preparing…' : 'Download Excel'}</button>
+          <button onClick={exportDailyReport} disabled={!data || exporting} className="btn-secondary"><Download className="h-4 w-4" /> {exporting === 'daily' ? 'Preparing…' : 'Daily Excel'}</button>
+          <button onClick={exportPayrollReport} disabled={!data || exporting} className="btn-primary"><Download className="h-4 w-4" /> {exporting === 'payroll' ? 'Preparing…' : 'Payroll-to-date Excel'}</button>
         </div>}
       </div>
 
@@ -435,12 +377,12 @@ export default function FactoryAttendance() {
       </details>}
 
       {lastUpload && !showManagement && <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-5">
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between"><div><p className="text-lg font-bold text-emerald-900">Attendance is ready</p><p className="mt-1 text-sm text-emerald-800">{lastUpload.reportFrom}—{lastUpload.reportTo} · {lastUpload.sourceFiles?.length || 1} machine file(s) · {data?.summary?.length || 0} employees · {lastUpload.inserted} new punches · {lastUpload.duplicates} duplicates · {pending} need review</p><p className="mt-1 text-xs text-emerald-700">The Excel will include payroll summaries, daily attendance, color-coded exceptions, and the import report.</p></div><div className="flex flex-wrap gap-2"><button onClick={exportWorkbook} disabled={exporting || loading} className="btn-primary disabled:opacity-50"><Download className="h-4 w-4" /> {exporting ? 'Preparing…' : 'Download Excel'}</button>{pending > 0 && <button onClick={() => { setShowManagement(true); setTab('daily'); setDailyFlag('needs_review') }} className="btn-secondary text-red-600"><AlertTriangle className="h-4 w-4" /> Review exceptions</button>}</div></div>
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between"><div><p className="text-lg font-bold text-emerald-900">Attendance is ready</p><p className="mt-1 text-sm text-emerald-800">{lastUpload.reportFrom}—{lastUpload.reportTo} · {lastUpload.sourceFiles?.length || 1} machine file(s) · {data?.summary?.length || 0} employees · {lastUpload.inserted} new punches · {lastUpload.duplicates} duplicates · {pending} need review</p><p className="mt-1 text-xs text-emerald-700">Choose the simple daily report or the current payroll-to-date report.</p></div><div className="flex flex-wrap gap-2"><button onClick={exportDailyReport} disabled={exporting || loading} className="btn-secondary disabled:opacity-50"><Download className="h-4 w-4" /> {exporting === 'daily' ? 'Preparing…' : 'Daily Excel'}</button><button onClick={exportPayrollReport} disabled={exporting || loading} className="btn-primary disabled:opacity-50"><Download className="h-4 w-4" /> {exporting === 'payroll' ? 'Preparing…' : 'Payroll-to-date Excel'}</button>{pending > 0 && <button onClick={() => { setShowManagement(true); setTab('daily'); setDailyFlag('needs_review') }} className="btn-secondary text-red-600"><AlertTriangle className="h-4 w-4" /> Review exceptions</button>}</div></div>
       </div>}
 
       {showManagement && <>
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <SummaryCard label="Employees" value={data?.summary?.length || 0} helper="With punches in range" icon={Users} />
+        <SummaryCard label="Employees" value={data?.summary?.length || 0} helper="Registered attendance employees" icon={Users} />
         <SummaryCard label="Confirmed workdays" value={workdays} helper="At least one confirmed in/out set" icon={CheckCircle2} color="green" />
         <SummaryCard label="Total worked" value={formatMinutes(totalMinutes)} helper={`${from} through ${to}`} icon={Clock3} color="amber" />
         <SummaryCard label="Needs review" value={pending} helper="Weekdays need 4 punches; Saturday needs 2 or 4" icon={AlertTriangle} color={pending ? 'red' : 'green'} />
@@ -462,15 +404,15 @@ export default function FactoryAttendance() {
 
       {!loading && tab === 'summary' && (
         <div className="card overflow-x-auto">
-          <table className="min-w-[1180px] w-full text-sm"><thead><tr className="border-b border-slate-200 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
-            {['ID / Employee', 'Days', 'Total', 'Overtime', 'Shortfall', 'Late', 'Early', 'Review', 'Daily pay', 'Basic salary', 'Hours ±', 'Bonus', 'Attendance pay'].map((label) => <th key={label} className="px-3 py-3 font-semibold">{label}</th>)}
+          <table className="min-w-[1280px] w-full text-sm"><thead><tr className="border-b border-slate-200 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+            {['ID / Employee', 'Days', 'Total', 'Overtime', 'Shortfall', 'Late', 'Early', 'Review', 'Daily pay', 'Normal hourly', 'Basic pay', 'Overtime pay', 'Bonus', 'Pay to date'].map((label) => <th key={label} className="px-3 py-3 font-semibold">{label}</th>)}
           </tr></thead><tbody className="divide-y divide-slate-100">{filteredSummary.map((row) => <tr key={row.employeeCode} className="hover:bg-slate-50">
             <td className="px-3 py-3"><p className="font-medium text-slate-800">{row.name}</p><p className="text-xs text-slate-400">{payrollCode(row.employeeCode)} · {row.department || 'No department'}</p></td>
             <td className="px-3 py-3">{row.workdays}</td><td className="px-3 py-3 font-semibold">{formatMinutes(row.totalMinutes)}</td>
             <td className="px-3 py-3 text-emerald-600">{formatMinutes(row.overtimeMinutes)}</td><td className="px-3 py-3 text-red-600">{formatMinutes(row.shortfallMinutes)}</td>
             <td className="px-3 py-3">{row.lateDays}</td><td className="px-3 py-3">{row.earlyDays}</td><td className="px-3 py-3">{row.reviewDays}</td>
-            <td className="px-3 py-3">{money(row.dailyPayment)}</td><td className="px-3 py-3">{money(row.basicSalary)}</td>
-            <td className={`px-3 py-3 font-medium ${row.hoursAdjustment < 0 ? 'text-red-600' : 'text-emerald-600'}`}>{money(row.hoursAdjustment)}</td>
+            <td className="px-3 py-3">{money(row.dailyPayment)}</td><td className="px-3 py-3">{money(row.normalHourlyRate)}</td><td className="px-3 py-3">{money(row.basicSalary)}</td>
+            <td className="px-3 py-3 font-medium text-emerald-600">{money(row.overtimePay)}</td>
             <td className="px-3 py-3">{money(row.bonus)}</td><td className="px-3 py-3 font-bold text-slate-800">{money(row.estimatedPay)}</td>
           </tr>)}</tbody></table>
         </div>
@@ -495,7 +437,7 @@ export default function FactoryAttendance() {
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">{[
             ['weekdayStart', 'Weekday start', 'time', 1], ['weekdayEnd', 'Weekday end', 'time', 1], ['weekdayStandardMinutes', 'Weekday standard minutes', 'number', 1],
             ['saturdayStart', 'Saturday start', 'time', 1], ['saturdayEnd', 'Saturday end', 'time', 1], ['saturdayStandardMinutes', 'Saturday standard minutes', 'number', 1],
-            ['payrollStandardMinutes', 'Payroll standard minutes', 'number', 1], ['hourlyAdjustmentRate', 'Hourly adjustment (Q)', 'number', '0.01'],
+            ['payrollStandardMinutes', 'Payroll standard minutes', 'number', 1], ['hourlyAdjustmentRate', 'Overtime rate (Q/hour)', 'number', '0.01'],
             ['fulltimeDailyRate', 'Full-time daily rate (Q)', 'number', '0.01'], ['fulltimeBonus', 'Full-time bonus (Q)', 'number', '0.01'],
           ].map(([key, label, type, step]) => <label key={key} className="text-xs font-medium text-slate-600">{label}<input type={type} step={step} value={settingsForm[key]} onChange={(event) => setSettingsForm((current) => ({ ...current, [key]: event.target.value }))} className="input-base mt-1 w-full" /></label>)}</div>
         </div>

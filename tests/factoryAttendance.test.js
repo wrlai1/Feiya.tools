@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 
 import {
   buildPayrollSummary,
+  buildDailyRoster,
   calculateAttendanceDays,
   parseAttendanceFiles,
   parseAttendanceText,
@@ -123,22 +124,48 @@ test('uses the two fixed payroll periods', () => {
   ])
 })
 
-test('payroll summary keeps overtime and shortfall separate while paying the signed variance', () => {
+test('payroll summary pays valid hours without negative adjustments', () => {
   const days = [
     { employeeCode: 5, name: 'Angelica', workday: true, workedMinutes: 600, late: false, early: false, needsReview: false },
   ]
-  const settings = { payrollStandardMinutes: 540, hourlyAdjustmentRate: 20, fulltimeBonus: 125 }
+  const settings = { payrollStandardMinutes: 540, weekdayStandardMinutes: 600, hourlyAdjustmentRate: 20, fulltimeBonus: 125 }
   const [overtime] = buildPayrollSummary(days, [{ employeeCode: 5, dailyPayment: 107.37, bonusEligible: true }], settings)
   assert.equal(overtime.overtimeMinutes, 60)
   assert.equal(overtime.shortfallMinutes, 0)
-  assert.equal(overtime.hoursAdjustment, 20)
+  assert.equal(overtime.basicSalary, 107.37)
+  assert.equal(overtime.overtimePay, 20)
   assert.equal(overtime.estimatedPay, 252.37)
 
   const [shortfall] = buildPayrollSummary(days, [{ employeeCode: 5, dailyPayment: 100 }], {
-    payrollStandardMinutes: 660,
+    payrollStandardMinutes: 660, weekdayStandardMinutes: 600,
     hourlyAdjustmentRate: 20,
   })
   assert.equal(shortfall.overtimeMinutes, 0)
   assert.equal(shortfall.shortfallMinutes, 60)
-  assert.equal(shortfall.hoursAdjustment, -20)
+  assert.equal(shortfall.basicSalary, 100)
+  assert.equal(shortfall.overtimePay, 0)
+  assert.equal(shortfall.estimatedPay, 100)
+})
+
+test('pays 89 hours at the normal hourly rate and lists employees without punches', () => {
+  const employees = [
+    { employeeCode: 5, name: 'Angelica', department: 'Inspection', dailyPayment: 107.37 },
+    { employeeCode: 6, name: 'Laura', department: 'Sewing', dailyPayment: 107.37 },
+  ]
+  const days = [{
+    employeeCode: 5, name: 'Angelica', workDate: '2026-08-18', workday: true,
+    workedMinutes: 89 * 60, late: false, early: false, needsReview: false,
+  }]
+  const summary = buildPayrollSummary(days, employees, { payrollStandardMinutes: 5400, weekdayStandardMinutes: 600 })
+  assert.equal(summary.length, 2)
+  assert.ok(Math.abs(summary[0].basicSalary - 955.593) < 0.000001)
+  assert.equal(summary[0].overtimePay, 0)
+  assert.equal(summary[1].totalMinutes, 0)
+  assert.equal(summary[1].basicSalary, 0)
+
+  const roster = buildDailyRoster(days, employees, '2026-08-18')
+  assert.equal(roster.length, 2)
+  assert.equal(roster[0].absent, undefined)
+  assert.equal(roster[1].absent, true)
+  assert.deepEqual(roster[1].flags, ['absent'])
 })

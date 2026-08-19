@@ -267,7 +267,7 @@ export function calculateAttendanceDays(punches, settingsInput = {}, reviews = [
 export function buildPayrollSummary(days, employees = [], settingsInput = {}) {
   const settings = { ...DEFAULT_ATTENDANCE_SETTINGS, ...settingsInput }
   const employeeMap = new Map(employees.map((employee) => [Number(employee.employeeCode ?? employee.employee_code), employee]))
-  const grouped = new Map()
+  const grouped = new Map([...employeeMap.keys()].map((employeeCode) => [employeeCode, []]))
 
   for (const day of days || []) {
     if (!grouped.has(day.employeeCode)) grouped.set(day.employeeCode, [])
@@ -278,13 +278,15 @@ export function buildPayrollSummary(days, employees = [], settingsInput = {}) {
     const employee = employeeMap.get(employeeCode) || {}
     const workedDays = employeeDays.filter((day) => day.workday)
     const totalMinutes = workedDays.reduce((sum, day) => sum + Number(day.workedMinutes || 0), 0)
-    const varianceMinutes = totalMinutes - Number(settings.payrollStandardMinutes)
-    const overtimeMinutes = Math.max(varianceMinutes, 0)
-    const shortfallMinutes = Math.max(-varianceMinutes, 0)
+    const overtimeMinutes = Math.max(totalMinutes - Number(settings.payrollStandardMinutes), 0)
+    const shortfallMinutes = Math.max(Number(settings.payrollStandardMinutes) - totalMinutes, 0)
     const dailyPayment = employee.dailyPayment ?? employee.daily_payment
     const bonusEligible = Boolean(employee.bonusEligible ?? employee.bonus_eligible)
-    const basicSalary = dailyPayment == null ? null : workedDays.length * Number(dailyPayment)
-    const hoursAdjustment = varianceMinutes / 60 * Number(settings.hourlyAdjustmentRate)
+    const normalHourlyRate = dailyPayment == null || Number(settings.weekdayStandardMinutes) <= 0
+      ? null
+      : Number(dailyPayment) / (Number(settings.weekdayStandardMinutes) / 60)
+    const basicSalary = normalHourlyRate == null ? null : totalMinutes / 60 * normalHourlyRate
+    const overtimePay = overtimeMinutes / 60 * Number(settings.hourlyAdjustmentRate)
     const bonus = bonusEligible ? Number(settings.fulltimeBonus) : 0
 
     return {
@@ -295,15 +297,46 @@ export function buildPayrollSummary(days, employees = [], settingsInput = {}) {
       totalMinutes,
       overtimeMinutes,
       shortfallMinutes,
-      varianceMinutes,
       lateDays: employeeDays.filter((day) => day.late).length,
       earlyDays: employeeDays.filter((day) => day.early).length,
       reviewDays: employeeDays.filter((day) => day.needsReview).length,
       dailyPayment: dailyPayment == null ? null : Number(dailyPayment),
+      normalHourlyRate,
       basicSalary,
-      hoursAdjustment,
+      overtimePay,
       bonus,
-      estimatedPay: basicSalary == null ? null : basicSalary + hoursAdjustment + bonus,
+      estimatedPay: basicSalary == null ? null : basicSalary + overtimePay + bonus,
+    }
+  }).sort((a, b) => a.employeeCode - b.employeeCode)
+}
+
+export function buildDailyRoster(days, employees = [], workDate) {
+  const dayMap = new Map((days || [])
+    .filter((day) => day.workDate === workDate)
+    .map((day) => [Number(day.employeeCode), day]))
+
+  return employees.map((employee) => {
+    const employeeCode = Number(employee.employeeCode ?? employee.employee_code)
+    const day = dayMap.get(employeeCode)
+    if (day) return { ...day, name: employee.name || day.name, department: employee.department || day.department }
+    return {
+      employeeCode,
+      name: employee.name || '',
+      department: employee.department || '',
+      workDate,
+      punches: [],
+      firstPunch: null,
+      lastPunch: null,
+      punchCount: 0,
+      workedMinutes: 0,
+      workday: false,
+      late: false,
+      early: false,
+      needsReview: false,
+      manuallyConfirmed: false,
+      reviewNote: '',
+      flags: ['absent'],
+      absent: true,
     }
   }).sort((a, b) => a.employeeCode - b.employeeCode)
 }
