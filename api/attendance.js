@@ -3,7 +3,7 @@ import { neon } from '@neondatabase/serverless';
 import authentication from '../lib/authentication.cjs';
 import {
   DEFAULT_ATTENDANCE_SETTINGS,
-  buildPayrollSummary,
+  buildAttendanceSummary,
   calculateAttendanceDays,
   parseAttendanceFiles,
   partitionAttendanceDuplicates,
@@ -233,7 +233,7 @@ async function loadDashboard(sql, from, to) {
     employees,
     punches,
     days,
-    summary: buildPayrollSummary(days, employees, settings),
+    summary: buildAttendanceSummary(days, employees),
     imports: importRows,
   };
 }

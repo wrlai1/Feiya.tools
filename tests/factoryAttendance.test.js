@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+  buildAttendanceSummary,
   buildPayrollSummary,
   buildDailyRoster,
   calculateAttendanceDays,
@@ -11,6 +12,36 @@ import {
   payrollRangeForDate,
   payrollRangesBetween,
 } from '../src/utils/factoryAttendance.js'
+
+test('attendance summary counts complete pairs but excludes unconfirmed hours', () => {
+  const employees = [
+    { employeeCode: 5, name: 'Angelica', department: 'Inspection' },
+    { employeeCode: 6, name: 'Laura', department: 'Sewing' },
+  ]
+  const days = [
+    {
+      employeeCode: 5, name: 'Angelica', workDate: '2026-08-18', punchCount: 4,
+      workday: true, workedMinutes: 590, late: true, early: false, needsReview: false,
+    },
+    {
+      employeeCode: 5, name: 'Angelica', workDate: '2026-08-19', punchCount: 3,
+      workday: false, workedMinutes: null, late: false, early: false, needsReview: true,
+    },
+    {
+      employeeCode: 5, name: 'Angelica', workDate: '2026-08-16', punchCount: 2,
+      workday: false, workedMinutes: null, late: false, early: false, needsReview: true,
+    },
+  ]
+
+  const summary = buildAttendanceSummary(days, employees)
+  assert.equal(summary.length, 2)
+  assert.deepEqual(summary[0], {
+    employeeCode: 5, name: 'Angelica', department: 'Inspection', attendanceDays: 2,
+    workdays: 1, totalMinutes: 590, lateDays: 1, earlyDays: 0, reviewDays: 2,
+  })
+  assert.equal(summary[1].attendanceDays, 0)
+  assert.equal(summary[1].totalMinutes, 0)
+})
 
 test('parses both attendance machine date formats', () => {
   const text = [

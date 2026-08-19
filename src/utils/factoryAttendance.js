@@ -310,6 +310,35 @@ export function buildPayrollSummary(days, employees = [], settingsInput = {}) {
   }).sort((a, b) => a.employeeCode - b.employeeCode)
 }
 
+export function buildAttendanceSummary(days, employees = []) {
+  const employeeMap = new Map(employees.map((employee) => [Number(employee.employeeCode ?? employee.employee_code), employee]))
+  const grouped = new Map([...employeeMap.keys()].map((employeeCode) => [employeeCode, []]))
+
+  for (const day of days || []) {
+    if (!grouped.has(day.employeeCode)) grouped.set(day.employeeCode, [])
+    grouped.get(day.employeeCode).push(day)
+  }
+
+  return [...grouped.entries()].map(([employeeCode, employeeDays]) => {
+    const employee = employeeMap.get(employeeCode) || {}
+    const attendanceDays = employeeDays.filter((day) => (
+      new Date(`${day.workDate}T00:00:00Z`).getUTCDay() !== 0 && Number(day.punchCount) >= 2
+    )).length
+    const confirmedDays = employeeDays.filter((day) => day.workday)
+    return {
+      employeeCode,
+      name: employee.name || employeeDays[0]?.name || '',
+      department: employee.department || employeeDays[0]?.department || '',
+      attendanceDays,
+      workdays: confirmedDays.length,
+      totalMinutes: confirmedDays.reduce((sum, day) => sum + Number(day.workedMinutes || 0), 0),
+      lateDays: employeeDays.filter((day) => day.late).length,
+      earlyDays: employeeDays.filter((day) => day.early).length,
+      reviewDays: employeeDays.filter((day) => day.needsReview).length,
+    }
+  }).sort((a, b) => a.employeeCode - b.employeeCode)
+}
+
 export function buildDailyRoster(days, employees = [], workDate) {
   const dayMap = new Map((days || [])
     .filter((day) => day.workDate === workDate)
