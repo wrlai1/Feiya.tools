@@ -2,10 +2,12 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+  attendancePunchLabel,
   buildAttendanceSummary,
   buildPayrollSummary,
   buildDailyRoster,
   calculateAttendanceDays,
+  filterAttendanceRecordsByDates,
   parseAttendanceFiles,
   parseAttendanceText,
   partitionAttendanceDuplicates,
@@ -13,6 +15,16 @@ import {
   payrollRangesBetween,
   standardMinutesForSchedule,
 } from '../src/utils/factoryAttendance.js'
+
+test('labels known and uncertain punch roles clearly', () => {
+  assert.deepEqual([0, 1, 2, 3].map((index) => attendancePunchLabel({ punches: ['a', 'b', 'c', 'd'] }, index)), [
+    'Clock In', 'Lunch Out', 'Lunch In', 'Clock Out',
+  ])
+  assert.deepEqual([0, 1, 2].map((index) => attendancePunchLabel({ punches: ['a', 'b', 'c'] }, index)), [
+    'Clock In', 'Unconfirmed Punch', 'Clock Out',
+  ])
+  assert.equal(attendancePunchLabel({ punches: ['a'] }, 0), 'Only Punch')
+})
 
 test('attendance summary counts complete pairs but excludes unconfirmed hours', () => {
   const employees = [
@@ -106,6 +118,15 @@ test('merges up to three machine files into one attendance batch', () => {
   assert.deepEqual(records.map((record) => record.sourceFile), ['machine-1.txt', 'machine-2.txt', 'machine-3.txt'])
   assert.equal(records.length, 3)
   assert.throws(() => parseAttendanceFiles([]), /one and three/)
+})
+
+test('keeps only the dates selected before a multi-day upload', () => {
+  const records = [
+    { employeeCode: 5, punchedAt: '2026-08-18T07:00:00' },
+    { employeeCode: 5, punchedAt: '2026-08-19T07:00:00' },
+  ]
+  assert.deepEqual(filterAttendanceRecordsByDates(records, ['2026-08-18']), [records[0]])
+  assert.deepEqual(filterAttendanceRecordsByDates(records, []), [])
 })
 
 test('treats two Saturday punches as a complete half day', () => {

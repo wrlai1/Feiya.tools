@@ -5,7 +5,7 @@ import {
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import { useToast } from '../hooks/useToast.js'
-import { formatMinutes, parseAttendanceFiles, payrollRangeForDate, standardMinutesForSchedule } from '../utils/factoryAttendance.js'
+import { attendancePunchLabel, formatMinutes, parseAttendanceFiles, payrollRangeForDate, standardMinutesForSchedule } from '../utils/factoryAttendance.js'
 import { buildAttendanceWorkbook } from '../utils/factoryAttendanceExcel.js'
 
 const BASE = '/api/attendance'
@@ -93,7 +93,7 @@ function ReviewPanel({ day, onClose, onSave, saving }) {
       <div className="flex items-start justify-between gap-4">
         <div>
           <p className="font-semibold text-slate-800">Confirm {day.name} · {day.workDate}</p>
-          <p className="mt-1 text-xs text-slate-600">Raw punches: {day.punches.map(timeOnly).join(' · ')}</p>
+          <div className="mt-2 flex flex-wrap gap-2">{day.punches.map((punch, index) => <span key={punch} className="rounded-lg bg-white px-2 py-1 text-xs text-slate-600"><span className="font-semibold">{attendancePunchLabel(day, index)}:</span> {timeOnly(punch)}</span>)}</div>
         </div>
         <button onClick={onClose} className="text-xs text-slate-500 hover:text-slate-800">Cancel</button>
       </div>
@@ -294,7 +294,11 @@ export default function FactoryAttendance() {
       const reportFrom = lastUpload?.dateFrom || from
       const reportTo = lastUpload?.reportTo || to
       const reportData = await apiFetch(`?action=dashboard&from=${reportFrom}&to=${reportTo}`, {}, getToken)
-      const workbook = buildAttendanceWorkbook(ExcelJS, { days: reportData.days, from: reportFrom, to: reportTo })
+      const selectedDates = lastUpload?.dateSchedules?.map((schedule) => schedule.workDate)
+      const reportDays = selectedDates?.length
+        ? reportData.days.filter((day) => selectedDates.includes(day.workDate))
+        : reportData.days
+      const workbook = buildAttendanceWorkbook(ExcelJS, { days: reportDays, from: reportFrom, to: reportTo })
       downloadBuffer(await workbook.xlsx.writeBuffer(), `attendance-${reportFrom}-to-${reportTo}.xlsx`)
       toast.success('Attendance Excel downloaded')
     } catch (error) { toast.error(error.message) }
@@ -341,13 +345,13 @@ export default function FactoryAttendance() {
 
       {pendingUpload && <div className="rounded-2xl border border-blue-200 bg-blue-50 p-5">
         <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-          <div><p className="font-bold text-blue-900">Choose the scheduled end time for each date</p><p className="mt-1 text-xs text-blue-700">Weekdays default to 17:00. Saturday keeps the 12:00 half-day default. Each day is finalized 30 minutes after its selected end time.</p><p className="mt-2 text-xs text-blue-600">{pendingUpload.files.map((file) => file.fileName).join(' · ')}</p></div>
-          <div className="flex flex-wrap gap-2"><button onClick={() => setPendingUpload(null)} disabled={uploading} className="btn-secondary disabled:opacity-50">Cancel</button><button onClick={upload} disabled={uploading || pendingUpload.dateSchedules.some((schedule) => Number(standardMinutesForSchedule(schedule.workDate, schedule.endTime)) <= 0)} className="btn-primary disabled:opacity-50"><Upload className="h-4 w-4" /> {uploading ? 'Uploading…' : 'Confirm Upload'}</button></div>
+          <div><p className="font-bold text-blue-900">Choose the scheduled end time for each date</p><p className="mt-1 text-xs text-blue-700">Weekdays default to 17:00. Saturday keeps the 12:00 half-day default. Remove any date you do not want to import. Each kept day is finalized 30 minutes after its selected end time.</p><p className="mt-2 text-xs text-blue-600">{pendingUpload.files.map((file) => file.fileName).join(' · ')}</p></div>
+          <div className="flex flex-wrap gap-2"><button onClick={() => setPendingUpload(null)} disabled={uploading} className="btn-secondary disabled:opacity-50">Cancel</button><button onClick={upload} disabled={uploading || pendingUpload.dateSchedules.length === 0 || pendingUpload.dateSchedules.some((schedule) => Number(standardMinutesForSchedule(schedule.workDate, schedule.endTime)) <= 0)} className="btn-primary disabled:opacity-50"><Upload className="h-4 w-4" /> {uploading ? 'Uploading…' : 'Confirm Upload'}</button></div>
         </div>
         <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">{pendingUpload.dateSchedules.map((schedule) => {
           const standardMinutes = standardMinutesForSchedule(schedule.workDate, schedule.endTime)
-          return <label key={schedule.workDate} className="rounded-xl border border-blue-200 bg-white p-3 text-xs font-medium text-slate-600"><span className="flex items-center justify-between gap-3"><span>{schedule.workDate}</span><span className="font-normal text-blue-600">{standardMinutes > 0 ? formatMinutes(standardMinutes) : 'Choose a later time'}</span></span><input type="time" min="08:01" value={schedule.endTime} onChange={(event) => setPendingUpload((current) => ({ ...current, dateSchedules: current.dateSchedules.map((item) => item.workDate === schedule.workDate ? { ...item, endTime: event.target.value } : item) }))} className="input-base mt-2 w-full" /></label>
-        })}</div>
+          return <div key={schedule.workDate} className="rounded-xl border border-blue-200 bg-white p-3 text-xs font-medium text-slate-600"><div className="flex items-center justify-between gap-3"><span>{schedule.workDate}</span><button type="button" onClick={() => setPendingUpload((current) => ({ ...current, dateSchedules: current.dateSchedules.filter((item) => item.workDate !== schedule.workDate) }))} disabled={uploading} className="rounded px-2 py-0.5 text-lg leading-none text-slate-400 hover:bg-red-50 hover:text-red-600 disabled:opacity-40" aria-label={`Remove ${schedule.workDate}`}>×</button></div><label className="mt-2 block"><span className="flex items-center justify-between gap-3"><span>Scheduled end</span><span className="font-normal text-blue-600">{standardMinutes > 0 ? formatMinutes(standardMinutes) : 'Choose a later time'}</span></span><input type="time" min="08:01" value={schedule.endTime} onChange={(event) => setPendingUpload((current) => ({ ...current, dateSchedules: current.dateSchedules.map((item) => item.workDate === schedule.workDate ? { ...item, endTime: event.target.value } : item) }))} className="input-base mt-1 w-full" /></label></div>
+        })}{pendingUpload.dateSchedules.length === 0 && <div className="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-700">Keep at least one date to continue.</div>}</div>
       </div>}
 
       {duplicateReport && <details className="rounded-xl border border-amber-200 bg-amber-50 p-4">

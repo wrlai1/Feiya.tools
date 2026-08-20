@@ -1,5 +1,7 @@
+import { attendancePunchLabel } from './factoryAttendance.js'
+
 const COLORS = {
-  total: 'FFDDEBF7', review: 'FFFFC7CE', dark: 'FF1F2937',
+  total: 'FFDDEBF7', review: 'FFFFC7CE', warning: 'FFFFEB9C', dark: 'FF1F2937',
 }
 
 function displayTimestamp(value) {
@@ -12,11 +14,22 @@ function isAttendanceDay(day) {
   return Boolean(day.workday) && !day.inProgress
 }
 
+function attendanceStatus(day) {
+  const labels = []
+  if (day.needsReview) labels.push('Needs Review')
+  if (day.flags?.includes('missing_lunch')) labels.push('Missing Lunch Punches')
+  if (day.late) labels.push('Late')
+  if (day.early) labels.push('Early')
+  if (day.possibleEarlyWork) labels.push('Possible Early Work')
+  if (day.possibleOvertime) labels.push('Possible Overtime')
+  return labels.join(' · ')
+}
+
 export function buildAttendanceWorkbook(ExcelJS, { days, from, to }) {
   const workbook = new ExcelJS.Workbook()
   workbook.creator = 'Feiya Factory Attendance'
   const sheet = workbook.addWorksheet(`${from.slice(5)}-${to.slice(5)}`.slice(0, 31))
-  const header = sheet.addRow(['ID.', 'Nombre', 'Depart.', 'Tiempo', 'WH', 'Working Days', 'Status'])
+  const header = sheet.addRow(['ID.', 'Nombre', 'Depart.', 'Punch Type', 'Tiempo', 'WH', 'Working Days', 'Status'])
   header.font = { bold: true, color: { argb: COLORS.dark } }
   header.alignment = { horizontal: 'center' }
 
@@ -36,28 +49,32 @@ export function buildAttendanceWorkbook(ExcelJS, { days, from, to }) {
       const punches = day.punches?.length ? day.punches : [day.firstPunch].filter(Boolean)
       punches.forEach((punch, index) => {
         const row = sheet.addRow([
-          employeeCode, day.name, day.department, displayTimestamp(punch),
+          employeeCode, day.name, day.department, attendancePunchLabel(day, index), displayTimestamp(punch),
           index === 0 && day.workedMinutes != null ? Number((day.workedMinutes / 60).toFixed(2)) : null,
           null,
-          index === 0 && day.needsReview ? 'Needs Review' : null,
+          index === 0 ? attendanceStatus(day) || null : null,
         ])
         if (day.needsReview) {
           row.eachCell({ includeEmpty: true }, (cell) => {
             cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: COLORS.review } }
           })
+        } else if (day.late || day.early) {
+          row.eachCell({ includeEmpty: true }, (cell) => {
+            cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: COLORS.warning } }
+          })
         }
       })
     }
-    const totalRow = sheet.addRow([null, null, 'Total', null, Number((totalMinutes / 60).toFixed(2)), workingDays, null])
+    const totalRow = sheet.addRow([null, null, 'Total', null, null, Number((totalMinutes / 60).toFixed(2)), workingDays, null])
     totalRow.font = { bold: true }
     totalRow.eachCell({ includeEmpty: true }, (cell) => {
       cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: COLORS.total } }
     })
   }
 
-  sheet.columns = [10, 28, 23, 25, 16, 16, 18].map((width) => ({ width }))
-  sheet.getColumn(5).numFmt = '0.00'
+  sheet.columns = [10, 28, 23, 20, 25, 16, 16, 52].map((width) => ({ width }))
+  sheet.getColumn(6).numFmt = '0.00'
   sheet.views = [{ state: 'frozen', ySplit: 1 }]
-  sheet.autoFilter = { from: 'A1', to: 'G1' }
+  sheet.autoFilter = { from: 'A1', to: 'H1' }
   return workbook
 }

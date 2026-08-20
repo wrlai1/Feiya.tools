@@ -84,6 +84,11 @@ export function parseAttendanceFiles(files) {
   })))
 }
 
+export function filterAttendanceRecordsByDates(records, dates) {
+  const selectedDates = new Set(dates || [])
+  return (records || []).filter((record) => selectedDates.has(String(record.punchedAt || '').slice(0, 10)))
+}
+
 export function attendanceRecordKey(record) {
   return [
     Number(record.employeeCode ?? record.employee_code),
@@ -167,6 +172,15 @@ function timeToSeconds(value) {
 
 function timestampSeconds(value) {
   return timeToSeconds(String(value).slice(11, 19))
+}
+
+export function attendancePunchLabel(day, index) {
+  const punchCount = Number(day?.punches?.length ?? day?.punchCount ?? 0)
+  if (punchCount <= 1) return 'Only Punch'
+  if (punchCount === 4) return ['Clock In', 'Lunch Out', 'Lunch In', 'Clock Out'][index] || 'Punch'
+  if (index === 0) return 'Clock In'
+  if (index === punchCount - 1) return 'Clock Out'
+  return 'Unconfirmed Punch'
 }
 
 export function standardMinutesForSchedule(date, endTime, startTime = '07:00') {

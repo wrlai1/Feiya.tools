@@ -5,6 +5,7 @@ import {
   DEFAULT_ATTENDANCE_SETTINGS,
   buildAttendanceSummary,
   calculateAttendanceDays,
+  filterAttendanceRecordsByDates,
   parseAttendanceFiles,
   partitionAttendanceDuplicates,
   standardMinutesForSchedule,
@@ -297,11 +298,8 @@ export default async function handler(req, res) {
       const sourceFiles = files.map((file) => file.fileName);
       const fileName = sourceFiles.length === 1 ? sourceFiles[0] : `${sourceFiles.length} files: ${sourceFiles.join(', ')}`;
       const contentHashes = files.map((file) => createHash('sha256').update(file.content).digest('hex')).sort();
-      const records = parseAttendanceFiles(files);
-      const recordDates = records.map((record) => record.punchedAt.slice(0, 10)).sort();
-      const dateFrom = recordDates[0];
-      const dateTo = recordDates.at(-1);
-      const uniqueDates = [...new Set(recordDates)];
+      const parsedRecords = parseAttendanceFiles(files);
+      const availableDates = [...new Set(parsedRecords.map((record) => record.punchedAt.slice(0, 10)))].sort();
       const submittedSchedules = Array.isArray(req.body?.dateSchedules) ? req.body.dateSchedules : [];
       const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
       const scheduleByDate = new Map();
@@ -313,10 +311,10 @@ export default async function handler(req, res) {
         }
         scheduleByDate.set(workDate, endTime);
       }
-      if (uniqueDates.some((date) => !scheduleByDate.has(date)) || [...scheduleByDate.keys()].some((date) => !uniqueDates.includes(date))) {
-        return res.status(400).json({ error: 'Choose one end time for every date found in the TXT files' });
+      if (!scheduleByDate.size || [...scheduleByDate.keys()].some((date) => !availableDates.includes(date))) {
+        return res.status(400).json({ error: 'Keep at least one valid date found in the TXT files' });
       }
-      const dateSchedules = uniqueDates.map((workDate) => {
+      const dateSchedules = [...scheduleByDate.keys()].sort().map((workDate) => {
         const endTime = scheduleByDate.get(workDate);
         const standardMinutes = standardMinutesForSchedule(workDate, endTime);
         return { workDate, startTime: '07:00', endTime, standardMinutes };
@@ -324,6 +322,10 @@ export default async function handler(req, res) {
       if (dateSchedules.some((schedule) => !Number.isFinite(schedule.standardMinutes) || schedule.standardMinutes <= 0)) {
         return res.status(400).json({ error: 'Every selected end time must produce a positive workday after 07:00' });
       }
+      const records = filterAttendanceRecordsByDates(parsedRecords, scheduleByDate.keys());
+      const recordDates = records.map((record) => record.punchedAt.slice(0, 10)).sort();
+      const dateFrom = recordDates[0];
+      const dateTo = recordDates.at(-1);
       const hash = createHash('sha256').update(`${contentHashes.join('|')}|${JSON.stringify(dateSchedules)}`).digest('hex');
       const preliminary = partitionAttendanceDuplicates(records);
       const lookupJson = JSON.stringify(preliminary.accepted.map((record) => ({
