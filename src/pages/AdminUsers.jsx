@@ -2,11 +2,18 @@ import React, { useState, useEffect, useCallback } from 'react'
 import {
   Users, Plus, KeyRound, Trash2, ShieldCheck, User,
   AlertCircle, RefreshCw, Eye, EyeOff, X, Check,
-  CalendarCheck,
+  CalendarCheck, SlidersHorizontal,
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import { useToast } from '../hooks/useToast.js'
 import { formatLastUpdated } from '../utils/dateUtils.js'
+import userPermissions from '../../lib/userPermissions.cjs'
+
+const {
+  INVENTORY_CHECK_EDIT,
+  INVENTORY_CHECK_VIEW,
+  normalizeUserPermissions,
+} = userPermissions
 
 const BASE = '/api'
 
@@ -37,7 +44,7 @@ function RoleBadge({ role }) {
 function Modal({ title, onClose, children }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md">
+      <div className="max-h-[calc(100dvh-2rem)] w-full max-w-md overflow-y-auto rounded-2xl bg-white shadow-2xl">
         <div className="flex items-center justify-between px-6 py-4 border-b border-slate-200">
           <h3 className="font-semibold text-slate-800">{title}</h3>
           <button onClick={onClose} className="p-1.5 rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-600">
@@ -71,6 +78,51 @@ function PasswordInput({ value, onChange, placeholder = 'Password' }) {
   )
 }
 
+function InventoryPermissionControls({ permissions, onChange, disabled = false }) {
+  const selected = normalizeUserPermissions(permissions)
+  const canView = selected.includes(INVENTORY_CHECK_VIEW)
+  const canEdit = selected.includes(INVENTORY_CHECK_EDIT)
+  const setAccess = (view, edit) => onChange(normalizeUserPermissions([
+    ...(view ? [INVENTORY_CHECK_VIEW] : []),
+    ...(edit ? [INVENTORY_CHECK_EDIT] : []),
+  ]))
+
+  return (
+    <div className={`rounded-xl border p-4 ${disabled ? 'border-slate-100 bg-slate-50 opacity-60' : 'border-slate-200'}`}>
+      <div>
+        <p className="text-sm font-semibold text-slate-800">Inventory Check</p>
+        <p className="mt-0.5 text-xs text-slate-500">Choose whether this user can see or change weekly inventory.</p>
+      </div>
+      <label className="mt-4 flex cursor-pointer items-start gap-3">
+        <input
+          type="checkbox"
+          checked={canView}
+          disabled={disabled}
+          onChange={(event) => setAccess(event.target.checked, event.target.checked ? canEdit : false)}
+          className="mt-0.5 h-4 w-4 rounded border-slate-300 text-blue-600"
+        />
+        <span>
+          <span className="block text-sm font-medium text-slate-700">View</span>
+          <span className="block text-xs text-slate-500">Search, inspect, and export inventory without changing it.</span>
+        </span>
+      </label>
+      <label className="mt-3 flex cursor-pointer items-start gap-3">
+        <input
+          type="checkbox"
+          checked={canEdit}
+          disabled={disabled}
+          onChange={(event) => setAccess(canView || event.target.checked, event.target.checked)}
+          className="mt-0.5 h-4 w-4 rounded border-slate-300 text-blue-600"
+        />
+        <span>
+          <span className="block text-sm font-medium text-slate-700">Edit</span>
+          <span className="block text-xs text-slate-500">Upload, add, edit, delete, and adjust quantities. Edit automatically includes View.</span>
+        </span>
+      </label>
+    </div>
+  )
+}
+
 export default function AdminUsers() {
   const { getToken, user: me } = useAuth()
   const toast = useToast()
@@ -85,7 +137,10 @@ export default function AdminUsers() {
   const [newPassword, setNewPassword]     = useState('')
   const [newRole, setNewRole]             = useState('user')
   const [newAttendanceAccess, setNewAttendanceAccess] = useState(false)
+  const [newPermissions, setNewPermissions] = useState([INVENTORY_CHECK_VIEW])
   const [resetPassword, setResetPassword] = useState('')
+  const [permissionDraft, setPermissionDraft] = useState([])
+  const [attendanceDraft, setAttendanceDraft] = useState(false)
 
   const loadUsers = useCallback(() => {
     setLoading(true)
@@ -104,7 +159,10 @@ export default function AdminUsers() {
     setNewPassword('')
     setNewRole('user')
     setNewAttendanceAccess(false)
+    setNewPermissions([INVENTORY_CHECK_VIEW])
     setResetPassword('')
+    setPermissionDraft([])
+    setAttendanceDraft(false)
   }
 
   async function handleCreate(e) {
@@ -114,7 +172,13 @@ export default function AdminUsers() {
     try {
       await apiFetch('/users', {
         method: 'POST',
-        body: JSON.stringify({ username: newUsername, password: newPassword, role: newRole, attendanceAccess: newAttendanceAccess }),
+        body: JSON.stringify({
+          username: newUsername,
+          password: newPassword,
+          role: newRole,
+          attendanceAccess: newRole === 'user' && newAttendanceAccess,
+          permissions: newRole === 'user' && !newAttendanceAccess ? newPermissions : [],
+        }),
       }, getToken)
       toast.success(`User "${newUsername}" created`)
       closeModal()
@@ -185,8 +249,36 @@ export default function AdminUsers() {
     }
   }
 
+  function openPermissions(u) {
+    setPermissionDraft(normalizeUserPermissions(u.permissions))
+    setAttendanceDraft(Boolean(u.attendance_access))
+    setModal({ type: 'permissions', user: u })
+  }
+
+  async function handlePermissions(e) {
+    e.preventDefault()
+    setFormError('')
+    setSaving(true)
+    try {
+      await apiFetch(`/users?id=${modal.user.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          attendanceAccess: attendanceDraft,
+          permissions: attendanceDraft ? [] : permissionDraft,
+        }),
+      }, getToken)
+      toast.success(`Access updated for "${modal.user.username}"`)
+      closeModal()
+      loadUsers()
+    } catch (err) {
+      setFormError(err.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
   return (
-    <div className="space-y-6 max-w-4xl">
+    <div className="max-w-6xl space-y-6">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
@@ -211,6 +303,7 @@ export default function AdminUsers() {
               <tr className="bg-slate-50 border-b border-slate-200">
                 <th className="px-4 py-3 text-left font-semibold text-slate-500 uppercase tracking-wide text-xs">Username</th>
                 <th className="px-4 py-3 text-left font-semibold text-slate-500 uppercase tracking-wide text-xs">Factory Attendance</th>
+                <th className="px-4 py-3 text-left font-semibold text-slate-500 uppercase tracking-wide text-xs hidden lg:table-cell">Inventory Check</th>
                 <th className="px-4 py-3 text-left font-semibold text-slate-500 uppercase tracking-wide text-xs">Role</th>
                 <th className="px-4 py-3 text-left font-semibold text-slate-500 uppercase tracking-wide text-xs hidden sm:table-cell">Created by</th>
                 <th className="px-4 py-3 text-left font-semibold text-slate-500 uppercase tracking-wide text-xs hidden md:table-cell">Joined</th>
@@ -228,6 +321,15 @@ export default function AdminUsers() {
                       <span className="font-medium text-slate-800">{u.username}</span>
                       {u.id === me?.id && <span className="text-xs text-slate-400">(you)</span>}
                     </div>
+                  </td>
+                  <td className="hidden px-4 py-3 text-xs text-slate-500 lg:table-cell">
+                    {u.role === 'admin'
+                      ? 'Full access'
+                      : u.attendance_access
+                        ? 'Hidden'
+                        : u.permissions?.includes(INVENTORY_CHECK_EDIT)
+                          ? 'View + Edit'
+                          : u.permissions?.includes(INVENTORY_CHECK_VIEW) ? 'View only' : 'No access'}
                   </td>
                   <td className="px-4 py-3">
                     {u.role === 'admin' ? (
@@ -252,6 +354,15 @@ export default function AdminUsers() {
                   <td className="px-4 py-3 text-slate-400 text-xs hidden md:table-cell">{formatLastUpdated(u.created_at)}</td>
                   <td className="px-4 py-3">
                     <div className="flex items-center justify-end gap-2">
+                      {u.role !== 'admin' && (
+                        <button
+                          onClick={() => openPermissions(u)}
+                          className="p-1.5 rounded-lg text-slate-400 hover:bg-violet-50 hover:text-violet-600 transition-colors"
+                          title="Set access"
+                        >
+                          <SlidersHorizontal className="w-4 h-4" />
+                        </button>
+                      )}
                       <button
                         onClick={() => setModal({ type: 'reset', user: u })}
                         className="p-1.5 rounded-lg text-slate-400 hover:bg-blue-50 hover:text-blue-600 transition-colors"
@@ -310,15 +421,42 @@ export default function AdminUsers() {
               </div>
             </div>
             {newRole === 'user' && (
-              <label className={`flex cursor-pointer items-start gap-3 rounded-lg border-2 p-3 transition-colors ${newAttendanceAccess ? 'border-emerald-500 bg-emerald-50' : 'border-slate-200'}`}>
-                <input type="checkbox" checked={newAttendanceAccess} onChange={(event) => setNewAttendanceAccess(event.target.checked)} className="mt-0.5" />
-                <span><span className="block text-sm font-medium text-slate-700">Factory attendance only</span><span className="block text-xs text-slate-500">This account will only see TXT upload, attendance review, and payroll summaries.</span></span>
-              </label>
+              <div className="space-y-3">
+                <label className={`flex cursor-pointer items-start gap-3 rounded-lg border-2 p-3 transition-colors ${newAttendanceAccess ? 'border-emerald-500 bg-emerald-50' : 'border-slate-200'}`}>
+                  <input type="checkbox" checked={newAttendanceAccess} onChange={(event) => setNewAttendanceAccess(event.target.checked)} className="mt-0.5" />
+                  <span><span className="block text-sm font-medium text-slate-700">Factory attendance only</span><span className="block text-xs text-slate-500">This account will only see TXT upload, attendance review, and payroll summaries.</span></span>
+                </label>
+                <InventoryPermissionControls permissions={newPermissions} onChange={setNewPermissions} disabled={newAttendanceAccess} />
+              </div>
             )}
             <div className="flex gap-3 pt-2">
               <button type="button" onClick={closeModal} className="btn-secondary flex-1 justify-center">Cancel</button>
               <button type="submit" disabled={saving} className="btn-primary flex-1 justify-center disabled:opacity-50">
                 {saving ? 'Creating…' : 'Create User'}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
+
+      {modal?.type === 'permissions' && (
+        <Modal title={`Access — ${modal.user.username}`} onClose={closeModal}>
+          <form onSubmit={handlePermissions} className="space-y-4">
+            {formError && (
+              <div className="flex items-center gap-2 px-3 py-2 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700">
+                <AlertCircle className="w-4 h-4 flex-shrink-0" />{formError}
+              </div>
+            )}
+            <label className={`flex cursor-pointer items-start gap-3 rounded-lg border-2 p-3 transition-colors ${attendanceDraft ? 'border-emerald-500 bg-emerald-50' : 'border-slate-200'}`}>
+              <input type="checkbox" checked={attendanceDraft} onChange={(event) => setAttendanceDraft(event.target.checked)} className="mt-0.5" />
+              <span><span className="block text-sm font-medium text-slate-700">Factory attendance only</span><span className="block text-xs text-slate-500">When enabled, all other modules are hidden from this account.</span></span>
+            </label>
+            <InventoryPermissionControls permissions={permissionDraft} onChange={setPermissionDraft} disabled={attendanceDraft} />
+            <p className="text-xs text-slate-500">Changes apply to the API immediately. The user may need to refresh the page to update the menu.</p>
+            <div className="flex gap-3 pt-2">
+              <button type="button" onClick={closeModal} className="btn-secondary flex-1 justify-center">Cancel</button>
+              <button type="submit" disabled={saving} className="btn-primary flex-1 justify-center disabled:opacity-50">
+                {saving ? 'Saving…' : 'Save Access'}
               </button>
             </div>
           </form>

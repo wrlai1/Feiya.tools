@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState, useTransition } from 'react'
 import {
   Archive, Boxes, CalendarClock, CheckCircle2, ChevronRight,
-  AlertCircle, Download, FileSpreadsheet, Layers3, Link2, MapPin,
+  AlertCircle, Download, Eye, FileSpreadsheet, Layers3, Link2, MapPin,
   Minus, PackageCheck, Pencil, Plus, RefreshCw, Search, Trash2,
   Upload, Warehouse, X,
 } from 'lucide-react'
@@ -11,6 +11,10 @@ import { useToast } from '../hooks/useToast.js'
 import { parseInventoryExcel, inventoryToCSV, downloadCSV } from '../utils/excelParser.js'
 import { formatLastUpdated } from '../utils/dateUtils.js'
 import { fetchInventory, saveInventory } from '../utils/api.js'
+import { useAuth } from '../context/AuthContext.jsx'
+import userPermissions from '../../lib/userPermissions.cjs'
+
+const { INVENTORY_CHECK_EDIT, userHasPermission } = userPermissions
 
 const SHEET_ORDER = [
   'Location final', 'Pending Shipment', 'PLUS', 'Petite', 'Missy',
@@ -90,7 +94,10 @@ function DetailField({ label, value, wide = false }) {
   )
 }
 
-function QuantityCell({ row, field, disabled, onAdjust, large = false }) {
+function QuantityCell({ row, field, disabled, onAdjust, large = false, readOnly = false }) {
+  if (readOnly) {
+    return <span className={`${large ? 'text-lg' : ''} font-bold tabular-nums`}>{num(row[field])}</span>
+  }
   return (
     <div className={`flex items-center ${large ? 'gap-2' : 'gap-1'}`} onClick={(event) => event.stopPropagation()}>
       <button
@@ -116,7 +123,7 @@ function QuantityCell({ row, field, disabled, onAdjust, large = false }) {
   )
 }
 
-function MobileInventoryCards({ rows, pending, disabled, resetKey, onAdjust, onEdit, onDelete, onSelect }) {
+function MobileInventoryCards({ rows, pending, disabled, editable, resetKey, onAdjust, onEdit, onDelete, onSelect }) {
   const [visibleCount, setVisibleCount] = useState(25)
 
   useEffect(() => setVisibleCount(25), [resetKey])
@@ -137,20 +144,22 @@ function MobileInventoryCards({ rows, pending, disabled, resetKey, onAdjust, onE
                 {[pending ? row.po : row.rack, row.color || row.customer].filter(Boolean).join(' · ') || 'No additional details'}
               </p>
             </div>
-            <div className="flex shrink-0 gap-1" onClick={(event) => event.stopPropagation()}>
-              <button type="button" disabled={disabled} onClick={() => onEdit(row)} className="flex h-11 w-11 items-center justify-center rounded-xl bg-indigo-50 text-indigo-600 disabled:opacity-40" aria-label="Edit record"><Pencil className="h-4 w-4" /></button>
-              <button type="button" disabled={disabled} onClick={() => onDelete(row)} className="flex h-11 w-11 items-center justify-center rounded-xl bg-red-50 text-red-600 disabled:opacity-40" aria-label="Delete record"><Trash2 className="h-4 w-4" /></button>
-            </div>
+            {editable && (
+              <div className="flex shrink-0 gap-1" onClick={(event) => event.stopPropagation()}>
+                <button type="button" disabled={disabled} onClick={() => onEdit(row)} className="flex h-11 w-11 items-center justify-center rounded-xl bg-indigo-50 text-indigo-600 disabled:opacity-40" aria-label="Edit record"><Pencil className="h-4 w-4" /></button>
+                <button type="button" disabled={disabled} onClick={() => onDelete(row)} className="flex h-11 w-11 items-center justify-center rounded-xl bg-red-50 text-red-600 disabled:opacity-40" aria-label="Delete record"><Trash2 className="h-4 w-4" /></button>
+              </div>
+            )}
           </div>
 
           <div className="mt-4 flex flex-wrap gap-3 border-t border-slate-100 pt-4" onClick={(event) => event.stopPropagation()}>
             <div className="w-full">
               <p className="mb-2 text-[11px] font-bold uppercase tracking-wider text-slate-400">Boxes</p>
-              <QuantityCell row={row} field="box" disabled={disabled} onAdjust={onAdjust} large />
+              <QuantityCell row={row} field="box" disabled={disabled} onAdjust={onAdjust} large readOnly={!editable} />
             </div>
             <div className="w-full">
               <p className="mb-2 text-[11px] font-bold uppercase tracking-wider text-slate-400">{pending ? 'Pcs' : 'Quantity'}</p>
-              <QuantityCell row={row} field="qty" disabled={disabled} onAdjust={onAdjust} large />
+              <QuantityCell row={row} field="qty" disabled={disabled} onAdjust={onAdjust} large readOnly={!editable} />
             </div>
           </div>
 
@@ -263,9 +272,12 @@ function InventoryEditor({ row, isNew, saving, onClose, onSave }) {
 }
 
 export default function InventoryCheck() {
+  const { user } = useAuth()
+  const canEdit = userHasPermission(user, INVENTORY_CHECK_EDIT)
   const [rows, setRows] = useState([])
   const [lastUpdated, setLastUpdated] = useState(null)
   const [fileName, setFileName] = useState(null)
+  const [revision, setRevision] = useState(0)
   const [activeSheet, setActiveSheet] = useState('Location final')
   const [inputValue, setInputValue] = useState('')
   const [searchQuery, setSearchQuery] = useState('')
@@ -289,6 +301,7 @@ export default function InventoryCheck() {
           setRows(result.rows || [])
           setLastUpdated(result.updatedAt || null)
           setFileName(result.fileName || null)
+          setRevision(Number(result.revision || 0))
         }
       } catch (error) {
         if (!cancelled) setApiError(error.message)
@@ -343,9 +356,10 @@ export default function InventoryCheck() {
   const persistRows = useCallback(async (nextRows, message) => {
     setIsSaving(true)
     try {
-      await saveInventory(nextRows, fileName)
+      const result = await saveInventory(nextRows, fileName, revision)
       setRows(nextRows)
-      setLastUpdated(new Date().toISOString())
+      setRevision(Number(result.revision))
+      setLastUpdated(result.updatedAt || new Date().toISOString())
       toast.success(message, 'Inventory Updated')
       return true
     } catch (error) {
@@ -354,7 +368,7 @@ export default function InventoryCheck() {
     } finally {
       setIsSaving(false)
     }
-  }, [fileName, toast])
+  }, [fileName, revision, toast])
 
   const handleAdjust = useCallback(async (row, field, delta) => {
     if (isSaving) return
@@ -419,9 +433,10 @@ export default function InventoryCheck() {
     setIsUploading(true)
     try {
       const parsed = await parseInventoryExcel(file)
-      await saveInventory(parsed, file.name)
+      const result = await saveInventory(parsed, file.name, revision)
       setRows(parsed)
-      setLastUpdated(new Date().toISOString())
+      setRevision(Number(result.revision))
+      setLastUpdated(result.updatedAt || new Date().toISOString())
       setFileName(file.name)
       setActiveSheet('Location final')
       setShowUpload(false)
@@ -431,7 +446,7 @@ export default function InventoryCheck() {
     } finally {
       setIsUploading(false)
     }
-  }, [toast])
+  }, [revision, toast])
 
   const handleDownload = useCallback(() => {
     downloadCSV(inventoryToCSV(filteredRows), `${SHEET_LABELS[activeSheet] || activeSheet}_${Date.now()}.csv`)
@@ -446,8 +461,8 @@ export default function InventoryCheck() {
     { key: 'rack', label: 'Location', sortable: true, render: (value) => value ? <span className="inline-flex items-center gap-1.5 whitespace-nowrap font-bold text-violet-700"><MapPin className="h-3.5 w-3.5" />{value}</span> : '—' },
     { key: 'style', label: 'Style', sortable: true, cellClassName: 'font-semibold whitespace-nowrap' },
     { key: 'color', label: 'Color', sortable: true },
-    { key: 'box', label: 'Boxes', sortable: true, render: (_, row) => <QuantityCell row={row} field="box" disabled={isSaving} onAdjust={handleAdjust} /> },
-    { key: 'qty', label: 'Qty', sortable: true, render: (_, row) => <QuantityCell row={row} field="qty" disabled={isSaving} onAdjust={handleAdjust} /> },
+    { key: 'box', label: 'Boxes', sortable: true, render: (_, row) => <QuantityCell row={row} field="box" disabled={isSaving} onAdjust={handleAdjust} readOnly={!canEdit} /> },
+    { key: 'qty', label: 'Qty', sortable: true, render: (_, row) => <QuantityCell row={row} field="qty" disabled={isSaving} onAdjust={handleAdjust} readOnly={!canEdit} /> },
     { key: 'sizes', label: 'Size Breakdown', render: (value, row) => <div className="min-w-[150px]"><p className="font-medium">{value || '—'}</p>{row.ratio && <p className="mt-0.5 text-xs text-slate-400">{row.ratio}</p>}</div> },
     { key: 'company', label: 'Company' },
     { key: 'customer', label: 'Customer' },
@@ -455,20 +470,20 @@ export default function InventoryCheck() {
       const links = getLinks(row)
       return links.length ? <span className="inline-flex items-center gap-1 whitespace-nowrap rounded-full bg-emerald-50 px-2 py-1 text-xs font-semibold text-emerald-700"><Link2 className="h-3 w-3" />{links.length === 1 ? links[0].rack || 'Linked' : `${links.length} locations`}</span> : <span className="inline-flex items-center gap-1 whitespace-nowrap rounded-full bg-amber-50 px-2 py-1 text-xs font-semibold text-amber-700"><AlertCircle className="h-3 w-3" />Review</span>
     } }] : []),
-    { key: 'actions', label: 'Actions', sortable: false, render: (_, row) => <div className="flex items-center gap-1" onClick={(event) => event.stopPropagation()}><button type="button" disabled={isSaving} onClick={() => { setIsAdding(false); setEditingRow(row) }} className="rounded-lg p-1.5 text-slate-400 hover:bg-indigo-50 hover:text-indigo-600 disabled:opacity-40" aria-label="Edit record"><Pencil className="h-4 w-4" /></button><button type="button" disabled={isSaving} onClick={() => handleDelete(row)} className="rounded-lg p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-600 disabled:opacity-40" aria-label="Delete record"><Trash2 className="h-4 w-4" /></button></div> },
+    ...(canEdit ? [{ key: 'actions', label: 'Actions', sortable: false, render: (_, row) => <div className="flex items-center gap-1" onClick={(event) => event.stopPropagation()}><button type="button" disabled={isSaving} onClick={() => { setIsAdding(false); setEditingRow(row) }} className="rounded-lg p-1.5 text-slate-400 hover:bg-indigo-50 hover:text-indigo-600 disabled:opacity-40" aria-label="Edit record"><Pencil className="h-4 w-4" /></button><button type="button" disabled={isSaving} onClick={() => handleDelete(row)} className="rounded-lg p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-600 disabled:opacity-40" aria-label="Delete record"><Trash2 className="h-4 w-4" /></button></div> }] : []),
   ]
 
   const pendingColumns = [
     { key: 'po', label: 'PO #', sortable: true, cellClassName: 'font-semibold whitespace-nowrap' },
     { key: 'style', label: 'Style / Description', sortable: true },
     { key: 'pallet', label: 'Pallet', sortable: true },
-    { key: 'box', label: 'Boxes', sortable: true, render: (_, row) => <QuantityCell row={row} field="box" disabled={isSaving} onAdjust={handleAdjust} /> },
-    { key: 'qty', label: 'Pcs', sortable: true, render: (_, row) => <QuantityCell row={row} field="qty" disabled={isSaving} onAdjust={handleAdjust} /> },
+    { key: 'box', label: 'Boxes', sortable: true, render: (_, row) => <QuantityCell row={row} field="box" disabled={isSaving} onAdjust={handleAdjust} readOnly={!canEdit} /> },
+    { key: 'qty', label: 'Pcs', sortable: true, render: (_, row) => <QuantityCell row={row} field="qty" disabled={isSaving} onAdjust={handleAdjust} readOnly={!canEdit} /> },
     { key: 'startDate', label: 'Start Date', sortable: true, cellClassName: 'whitespace-nowrap' },
     { key: 'cancelDate', label: 'Cancel Date', sortable: true, cellClassName: 'whitespace-nowrap' },
     { key: 'customer', label: 'Customer' },
     { key: 'remark', label: 'Remark' },
-    { key: 'actions', label: 'Actions', sortable: false, render: (_, row) => <div className="flex items-center gap-1" onClick={(event) => event.stopPropagation()}><button type="button" disabled={isSaving} onClick={() => { setIsAdding(false); setEditingRow(row) }} className="rounded-lg p-1.5 text-slate-400 hover:bg-indigo-50 hover:text-indigo-600 disabled:opacity-40" aria-label="Edit record"><Pencil className="h-4 w-4" /></button><button type="button" disabled={isSaving} onClick={() => handleDelete(row)} className="rounded-lg p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-600 disabled:opacity-40" aria-label="Delete record"><Trash2 className="h-4 w-4" /></button></div> },
+    ...(canEdit ? [{ key: 'actions', label: 'Actions', sortable: false, render: (_, row) => <div className="flex items-center gap-1" onClick={(event) => event.stopPropagation()}><button type="button" disabled={isSaving} onClick={() => { setIsAdding(false); setEditingRow(row) }} className="rounded-lg p-1.5 text-slate-400 hover:bg-indigo-50 hover:text-indigo-600 disabled:opacity-40" aria-label="Edit record"><Pencil className="h-4 w-4" /></button><button type="button" disabled={isSaving} onClick={() => handleDelete(row)} className="rounded-lg p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-600 disabled:opacity-40" aria-label="Delete record"><Trash2 className="h-4 w-4" /></button></div> }] : []),
   ]
 
   const selectedLinks = selected ? getLinks(selected) : []
@@ -488,18 +503,19 @@ export default function InventoryCheck() {
               {fileName && <InfoPill icon={FileSpreadsheet}>{fileName}</InfoPill>}
               {lastUpdated && <InfoPill icon={CalendarClock}>Updated {formatLastUpdated(lastUpdated)}</InfoPill>}
               {!!rows.length && <InfoPill icon={Layers3}>{sheets.length} sheets · {num(rows.length)} rows</InfoPill>}
+              {!canEdit && <InfoPill icon={Eye}>Read-only access</InfoPill>}
             </div>
           </div>
           <div className="flex flex-wrap gap-2">
             {!!rows.length && <button onClick={handleDownload} className="inline-flex items-center gap-2 rounded-xl border border-white/20 bg-white/10 px-4 py-2.5 text-sm font-semibold text-white backdrop-blur transition hover:bg-white/20"><Download className="h-4 w-4" />Export View</button>}
-            <button onClick={() => setShowUpload((value) => !value)} className="inline-flex items-center gap-2 rounded-xl bg-white px-4 py-2.5 text-sm font-bold text-indigo-950 shadow-lg shadow-black/10 transition hover:-translate-y-0.5 hover:bg-indigo-50"><Upload className="h-4 w-4" />Weekly Upload</button>
+            {canEdit && <button onClick={() => setShowUpload((value) => !value)} className="inline-flex items-center gap-2 rounded-xl bg-white px-4 py-2.5 text-sm font-bold text-indigo-950 shadow-lg shadow-black/10 transition hover:-translate-y-0.5 hover:bg-indigo-50"><Upload className="h-4 w-4" />Weekly Upload</button>}
           </div>
         </div>
       </section>
 
       {apiError && <div className="flex items-center gap-3 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700"><AlertCircle className="h-4 w-4" />The database is temporarily unavailable: {apiError}</div>}
 
-      {showUpload && (
+      {canEdit && showUpload && (
         <section className="rounded-3xl border border-indigo-100 bg-white p-5 shadow-lg shadow-indigo-950/5">
           <div className="mb-4 flex items-start justify-between gap-4">
             <div><h2 className="font-bold text-slate-800">Upload weekly workbook</h2><p className="mt-1 text-sm text-slate-500">The new upload replaces the previous Inventory Check file. It does not change Stock Management.</p></div>
@@ -540,7 +556,7 @@ export default function InventoryCheck() {
                 <div className="flex w-full items-center justify-between gap-2 text-xs text-slate-500 lg:w-auto lg:justify-start">
                   {isPending ? 'Searching…' : `${num(filteredRows.length)} results`}
                   {inputValue && <button onClick={() => { setInputValue(''); startTransition(() => setSearchQuery('')) }} className="rounded-lg px-2 py-1 font-semibold text-indigo-600 hover:bg-indigo-50">Clear</button>}
-                  <button type="button" onClick={openAdd} disabled={isSaving} className="ml-auto inline-flex min-h-11 items-center gap-1.5 rounded-xl bg-indigo-600 px-4 py-2 text-sm font-bold text-white shadow-sm hover:bg-indigo-700 disabled:opacity-50 lg:ml-2 lg:min-h-0 lg:px-3 lg:text-xs"><Plus className="h-4 w-4 lg:h-3.5 lg:w-3.5" />Add New</button>
+                  {canEdit && <button type="button" onClick={openAdd} disabled={isSaving} className="ml-auto inline-flex min-h-11 items-center gap-1.5 rounded-xl bg-indigo-600 px-4 py-2 text-sm font-bold text-white shadow-sm hover:bg-indigo-700 disabled:opacity-50 lg:ml-2 lg:min-h-0 lg:px-3 lg:text-xs"><Plus className="h-4 w-4 lg:h-3.5 lg:w-3.5" />Add New</button>}
                 </div>
               </div>
               <div className="mt-3 flex items-center gap-2 text-xs text-slate-500">
@@ -552,6 +568,7 @@ export default function InventoryCheck() {
                 rows={filteredRows}
                 pending={pendingSheet}
                 disabled={isSaving}
+                editable={canEdit}
                 resetKey={`${activeSheet}|${searchQuery}`}
                 onAdjust={handleAdjust}
                 onEdit={(row) => { setIsAdding(false); setEditingRow(row) }}
@@ -564,12 +581,18 @@ export default function InventoryCheck() {
             </div>
           </section>
         </>
-      ) : (
+      ) : canEdit ? (
         <button onClick={() => setShowUpload(true)} className="group flex min-h-[340px] w-full flex-col items-center justify-center rounded-3xl border-2 border-dashed border-indigo-200 bg-gradient-to-br from-white to-indigo-50/60 p-8 text-center transition hover:border-indigo-400">
           <span className="flex h-16 w-16 items-center justify-center rounded-2xl bg-indigo-100 text-indigo-600 transition group-hover:scale-105"><Warehouse className="h-8 w-8" /></span>
           <span className="mt-5 text-lg font-bold text-slate-800">Upload your first weekly inventory</span>
           <span className="mt-2 max-w-md text-sm leading-6 text-slate-500">The system will read Location Final and every category sheet to create a searchable inventory view.</span>
         </button>
+      ) : (
+        <div className="flex min-h-[340px] w-full flex-col items-center justify-center rounded-3xl border border-slate-200 bg-white p-8 text-center">
+          <Eye className="h-10 w-10 text-slate-300" />
+          <p className="mt-4 font-bold text-slate-700">No Inventory Check data is available yet.</p>
+          <p className="mt-1 text-sm text-slate-500">An Admin can upload the weekly inventory workbook.</p>
+        </div>
       )}
 
       {selected && (
@@ -577,10 +600,10 @@ export default function InventoryCheck() {
           <aside className="h-[100dvh] w-full max-w-xl overflow-y-auto bg-white shadow-2xl" onClick={(event) => event.stopPropagation()}>
             <div className="sticky top-0 z-10 border-b border-slate-100 bg-white/95 px-4 py-4 backdrop-blur sm:px-6 sm:py-5">
               <div className="flex items-start justify-between gap-4"><div className="min-w-0"><p className="text-xs font-bold uppercase tracking-widest text-indigo-500">{SHEET_LABELS[selected.sheet] || selected.sheet}</p><h2 className="mt-1 truncate text-2xl font-black text-slate-900">{selected.style || selected.po || 'Inventory Detail'}</h2><p className="mt-1 truncate text-sm text-slate-500">{selected.color || selected.customer || `Excel row ${selected.rowNumber}`}</p></div><button onClick={() => setSelected(null)} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-slate-500 hover:bg-slate-200"><X className="h-5 w-5" /></button></div>
-              <div className="mt-4 flex gap-2">
+              {canEdit && <div className="mt-4 flex gap-2">
                 <button type="button" disabled={isSaving} onClick={() => { setIsAdding(false); setEditingRow(selected) }} className="inline-flex min-h-11 flex-1 items-center justify-center gap-1.5 rounded-xl bg-indigo-600 px-3 py-2 text-sm font-bold text-white hover:bg-indigo-700 disabled:opacity-50 sm:min-h-0 sm:flex-none sm:text-xs"><Pencil className="h-4 w-4 sm:h-3.5 sm:w-3.5" />Edit</button>
                 <button type="button" disabled={isSaving} onClick={() => handleDelete(selected)} className="inline-flex min-h-11 flex-1 items-center justify-center gap-1.5 rounded-xl border border-red-200 px-3 py-2 text-sm font-bold text-red-600 hover:bg-red-50 disabled:opacity-50 sm:min-h-0 sm:flex-none sm:text-xs"><Trash2 className="h-4 w-4 sm:h-3.5 sm:w-3.5" />Delete</button>
-              </div>
+              </div>}
             </div>
             <div className="space-y-6 p-4 pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:p-6">
               {selected.rack && <div className="rounded-2xl bg-gradient-to-br from-indigo-600 to-violet-700 p-5 text-white"><p className="text-xs font-bold uppercase tracking-widest text-indigo-200">Warehouse Location</p><p className="mt-2 flex items-center gap-2 text-2xl font-black"><MapPin className="h-6 w-6" />{selected.rack}</p></div>}
@@ -601,7 +624,7 @@ export default function InventoryCheck() {
         </div>
       )}
 
-      {editingRow && (
+      {canEdit && editingRow && (
         <InventoryEditor
           row={editingRow}
           isNew={isAdding}

@@ -19,10 +19,13 @@ import {
   X,
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
+import userPermissions from '../../lib/userPermissions.cjs'
+
+const { INVENTORY_CHECK_VIEW, userHasPermission } = userPermissions
 
 const ROUTES = [
   { label: 'Dashboard', path: '/', icon: LayoutDashboard, adminOnly: true },
-  { label: 'Inventory Check', path: '/inventory', icon: Package, adminOnly: true },
+  { label: 'Inventory Check', path: '/inventory', icon: Package, permission: INVENTORY_CHECK_VIEW },
   { label: 'Tracking', path: '/tracking', icon: Truck },
   { label: 'Low Inventory Notes', path: '/notes', icon: MessageSquare },
   { label: 'Stock Management', path: '/stock', icon: Boxes, adminOnly: true },
@@ -51,9 +54,11 @@ export default function CommandPalette() {
     () => ROUTES.filter((route) => {
       if (user?.role === 'admin') return true
       if (user?.attendanceAccess) return route.attendance
-      return !route.adminOnly && !route.attendance
+      return !route.adminOnly
+        && !route.attendance
+        && (!route.permission || userHasPermission(user, route.permission))
     }),
-    [user?.attendanceAccess, user?.role],
+    [user],
   )
 
   const filteredRoutes = useMemo(() => {

@@ -19,6 +19,9 @@ import TimeClockPage from './pages/TimeClockPage.jsx'
 import AdminTimeReport from './pages/AdminTimeReport.jsx'
 import ReturnsReceiving from './pages/ReturnsReceiving.jsx'
 import FactoryAttendance from './pages/FactoryAttendance.jsx'
+import userPermissions from '../lib/userPermissions.cjs'
+
+const { INVENTORY_CHECK_VIEW, userHasPermission } = userPermissions
 
 // Full-page spinner shown while verifying token on first load
 function SplashLoader() {
@@ -66,6 +69,16 @@ function RequireAttendance({ children }) {
   return children
 }
 
+function RequirePermission({ permission, children }) {
+  const { user } = useAuth()
+  const location = useLocation()
+  if (import.meta.env.DEV && new URLSearchParams(location.search).get('mock') === '1') return children
+  if (!userHasPermission(user, permission)) {
+    return <Navigate to={user?.attendanceAccess ? '/attendance' : '/tracking'} replace />
+  }
+  return children
+}
+
 function RequireGeneralAccess({ children }) {
   const { user } = useAuth()
   const location = useLocation()
@@ -91,7 +104,7 @@ function AppRoutes() {
       {/* Protected */}
       <Route path="/" element={<RequireAuth><Layout /></RequireAuth>}>
         <Route index element={<RequireAdmin><Dashboard /></RequireAdmin>} />
-        <Route path="inventory" element={<RequireAdmin><InventoryCheck /></RequireAdmin>} />
+        <Route path="inventory" element={<RequirePermission permission={INVENTORY_CHECK_VIEW}><InventoryCheck /></RequirePermission>} />
         <Route path="tracking" element={<RequireGeneralAccess><TrackingPage /></RequireGeneralAccess>} />
         <Route path="notes" element={<RequireGeneralAccess><NotesPage /></RequireGeneralAccess>} />
         <Route path="stock" element={<RequireAdmin><StockManagement /></RequireAdmin>} />
