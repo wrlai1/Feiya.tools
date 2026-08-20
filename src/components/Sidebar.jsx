@@ -9,7 +9,7 @@ import {
 import { useAuth } from '../context/AuthContext.jsx'
 import ChangePasswordModal from './ChangePasswordModal.jsx'
 import { SECTION_THEMES } from '../utils/sectionTheme.js'
-import userPermissions from '../../lib/userPermissions.cjs'
+import userPermissions from '../utils/userPermissions.js'
 
 const { INVENTORY_CHECK_VIEW, userHasPermission } = userPermissions
 

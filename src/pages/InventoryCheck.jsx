@@ -12,7 +12,7 @@ import { parseInventoryExcel, inventoryToCSV, downloadCSV } from '../utils/excel
 import { formatLastUpdated } from '../utils/dateUtils.js'
 import { fetchInventory, saveInventory } from '../utils/api.js'
 import { useAuth } from '../context/AuthContext.jsx'
-import userPermissions from '../../lib/userPermissions.cjs'
+import userPermissions from '../utils/userPermissions.js'
 
 const { INVENTORY_CHECK_EDIT, userHasPermission } = userPermissions
 

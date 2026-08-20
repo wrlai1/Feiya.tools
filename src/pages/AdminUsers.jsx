@@ -7,7 +7,7 @@ import {
 import { useAuth } from '../context/AuthContext.jsx'
 import { useToast } from '../hooks/useToast.js'
 import { formatLastUpdated } from '../utils/dateUtils.js'
-import userPermissions from '../../lib/userPermissions.cjs'
+import userPermissions from '../utils/userPermissions.js'
 
 const {
   INVENTORY_CHECK_EDIT,

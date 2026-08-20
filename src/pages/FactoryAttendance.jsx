@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle, CalendarDays, CheckCircle2, Clock3, Download,
-  FileText, RefreshCw, RotateCcw, Save, Search, Settings, Upload, Users,
+  FileText, RefreshCw, RotateCcw, Save, Search, Settings, Trash2, Upload, Users, X,
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import { useToast } from '../hooks/useToast.js'
@@ -146,6 +146,12 @@ export default function FactoryAttendance() {
   const [lastUpload, setLastUpload] = useState(null)
   const [pendingUpload, setPendingUpload] = useState(null)
   const [exporting, setExporting] = useState('')
+  const [showClearPanel, setShowClearPanel] = useState(false)
+  const [clearOptions, setClearOptions] = useState(null)
+  const [clearScope, setClearScope] = useState('dates')
+  const [clearDates, setClearDates] = useState([])
+  const [clearingData, setClearingData] = useState(false)
+  const [restoringClear, setRestoringClear] = useState(false)
 
   const load = useCallback(async (rangeFrom = from, rangeTo = to) => {
     setLoading(true)
@@ -270,6 +276,7 @@ export default function FactoryAttendance() {
     .filter((item) => !item.reverted_at)
     .sort((a, b) => new Date(b.uploaded_at) - new Date(a.uploaded_at))[0]?.id, [sortedImports])
   const departments = useMemo(() => [...new Set((data?.summary || []).map((row) => row.department).filter(Boolean))].sort(compareText), [data?.summary])
+  const latestActiveClearId = useMemo(() => (data?.clearEvents || []).find((event) => !event.restored_at)?.id, [data?.clearEvents])
 
   const rollbackImport = async (item) => {
     if (!window.confirm(`Return attendance data to the version before “${item.file_name}”?`)) return
@@ -284,6 +291,59 @@ export default function FactoryAttendance() {
       await load()
     } catch (error) { toast.error(error.message) }
     finally { setRollingBack(false) }
+  }
+
+  const openClearPanel = async () => {
+    setShowClearPanel(true)
+    setClearOptions(null)
+    setClearScope('dates')
+    setClearDates([])
+    try {
+      setClearOptions(await apiFetch('?action=clear-options', {}, getToken))
+    } catch (error) {
+      toast.error(error.message)
+      setShowClearPanel(false)
+    }
+  }
+
+  const clearAttendanceData = async () => {
+    const selected = clearScope === 'all' ? [] : clearDates
+    if (clearScope !== 'all' && !selected.length) return
+    const selectedPunches = clearScope === 'all'
+      ? Number(clearOptions?.punchCount || 0)
+      : (clearOptions?.dates || [])
+        .filter((item) => selected.includes(item.workDate))
+        .reduce((sum, item) => sum + item.punchCount, 0)
+    const description = clearScope === 'all'
+      ? `all ${selectedPunches} active attendance punches`
+      : `${selectedPunches} punches from ${selected.length} selected date${selected.length === 1 ? '' : 's'}`
+    if (!window.confirm(`Clear ${description}? This creates a restorable cleanup version.`)) return
+    setClearingData(true)
+    try {
+      const result = await apiFetch('?action=clear-data', {
+        method: 'POST',
+        body: JSON.stringify({ scope: clearScope, dates: selected }),
+      }, getToken)
+      toast.success(`Cleared ${result.removedPunches} punches for ${result.affectedEmployees} employees`)
+      setShowClearPanel(false)
+      setLastUpload(null)
+      setDuplicateReport(null)
+      await load()
+    } catch (error) { toast.error(error.message) }
+    finally { setClearingData(false) }
+  }
+
+  const restoreClear = async (event) => {
+    if (!window.confirm('Restore the attendance data removed by this cleanup?')) return
+    setRestoringClear(true)
+    try {
+      const result = await apiFetch('?action=restore-clear', {
+        method: 'PATCH', body: JSON.stringify({ clearEventId: Number(event.id) }),
+      }, getToken)
+      toast.success(`Restored ${result.restoredPunches} attendance punches`)
+      await load()
+    } catch (error) { toast.error(error.message) }
+    finally { setRestoringClear(false) }
   }
 
   const exportAttendanceReport = async () => {
@@ -327,10 +387,34 @@ export default function FactoryAttendance() {
           <label className="text-xs font-medium text-slate-500">To<input type="date" value={to} onChange={(event) => setTo(event.target.value)} className="input-base mt-1 block" /></label>
           <button onClick={() => { setFrom(initialRange.start); setTo(today < initialRange.end ? today : initialRange.end) }} className="btn-secondary"><CalendarDays className="h-4 w-4" /> Current payroll</button>
           <button onClick={load} disabled={loading} className="btn-secondary"><RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} /> Refresh</button>
+          <button onClick={openClearPanel} disabled={loading || clearingData} className="btn-secondary text-red-600 disabled:opacity-50"><Trash2 className="h-4 w-4" /> Clear data</button>
           <button onClick={() => setShowManagement(false)} className="btn-secondary">Simple Upload</button>
           <button onClick={exportAttendanceReport} disabled={!data || exporting} className="btn-primary"><Download className="h-4 w-4" /> {exporting ? 'Preparing…' : 'Download Attendance Excel'}</button>
         </div>}
       </div>
+
+      {showClearPanel && <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4" onClick={() => !clearingData && setShowClearPanel(false)}>
+        <div className="max-h-[calc(100dvh-2rem)] w-full max-w-lg overflow-y-auto rounded-2xl bg-white shadow-2xl" onClick={(event) => event.stopPropagation()}>
+          <div className="flex items-start justify-between gap-4 border-b border-slate-200 px-5 py-4">
+            <div><h3 className="font-semibold text-slate-800">Clear attendance data</h3><p className="mt-1 text-xs text-slate-500">Employees, rates, and settings are kept. Only punches and their daily reviews are cleared.</p></div>
+            <button onClick={() => setShowClearPanel(false)} disabled={clearingData} className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 disabled:opacity-40"><X className="h-4 w-4" /></button>
+          </div>
+          <div className="space-y-4 p-5">
+            {!clearOptions ? <div className="flex items-center justify-center py-10 text-sm text-slate-500"><RefreshCw className="mr-2 h-4 w-4 animate-spin" /> Loading attendance dates…</div> : <>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <label className={`cursor-pointer rounded-xl border-2 p-3 ${clearScope === 'dates' ? 'border-blue-500 bg-blue-50' : 'border-slate-200'}`}><input type="radio" name="clearScope" checked={clearScope === 'dates'} onChange={() => setClearScope('dates')} className="mr-2" /><span className="text-sm font-semibold text-slate-800">Selected dates</span><span className="mt-1 block text-xs text-slate-500">Choose one or several workdays.</span></label>
+                <label className={`cursor-pointer rounded-xl border-2 p-3 ${clearScope === 'all' ? 'border-red-500 bg-red-50' : 'border-slate-200'}`}><input type="radio" name="clearScope" checked={clearScope === 'all'} onChange={() => setClearScope('all')} className="mr-2" /><span className="text-sm font-semibold text-slate-800">All history</span><span className="mt-1 block text-xs text-slate-500">Clear all {clearOptions.punchCount} active punches.</span></label>
+              </div>
+              {clearScope === 'dates' && <div className="rounded-xl border border-slate-200">
+                <div className="flex items-center justify-between border-b border-slate-100 px-3 py-2"><span className="text-xs font-semibold text-slate-600">Available dates</span><div className="flex gap-3"><button type="button" onClick={() => setClearDates((clearOptions.dates || []).map((item) => item.workDate))} className="text-xs font-medium text-blue-600">Select all</button><button type="button" onClick={() => setClearDates([])} className="text-xs font-medium text-slate-500">Clear selection</button></div></div>
+                <div className="max-h-64 divide-y divide-slate-100 overflow-y-auto">{(clearOptions.dates || []).map((item) => <label key={item.workDate} className="flex cursor-pointer items-center justify-between gap-3 px-3 py-2.5 hover:bg-slate-50"><span className="flex items-center gap-3"><input type="checkbox" checked={clearDates.includes(item.workDate)} onChange={(event) => setClearDates((current) => event.target.checked ? [...current, item.workDate] : current.filter((date) => date !== item.workDate))} /><span className="text-sm font-medium text-slate-700">{item.workDate}</span></span><span className="text-xs text-slate-400">{item.employeeCount} employees · {item.punchCount} punches</span></label>)}{!clearOptions.dates?.length && <p className="px-3 py-8 text-center text-sm text-slate-400">No active attendance data</p>}</div>
+              </div>}
+              <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">A cleanup version is saved in Import History. It can be restored until another attendance file is uploaded.</div>
+              <div className="flex gap-3"><button type="button" onClick={() => setShowClearPanel(false)} disabled={clearingData} className="btn-secondary flex-1 justify-center">Cancel</button><button type="button" onClick={clearAttendanceData} disabled={clearingData || !clearOptions.punchCount || (clearScope === 'dates' && !clearDates.length)} className="inline-flex flex-1 items-center justify-center gap-2 rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-40"><Trash2 className="h-4 w-4" /> {clearingData ? 'Clearing…' : clearScope === 'all' ? 'Clear all data' : 'Clear selected dates'}</button></div>
+            </>}
+          </div>
+        </div>
+      </div>}
 
       <div className="card flex flex-col gap-4 p-4 md:flex-row md:items-center md:justify-between">
         <div className="flex items-center gap-3">
@@ -410,7 +494,16 @@ export default function FactoryAttendance() {
         </tr>)}</tbody></table></div>
       </div>}
 
-      {!loading && tab === 'imports' && <div className="card overflow-hidden"><div className="border-b border-slate-100 px-4 py-3"><h3 className="font-semibold text-slate-800">Version history</h3><p className="text-xs text-slate-500">Only the latest active upload can be rolled back, preserving a complete audit trail.</p></div><div className="divide-y divide-slate-100">{sortedImports.map((item) => <div key={item.id} className={`flex flex-col gap-2 px-4 py-3 sm:flex-row sm:items-center sm:justify-between ${item.reverted_at ? 'bg-slate-50 opacity-70' : ''}`}><div><p className="text-sm font-medium text-slate-800">{item.file_name} <span className="ml-1 text-xs font-normal text-slate-400">Version #{item.id}</span></p><p className="text-xs text-slate-400">{item.date_from || 'Unknown date'}—{item.date_to || 'Unknown date'} · {new Date(item.uploaded_at).toLocaleString()}</p>{item.date_schedules?.length > 0 && <p className="mt-1 text-xs text-blue-600">Scheduled ends: {item.date_schedules.map((schedule) => `${schedule.workDate} ${schedule.endTime}`).join(' · ')}</p>}{item.reverted_at && <p className="text-xs text-red-600">Rolled back by {item.reverted_by} · {new Date(item.reverted_at).toLocaleString()}</p>}</div><div className="flex items-center gap-3"><p className="text-xs text-slate-500">{item.inserted_count} inserted · {item.record_count - item.inserted_count} duplicates</p>{!item.reverted_at && Number(item.id) === Number(latestActiveImportId) && <button onClick={() => rollbackImport(item)} disabled={rollingBack} className="btn-secondary px-3 py-1.5 text-xs text-red-600 disabled:opacity-50"><RotateCcw className="h-3.5 w-3.5" /> Restore previous</button>}</div></div>)}</div></div>}
+      {!loading && tab === 'imports' && <div className="space-y-4">
+        {!!data?.clearEvents?.length && <div className="card overflow-hidden">
+          <div className="border-b border-slate-100 px-4 py-3"><h3 className="font-semibold text-slate-800">Cleanup history</h3><p className="text-xs text-slate-500">Cleared punches stay in the audit trail and the latest cleanup can be restored before another upload.</p></div>
+          <div className="divide-y divide-slate-100">{data.clearEvents.map((event) => <div key={event.id} className={`flex flex-col gap-2 px-4 py-3 sm:flex-row sm:items-center sm:justify-between ${event.restored_at ? 'bg-slate-50 opacity-70' : ''}`}>
+            <div><p className="text-sm font-medium text-slate-800">{event.scope === 'all' ? 'All attendance history' : `${event.dates?.length || 0} selected date${event.dates?.length === 1 ? '' : 's'}`} <span className="ml-1 text-xs font-normal text-slate-400">Cleanup #{event.id}</span></p><p className="text-xs text-slate-400">{event.scope === 'all' ? 'All dates' : (event.dates || []).join(' · ')} · {new Date(event.cleared_at).toLocaleString()}</p><p className="text-xs text-slate-500">{event.punch_count} punches · {event.employee_count} employees · cleared by {event.cleared_by}</p>{event.restored_at && <p className="text-xs text-emerald-600">Restored by {event.restored_by} · {new Date(event.restored_at).toLocaleString()}</p>}</div>
+            {!event.restored_at && Number(event.id) === Number(latestActiveClearId) && <button onClick={() => restoreClear(event)} disabled={restoringClear} className="btn-secondary self-start px-3 py-1.5 text-xs text-blue-600 disabled:opacity-50 sm:self-auto"><RotateCcw className={`h-3.5 w-3.5 ${restoringClear ? 'animate-spin' : ''}`} /> Restore cleanup</button>}
+          </div>)}</div>
+        </div>}
+        <div className="card overflow-hidden"><div className="border-b border-slate-100 px-4 py-3"><h3 className="font-semibold text-slate-800">Upload history</h3><p className="text-xs text-slate-500">Only the latest active upload can be rolled back, preserving a complete audit trail.</p></div><div className="divide-y divide-slate-100">{sortedImports.map((item) => <div key={item.id} className={`flex flex-col gap-2 px-4 py-3 sm:flex-row sm:items-center sm:justify-between ${item.reverted_at ? 'bg-slate-50 opacity-70' : ''}`}><div><p className="text-sm font-medium text-slate-800">{item.file_name} <span className="ml-1 text-xs font-normal text-slate-400">Version #{item.id}</span></p><p className="text-xs text-slate-400">{item.date_from || 'Unknown date'}—{item.date_to || 'Unknown date'} · {new Date(item.uploaded_at).toLocaleString()}</p>{item.date_schedules?.length > 0 && <p className="mt-1 text-xs text-blue-600">Scheduled ends: {item.date_schedules.map((schedule) => `${schedule.workDate} ${schedule.endTime}`).join(' · ')}</p>}{item.reverted_at && <p className="text-xs text-red-600">Rolled back by {item.reverted_by} · {new Date(item.reverted_at).toLocaleString()}</p>}</div><div className="flex items-center gap-3"><p className="text-xs text-slate-500">{item.inserted_count} inserted · {item.record_count - item.inserted_count} duplicates</p>{!item.reverted_at && Number(item.id) === Number(latestActiveImportId) && <button onClick={() => rollbackImport(item)} disabled={rollingBack} className="btn-secondary px-3 py-1.5 text-xs text-red-600 disabled:opacity-50"><RotateCcw className="h-3.5 w-3.5" /> Restore previous</button>}</div></div>)}</div></div>
+      </div>}
 
       {!loading && tab === 'settings' && user?.role === 'admin' && settingsForm && <div className="space-y-5">
         <div className="card p-5"><div className="mb-4 flex items-center justify-between"><div><h3 className="font-semibold text-slate-800">Attendance schedule</h3><p className="text-xs text-slate-500">Times are interpreted in America/Guatemala.</p></div><button onClick={saveSettings} disabled={savingSettings} className="btn-primary"><Save className="h-4 w-4" /> {savingSettings ? 'Saving…' : 'Save settings'}</button></div>

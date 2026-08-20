@@ -105,6 +105,20 @@ async function ensureTables(sql) {
     )
   `;
   await sql`
+    CREATE TABLE IF NOT EXISTS attendance_clear_events (
+      id BIGSERIAL PRIMARY KEY,
+      scope TEXT NOT NULL CHECK (scope IN ('all', 'dates')),
+      dates JSONB NOT NULL DEFAULT '[]'::jsonb,
+      punch_count INTEGER NOT NULL DEFAULT 0,
+      employee_count INTEGER NOT NULL DEFAULT 0,
+      review_snapshots JSONB NOT NULL DEFAULT '[]'::jsonb,
+      cleared_by TEXT NOT NULL,
+      cleared_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      restored_by TEXT,
+      restored_at TIMESTAMPTZ
+    )
+  `;
+  await sql`
     CREATE TABLE IF NOT EXISTS attendance_punches (
       id BIGSERIAL PRIMARY KEY,
       employee_code INTEGER NOT NULL REFERENCES attendance_employees(employee_code),
@@ -143,9 +157,11 @@ async function ensureTables(sql) {
   await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS duplicate_details JSONB NOT NULL DEFAULT '[]'::jsonb`;
   await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS date_schedules JSONB NOT NULL DEFAULT '[]'::jsonb`;
   await sql`ALTER TABLE attendance_punches ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE`;
+  await sql`ALTER TABLE attendance_punches ADD COLUMN IF NOT EXISTS cleared_event_id BIGINT REFERENCES attendance_clear_events(id)`;
   await sql`ALTER TABLE attendance_imports DROP CONSTRAINT IF EXISTS attendance_imports_file_hash_key`;
   await sql`ALTER TABLE attendance_punches DROP CONSTRAINT IF EXISTS attendance_punches_employee_code_punched_at_device_id_key`;
-  await sql`CREATE UNIQUE INDEX IF NOT EXISTS attendance_imports_active_hash_idx ON attendance_imports (file_hash) WHERE reverted_at IS NULL`;
+  await sql`DROP INDEX IF EXISTS attendance_imports_active_hash_idx`;
+  await sql`CREATE INDEX IF NOT EXISTS attendance_imports_hash_idx ON attendance_imports (file_hash, uploaded_at DESC)`;
   await sql`CREATE UNIQUE INDEX IF NOT EXISTS attendance_punches_active_key_idx ON attendance_punches (employee_code, punched_at, device_id) WHERE active`;
   await sql`
     WITH ranked AS (
@@ -159,7 +175,7 @@ async function ensureTables(sql) {
 }
 
 async function loadDashboard(sql, from, to) {
-  const [settingsRows, punchRows, reviewRows, employeeRows, importRows, scheduleRows] = await Promise.all([
+  const [settingsRows, punchRows, reviewRows, employeeRows, importRows, scheduleRows, clearRows] = await Promise.all([
     sql`SELECT * FROM attendance_settings WHERE id = 1`,
     sql`
       SELECT employee_code, name, department,
@@ -213,6 +229,13 @@ async function loadDashboard(sql, from, to) {
         AND date_from <= CAST(${to} AS date)
       ORDER BY uploaded_at ASC, id ASC
     `,
+    sql`
+      SELECT id, scope, dates, punch_count, employee_count, cleared_by, cleared_at,
+             restored_by, restored_at
+      FROM attendance_clear_events
+      ORDER BY cleared_at DESC, id DESC
+      LIMIT 20
+    `,
   ]);
 
   const settings = settingsFromRow(settingsRows[0]);
@@ -251,6 +274,7 @@ async function loadDashboard(sql, from, to) {
     days,
     summary: buildAttendanceSummary(days, employees),
     imports: importRows,
+    clearEvents: clearRows,
   };
 }
 
@@ -279,6 +303,26 @@ export default async function handler(req, res) {
       const to = String(req.query.to || '');
       if (!validDate(from) || !validDate(to) || from > to) return res.status(400).json({ error: 'Valid date range required' });
       return res.status(200).json(await loadDashboard(sql, from, to));
+    }
+
+    if (req.method === 'GET' && action === 'clear-options') {
+      const rows = await sql`
+        SELECT punched_at::date::text AS work_date,
+               COUNT(*)::int AS punch_count,
+               COUNT(DISTINCT employee_code)::int AS employee_count
+        FROM attendance_punches
+        WHERE active
+        GROUP BY punched_at::date
+        ORDER BY punched_at::date DESC
+      `;
+      return res.status(200).json({
+        dates: rows.map((row) => ({
+          workDate: row.work_date,
+          punchCount: Number(row.punch_count),
+          employeeCount: Number(row.employee_count),
+        })),
+        punchCount: rows.reduce((sum, row) => sum + Number(row.punch_count), 0),
+      });
     }
 
     if (req.method === 'POST' && action === 'import') {
@@ -349,8 +393,10 @@ export default async function handler(req, res) {
       const activeFile = await sql`
         SELECT id, file_name, uploaded_at FROM attendance_imports
         WHERE file_hash = ${hash} AND reverted_at IS NULL
+        ORDER BY uploaded_at DESC, id DESC
+        LIMIT 1
       `;
-      if (activeFile[0]) {
+      if (activeFile[0] && newRecords.length === 0) {
         return res.status(200).json({
           importId: Number(activeFile[0].id), records: records.length, inserted: 0,
           duplicates: records.length, duplicateDetails, exactFileDuplicate: true,
@@ -420,6 +466,68 @@ export default async function handler(req, res) {
       });
     }
 
+    if (req.method === 'POST' && action === 'clear-data') {
+      const clearAll = req.body?.scope === 'all';
+      const dates = [...new Set((Array.isArray(req.body?.dates) ? req.body.dates : []).map(String))].sort();
+      if (!clearAll && (!dates.length || dates.some((date) => !validDate(date)))) {
+        return res.status(400).json({ error: 'Select at least one valid attendance date' });
+      }
+      const result = await sql`
+        WITH target_dates AS (
+          SELECT value::date AS work_date
+          FROM jsonb_array_elements_text(${JSON.stringify(dates)}::jsonb)
+        ), review_snapshot AS (
+          SELECT COALESCE(jsonb_agg(jsonb_build_object(
+            'employee_code', employee_code,
+            'work_date', work_date,
+            'confirmed', confirmed,
+            'adjusted_minutes', adjusted_minutes,
+            'late', late,
+            'early', early,
+            'note', note,
+            'updated_by', updated_by,
+            'updated_at', updated_at
+          )), '[]'::jsonb) AS snapshots
+          FROM attendance_day_reviews
+          WHERE ${clearAll} OR work_date IN (SELECT work_date FROM target_dates)
+        ), created AS (
+          INSERT INTO attendance_clear_events (scope, dates, review_snapshots, cleared_by)
+          SELECT ${clearAll ? 'all' : 'dates'}, ${JSON.stringify(dates)}::jsonb,
+                 review_snapshot.snapshots, ${user.username}
+          FROM review_snapshot
+          WHERE EXISTS (
+            SELECT 1 FROM attendance_punches
+            WHERE active AND (${clearAll} OR punched_at::date IN (SELECT work_date FROM target_dates))
+          ) OR jsonb_array_length(review_snapshot.snapshots) > 0
+          RETURNING id
+        ), deactivated AS (
+          UPDATE attendance_punches
+          SET active = FALSE, cleared_event_id = (SELECT id FROM created)
+          WHERE active
+            AND EXISTS (SELECT 1 FROM created)
+            AND (${clearAll} OR punched_at::date IN (SELECT work_date FROM target_dates))
+          RETURNING employee_code
+        ), removed_reviews AS (
+          DELETE FROM attendance_day_reviews
+          WHERE EXISTS (SELECT 1 FROM created)
+            AND (${clearAll} OR work_date IN (SELECT work_date FROM target_dates))
+          RETURNING employee_code
+        )
+        UPDATE attendance_clear_events
+        SET punch_count = (SELECT COUNT(*)::int FROM deactivated),
+            employee_count = (SELECT COUNT(DISTINCT employee_code)::int FROM deactivated)
+        WHERE id = (SELECT id FROM created)
+        RETURNING id, punch_count, employee_count
+      `;
+      if (!result[0]) return res.status(404).json({ error: 'No active attendance data matched this selection' });
+      return res.status(200).json({
+        ok: true,
+        clearEventId: Number(result[0].id),
+        removedPunches: Number(result[0].punch_count),
+        affectedEmployees: Number(result[0].employee_count),
+      });
+    }
+
     if (req.method === 'PATCH' && action === 'rollback-import') {
       const importId = Number(req.body?.importId);
       if (!Number.isSafeInteger(importId)) return res.status(400).json({ error: 'Import version required' });
@@ -446,6 +554,65 @@ export default async function handler(req, res) {
       `;
       if (!reverted[0]?.import_id) return res.status(409).json({ error: 'Only the latest active import can be rolled back' });
       return res.status(200).json({ ok: true, removedPunches: Number(reverted[0].removed_count) });
+    }
+
+    if (req.method === 'PATCH' && action === 'restore-clear') {
+      const clearEventId = Number(req.body?.clearEventId);
+      if (!Number.isSafeInteger(clearEventId)) return res.status(400).json({ error: 'Clear version required' });
+      const restored = await sql`
+        WITH chosen AS (
+          SELECT event.*
+          FROM attendance_clear_events event
+          WHERE event.id = ${clearEventId}
+            AND event.restored_at IS NULL
+            AND event.id = (
+              SELECT id FROM attendance_clear_events
+              WHERE restored_at IS NULL
+              ORDER BY cleared_at DESC, id DESC
+              LIMIT 1
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM attendance_imports WHERE uploaded_at > event.cleared_at
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM attendance_punches cleared
+              JOIN attendance_punches active
+                ON active.employee_code = cleared.employee_code
+               AND active.punched_at = cleared.punched_at
+               AND active.active
+              WHERE cleared.cleared_event_id = event.id
+            )
+        ), restored_punches AS (
+          UPDATE attendance_punches
+          SET active = TRUE, cleared_event_id = NULL
+          WHERE cleared_event_id = (SELECT id FROM chosen)
+          RETURNING id
+        ), restored_reviews AS (
+          INSERT INTO attendance_day_reviews (
+            employee_code, work_date, confirmed, adjusted_minutes, late, early,
+            note, updated_by, updated_at
+          )
+          SELECT employee_code, work_date, confirmed, adjusted_minutes, late, early,
+                 note, updated_by, updated_at
+          FROM chosen,
+          jsonb_to_recordset(chosen.review_snapshots) AS review(
+            employee_code INTEGER, work_date DATE, confirmed BOOLEAN,
+            adjusted_minutes NUMERIC, late BOOLEAN, early BOOLEAN, note TEXT,
+            updated_by TEXT, updated_at TIMESTAMPTZ
+          )
+          ON CONFLICT (employee_code, work_date) DO NOTHING
+          RETURNING employee_code
+        )
+        UPDATE attendance_clear_events
+        SET restored_by = ${user.username}, restored_at = NOW()
+        WHERE id = (SELECT id FROM chosen)
+        RETURNING id, (SELECT COUNT(*)::int FROM restored_punches) AS restored_count
+      `;
+      if (!restored[0]) {
+        return res.status(409).json({ error: 'Only the latest cleanup can be restored, and only before new attendance is uploaded' });
+      }
+      return res.status(200).json({ ok: true, restoredPunches: Number(restored[0].restored_count) });
     }
 
     if (req.method === 'PATCH' && action === 'review') {

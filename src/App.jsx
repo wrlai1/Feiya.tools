@@ -19,7 +19,7 @@ import TimeClockPage from './pages/TimeClockPage.jsx'
 import AdminTimeReport from './pages/AdminTimeReport.jsx'
 import ReturnsReceiving from './pages/ReturnsReceiving.jsx'
 import FactoryAttendance from './pages/FactoryAttendance.jsx'
-import userPermissions from '../lib/userPermissions.cjs'
+import userPermissions from './utils/userPermissions.js'
 
 const { INVENTORY_CHECK_VIEW, userHasPermission } = userPermissions
 

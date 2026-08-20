@@ -19,7 +19,7 @@ import {
   X,
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
-import userPermissions from '../../lib/userPermissions.cjs'
+import userPermissions from '../utils/userPermissions.js'
 
 const { INVENTORY_CHECK_VIEW, userHasPermission } = userPermissions
 

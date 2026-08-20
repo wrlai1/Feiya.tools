@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import userPermissions from '../lib/userPermissions.cjs'
+import frontendPermissions from '../src/utils/userPermissions.js'
 
 const {
   INVENTORY_CHECK_EDIT,
@@ -37,4 +38,8 @@ test('edit users and Admin can change Inventory Check', () => {
   assert.equal(userHasPermission(editor, INVENTORY_CHECK_VIEW), true)
   assert.equal(userCanAccessAppData(editor, 'inventory', 'POST'), true)
   assert.equal(userCanAccessAppData({ role: 'admin', permissions: [] }, 'inventory', 'DELETE'), true)
+})
+
+test('frontend and backend expose the same permission keys', () => {
+  assert.deepEqual(frontendPermissions.USER_PERMISSION_KEYS, userPermissions.USER_PERMISSION_KEYS)
 })
