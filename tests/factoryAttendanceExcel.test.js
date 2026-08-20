@@ -53,3 +53,42 @@ test('attendance workbook combines multiple days in one simple sheet', () => {
   assert.equal(saturdayTotal.getCell(7).value, 1)
   assert.equal(sheet.rowCount, 12)
 })
+
+test('attendance workbook lists employees without weekday punches as absent', () => {
+  const workbook = buildAttendanceWorkbook(ExcelJS, {
+    from: '2026-08-18',
+    to: '2026-08-18',
+    exportDates: ['2026-08-18', '2026-08-19'],
+    employees: [
+      { employeeCode: 5, name: 'Angelica', department: 'Inspection' },
+      { employeeCode: 6, name: 'Laura', department: 'Sewing' },
+    ],
+    days: [
+      {
+        employeeCode: 5, name: 'Angelica', department: 'Inspection', workDate: '2026-08-18',
+        punchCount: 2, workedMinutes: 600, workday: true, needsReview: false, inProgress: false,
+        punches: ['2026-08-18T07:00:00', '2026-08-18T18:00:00'],
+      },
+      {
+        employeeCode: 5, name: 'Angelica', department: 'Inspection', workDate: '2026-08-19',
+        punchCount: 1, workedMinutes: null, workday: false, needsReview: false, inProgress: true,
+        punches: ['2026-08-19T07:00:00'],
+      },
+    ],
+  })
+
+  const sheet = workbook.worksheets[0]
+  const absentRow = sheet.getRow(5)
+  assert.equal(absentRow.getCell(1).value, 6)
+  assert.equal(absentRow.getCell(2).value, 'Laura')
+  assert.equal(absentRow.getCell(3).value, 'Sewing')
+  assert.equal(absentRow.getCell(4).value, 'Absent')
+  assert.equal(absentRow.getCell(5).value, '18-08-2026')
+  assert.equal(absentRow.getCell(6).value, 0)
+  assert.equal(absentRow.getCell(7).value, null)
+  assert.equal(absentRow.getCell(8).value, '08/18 Absent')
+  assert.equal(absentRow.getCell(1).fill.fgColor.argb, 'FFFFC7CE')
+  assert.equal(sheet.getRow(6).getCell(6).value, 0)
+  assert.equal(sheet.getRow(6).getCell(7).value, 0)
+  assert.equal(sheet.rowCount, 6)
+})

@@ -10,6 +10,21 @@ function displayTimestamp(value) {
   return match ? `${match[3]}-${match[2]}-${match[1]}     ${match[4]}` : timestamp.replace('T', ' ')
 }
 
+function displayDate(value) {
+  const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})$/)
+  return match ? `${match[3]}-${match[2]}-${match[1]}` : String(value || '')
+}
+
+function displayMonthDay(value) {
+  const match = String(value || '').match(/^\d{4}-(\d{2})-(\d{2})$/)
+  return match ? `${match[1]}/${match[2]}` : String(value || '')
+}
+
+function isWeekday(value) {
+  const weekday = new Date(`${value}T00:00:00Z`).getUTCDay()
+  return weekday >= 1 && weekday <= 5
+}
+
 function isAttendanceDay(day) {
   return Boolean(day.workday) && !day.inProgress
 }
@@ -25,7 +40,7 @@ function attendanceStatus(day) {
   return labels.join(' · ')
 }
 
-export function buildAttendanceWorkbook(ExcelJS, { days, from, to }) {
+export function buildAttendanceWorkbook(ExcelJS, { days, employees: employeeList = [], exportDates = [], from, to }) {
   const workbook = new ExcelJS.Workbook()
   workbook.creator = 'Feiya Factory Attendance'
   const sheet = workbook.addWorksheet(`${from.slice(5)}-${to.slice(5)}`.slice(0, 31))
@@ -33,17 +48,48 @@ export function buildAttendanceWorkbook(ExcelJS, { days, from, to }) {
   header.font = { bold: true, color: { argb: COLORS.dark } }
   header.alignment = { horizontal: 'center' }
 
-  const employees = new Map()
+  const employees = new Map((employeeList || []).map((employee) => [
+    Number(employee.employeeCode ?? employee.employee_code),
+    { profile: employee, days: [] },
+  ]))
+  const presentDays = new Set((days || []).map((day) => `${day.employeeCode}|${day.workDate}`))
   for (const day of (days || []).filter((item) => !item.inProgress)) {
-    if (!employees.has(day.employeeCode)) employees.set(day.employeeCode, [])
-    employees.get(day.employeeCode).push(day)
+    if (!employees.has(day.employeeCode)) employees.set(day.employeeCode, { profile: day, days: [] })
+    employees.get(day.employeeCode).days.push(day)
+  }
+  const inProgressDates = new Set((days || []).filter((day) => day.inProgress).map((day) => day.workDate))
+  const attendanceDates = [...new Set(exportDates || [])]
+    .filter((date) => isWeekday(date) && !inProgressDates.has(date))
+    .sort()
+  for (const [employeeCode, employee] of employees) {
+    for (const workDate of attendanceDates) {
+      if (presentDays.has(`${employeeCode}|${workDate}`)) continue
+      employee.days.push({
+        employeeCode,
+        name: employee.profile.name || '',
+        department: employee.profile.department || '',
+        workDate,
+        absent: true,
+      })
+    }
   }
 
-  for (const [employeeCode, employeeDays] of [...employees.entries()].sort((a, b) => a[0] - b[0])) {
+  for (const [employeeCode, employee] of [...employees.entries()].sort((a, b) => a[0] - b[0])) {
+    const employeeDays = employee.days
     const orderedDays = [...employeeDays].sort((a, b) => a.workDate.localeCompare(b.workDate))
     let totalMinutes = 0
     let workingDays = 0
     for (const day of orderedDays) {
+      if (day.absent) {
+        const row = sheet.addRow([
+          employeeCode, day.name, day.department, 'Absent', displayDate(day.workDate), 0, null,
+          `${displayMonthDay(day.workDate)} Absent`,
+        ])
+        row.eachCell({ includeEmpty: true }, (cell) => {
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: COLORS.review } }
+        })
+        continue
+      }
       if (isAttendanceDay(day)) workingDays += 1
       if (day.workedMinutes != null) totalMinutes += Number(day.workedMinutes)
       const punches = day.punches?.length ? day.punches : [day.firstPunch].filter(Boolean)

@@ -358,7 +358,16 @@ export default function FactoryAttendance() {
       const reportDays = selectedDates?.length
         ? reportData.days.filter((day) => selectedDates.includes(day.workDate))
         : reportData.days
-      const workbook = buildAttendanceWorkbook(ExcelJS, { days: reportDays, from: reportFrom, to: reportTo })
+      const exportDates = selectedDates?.length
+        ? selectedDates
+        : [...new Set(reportDays.map((day) => day.workDate))]
+      const workbook = buildAttendanceWorkbook(ExcelJS, {
+        days: reportDays,
+        employees: reportData.employees,
+        exportDates,
+        from: reportFrom,
+        to: reportTo,
+      })
       downloadBuffer(await workbook.xlsx.writeBuffer(), `attendance-${reportFrom}-to-${reportTo}.xlsx`)
       toast.success('Attendance Excel downloaded')
     } catch (error) { toast.error(error.message) }
