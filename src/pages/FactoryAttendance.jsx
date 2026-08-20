@@ -5,7 +5,7 @@ import {
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import { useToast } from '../hooks/useToast.js'
-import { formatMinutes, payrollRangeForDate } from '../utils/factoryAttendance.js'
+import { formatMinutes, parseAttendanceFiles, payrollRangeForDate, standardMinutesForSchedule } from '../utils/factoryAttendance.js'
 import { buildAttendanceWorkbook } from '../utils/factoryAttendanceExcel.js'
 
 const BASE = '/api/attendance'
@@ -55,6 +55,10 @@ function Flag({ type }) {
     late: ['Late', 'bg-amber-100 text-amber-700'],
     early: ['Early', 'bg-orange-100 text-orange-700'],
     below_standard: ['Under hours', 'bg-violet-100 text-violet-700'],
+    in_progress: ['In progress', 'bg-blue-100 text-blue-700'],
+    missing_lunch: ['Missing lunch punches', 'bg-red-100 text-red-700'],
+    possible_early_work: ['Possible early work', 'bg-purple-100 text-purple-700'],
+    possible_overtime: ['Possible overtime', 'bg-purple-100 text-purple-700'],
   }
   const [label, color] = labels[type] || [type, 'bg-slate-100 text-slate-600']
   return <span className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${color}`}>{label}</span>
@@ -140,6 +144,7 @@ export default function FactoryAttendance() {
   const [rollingBack, setRollingBack] = useState(false)
   const [showManagement, setShowManagement] = useState(false)
   const [lastUpload, setLastUpload] = useState(null)
+  const [pendingUpload, setPendingUpload] = useState(null)
   const [exporting, setExporting] = useState('')
 
   const load = useCallback(async (rangeFrom = from, rangeTo = to) => {
@@ -155,7 +160,7 @@ export default function FactoryAttendance() {
 
   useEffect(() => { load() }, [from, to])
 
-  const upload = async (event) => {
+  const prepareUpload = async (event) => {
     const files = [...(event.target.files || [])]
     event.target.value = ''
     if (!files.length) return
@@ -164,8 +169,26 @@ export default function FactoryAttendance() {
     setUploading(true)
     try {
       const payloadFiles = await Promise.all(files.map(async (file) => ({ fileName: file.name, content: await file.text() })))
+      const dates = [...new Set(parseAttendanceFiles(payloadFiles).map((record) => record.punchedAt.slice(0, 10)))].sort()
+      setPendingUpload({
+        files: payloadFiles,
+        dateSchedules: dates.map((workDate) => ({
+          workDate,
+          endTime: new Date(`${workDate}T00:00:00Z`).getUTCDay() === 6 ? '12:00' : '17:00',
+        })),
+      })
+      setDuplicateReport(null)
+      setLastUpload(null)
+    } catch (error) { toast.error(error.message) }
+    finally { setUploading(false) }
+  }
+
+  const upload = async () => {
+    if (!pendingUpload) return
+    setUploading(true)
+    try {
       const result = await apiFetch('?action=import', {
-        method: 'POST', body: JSON.stringify({ files: payloadFiles }),
+        method: 'POST', body: JSON.stringify(pendingUpload),
       }, getToken)
       setDuplicateReport(result.duplicates ? result : null)
       const reportFrom = result.dateFrom
@@ -176,6 +199,7 @@ export default function FactoryAttendance() {
       else toast.success(`Imported ${result.inserted} punches${result.duplicates ? `; skipped ${result.duplicates} duplicates` : ''}`)
       await load(reportFrom, reportTo)
       setLastUpload({ ...result, reportFrom, reportTo })
+      setPendingUpload(null)
     } catch (error) { toast.error(error.message) }
     finally { setUploading(false) }
   }
@@ -269,9 +293,7 @@ export default function FactoryAttendance() {
       const { default: ExcelJS } = await import('exceljs')
       const reportFrom = lastUpload?.dateFrom || from
       const reportTo = lastUpload?.reportTo || to
-      const reportData = reportFrom === from && reportTo === to
-        ? data
-        : await apiFetch(`?action=dashboard&from=${reportFrom}&to=${reportTo}`, {}, getToken)
+      const reportData = await apiFetch(`?action=dashboard&from=${reportFrom}&to=${reportTo}`, {}, getToken)
       const workbook = buildAttendanceWorkbook(ExcelJS, { days: reportData.days, from: reportFrom, to: reportTo })
       downloadBuffer(await workbook.xlsx.writeBuffer(), `attendance-${reportFrom}-to-${reportTo}.xlsx`)
       toast.success('Attendance Excel downloaded')
@@ -311,11 +333,22 @@ export default function FactoryAttendance() {
           <span className="rounded-xl bg-blue-50 p-3 text-blue-600"><Upload className="h-5 w-5" /></span>
           <div><p className="font-semibold text-slate-800">Upload attendance TXT files</p><p className="text-xs text-slate-500">Select files from one, two, or all three machines. Punches are merged by employee and time.</p></div>
         </div>
-        <input ref={fileRef} type="file" accept=".txt,text/plain" multiple onChange={upload} className="hidden" />
+        <input ref={fileRef} type="file" accept=".txt,text/plain" multiple onChange={prepareUpload} className="hidden" />
         <button onClick={() => fileRef.current?.click()} disabled={uploading} className="btn-primary justify-center disabled:opacity-50">
-          <FileText className="h-4 w-4" /> {uploading ? 'Merging…' : 'Choose TXT Files'}
+          <FileText className="h-4 w-4" /> {uploading ? 'Reading…' : pendingUpload ? 'Change TXT Files' : 'Choose TXT Files'}
         </button>
       </div>
+
+      {pendingUpload && <div className="rounded-2xl border border-blue-200 bg-blue-50 p-5">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div><p className="font-bold text-blue-900">Choose the scheduled end time for each date</p><p className="mt-1 text-xs text-blue-700">Weekdays default to 17:00. Saturday keeps the 12:00 half-day default. Each day is finalized 30 minutes after its selected end time.</p><p className="mt-2 text-xs text-blue-600">{pendingUpload.files.map((file) => file.fileName).join(' · ')}</p></div>
+          <div className="flex flex-wrap gap-2"><button onClick={() => setPendingUpload(null)} disabled={uploading} className="btn-secondary disabled:opacity-50">Cancel</button><button onClick={upload} disabled={uploading || pendingUpload.dateSchedules.some((schedule) => Number(standardMinutesForSchedule(schedule.workDate, schedule.endTime)) <= 0)} className="btn-primary disabled:opacity-50"><Upload className="h-4 w-4" /> {uploading ? 'Uploading…' : 'Confirm Upload'}</button></div>
+        </div>
+        <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">{pendingUpload.dateSchedules.map((schedule) => {
+          const standardMinutes = standardMinutesForSchedule(schedule.workDate, schedule.endTime)
+          return <label key={schedule.workDate} className="rounded-xl border border-blue-200 bg-white p-3 text-xs font-medium text-slate-600"><span className="flex items-center justify-between gap-3"><span>{schedule.workDate}</span><span className="font-normal text-blue-600">{standardMinutes > 0 ? formatMinutes(standardMinutes) : 'Choose a later time'}</span></span><input type="time" min="08:01" value={schedule.endTime} onChange={(event) => setPendingUpload((current) => ({ ...current, dateSchedules: current.dateSchedules.map((item) => item.workDate === schedule.workDate ? { ...item, endTime: event.target.value } : item) }))} className="input-base mt-2 w-full" /></label>
+        })}</div>
+      </div>}
 
       {duplicateReport && <details className="rounded-xl border border-amber-200 bg-amber-50 p-4">
         <summary className="cursor-pointer font-semibold text-amber-900">{duplicateReport.duplicates} duplicate punch{duplicateReport.duplicates === 1 ? '' : 'es'} skipped · View details</summary>
@@ -324,7 +357,7 @@ export default function FactoryAttendance() {
       </details>}
 
       {lastUpload && !showManagement && <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-5">
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between"><div><p className="text-lg font-bold text-emerald-900">Attendance is ready</p><p className="mt-1 text-sm text-emerald-800">{lastUpload.reportFrom}—{lastUpload.reportTo} · {lastUpload.sourceFiles?.length || 1} machine file(s) · {data?.summary?.length || 0} employees · {lastUpload.inserted} new punches · {lastUpload.duplicates} duplicates · {pending} need review</p><p className="mt-1 text-xs text-emerald-700">Download the simple hours-and-days Excel. Incomplete punch days are marked red for review.</p></div><div className="flex flex-wrap gap-2"><button onClick={exportAttendanceReport} disabled={exporting || loading || rollingBack} className="btn-primary disabled:opacity-50"><Download className="h-4 w-4" /> {exporting ? 'Preparing…' : 'Download Attendance Excel'}</button>{pending > 0 && <button onClick={() => { setShowManagement(true); setTab('daily'); setDailyFlag('needs_review') }} className="btn-secondary text-red-600"><AlertTriangle className="h-4 w-4" /> Review exceptions</button>}{!lastUpload.exactFileDuplicate && lastUpload.inserted > 0 && <button onClick={() => rollbackImport({ id: lastUpload.importId, file_name: lastUpload.sourceFiles?.join(', ') || 'this upload' })} disabled={rollingBack || exporting || loading} className="btn-secondary text-red-600 disabled:opacity-50"><RotateCcw className={`h-4 w-4 ${rollingBack ? 'animate-spin' : ''}`} /> {rollingBack ? 'Removing…' : 'Undo this upload'}</button>}</div></div>
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between"><div><p className="text-lg font-bold text-emerald-900">Attendance is ready</p><p className="mt-1 text-sm text-emerald-800">{lastUpload.reportFrom}—{lastUpload.reportTo} · {lastUpload.sourceFiles?.length || 1} machine file(s) · {data?.summary?.length || 0} employees · {lastUpload.inserted} new punches · {lastUpload.duplicates} duplicates · {pending} need review</p><p className="mt-1 text-xs text-emerald-700">Download the simple hours-and-days Excel. Incomplete punch days are marked red for review.</p></div><div className="flex flex-wrap gap-2"><button onClick={exportAttendanceReport} disabled={exporting || loading || rollingBack} className="btn-primary disabled:opacity-50"><Download className="h-4 w-4" /> {exporting ? 'Preparing…' : 'Download Attendance Excel'}</button>{pending > 0 && <button onClick={() => { setShowManagement(true); setTab('daily'); setDailyFlag('needs_review') }} className="btn-secondary text-red-600"><AlertTriangle className="h-4 w-4" /> Review exceptions</button>}{!lastUpload.exactFileDuplicate && <button onClick={() => rollbackImport({ id: lastUpload.importId, file_name: lastUpload.sourceFiles?.join(', ') || 'this upload' })} disabled={rollingBack || exporting || loading} className="btn-secondary text-red-600 disabled:opacity-50"><RotateCcw className={`h-4 w-4 ${rollingBack ? 'animate-spin' : ''}`} /> {rollingBack ? 'Removing…' : 'Undo this upload'}</button>}</div></div>
       </div>}
 
       {showManagement && <>
@@ -342,7 +375,7 @@ export default function FactoryAttendance() {
         <div className="flex flex-wrap gap-2">
           {(tab === 'summary' || tab === 'daily') && <div className="relative"><Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search employee" className="input-base pl-9" /></div>}
           {tab === 'summary' && <><select value={departmentFilter} onChange={(event) => setDepartmentFilter(event.target.value)} className="input-base"><option value="all">All departments</option>{departments.map((department) => <option key={department} value={department}>{department}</option>)}</select><select value={summarySort} onChange={(event) => setSummarySort(event.target.value)} className="input-base"><option value="name-asc">Name A–Z</option><option value="name-desc">Name Z–A</option><option value="hours-desc">Hours high–low</option><option value="hours-asc">Hours low–high</option><option value="days-desc">Days high–low</option><option value="review-desc">Reviews high–low</option></select></>}
-          {tab === 'daily' && <><select value={dailyFlag} onChange={(event) => setDailyFlag(event.target.value)} className="input-base"><option value="all">All statuses</option><option value="needs_review">Needs review</option><option value="late">Late</option><option value="early">Early</option><option value="below_standard">Under hours</option></select><select value={dailySort} onChange={(event) => setDailySort(event.target.value)} className="input-base"><option value="date-desc">Date newest</option><option value="date-asc">Date oldest</option><option value="name-asc">Name A–Z</option><option value="name-desc">Name Z–A</option><option value="hours-desc">Hours high–low</option><option value="punches-desc">Punches high–low</option></select></>}
+          {tab === 'daily' && <><select value={dailyFlag} onChange={(event) => setDailyFlag(event.target.value)} className="input-base"><option value="all">All statuses</option><option value="in_progress">In progress</option><option value="needs_review">Needs review</option><option value="missing_lunch">Missing lunch punches</option><option value="possible_overtime">Possible overtime</option><option value="possible_early_work">Possible early work</option><option value="late">Late</option><option value="early">Early</option><option value="below_standard">Under hours</option></select><select value={dailySort} onChange={(event) => setDailySort(event.target.value)} className="input-base"><option value="date-desc">Date newest</option><option value="date-asc">Date oldest</option><option value="name-asc">Name A–Z</option><option value="name-desc">Name Z–A</option><option value="hours-desc">Hours high–low</option><option value="punches-desc">Punches high–low</option></select></>}
           {tab === 'imports' && <select value={importSort} onChange={(event) => setImportSort(event.target.value)} className="input-base"><option value="newest">Newest version</option><option value="oldest">Oldest version</option><option value="duplicates-desc">Duplicates high–low</option></select>}
         </div>
       </div>
@@ -366,14 +399,14 @@ export default function FactoryAttendance() {
         <div className="card overflow-x-auto"><table className="min-w-[950px] w-full text-sm"><thead><tr className="border-b border-slate-200 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
           {['Date', 'Employee', 'Punches', 'First', 'Last', 'Worked', 'Flags', 'Action'].map((label) => <th key={label} className="px-3 py-3 font-semibold">{label}</th>)}
         </tr></thead><tbody className="divide-y divide-slate-100">{filteredDays.map((day) => <tr key={`${day.employeeCode}-${day.workDate}`} className="hover:bg-slate-50">
-          <td className="px-3 py-3 font-medium">{day.workDate}</td><td className="px-3 py-3"><p className="font-medium text-slate-800">{day.name}</p><p className="text-xs text-slate-400">{day.employeeCode}</p></td>
+          <td className="px-3 py-3 font-medium">{day.workDate}<p className="text-xs font-normal text-slate-400">Ends {day.scheduledEnd || '—'}</p></td><td className="px-3 py-3"><p className="font-medium text-slate-800">{day.name}</p><p className="text-xs text-slate-400">{day.employeeCode}</p></td>
           <td className="px-3 py-3">{day.punchCount}<p className="text-xs text-slate-400">{day.punches.map(timeOnly).join(' · ')}</p></td><td className="px-3 py-3">{timeOnly(day.firstPunch)}</td><td className="px-3 py-3">{timeOnly(day.lastPunch)}</td>
           <td className="px-3 py-3 font-semibold">{formatMinutes(day.workedMinutes)}</td><td className="px-3 py-3"><div className="flex flex-wrap gap-1">{day.flags.length ? day.flags.map((flag) => <Flag key={flag} type={flag} />) : <span className="text-xs text-emerald-600">OK</span>}</div></td>
           <td className="px-3 py-3">{day.needsReview && <button onClick={() => setReviewDay(day)} className="text-xs font-semibold text-blue-600 hover:text-blue-800">Review</button>}</td>
         </tr>)}</tbody></table></div>
       </div>}
 
-      {!loading && tab === 'imports' && <div className="card overflow-hidden"><div className="border-b border-slate-100 px-4 py-3"><h3 className="font-semibold text-slate-800">Version history</h3><p className="text-xs text-slate-500">Only the latest active upload can be rolled back, preserving a complete audit trail.</p></div><div className="divide-y divide-slate-100">{sortedImports.map((item) => <div key={item.id} className={`flex flex-col gap-2 px-4 py-3 sm:flex-row sm:items-center sm:justify-between ${item.reverted_at ? 'bg-slate-50 opacity-70' : ''}`}><div><p className="text-sm font-medium text-slate-800">{item.file_name} <span className="ml-1 text-xs font-normal text-slate-400">Version #{item.id}</span></p><p className="text-xs text-slate-400">{item.date_from || 'Unknown date'}—{item.date_to || 'Unknown date'} · {new Date(item.uploaded_at).toLocaleString()}</p>{item.reverted_at && <p className="text-xs text-red-600">Rolled back by {item.reverted_by} · {new Date(item.reverted_at).toLocaleString()}</p>}</div><div className="flex items-center gap-3"><p className="text-xs text-slate-500">{item.inserted_count} inserted · {item.record_count - item.inserted_count} duplicates</p>{!item.reverted_at && Number(item.id) === Number(latestActiveImportId) && <button onClick={() => rollbackImport(item)} disabled={rollingBack} className="btn-secondary px-3 py-1.5 text-xs text-red-600 disabled:opacity-50"><RotateCcw className="h-3.5 w-3.5" /> Restore previous</button>}</div></div>)}</div></div>}
+      {!loading && tab === 'imports' && <div className="card overflow-hidden"><div className="border-b border-slate-100 px-4 py-3"><h3 className="font-semibold text-slate-800">Version history</h3><p className="text-xs text-slate-500">Only the latest active upload can be rolled back, preserving a complete audit trail.</p></div><div className="divide-y divide-slate-100">{sortedImports.map((item) => <div key={item.id} className={`flex flex-col gap-2 px-4 py-3 sm:flex-row sm:items-center sm:justify-between ${item.reverted_at ? 'bg-slate-50 opacity-70' : ''}`}><div><p className="text-sm font-medium text-slate-800">{item.file_name} <span className="ml-1 text-xs font-normal text-slate-400">Version #{item.id}</span></p><p className="text-xs text-slate-400">{item.date_from || 'Unknown date'}—{item.date_to || 'Unknown date'} · {new Date(item.uploaded_at).toLocaleString()}</p>{item.date_schedules?.length > 0 && <p className="mt-1 text-xs text-blue-600">Scheduled ends: {item.date_schedules.map((schedule) => `${schedule.workDate} ${schedule.endTime}`).join(' · ')}</p>}{item.reverted_at && <p className="text-xs text-red-600">Rolled back by {item.reverted_by} · {new Date(item.reverted_at).toLocaleString()}</p>}</div><div className="flex items-center gap-3"><p className="text-xs text-slate-500">{item.inserted_count} inserted · {item.record_count - item.inserted_count} duplicates</p>{!item.reverted_at && Number(item.id) === Number(latestActiveImportId) && <button onClick={() => rollbackImport(item)} disabled={rollingBack} className="btn-secondary px-3 py-1.5 text-xs text-red-600 disabled:opacity-50"><RotateCcw className="h-3.5 w-3.5" /> Restore previous</button>}</div></div>)}</div></div>}
 
       {!loading && tab === 'settings' && user?.role === 'admin' && settingsForm && <div className="space-y-5">
         <div className="card p-5"><div className="mb-4 flex items-center justify-between"><div><h3 className="font-semibold text-slate-800">Attendance schedule</h3><p className="text-xs text-slate-500">Times are interpreted in America/Guatemala.</p></div><button onClick={saveSettings} disabled={savingSettings} className="btn-primary"><Save className="h-4 w-4" /> {savingSettings ? 'Saving…' : 'Save settings'}</button></div>

@@ -169,9 +169,42 @@ function timestampSeconds(value) {
   return timeToSeconds(String(value).slice(11, 19))
 }
 
-function daySchedule(date, settings) {
+export function standardMinutesForSchedule(date, endTime, startTime = '07:00') {
+  const startSeconds = timeToSeconds(startTime)
+  const endSeconds = timeToSeconds(endTime)
+  if (startSeconds == null || endSeconds == null || endSeconds <= startSeconds) return null
+  const weekday = new Date(`${date}T00:00:00Z`).getUTCDay()
+  const lunchMinutes = weekday === 6 && endSeconds <= timeToSeconds('12:00') ? 0 : 60
+  return Math.max((endSeconds - startSeconds) / 60 - lunchMinutes, 0)
+}
+
+function guatemalaTimestamp(now) {
+  if (typeof now === 'string') return now.slice(0, 19)
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: DEFAULT_TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+  }).formatToParts(now instanceof Date ? now : new Date())
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]))
+  return `${values.year}-${values.month}-${values.day}T${values.hour}:${values.minute}:${values.second}`
+}
+
+function scheduleMap(dateSchedules) {
+  const entries = Array.isArray(dateSchedules)
+    ? dateSchedules.map((schedule) => [schedule.workDate, schedule])
+    : Object.entries(dateSchedules || {})
+  return new Map(entries)
+}
+
+function daySchedule(date, settings, schedules) {
   const weekday = new Date(`${date}T00:00:00Z`).getUTCDay()
   if (weekday === 0) return { start: null, end: null, standardMinutes: 0 }
+  const selected = schedules.get(date)
+  if (selected) {
+    const end = String(selected.endTime || selected.end_time || '').slice(0, 5)
+    const start = String(selected.startTime || selected.start_time || settings.weekdayStart).slice(0, 5)
+    const standardMinutes = Number(selected.standardMinutes ?? selected.standard_minutes ?? standardMinutesForSchedule(date, end, start))
+    if (timeToSeconds(end) != null && Number.isFinite(standardMinutes)) return { start, end, standardMinutes }
+  }
   if (weekday === 6) {
     return {
       start: settings.saturdayStart,
@@ -186,9 +219,13 @@ function daySchedule(date, settings) {
   }
 }
 
-export function calculateAttendanceDays(punches, settingsInput = {}, reviews = []) {
+export function calculateAttendanceDays(punches, settingsInput = {}, reviews = [], dateSchedules = [], now = new Date()) {
   const settings = { ...DEFAULT_ATTENDANCE_SETTINGS, ...settingsInput }
   const reviewMap = new Map(reviews.map((review) => [`${review.employeeCode}|${review.workDate}`, review]))
+  const schedules = scheduleMap(dateSchedules)
+  const localNow = guatemalaTimestamp(now)
+  const currentDate = localNow.slice(0, 10)
+  const currentSeconds = timestampSeconds(localNow)
   const groups = new Map()
 
   for (const punch of punches || []) {
@@ -213,30 +250,51 @@ export function calculateAttendanceDays(punches, settingsInput = {}, reviews = [
     day.punches.sort()
     const review = reviewMap.get(`${day.employeeCode}|${day.workDate}`)
     const punchCount = day.punches.length
-    const schedule = daySchedule(day.workDate, settings)
+    const schedule = daySchedule(day.workDate, settings, schedules)
     const isSaturday = new Date(`${day.workDate}T00:00:00Z`).getUTCDay() === 6
-    const automaticallyValid = punchCount === 4 || (isSaturday && punchCount === 2)
+    const expectedPunchCount = punchCount === 4 || (isSaturday && punchCount === 2)
     const manuallyConfirmed = Boolean(review?.confirmed) && Number(review?.adjustedMinutes) >= 0
-    let workedMinutes = null
-
-    if (automaticallyValid) {
-      workedMinutes = 0
-      for (let index = 0; index < day.punches.length; index += 2) {
-        workedMinutes += (timestampSeconds(day.punches[index + 1]) - timestampSeconds(day.punches[index])) / 60
-      }
-    } else if (manuallyConfirmed) {
-      workedMinutes = Number(review.adjustedMinutes)
-    }
-
     const firstSeconds = timestampSeconds(day.punches[0])
     const lastSeconds = timestampSeconds(day.punches.at(-1))
-    const possibleLate = schedule.start != null && firstSeconds > timeToSeconds(schedule.start)
-    const possibleEarly = schedule.end != null && lastSeconds < timeToSeconds(schedule.end)
-    const late = automaticallyValid ? possibleLate : manuallyConfirmed ? Boolean(review?.late) : false
-    const early = automaticallyValid ? possibleEarly : manuallyConfirmed ? Boolean(review?.early) : false
+    const startSeconds = timeToSeconds(schedule.start)
+    const endSeconds = timeToSeconds(schedule.end)
+    const inProgress = day.workDate > currentDate || (
+      day.workDate === currentDate && endSeconds != null && currentSeconds <= endSeconds + 30 * 60
+    )
+    const possibleLate = startSeconds != null && firstSeconds > startSeconds
+    const possibleEarly = endSeconds != null && lastSeconds < endSeconds
+    const possibleEarlyWork = startSeconds != null && firstSeconds < startSeconds - 30 * 60
+    const possibleOvertime = endSeconds != null && lastSeconds > endSeconds + 30 * 60
+    const lateMinutes = possibleLate ? (firstSeconds - startSeconds) / 60 : 0
+    const earlyMinutes = possibleEarly ? (endSeconds - lastSeconds) / 60 : 0
+    const allowedMinutes = Math.max(schedule.standardMinutes - lateMinutes - earlyMinutes, 0)
+    let workedMinutes = null
+
+    if (!inProgress && manuallyConfirmed) {
+      workedMinutes = Number(review.adjustedMinutes)
+    } else if (!inProgress && expectedPunchCount) {
+      let pairedMinutes = 0
+      for (let index = 0; index < day.punches.length; index += 2) {
+        pairedMinutes += (timestampSeconds(day.punches[index + 1]) - timestampSeconds(day.punches[index])) / 60
+      }
+      workedMinutes = Math.min(pairedMinutes, allowedMinutes)
+    } else if (!inProgress && punchCount >= 2) {
+      workedMinutes = allowedMinutes
+    }
+
+    const late = !inProgress && (manuallyConfirmed ? Boolean(review?.late) : possibleLate)
+    const early = !inProgress && (manuallyConfirmed ? Boolean(review?.early) : possibleEarly)
     const belowStandard = workedMinutes != null && schedule.standardMinutes > 0 && workedMinutes < schedule.standardMinutes
+    const missingPunches = !expectedPunchCount
+    const needsReview = !manuallyConfirmed && !inProgress && (
+      missingPunches || possibleLate || possibleEarly || possibleEarlyWork || possibleOvertime
+    )
     const flags = []
-    if (!automaticallyValid && !manuallyConfirmed) flags.push('needs_review')
+    if (inProgress) flags.push('in_progress')
+    if (needsReview) flags.push('needs_review')
+    if (needsReview && missingPunches && !isSaturday && punchCount >= 2) flags.push('missing_lunch')
+    if (needsReview && possibleEarlyWork) flags.push('possible_early_work')
+    if (needsReview && possibleOvertime) flags.push('possible_overtime')
     if (late) flags.push('late')
     if (early) flags.push('early')
     if (belowStandard) flags.push('below_standard')
@@ -248,13 +306,18 @@ export function calculateAttendanceDays(punches, settingsInput = {}, reviews = [
       punchCount,
       workedMinutes,
       standardMinutes: schedule.standardMinutes,
+      scheduledStart: schedule.start,
+      scheduledEnd: schedule.end,
       workday: workedMinutes != null,
       late,
       early,
       possibleLate,
       possibleEarly,
+      possibleEarlyWork,
+      possibleOvertime,
       belowStandard,
-      needsReview: !automaticallyValid && !manuallyConfirmed,
+      inProgress,
+      needsReview,
       reviewNote: review?.note || '',
       manuallyConfirmed,
       reviewedBy: review?.updatedBy || '',
@@ -321,17 +384,15 @@ export function buildAttendanceSummary(days, employees = []) {
 
   return [...grouped.entries()].map(([employeeCode, employeeDays]) => {
     const employee = employeeMap.get(employeeCode) || {}
-    const attendanceDays = employeeDays.filter((day) => (
-      new Date(`${day.workDate}T00:00:00Z`).getUTCDay() !== 0 && Number(day.punchCount) >= 2
-    )).length
-    const confirmedDays = employeeDays.filter((day) => day.workday)
+    const attendanceDays = employeeDays.filter((day) => day.workday).length
+    const confirmedDays = employeeDays.filter((day) => day.workday && !day.needsReview)
     return {
       employeeCode,
       name: employee.name || employeeDays[0]?.name || '',
       department: employee.department || employeeDays[0]?.department || '',
       attendanceDays,
       workdays: confirmedDays.length,
-      totalMinutes: confirmedDays.reduce((sum, day) => sum + Number(day.workedMinutes || 0), 0),
+      totalMinutes: employeeDays.filter((day) => day.workday).reduce((sum, day) => sum + Number(day.workedMinutes || 0), 0),
       lateDays: employeeDays.filter((day) => day.late).length,
       earlyDays: employeeDays.filter((day) => day.early).length,
       reviewDays: employeeDays.filter((day) => day.needsReview).length,

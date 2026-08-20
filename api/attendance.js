@@ -7,6 +7,7 @@ import {
   calculateAttendanceDays,
   parseAttendanceFiles,
   partitionAttendanceDuplicates,
+  standardMinutesForSchedule,
 } from '../src/utils/factoryAttendance.js';
 
 const { authenticateUser } = authentication;
@@ -97,6 +98,7 @@ async function ensureTables(sql) {
       date_to DATE,
       source_files JSONB NOT NULL DEFAULT '[]'::jsonb,
       duplicate_details JSONB NOT NULL DEFAULT '[]'::jsonb,
+      date_schedules JSONB NOT NULL DEFAULT '[]'::jsonb,
       reverted_by TEXT,
       reverted_at TIMESTAMPTZ
     )
@@ -138,6 +140,7 @@ async function ensureTables(sql) {
   await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS date_to DATE`;
   await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS source_files JSONB NOT NULL DEFAULT '[]'::jsonb`;
   await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS duplicate_details JSONB NOT NULL DEFAULT '[]'::jsonb`;
+  await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS date_schedules JSONB NOT NULL DEFAULT '[]'::jsonb`;
   await sql`ALTER TABLE attendance_punches ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE`;
   await sql`ALTER TABLE attendance_imports DROP CONSTRAINT IF EXISTS attendance_imports_file_hash_key`;
   await sql`ALTER TABLE attendance_punches DROP CONSTRAINT IF EXISTS attendance_punches_employee_code_punched_at_device_id_key`;
@@ -155,7 +158,7 @@ async function ensureTables(sql) {
 }
 
 async function loadDashboard(sql, from, to) {
-  const [settingsRows, punchRows, reviewRows, employeeRows, importRows] = await Promise.all([
+  const [settingsRows, punchRows, reviewRows, employeeRows, importRows, scheduleRows] = await Promise.all([
     sql`SELECT * FROM attendance_settings WHERE id = 1`,
     sql`
       SELECT employee_code, name, department,
@@ -198,8 +201,16 @@ async function loadDashboard(sql, from, to) {
     `,
     sql`
       SELECT id, file_name, record_count, inserted_count, uploaded_by, uploaded_at,
-             date_from::text, date_to::text, source_files, duplicate_details, reverted_by, reverted_at
+             date_from::text, date_to::text, source_files, duplicate_details, date_schedules, reverted_by, reverted_at
       FROM attendance_imports ORDER BY uploaded_at DESC LIMIT 50
+    `,
+    sql`
+      SELECT date_schedules
+      FROM attendance_imports
+      WHERE reverted_at IS NULL
+        AND date_to >= CAST(${from} AS date)
+        AND date_from <= CAST(${to} AS date)
+      ORDER BY uploaded_at ASC, id ASC
     `,
   ]);
 
@@ -225,7 +236,11 @@ async function loadDashboard(sql, from, to) {
     updatedAt: row.updated_at,
   }));
   const employees = employeeRows.map(employeeFromRow);
-  const days = calculateAttendanceDays(punches, settings, reviews);
+  const dateSchedules = new Map();
+  for (const row of scheduleRows) {
+    for (const schedule of row.date_schedules || []) dateSchedules.set(schedule.workDate, schedule);
+  }
+  const days = calculateAttendanceDays(punches, settings, reviews, [...dateSchedules.values()]);
   return {
     from,
     to,
@@ -282,11 +297,34 @@ export default async function handler(req, res) {
       const sourceFiles = files.map((file) => file.fileName);
       const fileName = sourceFiles.length === 1 ? sourceFiles[0] : `${sourceFiles.length} files: ${sourceFiles.join(', ')}`;
       const contentHashes = files.map((file) => createHash('sha256').update(file.content).digest('hex')).sort();
-      const hash = createHash('sha256').update(contentHashes.join('|')).digest('hex');
       const records = parseAttendanceFiles(files);
       const recordDates = records.map((record) => record.punchedAt.slice(0, 10)).sort();
       const dateFrom = recordDates[0];
       const dateTo = recordDates.at(-1);
+      const uniqueDates = [...new Set(recordDates)];
+      const submittedSchedules = Array.isArray(req.body?.dateSchedules) ? req.body.dateSchedules : [];
+      const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
+      const scheduleByDate = new Map();
+      for (const schedule of submittedSchedules) {
+        const workDate = String(schedule?.workDate || '');
+        const endTime = String(schedule?.endTime || '').slice(0, 5);
+        if (!validDate(workDate) || !timePattern.test(endTime) || scheduleByDate.has(workDate)) {
+          return res.status(400).json({ error: 'Choose one valid end time for every attendance date' });
+        }
+        scheduleByDate.set(workDate, endTime);
+      }
+      if (uniqueDates.some((date) => !scheduleByDate.has(date)) || [...scheduleByDate.keys()].some((date) => !uniqueDates.includes(date))) {
+        return res.status(400).json({ error: 'Choose one end time for every date found in the TXT files' });
+      }
+      const dateSchedules = uniqueDates.map((workDate) => {
+        const endTime = scheduleByDate.get(workDate);
+        const standardMinutes = standardMinutesForSchedule(workDate, endTime);
+        return { workDate, startTime: '07:00', endTime, standardMinutes };
+      });
+      if (dateSchedules.some((schedule) => !Number.isFinite(schedule.standardMinutes) || schedule.standardMinutes <= 0)) {
+        return res.status(400).json({ error: 'Every selected end time must produce a positive workday after 07:00' });
+      }
+      const hash = createHash('sha256').update(`${contentHashes.join('|')}|${JSON.stringify(dateSchedules)}`).digest('hex');
       const preliminary = partitionAttendanceDuplicates(records);
       const lookupJson = JSON.stringify(preliminary.accepted.map((record) => ({
         employee_code: record.employeeCode,
@@ -314,7 +352,7 @@ export default async function handler(req, res) {
         return res.status(200).json({
           importId: Number(activeFile[0].id), records: records.length, inserted: 0,
           duplicates: records.length, duplicateDetails, exactFileDuplicate: true,
-          existing: activeFile[0], dateFrom, dateTo, sourceFiles,
+          existing: activeFile[0], dateFrom, dateTo, sourceFiles, dateSchedules,
         });
       }
       const employeeMap = new Map();
@@ -344,12 +382,13 @@ export default async function handler(req, res) {
 
       const imports = await sql`
         INSERT INTO attendance_imports (
-          file_name, file_hash, record_count, uploaded_by, date_from, date_to, source_files, duplicate_details
+          file_name, file_hash, record_count, uploaded_by, date_from, date_to, source_files, duplicate_details, date_schedules
         )
         VALUES (
           ${fileName}, ${hash}, ${records.length}, ${user.username}, ${dateFrom}, ${dateTo},
           ${JSON.stringify(sourceFiles)}::jsonb,
-          ${JSON.stringify(duplicateDetails)}::jsonb
+          ${JSON.stringify(duplicateDetails)}::jsonb,
+          ${JSON.stringify(dateSchedules)}::jsonb
         )
         RETURNING id
       `;
@@ -375,7 +414,7 @@ export default async function handler(req, res) {
       await sql`UPDATE attendance_imports SET inserted_count = ${inserted.length} WHERE id = ${importId}`;
       return res.status(200).json({
         importId, records: records.length, inserted: inserted.length,
-        duplicates: records.length - inserted.length, duplicateDetails, dateFrom, dateTo, sourceFiles,
+        duplicates: records.length - inserted.length, duplicateDetails, dateFrom, dateTo, sourceFiles, dateSchedules,
       });
     }
 

@@ -11,6 +11,7 @@ import {
   partitionAttendanceDuplicates,
   payrollRangeForDate,
   payrollRangesBetween,
+  standardMinutesForSchedule,
 } from '../src/utils/factoryAttendance.js'
 
 test('attendance summary counts complete pairs but excludes unconfirmed hours', () => {
@@ -25,7 +26,7 @@ test('attendance summary counts complete pairs but excludes unconfirmed hours', 
     },
     {
       employeeCode: 5, name: 'Angelica', workDate: '2026-08-19', punchCount: 3,
-      workday: false, workedMinutes: null, late: false, early: false, needsReview: true,
+      workday: true, workedMinutes: 600, late: false, early: false, needsReview: true,
     },
     {
       employeeCode: 5, name: 'Angelica', workDate: '2026-08-16', punchCount: 2,
@@ -37,7 +38,7 @@ test('attendance summary counts complete pairs but excludes unconfirmed hours', 
   assert.equal(summary.length, 2)
   assert.deepEqual(summary[0], {
     employeeCode: 5, name: 'Angelica', department: 'Inspection', attendanceDays: 2,
-    workdays: 1, totalMinutes: 590, lateDays: 1, earlyDays: 0, reviewDays: 2,
+    workdays: 1, totalMinutes: 1190, lateDays: 1, earlyDays: 0, reviewDays: 2,
   })
   assert.equal(summary[1].attendanceDays, 0)
   assert.equal(summary[1].totalMinutes, 0)
@@ -127,15 +128,16 @@ test('calculates four punches and flags late, early, and short days', () => {
   const [day] = calculateAttendanceDays(punches)
   assert.equal(day.workedMinutes, 580)
   assert.equal(day.workday, true)
-  assert.deepEqual(day.flags, ['late', 'early', 'below_standard'])
+  assert.deepEqual(day.flags, ['needs_review', 'late', 'early', 'below_standard'])
 })
 
-test('non-four-punch day requires manual confirmation', () => {
+test('non-four-punch day calculates known hours and requires manual confirmation', () => {
   const punches = ['07:00:00', '12:00:00'].map((time) => ({ employeeCode: 7, punchedAt: `2026-08-14T${time}` }))
   const [pending] = calculateAttendanceDays(punches)
-  assert.equal(pending.workday, false)
+  assert.equal(pending.workday, true)
+  assert.equal(pending.workedMinutes, 240)
   assert.equal(pending.needsReview, true)
-  assert.deepEqual(pending.flags, ['needs_review'])
+  assert.deepEqual(pending.flags, ['needs_review', 'missing_lunch', 'early', 'below_standard'])
 
   const [confirmed] = calculateAttendanceDays(punches, {}, [
     { employeeCode: 7, workDate: '2026-08-14', confirmed: true, adjustedMinutes: 300, late: false, early: true },
@@ -143,6 +145,69 @@ test('non-four-punch day requires manual confirmation', () => {
   assert.equal(confirmed.workday, true)
   assert.equal(confirmed.workedMinutes, 300)
   assert.equal(confirmed.early, true)
+})
+
+test('derives daily hours from the selected end time', () => {
+  assert.equal(standardMinutesForSchedule('2026-08-18', '17:00'), 540)
+  assert.equal(standardMinutesForSchedule('2026-08-18', '18:00'), 600)
+  assert.equal(standardMinutesForSchedule('2026-08-18', '19:00'), 660)
+  assert.equal(standardMinutesForSchedule('2026-08-15', '12:00'), 300)
+})
+
+test('missing lunch punches still count a full covered day but need review', () => {
+  const [day] = calculateAttendanceDays([
+    { employeeCode: 5, punchedAt: '2026-08-18T06:41:52' },
+    { employeeCode: 5, punchedAt: '2026-08-18T18:10:43' },
+  ], {}, [], [{ workDate: '2026-08-18', endTime: '18:00', standardMinutes: 600 }], '2026-08-19T08:00:00')
+  assert.equal(day.workedMinutes, 600)
+  assert.equal(day.workday, true)
+  assert.equal(day.needsReview, true)
+  assert.deepEqual(day.flags, ['needs_review', 'missing_lunch'])
+})
+
+test('deducts late or early minutes from a covered two-punch day', () => {
+  const schedules = [{ workDate: '2026-08-18', endTime: '18:00', standardMinutes: 600 }]
+  const [late] = calculateAttendanceDays([
+    { employeeCode: 5, punchedAt: '2026-08-18T07:10:00' },
+    { employeeCode: 5, punchedAt: '2026-08-18T18:10:00' },
+  ], {}, [], schedules, '2026-08-19T08:00:00')
+  assert.equal(late.workedMinutes, 590)
+  assert.deepEqual(late.flags, ['needs_review', 'missing_lunch', 'late', 'below_standard'])
+
+  const [early] = calculateAttendanceDays([
+    { employeeCode: 5, punchedAt: '2026-08-18T06:50:00' },
+    { employeeCode: 5, punchedAt: '2026-08-18T17:40:00' },
+  ], {}, [], schedules, '2026-08-19T08:00:00')
+  assert.equal(early.workedMinutes, 580)
+  assert.deepEqual(early.flags, ['needs_review', 'missing_lunch', 'early', 'below_standard'])
+})
+
+test('caps normal hours and flags possible early work or overtime', () => {
+  const schedules = [{ workDate: '2026-08-18', endTime: '18:00', standardMinutes: 600 }]
+  const [day] = calculateAttendanceDays([
+    { employeeCode: 5, punchedAt: '2026-08-18T05:50:00' },
+    { employeeCode: 5, punchedAt: '2026-08-18T12:00:00' },
+    { employeeCode: 5, punchedAt: '2026-08-18T13:00:00' },
+    { employeeCode: 5, punchedAt: '2026-08-18T19:00:00' },
+  ], {}, [], schedules, '2026-08-19T08:00:00')
+  assert.equal(day.workedMinutes, 600)
+  assert.equal(day.needsReview, true)
+  assert.deepEqual(day.flags, ['needs_review', 'possible_early_work', 'possible_overtime'])
+})
+
+test('keeps the current Guatemala workday in progress through the 30-minute grace period', () => {
+  const punches = [{ employeeCode: 5, punchedAt: '2026-08-19T07:00:00' }]
+  const schedules = [{ workDate: '2026-08-19', endTime: '17:00', standardMinutes: 540 }]
+  const [inProgress] = calculateAttendanceDays(punches, {}, [], schedules, '2026-08-19T17:30:00')
+  assert.equal(inProgress.inProgress, true)
+  assert.equal(inProgress.workedMinutes, null)
+  assert.equal(inProgress.needsReview, false)
+  assert.deepEqual(inProgress.flags, ['in_progress'])
+
+  const [finished] = calculateAttendanceDays(punches, {}, [], schedules, '2026-08-19T17:30:01')
+  assert.equal(finished.inProgress, false)
+  assert.equal(finished.needsReview, true)
+  assert.deepEqual(finished.flags, ['needs_review', 'early'])
 })
 
 test('uses the two fixed payroll periods', () => {

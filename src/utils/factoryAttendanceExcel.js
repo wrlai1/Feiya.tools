@@ -9,19 +9,19 @@ function displayTimestamp(value) {
 }
 
 function isAttendanceDay(day) {
-  return new Date(`${day.workDate}T00:00:00Z`).getUTCDay() !== 0 && Number(day.punchCount) >= 2
+  return Boolean(day.workday) && !day.inProgress
 }
 
 export function buildAttendanceWorkbook(ExcelJS, { days, from, to }) {
   const workbook = new ExcelJS.Workbook()
   workbook.creator = 'Feiya Factory Attendance'
   const sheet = workbook.addWorksheet(`${from.slice(5)}-${to.slice(5)}`.slice(0, 31))
-  const header = sheet.addRow(['ID.', 'Nombre', 'Depart.', 'Tiempo', 'WH', 'Working Days'])
+  const header = sheet.addRow(['ID.', 'Nombre', 'Depart.', 'Tiempo', 'WH', 'Working Days', 'Status'])
   header.font = { bold: true, color: { argb: COLORS.dark } }
   header.alignment = { horizontal: 'center' }
 
   const employees = new Map()
-  for (const day of days || []) {
+  for (const day of (days || []).filter((item) => !item.inProgress)) {
     if (!employees.has(day.employeeCode)) employees.set(day.employeeCode, [])
     employees.get(day.employeeCode).push(day)
   }
@@ -37,8 +37,9 @@ export function buildAttendanceWorkbook(ExcelJS, { days, from, to }) {
       punches.forEach((punch, index) => {
         const row = sheet.addRow([
           employeeCode, day.name, day.department, displayTimestamp(punch),
-          index === 0 ? (day.needsReview ? 'Needs Review' : day.workedMinutes == null ? null : Number((day.workedMinutes / 60).toFixed(2))) : null,
+          index === 0 && day.workedMinutes != null ? Number((day.workedMinutes / 60).toFixed(2)) : null,
           null,
+          index === 0 && day.needsReview ? 'Needs Review' : null,
         ])
         if (day.needsReview) {
           row.eachCell({ includeEmpty: true }, (cell) => {
@@ -47,16 +48,16 @@ export function buildAttendanceWorkbook(ExcelJS, { days, from, to }) {
         }
       })
     }
-    const totalRow = sheet.addRow([null, null, 'Total', null, Number((totalMinutes / 60).toFixed(2)), workingDays])
+    const totalRow = sheet.addRow([null, null, 'Total', null, Number((totalMinutes / 60).toFixed(2)), workingDays, null])
     totalRow.font = { bold: true }
     totalRow.eachCell({ includeEmpty: true }, (cell) => {
       cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: COLORS.total } }
     })
   }
 
-  sheet.columns = [10, 28, 23, 25, 16, 16].map((width) => ({ width }))
+  sheet.columns = [10, 28, 23, 25, 16, 16, 18].map((width) => ({ width }))
   sheet.getColumn(5).numFmt = '0.00'
   sheet.views = [{ state: 'frozen', ySplit: 1 }]
-  sheet.autoFilter = { from: 'A1', to: 'F1' }
+  sheet.autoFilter = { from: 'A1', to: 'G1' }
   return workbook
 }
