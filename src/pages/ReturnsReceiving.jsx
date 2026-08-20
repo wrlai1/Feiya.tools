@@ -32,7 +32,11 @@ import {
   suggestProductCatalogSelections,
 } from '../utils/returnImportEngine.js'
 import { parseOrderHistoryRows } from '../utils/orderImportEngine.js'
-import { groupReturnProducts, summarizeReturnInspection } from '../utils/returnInspection.js'
+import {
+  groupReturnProducts,
+  hasCompleteInventoryMapping,
+  summarizeReturnInspection,
+} from '../utils/returnInspection.js'
 
 const BASE = '/api'
 
@@ -360,6 +364,7 @@ export default function ReturnsReceiving() {
   const [orderUploading, setOrderUploading] = useState(false)
   const [orderStats, setOrderStats] = useState([])
   const [adminSelections, setAdminSelections] = useState({})
+  const [adminItemMappings, setAdminItemMappings] = useState({})
   const [reviewCatalogRows, setReviewCatalogRows] = useState([])
   const [reviewInventoryRows, setReviewInventoryRows] = useState([])
   const [reviewAliases, setReviewAliases] = useState({})
@@ -522,10 +527,17 @@ export default function ReturnsReceiving() {
 
   useEffect(() => {
     const unresolvedSkus = pkg?.review_data?.unresolvedSkus || []
+    const needsOrderItemMapping = Boolean(
+      pkg?.requires_item_resolution
+      && (pkg.related_orders || []).some((order) =>
+        (order.items || []).some((item) => item.catalog_status !== 'ready')
+      ),
+    )
     setReviewSkuSelections({})
     setReviewManualTargets({})
     setReviewMappingModes({})
-    if (!isAdmin || !unresolvedSkus.length || demoMode) {
+    setAdminItemMappings({})
+    if (!isAdmin || (!unresolvedSkus.length && !needsOrderItemMapping) || demoMode) {
       setReviewCatalogRows([])
       setReviewInventoryRows([])
       setReviewAliases({})
@@ -709,6 +721,7 @@ export default function ReturnsReceiving() {
       .map(([orderItemId, quantity]) => ({
         orderItemId: Number(orderItemId),
         quantity: Number(quantity),
+        components: adminItemMappings[orderItemId] || undefined,
       }))
       .filter((selection) => selection.quantity > 0)
     setLoading(true)
@@ -1670,7 +1683,13 @@ export default function ReturnsReceiving() {
                     Select every returned product from the original order. This replaces any incomplete automatic match.
                   </p>
                   <div className="mt-3 space-y-3">
-                    {(pkg.related_orders || []).flatMap((order) => (order.items || []).map((item) => (
+                    {(pkg.related_orders || []).flatMap((order) => (order.items || []).map((item) => {
+                      const mapping = adminItemMappings[item.id] || [
+                        { style: '', color: '', size: '', qty: 1 },
+                      ]
+                      const mappingReady = item.catalog_status === 'ready'
+                        || hasCompleteInventoryMapping(mapping)
+                      return (
                       <div key={item.id} className="rounded-xl border border-amber-200 bg-white p-3">
                         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                           <div className="min-w-0">
@@ -1683,7 +1702,7 @@ export default function ReturnsReceiving() {
                             </p>
                             {item.catalog_status !== 'ready' && (
                               <p className="mt-1 text-xs font-medium text-red-700">
-                                Product catalog mapping required before this item can be selected.
+                                Choose the matching inventory product below before selecting this item.
                               </p>
                             )}
                           </div>
@@ -1691,15 +1710,121 @@ export default function ReturnsReceiving() {
                             label={`Returned quantity for ${item.sku_code || item.sku_id}`}
                             value={Number(adminSelections[item.id] || 0)}
                             max={Number(item.quantity || 0)}
-                            disabled={item.catalog_status !== 'ready'}
+                            disabled={!mappingReady}
                             onChange={(value) => setAdminSelections((current) => ({
                               ...current,
                               [item.id]: value,
                             }))}
                           />
                         </div>
+                        {item.catalog_status !== 'ready' && (
+                          <div className="mt-3 space-y-2 border-t border-amber-100 pt-3">
+                            {reviewMappingLoading ? (
+                              <p className="text-xs text-slate-500">Loading inventory products…</p>
+                            ) : mapping.map((target, index) => {
+                              const styleOptions = [...new Set(reviewInventoryRows.map((row) => row.STYLE))].sort()
+                              const colorOptions = [...new Set(reviewInventoryRows
+                                .filter((row) => row.STYLE === target.style)
+                                .map((row) => row.COLOR))].sort()
+                              const sizeOptions = [...new Set(reviewInventoryRows
+                                .filter((row) => row.STYLE === target.style && row.COLOR === target.color)
+                                .map((row) => row.SIZE))].sort()
+                              const updateTarget = (changes) => {
+                                const next = mapping.map((row, rowIndex) =>
+                                  rowIndex === index ? { ...row, ...changes } : row
+                                )
+                                setAdminItemMappings((current) => ({ ...current, [item.id]: next }))
+                                setAdminSelections((current) => ({ ...current, [item.id]: 0 }))
+                              }
+                              return (
+                                <div key={`${item.id}-mapping-${index}`} className="grid gap-2 sm:grid-cols-4">
+                                  <select
+                                    aria-label="Inventory style"
+                                    value={target.style}
+                                    onChange={(event) => updateTarget({
+                                      style: event.target.value, color: '', size: '',
+                                    })}
+                                    className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm"
+                                  >
+                                    <option value="">Style / Estilo</option>
+                                    {styleOptions.map((style) => <option key={style} value={style}>{style}</option>)}
+                                  </select>
+                                  <select
+                                    aria-label="Inventory color"
+                                    value={target.color}
+                                    disabled={!target.style}
+                                    onChange={(event) => updateTarget({ color: event.target.value, size: '' })}
+                                    className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm disabled:bg-slate-100"
+                                  >
+                                    <option value="">Color</option>
+                                    {colorOptions.map((color) => <option key={color} value={color}>{color}</option>)}
+                                  </select>
+                                  <select
+                                    aria-label="Inventory size"
+                                    value={target.size}
+                                    disabled={!target.color}
+                                    onChange={(event) => updateTarget({ size: event.target.value })}
+                                    className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm disabled:bg-slate-100"
+                                  >
+                                    <option value="">Size / Talla</option>
+                                    {sizeOptions.map((size) => <option key={size} value={size}>{size}</option>)}
+                                  </select>
+                                  <div className="flex gap-2">
+                                    <input
+                                      type="number"
+                                      min="1"
+                                      max="9999"
+                                      step="1"
+                                      aria-label="Inventory pieces per returned product"
+                                      value={target.qty}
+                                      onChange={(event) => updateTarget({ qty: Number(event.target.value) })}
+                                      className="h-11 min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-2 text-sm"
+                                    />
+                                    {mapping.length > 1 && (
+                                      <button
+                                        type="button"
+                                        aria-label="Remove inventory product"
+                                        onClick={() => {
+                                          setAdminItemMappings((current) => ({
+                                            ...current,
+                                            [item.id]: mapping.filter((_, rowIndex) => rowIndex !== index),
+                                          }))
+                                          setAdminSelections((current) => ({ ...current, [item.id]: 0 }))
+                                        }}
+                                        className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-red-200 text-red-600"
+                                      >
+                                        <XCircle className="h-4 w-4" />
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+                              )
+                            })}
+                            {!reviewMappingLoading && !reviewInventoryRows.length && (
+                              <p className="text-xs font-medium text-red-700">
+                                No inventory products are available. Add inventory before resolving this return.
+                              </p>
+                            )}
+                            {!reviewMappingLoading && reviewInventoryRows.length > 0 && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setAdminItemMappings((current) => ({
+                                    ...current,
+                                    [item.id]: [...mapping, { style: '', color: '', size: '', qty: 1 }],
+                                  }))
+                                  setAdminSelections((current) => ({ ...current, [item.id]: 0 }))
+                                }}
+                                className="btn-secondary min-h-10 w-full justify-center sm:w-auto"
+                              >
+                                <Plus className="h-4 w-4" />
+                                Add inventory product / Agregar producto
+                              </button>
+                            )}
+                          </div>
+                        )}
                       </div>
-                    )))}
+                    )}))}
                   </div>
                   <button
                     type="button"

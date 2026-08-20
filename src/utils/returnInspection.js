@@ -97,3 +97,13 @@ export function groupReturnProducts(items = [], unresolvedSkus = []) {
     productQty: group.productQty || (group.inventoryPieces > 0 ? 1 : 0),
   }))
 }
+
+export function hasCompleteInventoryMapping(components = []) {
+  return Array.isArray(components) && components.length > 0 && components.every((component) =>
+    String(component.style || '').trim()
+    && String(component.color || '').trim()
+    && String(component.size || '').trim()
+    && Number.isSafeInteger(Number(component.qty))
+    && Number(component.qty) > 0
+  )
+}

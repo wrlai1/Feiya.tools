@@ -158,6 +158,21 @@ async function ensureTables(sql) {
   await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS date_schedules JSONB NOT NULL DEFAULT '[]'::jsonb`;
   await sql`ALTER TABLE attendance_punches ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE`;
   await sql`ALTER TABLE attendance_punches ADD COLUMN IF NOT EXISTS cleared_event_id BIGINT REFERENCES attendance_clear_events(id)`;
+  await sql`
+    UPDATE attendance_clear_events event
+    SET punch_count = cleared.punch_count,
+        employee_count = cleared.employee_count
+    FROM (
+      SELECT cleared_event_id,
+             COUNT(*)::int AS punch_count,
+             COUNT(DISTINCT employee_code)::int AS employee_count
+      FROM attendance_punches
+      WHERE cleared_event_id IS NOT NULL
+      GROUP BY cleared_event_id
+    ) cleared
+    WHERE event.id = cleared.cleared_event_id
+      AND event.punch_count = 0
+  `;
   await sql`ALTER TABLE attendance_imports DROP CONSTRAINT IF EXISTS attendance_imports_file_hash_key`;
   await sql`ALTER TABLE attendance_punches DROP CONSTRAINT IF EXISTS attendance_punches_employee_code_punched_at_device_id_key`;
   await sql`DROP INDEX IF EXISTS attendance_imports_active_hash_idx`;
@@ -490,16 +505,23 @@ export default async function handler(req, res) {
           )), '[]'::jsonb) AS snapshots
           FROM attendance_day_reviews
           WHERE ${clearAll} OR work_date IN (SELECT work_date FROM target_dates)
+        ), target_stats AS (
+          SELECT COUNT(*)::int AS punch_count,
+                 COUNT(DISTINCT employee_code)::int AS employee_count
+          FROM attendance_punches
+          WHERE active
+            AND (${clearAll} OR punched_at::date IN (SELECT work_date FROM target_dates))
         ), created AS (
-          INSERT INTO attendance_clear_events (scope, dates, review_snapshots, cleared_by)
+          INSERT INTO attendance_clear_events (
+            scope, dates, punch_count, employee_count, review_snapshots, cleared_by
+          )
           SELECT ${clearAll ? 'all' : 'dates'}, ${JSON.stringify(dates)}::jsonb,
+                 target_stats.punch_count, target_stats.employee_count,
                  review_snapshot.snapshots, ${user.username}
-          FROM review_snapshot
-          WHERE EXISTS (
-            SELECT 1 FROM attendance_punches
-            WHERE active AND (${clearAll} OR punched_at::date IN (SELECT work_date FROM target_dates))
-          ) OR jsonb_array_length(review_snapshot.snapshots) > 0
-          RETURNING id
+          FROM review_snapshot, target_stats
+          WHERE target_stats.punch_count > 0
+             OR jsonb_array_length(review_snapshot.snapshots) > 0
+          RETURNING id, punch_count, employee_count
         ), deactivated AS (
           UPDATE attendance_punches
           SET active = FALSE, cleared_event_id = (SELECT id FROM created)
@@ -513,11 +535,8 @@ export default async function handler(req, res) {
             AND (${clearAll} OR work_date IN (SELECT work_date FROM target_dates))
           RETURNING employee_code
         )
-        UPDATE attendance_clear_events
-        SET punch_count = (SELECT COUNT(*)::int FROM deactivated),
-            employee_count = (SELECT COUNT(DISTINCT employee_code)::int FROM deactivated)
-        WHERE id = (SELECT id FROM created)
-        RETURNING id, punch_count, employee_count
+        SELECT id, punch_count, employee_count
+        FROM created
       `;
       if (!result[0]) return res.status(404).json({ error: 'No active attendance data matched this selection' });
       return res.status(200).json({

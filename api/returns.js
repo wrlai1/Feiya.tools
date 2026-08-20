@@ -1793,7 +1793,7 @@ export default async function handler(req, res) {
           .map((item) => [Number(item.id), item]),
       )
       const selectedIds = new Set()
-      const resolvedItems = []
+      const selectedItems = []
       for (const selection of selections) {
         const orderItemId = Number(selection.orderItemId)
         const quantity = Number(selection.quantity)
@@ -1808,17 +1808,38 @@ export default async function handler(req, res) {
         ) {
           return res.status(400).json({ error: 'Choose valid returned quantities from the original order' })
         }
-        if (
-          orderItem.catalog_status !== 'ready'
-          || !Array.isArray(orderItem.catalog_components)
-          || !orderItem.catalog_components.length
-        ) {
-          return res.status(409).json({
-            error: `Product mapping is required for ${orderItem.sku_code || orderItem.sku_id || 'this SKU'}`,
+        const catalogReady = orderItem.catalog_status === 'ready'
+          && Array.isArray(orderItem.catalog_components)
+          && orderItem.catalog_components.length
+        let components
+        try {
+          components = mergeInventoryComponents(
+            catalogReady ? orderItem.catalog_components : selection.components,
+          )
+          if (!components.length) throw new Error('Inventory mapping required')
+        } catch {
+          return res.status(400).json({
+            error: `Choose a complete inventory product for ${orderItem.sku_code || orderItem.sku_id || 'this item'}`,
           })
         }
         selectedIds.add(orderItemId)
-        for (const component of orderItem.catalog_components) {
+        if (!catalogReady) {
+          const resolution = await resolveInventoryRows(sql, components.map((component) => ({
+            ...component,
+            allowCreate: false,
+          })))
+          if (resolution.missing.length || resolution.ambiguous.length) {
+            return res.status(409).json({
+              error: `The selected inventory product is missing or duplicated for ${orderItem.sku_code || orderItem.sku_id || 'this item'}`,
+            })
+          }
+          components = mergeInventoryComponents(resolution.rows)
+        }
+        selectedItems.push({ orderItem, quantity, components })
+      }
+      const resolvedItems = []
+      for (const { orderItem, quantity, components } of selectedItems) {
+        for (const component of components) {
           const componentQty = Number(component.qty || 1)
           if (
             !component.style
