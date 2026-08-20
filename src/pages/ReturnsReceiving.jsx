@@ -35,6 +35,7 @@ import { parseOrderHistoryRows } from '../utils/orderImportEngine.js'
 import {
   groupReturnProducts,
   hasCompleteInventoryMapping,
+  inventoryMappingFromPackageItems,
   summarizeReturnInspection,
 } from '../utils/returnInspection.js'
 
@@ -717,11 +718,17 @@ export default function ReturnsReceiving() {
 
   const resolveAdminItems = async () => {
     if (!isAdmin || !pkg?.requires_item_resolution || loading) return
+    const orderItems = new Map(
+      (pkg.related_orders || []).flatMap((order) => order.items || [])
+        .map((item) => [String(item.id), item]),
+    )
     const selections = Object.entries(adminSelections)
       .map(([orderItemId, quantity]) => ({
         orderItemId: Number(orderItemId),
         quantity: Number(quantity),
-        components: adminItemMappings[orderItemId] || undefined,
+        components: adminItemMappings[orderItemId]
+          || inventoryMappingFromPackageItems(orderItems.get(orderItemId), pkg.items)
+          || undefined,
       }))
       .filter((selection) => selection.quantity > 0)
     setLoading(true)
@@ -1675,7 +1682,7 @@ export default function ReturnsReceiving() {
                 </div>
               )}
 
-              {isAdmin && pkg.status === 'needs_review' && pkg.requires_item_resolution
+              {isAdmin && ['pending', 'needs_review'].includes(pkg.status) && pkg.requires_item_resolution
                 && !pkg.review_data?.unresolvedSkus?.length && (
                 <div className="border-b border-amber-200 bg-amber-50 px-4 py-4 sm:px-5">
                   <p className="font-semibold text-amber-900">Choose the products actually returned</p>
@@ -1684,9 +1691,11 @@ export default function ReturnsReceiving() {
                   </p>
                   <div className="mt-3 space-y-3">
                     {(pkg.related_orders || []).flatMap((order) => (order.items || []).map((item) => {
-                      const mapping = adminItemMappings[item.id] || [
-                        { style: '', color: '', size: '', qty: 1 },
-                      ]
+                      const packageMapping = inventoryMappingFromPackageItems(item, pkg.items)
+                      const mapping = adminItemMappings[item.id]
+                        || (packageMapping.length ? packageMapping : [
+                          { style: '', color: '', size: '', qty: 1 },
+                        ])
                       const mappingReady = item.catalog_status === 'ready'
                         || hasCompleteInventoryMapping(mapping)
                       return (
@@ -1838,7 +1847,7 @@ export default function ReturnsReceiving() {
                 </div>
               )}
 
-              {!isAdmin && pkg.status === 'needs_review' && pkg.requires_item_resolution && (
+              {!isAdmin && ['pending', 'needs_review'].includes(pkg.status) && pkg.requires_item_resolution && (
                 <div className="border-b border-amber-200 bg-amber-50 px-4 py-5 text-center sm:px-5">
                   <AlertTriangle className="mx-auto h-9 w-9 text-amber-600" />
                   <p className="mt-2 text-lg font-bold text-amber-900">

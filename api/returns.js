@@ -6,7 +6,13 @@ import { summarizeReturnInspection } from '../src/utils/returnInspection.js'
 
 const { resolveInventoryTargets } = inventoryTargetResolution
 const { authenticateUser } = authentication
-const { itemIdentity, mergeInventoryComponents, mergeReturnPackageItems } = returnPackageSafety
+const {
+  canResolveReturnItems,
+  itemIdentity,
+  mergeInventoryComponents,
+  mergeReturnPackageItems,
+  replaceSelectedReturnPackageItems,
+} = returnPackageSafety
 const MAX_PACKAGES_PER_IMPORT = 5000
 const MAX_ITEMS_PER_IMPORT = 50000
 const MAX_CATALOG_ROWS_PER_IMPORT = 20000
@@ -1783,7 +1789,7 @@ export default async function handler(req, res) {
       if (!trackingKey) return res.status(400).json({ error: 'tracking required' })
       const pkg = await loadPackage(sql, trackingKey)
       if (!pkg) return res.status(404).json({ error: 'Tracking is not in the uploaded return manifest' })
-      if (pkg.status !== 'needs_review' || !pkg.requires_item_resolution) {
+      if (!canResolveReturnItems(pkg)) {
         return res.status(409).json({ error: 'This package does not require item selection' })
       }
 
@@ -1866,7 +1872,11 @@ export default async function handler(req, res) {
         return res.status(400).json({ error: 'Select at least one returned product' })
       }
 
-      const items = mergeReturnPackageItems(pkg.items, resolvedItems)
+      const items = replaceSelectedReturnPackageItems(
+        pkg.items,
+        resolvedItems,
+        selectedItems.map(({ orderItem }) => orderItem),
+      )
       const expectedUnits = items.reduce((sum, item) => sum + item.expected_qty, 0)
 
       await sql.transaction((txn) => [
@@ -1891,7 +1901,7 @@ export default async function handler(req, res) {
                 '[]'::jsonb,
                 true
               )
-          WHERE id = ${pkg.id} AND status = 'needs_review'
+          WHERE id = ${pkg.id} AND status = ${pkg.status}
         `,
       ], { isolationLevel: 'Serializable' })
 

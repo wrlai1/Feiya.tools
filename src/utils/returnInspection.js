@@ -107,3 +107,27 @@ export function hasCompleteInventoryMapping(components = []) {
     && Number(component.qty) > 0
   )
 }
+
+export function inventoryMappingFromPackageItems(orderItem, packageItems = []) {
+  const skuId = String(orderItem?.sku_id || orderItem?.skuId || '').trim()
+  const skuCode = String(orderItem?.sku_code || orderItem?.skuCode || '').trim().toLowerCase()
+  const matchingItems = (packageItems || []).filter((item) => {
+    const itemSkuId = String(item.sku_id || item.skuId || '').trim()
+    const itemSkuCode = String(item.sku_code || item.skuCode || '').trim().toLowerCase()
+    return skuId && itemSkuId ? itemSkuId === skuId : Boolean(skuCode && itemSkuCode === skuCode)
+  })
+  if (!matchingItems.length) return []
+
+  const components = matchingItems.map((item) => {
+    const expectedQty = Number(item.expected_qty ?? item.expectedQty)
+    const sourceQty = Number(item.source_qty ?? item.sourceQty)
+    const qty = expectedQty / sourceQty
+    return {
+      style: String(item.style || '').trim(),
+      color: String(item.color || '').trim(),
+      size: String(item.size || '').trim(),
+      qty,
+    }
+  })
+  return hasCompleteInventoryMapping(components) ? components : []
+}

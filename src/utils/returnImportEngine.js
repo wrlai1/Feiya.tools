@@ -335,6 +335,37 @@ function resolvedCatalogProduct(catalog, skuId) {
   return { product: matches[0], issue: '' }
 }
 
+function catalogProductFromOrderItem(orderItem, skuId) {
+  const storeName = String(orderItem?.catalog_store_name || '').trim()
+  const storeKey = String(orderItem?.catalog_store_key || storeName).trim().toLowerCase()
+  const status = String(orderItem?.catalog_status || '').trim()
+  const components = Array.isArray(orderItem?.catalog_components)
+    ? orderItem.catalog_components
+    : []
+  if (!skuId || !storeKey || !status) return null
+  return {
+    store_name: storeName,
+    store_key: storeKey,
+    sku_id: skuId,
+    sku_code: String(orderItem?.sku_code || orderItem?.skuCode || '').trim(),
+    status,
+    components,
+    issue: status === 'ready' ? '' : 'sku_mapping_needs_review',
+  }
+}
+
+function matchingOrderCatalogProduct(orders, orderNumber, group, skuId) {
+  const orderKey = normalizeOrderNumber(orderNumber)
+  if (!orderKey) return null
+  const { order } = resolvedHistoricalOrder(orders.get(orderKey), group)
+  const matches = (order?.items || []).filter((item) =>
+    String(item.sku_id || item.skuId || '').trim() === String(skuId || '').trim()
+  )
+  if (matches.length !== 1) return null
+  const product = catalogProductFromOrderItem(matches[0], skuId)
+  return product?.status === 'ready' && product.components.length ? product : null
+}
+
 function resolvedGroupStore(group) {
   if (group.stores.size === 1) {
     const [[key, name]] = group.stores
@@ -576,10 +607,10 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
         parse_issue: 'quantity_invalid',
       })
     } else {
-      const {
-        product,
-        issue: productIssue,
-      } = resolvedCatalogProduct(catalog, skuId)
+      const catalogResolution = resolvedCatalogProduct(catalog, skuId)
+      const product = matchingOrderCatalogProduct(orders, orderNumber, group, skuId)
+        || catalogResolution.product
+      const productIssue = product ? '' : catalogResolution.issue
       if (!product) {
         group.review.push({
           tracking: trackingNumber,
