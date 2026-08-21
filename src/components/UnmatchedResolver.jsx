@@ -60,6 +60,7 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
   const [createForms,     setCreateForms]     = useState(() => Array(unmatchedRows.length).fill(null))
   const [comboSelections, setComboSelections] = useState(() => Array(unmatchedRows.length).fill(null).map(() => []))
   const [packCounts,      setPackCounts]      = useState(() => unmatchedRows.map(row => row.packCount > 1 ? row.packCount : ''))
+  const [itemModes,       setItemModes]       = useState(() => Array(unmatchedRows.length).fill(null))
   const [activeSearch,    setActiveSearch]    = useState(null)
   const [ruleBatches,     setRuleBatches]     = useState([])
 
@@ -148,6 +149,14 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
     setSearches(prev => { const n = [...prev]; n[i] = v; return n })
   }
 
+  function chooseItemMode(i, mode) {
+    setItemModes(prev => { const next = [...prev]; next[i] = mode; return next })
+    setResolved(prev => { const next = [...prev]; next[i] = null; return next })
+    setCreateForms(prev => { const next = [...prev]; next[i] = null; return next })
+    setComboSelections(prev => { const next = [...prev]; next[i] = []; return next })
+    setActiveSearch(i)
+  }
+
   function openCreate(i, row) {
     setCreateForms(prev => {
       const n = [...prev]
@@ -206,12 +215,8 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
     })
   }
 
-  function isSetReview(row) {
-    return row.packCount > 1 || /set_components_unknown|cross_style_combo|ambiguous_color_separator/.test(row.parseIssue || '')
-  }
-
-  function expectedPackCount(i, row) {
-    if (!isSetReview(row)) return null
+  function expectedPackCount(i) {
+    if (itemModes[i] !== 'set') return null
     const value = parseInt(packCounts[i], 10)
     return value > 0 ? value : null
   }
@@ -223,8 +228,8 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
   function confirmCombo(i, row) {
     const components = comboSelections[i] || []
     if (!components.length) return
-    const expected = expectedPackCount(i, row)
-    if (isSetReview(row) && (!expected || comboMultiplierTotal(i) !== expected)) return
+    const expected = expectedPackCount(i)
+    if (itemModes[i] !== 'set' || !expected || comboMultiplierTotal(i) !== expected) return
     const additional = findAdditionalComboSizeMappings({
       unmatchedRows,
       templateRows: normTemplate,
@@ -459,8 +464,9 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
           const form     = createForms[i]
           const matches  = activeSearch === i && !r && !isCreate ? getMatches(i, row) : []
           const comboComponents = comboSelections[i] || []
-          const setReview = isSetReview(row)
-          const expected = expectedPackCount(i, row)
+          const itemMode = itemModes[i]
+          const setReview = itemMode === 'set'
+          const expected = expectedPackCount(i)
           const comboTotal = comboMultiplierTotal(i)
           const sourceBatch = ruleBatches.find(batch => batch.sourceIndex === i)
 
@@ -491,6 +497,38 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
               {row.parseIssue && !r && (
                 <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
                   {REVIEW_REASONS[row.parseIssue] || `Source needs review: ${row.parseIssue.replaceAll('_', ' ')}`}
+                </div>
+              )}
+
+              {!r && (
+                <div className="rounded-lg border border-blue-100 bg-blue-50/60 px-3 py-3">
+                  <p className="mb-2 text-xs font-semibold text-slate-700">
+                    Is this sold SKU one item or a set?
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => chooseItemMode(i, 'single')}
+                      className={`rounded-lg border px-3 py-1.5 text-xs font-semibold ${
+                        itemMode === 'single'
+                          ? 'border-blue-500 bg-blue-600 text-white'
+                          : 'border-blue-200 bg-white text-blue-700 hover:bg-blue-50'
+                      }`}
+                    >
+                      Single item / Not a set
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => chooseItemMode(i, 'set')}
+                      className={`rounded-lg border px-3 py-1.5 text-xs font-semibold ${
+                        itemMode === 'set'
+                          ? 'border-indigo-500 bg-indigo-600 text-white'
+                          : 'border-indigo-200 bg-white text-indigo-700 hover:bg-indigo-50'
+                      }`}
+                    >
+                      Set / Combination
+                    </button>
+                  </div>
                 </div>
               )}
 
@@ -547,6 +585,14 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
                     <X className="w-3.5 h-3.5" />
                   </button>
                 </div>
+              ) : !itemMode ? (
+                <button
+                  onClick={() => resolve(i, 'skip', null)}
+                  className="flex items-center gap-1.5 text-xs px-3 py-1.5 text-slate-400 hover:text-slate-600"
+                >
+                  <SkipForward className="w-3 h-3" />
+                  Skip
+                </button>
               ) : isCreate ? (
                 /* Create form */
                 <div className="space-y-2">
@@ -646,24 +692,30 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
                             <span className="text-slate-500 flex-1 truncate">{t.COLOR}</span>
                             <span className="text-slate-400 shrink-0">{t.SIZE}</span>
                           </button>
-                          <button
-                            onClick={() => addComboComponent(i, t)}
-                            className="mr-2 shrink-0 rounded-md border border-indigo-100 px-2 py-1 text-xs text-indigo-600 hover:bg-indigo-50"
-                            title="Add this row to a combo set"
-                          >
-                            Set +
-                          </button>
+                          {setReview && (
+                            <button
+                              onClick={() => addComboComponent(i, t)}
+                              className="mr-2 shrink-0 rounded-md border border-indigo-100 px-2 py-1 text-xs text-indigo-600 hover:bg-indigo-50"
+                              title="Add this row to a combo set"
+                            >
+                              Set +
+                            </button>
+                          )}
                         </div>
                       ))}
                     </div>
                   )}
 
                   {activeSearch === i && matches.length === 0 && searches[i] && (
-                    <p className="text-xs text-slate-400 px-1">No matches — try a different search or create a new entry.</p>
+                    <p className="text-xs text-slate-400 px-1">
+                      {itemMode === 'single'
+                        ? 'No matches — try a different search or create a new entry.'
+                        : 'No matches — try a different search for each inventory item in this set.'}
+                    </p>
                   )}
 
                   <div className="flex gap-2 pt-1">
-                    {!setReview && (
+                    {itemMode === 'single' && (
                       <button
                         onClick={() => openCreate(i, row)}
                         className="flex items-center gap-1.5 text-xs px-3 py-1.5 border border-slate-200 rounded-lg hover:bg-slate-50 text-slate-600"
