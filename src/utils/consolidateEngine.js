@@ -180,7 +180,16 @@ export function consolidateRows(rows) {
   if (!styleKey) throw new Error('找不到 Style/SKU 列')
   if (!qtyKey) throw new Error('找不到 Quantity/Qty/数量 列')
 
-  const invalidQtyIndex = rows.findIndex((row) => {
+  // TEMU exports may end with a quantity-only formula total. It is not a
+  // product, but incomplete order rows with any other data still need review.
+  const productRows = rows.filter((row) => {
+    if (String(row[styleKey] ?? '').trim()) return true
+    return Object.entries(row).some(([key, value]) =>
+      key !== qtyKey && String(value ?? '').trim()
+    )
+  })
+
+  const invalidQtyIndex = productRows.findIndex((row) => {
     const raw = row[qtyKey]
     const qty = Number(raw)
     return String(raw ?? '').trim() === '' || !Number.isSafeInteger(qty) || qty < 0
@@ -189,10 +198,10 @@ export function consolidateRows(rows) {
     throw new Error(`第 ${invalidQtyIndex + 2} 行数量无效；Quantity 必须是 0 或正整数`)
   }
 
-  const origTotal = rows.reduce((s, r) => s + (Number(r[qtyKey]) || 0), 0)
+  const origTotal = productRows.reduce((s, r) => s + (Number(r[qtyKey]) || 0), 0)
 
   // 解析每一行
-  let parsed = rows.map((r) => {
+  let parsed = productRows.map((r) => {
     const rawStyle = String(r[styleKey] ?? '').trim()
     const rawAttr = attrKey ? String(r[attrKey] ?? '').trim() : ''
     const qty = Number(r[qtyKey]) || 0
@@ -301,7 +310,15 @@ export function consolidateRows(rows) {
   const groups = new Map()
   for (const p of parsed) {
     const k = `${p.style}||${p.color}||${p.size}||${p.issue}||${p.packCount}`
-    const g = groups.get(k) || { style: p.style, color: p.color, size: p.size, QTY: 0, pack_count: p.packCount || 1, parse_issue: p.issue || '' }
+    const g = groups.get(k) || {
+      style: p.style,
+      color: p.color,
+      size: p.size,
+      QTY: 0,
+      pack_count: p.packCount || 1,
+      parse_issue: p.issue || '',
+      ...(p.issue ? { raw_style: p.rawStyle } : {}),
+    }
     g.QTY += p.qty
     groups.set(k, g)
   }
@@ -330,7 +347,7 @@ export function consolidateRows(rows) {
     consolidated,
     needsReview,
     stats: {
-      origRows: rows.length,
+      origRows: productRows.length,
       origTotal,
       expandedTotal,
       newTotal,

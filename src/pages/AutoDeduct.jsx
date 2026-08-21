@@ -416,18 +416,25 @@ export default function AutoDeduct() {
     const learned = {}
     for (const item of items) {
       if (!item._learnAlias || !item._source) continue
+      const isDimensionReview = Boolean(item._source.parseIssue)
       // A human-confirmed link is stable at style+color level. Future sizes
       // reuse it only when every exact target size exists in inventory.
       if (item._isCombo) {
         const sourceSize = normalizeSize(item._source.size)
-        if ((item.components || []).some((component) => normalizeSize(component.SIZE) !== sourceSize)) continue
-        learned[aliasKey(item._source.style, item._source.color)] = {
-          components: (item.components || []).map((component) => ({
+        const sourceComponents = item.components || []
+        if (!isDimensionReview && sourceComponents.some((component) => normalizeSize(component.SIZE) !== sourceSize)) continue
+        const key = isDimensionReview
+          ? aliasKey(item._source.style, item._source.color, item._source.size)
+          : aliasKey(item._source.style, item._source.color)
+        learned[key] = {
+          components: sourceComponents.map((component) => ({
             STYLE: component.STYLE,
             COLOR: component.COLOR,
+            ...(isDimensionReview ? { SIZE: component.SIZE } : {}),
             multiplier: Math.max(1, parseInt(component.multiplier, 10) || 1),
           })),
           _confirmed: true,
+          ...(isDimensionReview ? { _confirmedDimensions: true } : {}),
         }
         continue
       }
@@ -437,7 +444,13 @@ export default function AutoDeduct() {
           _isNew: !!item._isNew,
           _confirmed: true,
         }
-      if (item._isNew) {
+      if (isDimensionReview) {
+        learned[aliasKey(item._source.style, item._source.color, item._source.size)] = {
+          ...aliasValue,
+          SIZE: item.SIZE,
+          _confirmedDimensions: true,
+        }
+      } else if (item._isNew) {
         learned[aliasKey(item._source.style, item._source.color, item._source.size)] = {
           ...aliasValue,
           SIZE: item.SIZE,

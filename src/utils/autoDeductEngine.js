@@ -350,8 +350,10 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
 
   salesRows.forEach(row => {
     const style    = String(row.style || row.STYLE || '').trim()
+    const rawStyle = String(row.raw_style || row.rawStyle || '').trim()
     const color    = String(row.color || row.COLOR || '').trim()
     const rawSize  = String(row.size  || row.SIZE  || '').trim()
+    const normSize = normalizeSize(rawSize)
     const rawQty   = row.QTY ?? row.qty ?? 0
     const qty      = Number(rawQty)
 
@@ -362,13 +364,59 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
     const packCount = Math.max(1, parseInt(row.pack_count || row.packCount, 10) || 1)
     let parseIssue = String(row.parse_issue || row.parseIssue || '')
     if (!style) {
-      srcTotal += qty * packCount
-      unmatchedRows.push({ style, color, size: normalizeSize(rawSize), qty, packCount, parseIssue: parseIssue || 'missing_style' })
+      const sourceIssue = parseIssue || 'missing_style'
+      const remembered = aliases[aliasKey('', color, normSize)]
+      const confirmed = remembered?._confirmed === true && remembered?._confirmedDimensions === true
+      const targets = confirmed
+        ? (Array.isArray(remembered.components) ? remembered.components : [remembered])
+        : []
+      const targetRows = targets.map((target) => {
+        const targetSize = normalizeSize(target.SIZE || normSize)
+        const matches = entries.filter((entry) =>
+          normalizeStyleIdentity(entry.style) === normalizeStyleIdentity(target.STYLE)
+          && normalizeColor(entry.color) === normalizeColor(target.COLOR)
+          && normalizeSize(entry.size) === targetSize
+        )
+        return matches.length === 1 ? matches[0] : null
+      })
+      const effectivePackCount = targets.length
+        ? targets.reduce((sum, target) => sum + Math.max(1, parseInt(target.multiplier, 10) || 1), 0)
+        : packCount
+      srcTotal += qty * effectivePackCount
+
+      if (confirmed && targetRows.length && targetRows.every(Boolean)) {
+        targetRows.forEach((targetRow, index) => {
+          const multiplier = Math.max(1, parseInt(targets[index].multiplier, 10) || 1)
+          const componentQty = qty * multiplier
+          targetRow.qty += componentQty
+          filledTotal += componentQty
+          matchLog.push({
+            style: rawStyle,
+            salesColor: color,
+            size: normSize,
+            qty: componentQty,
+            targetStyle: targetRow.style,
+            targetColor: targetRow.color,
+            targetSize: targetRow.size,
+            via: 'confirmed missing-style source',
+          })
+        })
+        return
+      }
+
+      unmatchedRows.push({
+        style,
+        rawStyle,
+        color,
+        size: normSize,
+        qty,
+        packCount: effectivePackCount,
+        parseIssue: confirmed ? 'confirmed_mapping_size_missing' : sourceIssue,
+      })
       return
     }
     // Consolidated rows already contain warehouse sizes. Petite conversion must
     // happen exactly once in consolidateRows, never again during matching.
-    const normSize  = normalizeSize(rawSize)
     const routedStyle = routedInventoryStyle(style, normSize)
     if (routedStyle === null) {
       parseIssue = [...new Set([...parseIssue.split(';'), 'm022_size_unknown'].filter(Boolean))].join(';')
@@ -390,6 +438,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
     }
 
     const confirmedStyleColorRule = aliasTarget?._confirmed === true
+    const confirmedDimensionReview = parseIssue && aliasTarget?._confirmedDimensions === true
     const confirmedComboRule = confirmedStyleColorRule && Array.isArray(aliasTarget?.components)
     const effectivePackCount = confirmedComboRule
       ? aliasTarget.components.reduce((sum, component) =>
@@ -489,7 +538,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
 
     // A confirmed combo resolves only the known set/combo uncertainty. Other
     // parsing warnings still require a fresh human decision.
-    const comboResolvedIssue = confirmedComboRule
+    const comboResolvedIssue = confirmedDimensionReview || confirmedComboRule
       && parseIssue
         .split(';')
         .filter(Boolean)

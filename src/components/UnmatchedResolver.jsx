@@ -264,6 +264,7 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
             size: row.size,
             packCount: confirmedPackCount,
             originalPackCount: row.packCount,
+            parseIssue: row.parseIssue,
           },
           _learnAlias: true,
         })
@@ -275,7 +276,12 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
         SIZE:   r.entry.SIZE,
         QTY:    row.qty,
         _isNew: r.type === 'create',
-        _source: { style: row.style, color: row.color, size: row.size },
+        _source: {
+          style: row.style,
+          color: row.color,
+          size: row.size,
+          parseIssue: row.parseIssue,
+        },
         _learnAlias: r.type === 'link' || r.type === 'create',
       })
     }
@@ -472,7 +478,7 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
               {/* Sales row info */}
               <div className="flex items-center gap-2 flex-wrap">
                 <span className="font-mono text-sm font-semibold text-slate-800 bg-slate-100 px-2 py-0.5 rounded">
-                  {row.style}
+                  {row.style || row.rawStyle || 'Unknown style'}
                 </span>
                 <span className="text-sm text-slate-600">{row.color}</span>
                 <span className="text-slate-300">·</span>

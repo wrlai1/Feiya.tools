@@ -33,25 +33,26 @@ export function findAdditionalSizeMappings({
   targetEntry,
 }) {
   const source = unmatchedRows[sourceIndex]
-  if (!source || source.packCount > 1 || !canReuseAcrossSizes(source.parseIssue)) return []
+  if (!source || source.packCount > 1) return []
 
   const sourceStyle = normalizeStyleIdentity(source.style)
   const sourceColor = sourceColorKey(source.color)
+  const sourceSize = normalizeSize(source.size)
   const targetStyle = normalizeStyleIdentity(targetEntry.STYLE)
   const targetColor = normalizeColor(targetEntry.COLOR)
-  if (normalizeSize(targetEntry.SIZE) !== normalizeSize(source.size)) return []
+  if (normalizeSize(targetEntry.SIZE) !== sourceSize) return []
 
   return unmatchedRows.flatMap((row, index) => {
     if (
       index === sourceIndex
       || resolved[index]
       || row.packCount > 1
-      || row.parseIssue !== source.parseIssue
-      || !canReuseAcrossSizes(row.parseIssue)
     ) return []
     if (normalizeStyleIdentity(row.style) !== sourceStyle || sourceColorKey(row.color) !== sourceColor) return []
 
     const targetSize = normalizeSize(row.size)
+    if (targetSize === sourceSize) return [{ index, entry: targetEntry }]
+    if (row.parseIssue !== source.parseIssue || !canReuseAcrossSizes(source.parseIssue) || !canReuseAcrossSizes(row.parseIssue)) return []
     const entry = templateRows.find((candidate) =>
       normalizeStyleIdentity(candidate.STYLE) === targetStyle &&
       normalizeColor(candidate.COLOR) === targetColor &&
