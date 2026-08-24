@@ -6,7 +6,6 @@ import Layout from './components/Layout.jsx'
 import LoginPage from './pages/LoginPage.jsx'
 import Dashboard from './pages/Dashboard.jsx'
 import InventoryCheck from './pages/InventoryCheck.jsx'
-import TrackingPage from './pages/TrackingPage.jsx'
 import NotesPage from './pages/NotesPage.jsx'
 import StockManagement from './pages/StockManagement.jsx'
 import AutoDeduct from './pages/AutoDeduct.jsx'
@@ -52,12 +51,12 @@ function RequireAuth({ children }) {
   return children
 }
 
-// Admin-only gate — regular users are redirected to /tracking
+// Admin-only gate — regular users are redirected to their operations workspace.
 function RequireAdmin({ children }) {
   const { user } = useAuth()
   const location = useLocation()
   if (import.meta.env.DEV && new URLSearchParams(location.search).get('mock') === '1') return children
-  if (user?.role !== 'admin') return <Navigate to="/tracking" replace />
+  if (user?.role !== 'admin') return <Navigate to="/returns" replace />
   return children
 }
 
@@ -65,7 +64,7 @@ function RequireAttendance({ children }) {
   const { user } = useAuth()
   const location = useLocation()
   if (import.meta.env.DEV && new URLSearchParams(location.search).get('mock') === '1') return children
-  if (user?.role !== 'admin' && !user?.attendanceAccess) return <Navigate to="/tracking" replace />
+  if (user?.role !== 'admin' && !user?.attendanceAccess) return <Navigate to="/returns" replace />
   return children
 }
 
@@ -74,7 +73,7 @@ function RequirePermission({ permission, children }) {
   const location = useLocation()
   if (import.meta.env.DEV && new URLSearchParams(location.search).get('mock') === '1') return children
   if (!userHasPermission(user, permission)) {
-    return <Navigate to={user?.attendanceAccess ? '/attendance' : '/tracking'} replace />
+    return <Navigate to={user?.attendanceAccess ? '/attendance' : '/returns'} replace />
   }
   return children
 }
@@ -91,7 +90,7 @@ function RequireGeneralAccess({ children }) {
 function GuestOnly({ children }) {
   const { user, loading } = useAuth()
   if (loading) return <SplashLoader />
-  if (user) return <Navigate to={user.role === 'admin' ? '/' : user.attendanceAccess ? '/attendance' : '/tracking'} replace />
+  if (user) return <Navigate to={user.role === 'admin' ? '/' : user.attendanceAccess ? '/attendance' : '/returns'} replace />
   return children
 }
 
@@ -105,7 +104,7 @@ function AppRoutes() {
       <Route path="/" element={<RequireAuth><Layout /></RequireAuth>}>
         <Route index element={<RequireAdmin><Dashboard /></RequireAdmin>} />
         <Route path="inventory" element={<RequirePermission permission={INVENTORY_CHECK_VIEW}><InventoryCheck /></RequirePermission>} />
-        <Route path="tracking" element={<RequireGeneralAccess><TrackingPage /></RequireGeneralAccess>} />
+        <Route path="tracking" element={<Navigate to="/returns" replace />} />
         <Route path="notes" element={<RequireGeneralAccess><NotesPage /></RequireGeneralAccess>} />
         <Route path="stock" element={<RequireAdmin><StockManagement /></RequireAdmin>} />
         <Route path="auto-deduct" element={<RequireAdmin><AutoDeduct /></RequireAdmin>} />

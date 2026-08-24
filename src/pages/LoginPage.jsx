@@ -19,7 +19,7 @@ export default function LoginPage() {
     setLoading(true)
     try {
       const user = await login(username.trim(), password)
-      navigate(user.role === 'admin' ? '/' : user.attendanceAccess ? '/attendance' : '/tracking', { replace: true })
+      navigate(user.role === 'admin' ? '/' : user.attendanceAccess ? '/attendance' : '/returns', { replace: true })
     } catch (err) {
       setError(err.message)
     } finally {

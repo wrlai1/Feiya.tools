@@ -7,7 +7,6 @@ import ActionCenter from './ActionCenter.jsx'
 const PAGE_TITLES = {
   '/':             'Dashboard',
   '/inventory':    'Inventory Check',
-  '/tracking':     'Tracking',
   '/notes':        'Low Inventory Notes',
   '/stock':        'Stock Management',
   '/auto-deduct':  'Auto Deduct',
@@ -25,7 +24,6 @@ const PAGE_TITLES = {
 const PAGE_DESCRIPTIONS = {
   '/': 'Your daily operations at a glance',
   '/inventory': 'Review and validate inventory data',
-  '/tracking': 'Follow shipments and warehouse progress',
   '/notes': 'Keep low-stock actions organized',
   '/stock': 'Manage available stock and adjustments',
   '/auto-deduct': 'Run and review inventory deductions',

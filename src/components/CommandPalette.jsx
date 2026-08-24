@@ -14,7 +14,6 @@ import {
   Rocket,
   Search,
   ScanLine,
-  Truck,
   Users,
   X,
 } from 'lucide-react'
@@ -26,7 +25,6 @@ const { INVENTORY_CHECK_VIEW, userHasPermission } = userPermissions
 const ROUTES = [
   { label: 'Dashboard', path: '/', icon: LayoutDashboard, adminOnly: true },
   { label: 'Inventory Check', path: '/inventory', icon: Package, permission: INVENTORY_CHECK_VIEW },
-  { label: 'Tracking', path: '/tracking', icon: Truck },
   { label: 'Low Inventory Notes', path: '/notes', icon: MessageSquare },
   { label: 'Stock Management', path: '/stock', icon: Boxes, adminOnly: true },
   { label: 'Auto Deduct', path: '/auto-deduct', icon: Minus, adminOnly: true },

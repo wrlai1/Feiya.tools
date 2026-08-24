@@ -1,7 +1,7 @@
 import React, { useState } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
 import {
-  LayoutDashboard, Package, Truck, MessageSquare,
+  LayoutDashboard, Package, MessageSquare,
   Boxes, Minus, X, Users, LogOut, KeyRound, ShieldCheck, User, Clock,
   ClipboardList, BarChart3, Rocket,
   ScanLine, CalendarCheck,
@@ -24,7 +24,6 @@ const ADMIN_GROUPS = [
     theme: 'operations',
     items: [
       { label: 'Inventory Check', to: '/inventory', icon: Package },
-      { label: 'Tracking', to: '/tracking', icon: Truck },
       { label: 'Low Inventory Notes', to: '/notes', icon: MessageSquare },
       { label: 'Stock Management', to: '/stock', icon: Boxes },
       { label: 'Auto Deduct', to: '/auto-deduct', icon: Minus, end: true },
@@ -57,7 +56,6 @@ const USER_GROUPS = [
     theme: 'operations',
     items: [
       { label: 'Inventory Check', to: '/inventory', icon: Package, permission: INVENTORY_CHECK_VIEW },
-      { label: 'Tracking', to: '/tracking', icon: Truck },
       { label: 'Returns Receiving', to: '/returns', icon: ScanLine },
       { label: 'Low Inventory Notes', to: '/notes', icon: MessageSquare },
     ],
