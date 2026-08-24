@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1">
+<title>Feiya 库存</title>
+<link rel="manifest" href="/m/manifest.webmanifest">
+<meta name="theme-color" content="#2563eb">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Feiya 库存">
+<link rel="apple-touch-icon" href="/m/apple-touch-icon.png">
+<style>
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+       background:#f1f5f9;color:#0f172a;-webkit-font-smoothing:antialiased}
+  .hide{display:none!important}
+
+  /* 顶栏 */
+  header{position:sticky;top:0;z-index:10;background:#2563eb;color:#fff;
+         padding:calc(env(safe-area-inset-top) + 12px) 14px 10px}
+  .bar{display:flex;align-items:center;gap:10px}
+  .bar h1{font-size:17px;margin:0;font-weight:700;flex:1}
+  .status{font-size:11px;opacity:.9;display:flex;align-items:center;gap:5px;margin-top:6px}
+  .dot{width:7px;height:7px;border-radius:50%;background:#4ade80;flex:none}
+  .dot.off{background:#fbbf24}
+  .iconbtn{background:rgba(255,255,255,.18);border:0;color:#fff;width:36px;height:36px;
+           border-radius:10px;font-size:16px;flex:none}
+  .iconbtn:active{background:rgba(255,255,255,.32)}
+  .iconbtn:disabled{opacity:.5}
+
+  /* 搜索 */
+  .searchwrap{padding:10px 14px 8px;background:#2563eb}
+  #q{width:100%;padding:13px 14px;font-size:17px;border:0;border-radius:12px;
+     background:#fff;color:#0f172a}
+  #q:focus{outline:2px solid #93c5fd}
+  .chips{display:flex;gap:6px;overflow-x:auto;padding:8px 14px;background:#fff;
+         border-bottom:1px solid #e2e8f0;scrollbar-width:none}
+  .chips::-webkit-scrollbar{display:none}
+  .chip{flex:none;padding:6px 12px;border-radius:999px;border:1px solid #cbd5e1;
+        background:#fff;color:#475569;font-size:13px;white-space:nowrap}
+  .chip.on{background:#eff6ff;border-color:#93c5fd;color:#1d4ed8;font-weight:600}
+
+  /* 结果 */
+  main{padding:10px 12px calc(env(safe-area-inset-bottom) + 24px)}
+  .meta{font-size:12px;color:#64748b;padding:4px 4px 10px}
+  .card{background:#fff;border-radius:14px;padding:13px 14px;margin-bottom:9px;
+        box-shadow:0 1px 2px rgba(15,23,42,.07)}
+  .row1{display:flex;align-items:flex-start;gap:10px;margin-bottom:9px}
+  .rack{background:#f5f3ff;color:#6d28d9;font-weight:800;font-size:16px;
+        padding:7px 11px;border-radius:10px;flex:none;letter-spacing:.3px}
+  .rack.none{background:#f1f5f9;color:#94a3b8;font-weight:600;font-size:13px}
+  .titles{flex:1;min-width:0}
+  .style{font-size:16px;font-weight:700;word-break:break-word}
+  .color{font-size:13px;color:#64748b;margin-top:2px;word-break:break-word}
+  .nums{display:flex;gap:20px;border-top:1px solid #f1f5f9;padding-top:9px}
+  .num b{display:block;font-size:19px;font-weight:800;line-height:1.15}
+  .num span{font-size:11px;color:#94a3b8}
+  .sheet{font-size:10px;color:#64748b;background:#f1f5f9;padding:3px 7px;
+         border-radius:6px;margin-left:auto;align-self:center}
+  .extra{font-size:12px;color:#64748b;margin-top:8px;padding-top:8px;
+         border-top:1px solid #f1f5f9;word-break:break-word}
+  .empty{text-align:center;color:#94a3b8;padding:56px 20px;font-size:15px;line-height:1.7}
+
+  /* 登录 */
+  #login{padding:56px 24px;max-width:400px;margin:0 auto}
+  #login h2{font-size:21px;margin:0 0 6px}
+  #login p{color:#64748b;font-size:14px;margin:0 0 26px}
+  #login input{width:100%;padding:14px;font-size:16px;border:1px solid #cbd5e1;
+               border-radius:11px;margin-bottom:11px;background:#fff}
+  #login button{width:100%;padding:14px;font-size:16px;font-weight:600;background:#2563eb;
+                color:#fff;border:0;border-radius:11px}
+  #login button:disabled{opacity:.6}
+  .err{color:#dc2626;font-size:13px;margin-top:12px;min-height:18px}
+  .banner{background:#fef3c7;color:#92400e;font-size:12px;padding:9px 14px;text-align:center}
+</style>
+</head>
+<body>
+
+<div id="login" class="hide">
+  <h2>Feiya 库存</h2>
+  <p>登录一次即可，之后离线也能查库</p>
+  <input id="u" placeholder="用户名" autocapitalize="off" autocorrect="off" autocomplete="username">
+  <input id="p" type="password" placeholder="密码" autocomplete="current-password">
+  <button id="loginBtn">登录</button>
+  <div class="err" id="loginErr"></div>
+</div>
+
+<div id="app" class="hide">
+  <header>
+    <div class="bar">
+      <h1>库存查询</h1>
+      <button class="iconbtn" id="sync" title="同步">⟳</button>
+      <button class="iconbtn" id="out" title="退出">⏻</button>
+    </div>
+    <div class="status"><span class="dot" id="dot"></span><span id="statusText">—</span></div>
+    <div class="searchwrap">
+      <input id="q" placeholder="搜款号 / 颜色 / 库位…" autocapitalize="off" autocorrect="off" enterkeyhint="search">
+    </div>
+  </header>
+  <div class="chips" id="chips"></div>
+  <div class="banner hide" id="banner"></div>
+  <main>
+    <div class="meta" id="meta"></div>
+    <div id="results"></div>
+  </main>
+</div>
+
+<script>
+(() => {
+  'use strict'
+  const TOKEN='feiya_m_token', CACHE='feiya_m_inv', LIMIT=100
+  const $=id=>document.getElementById(id)
+  let rows=[], sheet='全部', shown=LIMIT, cachedAt=null, srcUpdated=null
+
+  const token=()=>localStorage.getItem(TOKEN)
+  const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))
+
+  function ago(ts){
+    if(!ts) return '从未同步'
+    const s=Math.floor((Date.now()-ts)/1000)
+    if(s<60) return '刚刚同步'
+    if(s<3600) return `${Math.floor(s/60)} 分钟前同步`
+    if(s<86400) return `${Math.floor(s/3600)} 小时前同步`
+    return `${Math.floor(s/86400)} 天前同步`
+  }
+
+  // ── 缓存 ───────────────────────────────────────────────────────────────
+  function loadCache(){
+    try{
+      const c=JSON.parse(localStorage.getItem(CACHE)||'null')
+      if(c&&Array.isArray(c.rows)){ rows=c.rows; cachedAt=c.at; srcUpdated=c.updatedAt; return true }
+    }catch{}
+    return false
+  }
+  function saveCache(){
+    try{ localStorage.setItem(CACHE,JSON.stringify({rows,at:cachedAt,updatedAt:srcUpdated})) }
+    catch(e){ note('数据太大，本地只保留部分缓存') }
+  }
+
+  // ── 同步 ───────────────────────────────────────────────────────────────
+  async function sync(manual){
+    if(!navigator.onLine){ if(manual) note('当前离线，显示的是上次同步的数据'); render(); return }
+    $('sync').disabled=true; $('statusText').textContent='同步中…'
+    try{
+      const r=await fetch('/api/app-data?type=inventory',{headers:{Authorization:'Bearer '+token()}})
+      if(r.status===401){ logout(); return }
+      if(!r.ok) throw new Error('HTTP '+r.status)
+      const d=await r.json()
+      rows=Array.isArray(d.rows)?d.rows:[]
+      srcUpdated=d.updatedAt||null; cachedAt=Date.now()
+      saveCache(); note('')
+    }catch(e){
+      note('同步失败，显示上次数据 · '+e.message)
+    }finally{ $('sync').disabled=false; render() }
+  }
+
+  function note(msg){
+    const b=$('banner')
+    b.textContent=msg||''
+    b.classList.toggle('hide',!msg)
+  }
+
+  // ── 渲染 ───────────────────────────────────────────────────────────────
+  function sheets(){
+    return ['全部',...[...new Set(rows.map(r=>r.sheet).filter(Boolean))]]
+  }
+  function drawChips(){
+    const list=sheets()
+    if(list.length<=2){ $('chips').classList.add('hide'); return }
+    $('chips').classList.remove('hide')
+    $('chips').innerHTML=list.map(s=>
+      `<button class="chip${s===sheet?' on':''}" data-s="${esc(s)}">${esc(s)}</button>`).join('')
+  }
+  function match(r,terms){
+    const hay=[r.rack,r.style,r.color,r.qty,r.box,r.sizes,r.fabric,r.label,r.company,r.customer,r.po,r.remark]
+      .join(' ').toLowerCase()
+    return terms.every(t=>hay.includes(t))
+  }
+  function render(){
+    const terms=$('q').value.trim().toLowerCase().split(/\s+/).filter(Boolean)
+    let list=sheet==='全部'?rows:rows.filter(r=>r.sheet===sheet)
+    if(terms.length) list=list.filter(r=>match(r,terms))
+
+    $('dot').className='dot'+(navigator.onLine?'':' off')
+    $('statusText').textContent=(navigator.onLine?'在线 · ':'离线 · ')+ago(cachedAt)
+
+    const total=list.length
+    $('meta').textContent=rows.length
+      ? `${total.toLocaleString()} 条${terms.length?'（已筛选）':''}${total>shown?` · 显示前 ${shown}`:''}`
+      : ''
+
+    if(!rows.length){
+      $('results').innerHTML=`<div class="empty">还没有数据${navigator.onLine?'<br>点右上角 ⟳ 同步':'<br>联网后点 ⟳ 同步'}</div>`
+      return
+    }
+    if(!total){ $('results').innerHTML=`<div class="empty">没找到匹配的库存<br><span style="font-size:13px">换个款号或颜色试试</span></div>`; return }
+
+    const html=list.slice(0,shown).map(r=>{
+      const rack=r.rack?`<div class="rack">${esc(r.rack)}</div>`:`<div class="rack none">无库位</div>`
+      const extra=[r.sizes&&`尺码：${esc(r.sizes)}`,r.fabric&&`面料：${esc(r.fabric)}`,
+                   r.company&&`公司：${esc(r.company)}`,r.remark&&`备注：${esc(r.remark)}`]
+                  .filter(Boolean).join(' · ')
+      return `<div class="card">
+        <div class="row1">${rack}
+          <div class="titles">
+            <div class="style">${esc(r.style||r.po||'—')}</div>
+            ${r.color?`<div class="color">${esc(r.color)}</div>`:''}
+          </div>
+        </div>
+        <div class="nums">
+          <div class="num"><b>${r.qty!=null&&r.qty!==''?esc(r.qty):'—'}</b><span>数量</span></div>
+          <div class="num"><b>${r.box!=null&&r.box!==''?esc(r.box):'—'}</b><span>箱数</span></div>
+          ${r.sheet?`<div class="sheet">${esc(r.sheet)}</div>`:''}
+        </div>
+        ${extra?`<div class="extra">${extra}</div>`:''}
+      </div>`
+    }).join('')
+    const more=total>shown?`<button class="chip" id="more" style="width:100%;padding:12px;margin-top:4px">加载更多（还有 ${total-shown} 条）</button>`:''
+    $('results').innerHTML=html+more
+    const mb=$('more'); if(mb) mb.onclick=()=>{ shown+=LIMIT; render() }
+  }
+
+  // ── 登录/退出 ──────────────────────────────────────────────────────────
+  function showLogin(){ $('login').classList.remove('hide'); $('app').classList.add('hide') }
+  function showApp(){ $('login').classList.add('hide'); $('app').classList.remove('hide') }
+  function logout(){
+    localStorage.removeItem(TOKEN); localStorage.removeItem(CACHE)
+    rows=[]; cachedAt=null; showLogin()
+  }
+  async function login(){
+    const btn=$('loginBtn'), err=$('loginErr')
+    err.textContent=''; btn.disabled=true; btn.textContent='登录中…'
+    try{
+      const r=await fetch('/api/auth?action=login',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({username:$('u').value.trim(),password:$('p').value})
+      })
+      const d=await r.json().catch(()=>({}))
+      if(!r.ok) throw new Error(d.error||'登录失败')
+      localStorage.setItem(TOKEN,d.token)
+      showApp(); await sync(false)
+    }catch(e){
+      err.textContent=navigator.onLine?e.message:'离线状态无法登录，请先联网登录一次'
+    }finally{ btn.disabled=false; btn.textContent='登录' }
+  }
+
+  // ── 事件 ───────────────────────────────────────────────────────────────
+  $('loginBtn').onclick=login
+  $('p').onkeydown=e=>{ if(e.key==='Enter') login() }
+  $('sync').onclick=()=>sync(true)
+  $('out').onclick=()=>{ if(confirm('退出登录？离线缓存也会清除。')) logout() }
+  let t; $('q').oninput=()=>{ clearTimeout(t); t=setTimeout(()=>{shown=LIMIT;render()},130) }
+  $('chips').onclick=e=>{ const b=e.target.closest('.chip'); if(!b||!b.dataset.s) return
+    sheet=b.dataset.s; shown=LIMIT; drawChips(); render() }
+  addEventListener('online',()=>{ render(); sync(false) })
+  addEventListener('offline',render)
+
+  // ── 启动：先显示缓存，再后台同步 ────────────────────────────────────────
+  if(!token()){ showLogin() }
+  else{
+    showApp(); loadCache(); drawChips(); render()
+    sync(false).then(drawChips)
+  }
+  if('serviceWorker' in navigator) addEventListener('load',()=>
+    navigator.serviceWorker.register('/m/sw.js',{scope:'/m/'}).catch(()=>{}))
+})()
+</script>
+</body>
+</html>
