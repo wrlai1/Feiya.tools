@@ -6,10 +6,16 @@ import {
   calculateResolvedSourceUnits,
   countSkippedUnits,
   fillTemplate,
+  reviewAliasKey,
 } from '../src/utils/autoDeductEngine.js'
-import { summarizeReturnInspection } from '../src/utils/returnInspection.js'
+import {
+  groupReturnProducts,
+  hasCompleteInventoryMapping,
+  summarizeReturnInspection,
+} from '../src/utils/returnInspection.js'
 import { consolidateRows } from '../src/utils/consolidateEngine.js'
 import { findAdditionalComboSizeMappings, findAdditionalSizeMappings } from '../src/utils/autoDeductRules.js'
+import { inventoryRestoreMode, inventoryRestoreUsesQuantities } from '../src/utils/inventoryRestoreMode.js'
 import {
   applyProductCatalogMapping,
   applyReturnOrderMatch,
@@ -115,6 +121,64 @@ test('return inspection supports mixed set outcomes and rejects over-counting', 
   )
 })
 
+test('return inspection records missing set pieces without adding them to inventory', () => {
+  const missingPiece = summarizeReturnInspection([
+    { expectedQty: 4, goodQty: 3, damagedQty: 0, notOursQty: 0 },
+  ])
+
+  assert.deepEqual({
+    status: missingPiece.status,
+    expected: missingPiece.expectedUnits,
+    categorized: missingPiece.categorizedUnits,
+    missing: missingPiece.missingUnits,
+    actual: missingPiece.actualUnits,
+    restock: missingPiece.restockUnits,
+  }, {
+    status: 'discrepancy',
+    expected: 4,
+    categorized: 3,
+    missing: 1,
+    actual: 3,
+    restock: 3,
+  })
+})
+
+test('return workers see one sold set while inventory keeps every physical piece', () => {
+  const products = groupReturnProducts([
+    { sku_id: 'SET-3', sku_code: 'SET3M', expected_qty: 1, source_qty: 1 },
+    { sku_id: 'SET-3', sku_code: 'SET3M', expected_qty: 1, source_qty: 1 },
+    { sku_id: 'SET-3', sku_code: 'SET3M', expected_qty: 1, source_qty: 1 },
+  ])
+
+  assert.deepEqual(products, [{
+    key: 'SET-3\u241fSET3M',
+    skuId: 'SET-3',
+    skuCode: 'SET3M',
+    productQty: 1,
+    inventoryPieces: 3,
+    inventoryLines: 3,
+    mappingPending: false,
+  }])
+})
+
+test('unresolved return products keep sold quantity for worker review', () => {
+  const products = groupReturnProducts([], [{
+    skuId: 'UNKNOWN-SET',
+    skuCode: 'UNKNOWN3M',
+    quantity: 2,
+  }])
+
+  assert.deepEqual(products, [{
+    key: 'UNKNOWN-SET\u241fUNKNOWN3M',
+    skuId: 'UNKNOWN-SET',
+    skuCode: 'UNKNOWN3M',
+    productQty: 2,
+    inventoryPieces: null,
+    inventoryLines: 0,
+    mappingPending: true,
+  }])
+})
+
 test('Admin item resolution preserves already identified return items', () => {
   const items = mergeReturnPackageItems([
     {
@@ -185,6 +249,16 @@ test('admin return combinations keep multiple inventory targets and merge duplic
     { style: '62300SET', color: 'BLACK', size: '1X', qty: 3 },
     { style: '62300SET', color: 'DENIM', size: '1X', qty: 1 },
   ])
+})
+
+test('order items without a SKU ID become selectable after a complete inventory mapping', () => {
+  assert.equal(hasCompleteInventoryMapping([]), false)
+  assert.equal(hasCompleteInventoryMapping([
+    { style: '0015', color: 'Lavender', size: '', qty: 1 },
+  ]), false)
+  assert.equal(hasCompleteInventoryMapping([
+    { style: '0015', color: 'Lavender', size: 'M', qty: 1 },
+  ]), true)
 })
 
 test('petite sales sizes are shifted exactly once', () => {
@@ -275,6 +349,43 @@ test('confirmed unknown sets update the protected physical-unit source total', (
     _isCombo: true,
     _source: { originalPackCount: 3, packCount: 3 },
   }]), 10)
+})
+
+test('auto-mapped combo siblings use component units in the protected source total', () => {
+  const componentsForSize = (size) => ['BLACK', 'WHITE', 'NAVY', 'RED'].map((color) => ({
+    STYLE: '62300',
+    COLOR: color,
+    SIZE: size,
+    multiplier: 1,
+  }))
+
+  assert.equal(calculateResolvedSourceUnits(5, [
+    {
+      QTY: 2,
+      _isCombo: true,
+      components: componentsForSize('S'),
+      _source: { originalPackCount: 1, packCount: 4 },
+    },
+    {
+      QTY: 3,
+      _isCombo: true,
+      components: componentsForSize('M'),
+      _source: { originalPackCount: 1, packCount: null },
+    },
+  ]), 20)
+})
+
+test('inventory history keeps daily rollbacks quantity-only and reserves full restore for replacements', () => {
+  for (const label of ['sales', 'return', 'adjustment', 'pre_reset', 'pre_remove']) {
+    assert.equal(inventoryRestoreMode(label), 'quantities')
+  }
+  assert.equal(inventoryRestoreMode('pre_init'), 'full')
+  assert.equal(inventoryRestoreMode('pre_replace'), 'full')
+  assert.equal(inventoryRestoreUsesQuantities('sales'), true)
+  assert.equal(inventoryRestoreUsesQuantities('pre_remove'), true)
+  assert.equal(inventoryRestoreUsesQuantities('pre_init'), false)
+  assert.equal(inventoryRestoreUsesQuantities('pre_replace'), false)
+  assert.equal(inventoryRestoreUsesQuantities('pre_init', 'quantities'), true)
 })
 
 test('explicit ampersand color combinations split for any style', () => {
@@ -572,6 +683,7 @@ test('confirmed style and color rule stops when target size does not exist', () 
 
   assert.equal(result.filledRows.reduce((sum, row) => sum + row.QTY, 0), 0)
   assert.equal(result.unmatchedRows[0].parseIssue, 'confirmed_mapping_size_missing')
+  assert.equal(result.unmatchedRows[0].sourceIssue, undefined)
 })
 
 test('remembered new mapping reuses the unique normalized inventory target', () => {
@@ -694,6 +806,61 @@ test('learned mapping cannot bypass a source parsing warning', () => {
   assert.equal(result.unmatchedRows[0].parseIssue, 'ambiguous_style')
 })
 
+test('a reviewed dimension is reused across source signatures without bypassing a missing target', () => {
+  const firstSource = consolidateRows([{
+    SKU: 'A100BlackS',
+    'Product Attribute': 'Black / M',
+    Quantity: 2,
+  }]).consolidated[0]
+  assert.equal(firstSource.parse_issue, 'sku_attribute_size_conflict')
+  assert.ok(firstSource.source_signature)
+
+  const aliases = {
+    [reviewAliasKey(
+      firstSource.style,
+      firstSource.color,
+      firstSource.size,
+      firstSource.source_signature,
+      firstSource.parse_issue,
+    )]: {
+      STYLE: 'A100',
+      COLOR: 'BLACK',
+      SIZE: 'S',
+      _confirmed: true,
+      _sourceSignature: firstSource.source_signature,
+      _confirmedIssues: firstSource.parse_issue,
+    },
+  }
+  const remembered = fillTemplate([
+    { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S' },
+  ], [firstSource], aliases)
+
+  assert.deepEqual(
+    remembered.filledRows.filter((row) => row.QTY),
+    [{ STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S', QTY: 2 }],
+  )
+  assert.equal(remembered.unmatchedRows.length, 0)
+
+  const changedSource = consolidateRows([{
+    SKU: 'A100BlackS',
+    'Product Attribute': 'Black / L',
+    Quantity: 2,
+  }]).consolidated[0]
+  const reused = fillTemplate([
+    { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S' },
+  ], [changedSource], aliases)
+
+  assert.deepEqual(
+    reused.filledRows.filter((row) => row.QTY),
+    [{ STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S', QTY: 2 }],
+  )
+  assert.equal(reused.unmatchedRows.length, 0)
+
+  const missingTarget = fillTemplate([], [firstSource], aliases)
+  assert.equal(missingTarget.unmatchedRows[0].parseIssue, 'confirmed_mapping_size_missing')
+  assert.equal(missingTarget.unmatchedRows[0].sourceIssue, 'sku_attribute_size_conflict')
+})
+
 test('invalid source quantities stop the run instead of being partially parsed', () => {
   assert.throws(
     () => fillTemplate(
@@ -706,6 +873,29 @@ test('invalid source quantities stop the run instead of being partially parsed',
     () => consolidateRows([{ SKU: 'A100BlackS', Quantity: 'one' }]),
     /数量无效/,
   )
+})
+
+test('sales movements retain order business days after consolidation and matching', () => {
+  const sales = consolidateRows([
+    { SKU: 'A100BlackS', Quantity: 2, '订单创建时间': '2026-07-27 10:00:00' },
+    { SKU: 'A100BlackS', Quantity: 3, '订单创建时间': '2026-07-28 11:00:00' },
+    { SKU: 'A100BlackS', Quantity: 4, '订单创建时间': '2026-07-29T23:30:00-04:00' },
+  ]).consolidated
+  assert.deepEqual(sales.map((row) => [row.QTY, row.business_day]), [
+    [2, '2026-07-27'],
+    [3, '2026-07-28'],
+    [4, '2026-07-29'],
+  ])
+
+  const result = fillTemplate([
+    { STYLE: 'A100', COLOR: 'black', SIZE: 'S' },
+  ], sales)
+  assert.equal(result.filledRows[0].QTY, 9)
+  assert.deepEqual(result.matchLog.map((row) => [row.qty, row.businessDay]), [
+    [2, '2026-07-27'],
+    [3, '2026-07-28'],
+    [4, '2026-07-29'],
+  ])
 })
 
 test('apply resolves inventory capitalization without changing SKU identity', () => {
@@ -1316,6 +1506,41 @@ test('a single-SKU order safely fills a missing return SKU without a selection',
   assert.equal(result.packages[0].items[0].skuId, 'SKU-ONLY')
 })
 
+test('a missing manifest SKU reuses the unique catalog mapping embedded in All Stores history', () => {
+  const result = parseSkuReturnManifestRows([{
+    '订单号 PO': 'PO-ALL-STORES',
+    'SKU ID': '',
+    '运单号 Tracking Number': 'RETURN-ALL-STORES',
+  }], [], [{
+    order_number: 'PO-ALL-STORES',
+    store_name: 'All Stores',
+    store_key: 'all stores',
+    items: [{
+      id: 12,
+      sku_id: 'SKU-HOUSE-ONLY',
+      sku_code: 'A100BlackM',
+      quantity: 2,
+      catalog_status: 'ready',
+      catalog_store_name: 'House',
+      catalog_store_key: 'house',
+      catalog_components: [{ style: 'A100', color: 'Black', size: 'M', qty: 1 }],
+    }],
+  }])
+
+  assert.equal(result.needsReview.length, 0)
+  assert.equal(result.reviewPackages.length, 0)
+  assert.equal(result.packages[0].storeName, 'House')
+  assert.deepEqual(result.packages[0].items, [{
+    skuId: 'SKU-HOUSE-ONLY',
+    skuCode: 'A100BlackM',
+    style: 'A100',
+    color: 'Black',
+    size: 'M',
+    expectedQty: 2,
+    sourceQty: 2,
+  }])
+})
+
 test('missing return SKU stays in review when its order history is unavailable', () => {
   const result = parseSkuReturnManifestRows([{
     '订单号 PO': 'PO-NOT-UPLOADED',
@@ -1349,6 +1574,32 @@ test('a confirmed style and color safely carries to sibling sizes during review'
     index: 1,
     entry: { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'M' },
   }])
+})
+
+test('a source-data conflict is never propagated to sibling sizes through a generated review reason', () => {
+  const mappings = findAdditionalSizeMappings({
+    unmatchedRows: [
+      {
+        style: 'A100', color: 'Black', size: 'S', packCount: 1,
+        parseIssue: 'confirmed_mapping_size_missing',
+        sourceIssue: 'sku_attribute_size_conflict',
+      },
+      {
+        style: 'A100', color: 'Black', size: 'M', packCount: 1,
+        parseIssue: 'confirmed_mapping_size_missing',
+        sourceIssue: 'sku_attribute_size_conflict',
+      },
+    ],
+    templateRows: [
+      { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S' },
+      { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'M' },
+    ],
+    resolved: [null, null],
+    sourceIndex: 0,
+    targetEntry: { STYLE: 'A100', COLOR: 'BLACK', SIZE: 'S' },
+  })
+
+  assert.deepEqual(mappings, [])
 })
 
 test('a confirmed combo selection carries all components to sibling sizes', () => {

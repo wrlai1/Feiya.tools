@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { AlertTriangle, ArrowLeft, CheckCircle, History, Minus, RefreshCw, RotateCcw, TrendingUp } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import { useToast } from '../hooks/useToast.js'
+import { inventoryRestoreMode } from '../utils/inventoryRestoreMode.js'
 
 function formatDate(value) {
   if (!value) return '—'
@@ -61,7 +62,8 @@ export default function AutoDeductHistory() {
     setRestoring(snapshot.id)
     setError('')
     try {
-      const res = await fetch(`/api/inventory-balance?action=restore&id=${snapshot.id}&mode=quantities`, {
+      const mode = inventoryRestoreMode(snapshot.label)
+      const res = await fetch(`/api/inventory-balance?action=restore&id=${snapshot.id}&mode=${mode}`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${getToken()}` },
       })

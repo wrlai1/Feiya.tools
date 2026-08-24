@@ -515,10 +515,10 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
         const candidates = historicalOrder.items.flatMap((orderItem, itemIndex) => {
           const recoveredSkuId = String(orderItem.sku_id || orderItem.skuId || '').trim()
           const recoveredQuantity = Number(orderItem.quantity)
-          const {
-            product,
-            issue: productIssue,
-          } = resolvedCatalogProduct(catalog, recoveredSkuId)
+          const catalogResolution = resolvedCatalogProduct(catalog, recoveredSkuId)
+          const product = catalogResolution.product
+            || catalogProductFromOrderItem(orderItem, recoveredSkuId)
+          const productIssue = product ? '' : catalogResolution.issue
           if (explicitSkuIdsByTracking.get(tracking)?.has(recoveredSkuId)) return []
           let issue = ''
           if (!recoveredSkuId) {

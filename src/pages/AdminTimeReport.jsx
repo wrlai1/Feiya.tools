@@ -5,8 +5,9 @@ import {
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import {
-  calcHours, formatHours, filterToday, filterThisWeek,
-  groupByUser, isMissedPunch, getStatus, STATUS_LABEL, PUNCH_LABEL,
+  calcHours, calcHoursInRange, formatHours, filterToday, filterThisWeek,
+  groupByUser, isMissedPunch, getStatus, toLocalDateTimeInput,
+  STATUS_LABEL, PUNCH_LABEL,
 } from '../utils/timeCalc.js'
 
 const BASE = '/api'
@@ -42,7 +43,7 @@ function StatusBadge({ status }) {
 /* ── Inline edit for a single punch ──────────────────────────────────── */
 function PunchRow({ punch, token, onUpdated, onDeleted }) {
   const [editing, setEditing] = useState(false)
-  const [val, setVal]         = useState(punch.punched_at?.slice(0, 16) ?? '')
+  const [val, setVal]         = useState(toLocalDateTimeInput(punch.punched_at))
   const [note, setNote]       = useState(punch.note ?? '')
   const [saving, setSaving]   = useState(false)
   const [err, setErr]         = useState(null)
@@ -258,7 +259,7 @@ function ResetModal({ token, onDone, onClose }) {
 }
 
 /* ── Export helpers ──────────────────────────────────────────────────── */
-function exportCSV(punches, from, to) {
+function exportCSV(punches, contextPunches, from, to) {
   const headers = ['Username', 'Type', 'Punched At', 'Note', 'Edited By', 'Original Time']
   const rows = punches.map(p => [
     p.username,
@@ -270,10 +271,13 @@ function exportCSV(punches, from, to) {
   ])
 
   // Build summary rows per user
-  const byUser = groupByUser(punches)
+  const calculationPunches = [...(contextPunches || []), ...punches]
+  const byUser = groupByUser(calculationPunches)
+  const rangeStartMs = new Date(from).getTime()
+  const rangeEndMs = new Date(to).getTime()
   const summaryRows = Object.entries(byUser).map(([u, ps]) => ({
     username: u,
-    hours: calcHours(ps),
+    hours: calcHoursInRange(ps, rangeStartMs, rangeEndMs),
   }))
 
   let csv = 'PUNCH LOG EXPORT\n'
@@ -332,15 +336,15 @@ export default function AdminTimeReport() {
   const handleExport = async () => {
     setExporting(true)
     try {
-      const from = exportFrom ? new Date(exportFrom).toISOString() : periodStart
-      const to   = exportTo   ? new Date(exportTo + 'T23:59:59').toISOString() : new Date().toISOString()
+      const from = exportFrom ? new Date(`${exportFrom}T00:00:00`).toISOString() : periodStart
+      const to   = exportTo ? new Date(`${exportTo}T23:59:59.999`).toISOString() : new Date().toISOString()
       const params = new URLSearchParams({ action: 'export', from, to })
       const res  = await fetch(`${BASE}/timeclock?${params}`, {
         headers: authHeaders(getToken()),
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error)
-      exportCSV(data.punches, data.from, data.to)
+      exportCSV(data.punches || [], data.contextPunches || [], data.from, data.to)
     } catch (e) {
       setError(e.message)
     } finally {

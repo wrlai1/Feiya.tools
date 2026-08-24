@@ -113,3 +113,45 @@ test('equivalent plus-size labels share one replenishment identity', () => {
     replenishmentSkuKey({ style: 'm022 plus', color: 'BLACK', size: '1X' }),
   )
 })
+
+test('a new SKU uses its own sales history instead of an older SKU window', () => {
+  const inventoryRows = [
+    { Style: 'OLD', Color: 'BLACK', Size: 'M', Quantity: 100 },
+    { Style: 'NEW', Color: 'WHITE', Size: 'M', Quantity: 100 },
+  ]
+  const movements = [
+    {
+      txn_type: 'sales',
+      style: 'OLD',
+      color: 'BLACK',
+      size: 'M',
+      qty: 1,
+      day: '2026-07-01',
+    },
+    ...Array.from({ length: 5 }, (_, index) => ({
+      txn_type: 'sales',
+      style: 'NEW',
+      color: 'WHITE',
+      size: 'M',
+      qty: 10,
+      day: `2026-07-${26 + index}`,
+    })),
+  ]
+
+  const result = calculateReplenishmentPlan({
+    inventoryRows,
+    movements,
+    windowDays: 30,
+    today: '2026-07-30',
+  })
+  const oldSku = result.rows.find((row) => row.style === 'OLD')
+  const newSku = result.rows.find((row) => row.style === 'NEW')
+
+  assert.equal(result.meta.historySpanDays, 30)
+  assert.equal(oldSku.historySpanDays, 30)
+  assert.equal(newSku.historySpanDays, 5)
+  assert.equal(newSku.activeDayCount, 5)
+  assert.equal(newSku.confidence, 'low')
+  assert.equal(newSku.dailyNetSales, 10)
+  assert.equal(newSku.daysLeft, 10)
+})

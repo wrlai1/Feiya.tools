@@ -12,7 +12,9 @@
 //   POST ?action=apply           — log a deduction/return transaction
 
 import { neon } from '@neondatabase/serverless'
-import jwt from 'jsonwebtoken'
+import authentication from '../lib/authentication.cjs'
+
+const { authenticateUser } = authentication
 
 function getDB() {
   const url = process.env.DATABASE_URL
@@ -24,11 +26,6 @@ function getSecret() {
   const s = process.env.JWT_SECRET
   if (!s) throw new Error('JWT_SECRET not set')
   return s
-}
-
-function verifyToken(authHeader, secret) {
-  if (!authHeader?.startsWith('Bearer ')) return null
-  try { return jwt.verify(authHeader.slice(7), secret) } catch { return null }
 }
 
 async function ensureAppDataTable(sql) {
@@ -100,11 +97,13 @@ export default async function handler(req, res) {
   try {
     const sql    = getDB()
     const secret = getSecret()
-    const payload = verifyToken(req.headers.authorization, secret)
+    const payload = await authenticateUser(sql, req.headers.authorization, secret)
     if (!payload) return res.status(401).json({ error: 'Not authenticated' })
 
     const isAdmin = payload.role === 'admin'
     const action  = req.query.action
+
+    if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
 
     await ensureAppDataTable(sql)
 
@@ -203,10 +202,18 @@ export default async function handler(req, res) {
 
     // ── POST apply ──────────────────────────────────────────────────────────
     if (req.method === 'POST' && action === 'apply') {
+      if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
       await ensureDeductLogTable(sql)
       const { filledRows = [], txnType = 'sales', sourceName = '' } = req.body || {}
+      if (!Array.isArray(filledRows) || !['sales', 'return'].includes(txnType)) {
+        return res.status(400).json({ error: 'Valid filledRows and transaction type are required' })
+      }
+      const quantities = filledRows.map((row) => Number(row.QTY || 0))
+      if (quantities.some((quantity) => !Number.isSafeInteger(quantity) || quantity < 0)) {
+        return res.status(400).json({ error: 'Every quantity must be a whole number of 0 or more' })
+      }
       const rowCount  = filledRows.length
-      const totalQty  = filledRows.reduce((s, r) => s + (parseInt(r.QTY, 10) || 0), 0)
+      const totalQty = quantities.reduce((sum, quantity) => sum + quantity, 0)
 
       await sql`
         INSERT INTO deduct_log (txn_type, source_name, applied_by, row_count, total_qty)

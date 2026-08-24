@@ -51,16 +51,16 @@ export function fetchTracking() {
   return request(`${BASE}/app-data?type=tracking`)
 }
 
-export function saveTracking(data, fileName = null) {
+export function saveTracking(data, fileName = null, expectedRevision = 0) {
   return request(`${BASE}/app-data`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: 'tracking', data, fileName, updatedAt: new Date().toISOString() }),
+    body: JSON.stringify({ type: 'tracking', data, fileName, expectedRevision }),
   })
 }
 
-export function clearTracking() {
-  return request(`${BASE}/app-data?type=tracking`, { method: 'DELETE' })
+export function clearTracking(expectedRevision = 0) {
+  return request(`${BASE}/app-data?type=tracking&expectedRevision=${expectedRevision}`, { method: 'DELETE' })
 }
 
 // ─── Chat Messages ────────────────────────────────────────────────────────────
@@ -69,11 +69,11 @@ export function fetchMessages() {
   return request(`${BASE}/chat-messages`)
 }
 
-export function sendMessage(name, text) {
+export function sendMessage(text) {
   return request(`${BASE}/chat-messages`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, text }),
+    body: JSON.stringify({ text }),
   })
 }
 

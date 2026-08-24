@@ -17,14 +17,18 @@
 //   POST ?action=restore&id=N  — restore a snapshot (admin)
 
 import { neon } from '@neondatabase/serverless'
-import jwt from 'jsonwebtoken'
+import authentication from '../lib/authentication.cjs'
 import inventoryTargetResolution from '../lib/inventoryTargetResolution.cjs'
 import inventoryTransactionSafety from '../lib/inventoryTransactionSafety.cjs'
+import { inventoryRestoreMode, inventoryRestoreUsesQuantities } from '../src/utils/inventoryRestoreMode.js'
 
 const MAX_SNAPSHOTS = 20
+const { authenticateUser } = authentication
 const { resolveInventoryTargets } = inventoryTargetResolution
 const {
+  inventoryIdentity,
   normalizeInventoryQuantity,
+  normalizeInventoryRows,
   normalizeOrderClaims,
   orderClaimsToSqlRecords,
 } = inventoryTransactionSafety
@@ -39,14 +43,96 @@ function getSecret() {
   if (!s) throw new Error('JWT_SECRET not set')
   return s
 }
-function verifyToken(header, secret) {
-  if (!header?.startsWith('Bearer ')) return null
-  try { return jwt.verify(header.slice(7), secret) } catch { return null }
-}
-
 function normalizeStore(value) {
   const name = String(value || '').trim().replace(/\s+/g, ' ').slice(0, 100)
   return name ? { name, key: name.toLowerCase() } : { name: '', key: '' }
+}
+
+export function normalizeInventoryRowIds(rawIds) {
+  if (!Array.isArray(rawIds) || rawIds.length === 0) throw new Error('ids required')
+  const ids = rawIds.map(Number)
+  if (ids.some((id) => !Number.isSafeInteger(id) || id <= 0)) {
+    throw new Error('ids must contain positive whole-number inventory row IDs')
+  }
+  return [...new Set(ids)]
+}
+
+export function trimInventorySnapshots(sql) {
+  return sql`
+    DELETE FROM inventory_snapshots snapshots
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM inventory_transactions transactions
+      WHERE transactions.rolled_back_at IS NULL
+        AND transactions.rollback_snapshot_id = snapshots.id
+    )
+      AND snapshots.id NOT IN (
+        SELECT candidate.id
+        FROM inventory_snapshots candidate
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM inventory_transactions transactions
+          WHERE transactions.rolled_back_at IS NULL
+            AND transactions.rollback_snapshot_id = candidate.id
+        )
+        ORDER BY candidate.created_at DESC, candidate.id DESC
+        LIMIT ${MAX_SNAPSHOTS}
+      )
+  `
+}
+
+export function queryInventorySnapshotHistory(sql) {
+  return sql`
+    WITH active_transaction_snapshot_ids AS MATERIALIZED (
+      SELECT DISTINCT transactions.rollback_snapshot_id AS id
+      FROM inventory_transactions transactions
+      WHERE transactions.rolled_back_at IS NULL
+        AND transactions.rollback_snapshot_id IS NOT NULL
+    ),
+    recent_other_snapshot_ids AS MATERIALIZED (
+      SELECT snapshots.id
+      FROM inventory_snapshots snapshots
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM active_transaction_snapshot_ids active
+        WHERE active.id = snapshots.id
+      )
+      ORDER BY snapshots.created_at DESC, snapshots.id DESC
+      LIMIT ${MAX_SNAPSHOTS}
+    ),
+    visible_snapshot_ids AS (
+      SELECT id FROM active_transaction_snapshot_ids
+      UNION
+      SELECT id FROM recent_other_snapshot_ids
+    )
+    SELECT
+      snapshots.id,
+      snapshots.label,
+      snapshots.source_name,
+      snapshots.total_rows,
+      snapshots.total_units,
+      snapshots.created_at,
+      CASE
+        WHEN snapshots.label IN ('sales', 'return', 'adjustment') THEN EXISTS (
+          SELECT 1
+          FROM inventory_transactions transactions
+          WHERE transactions.rolled_back_at IS NULL
+            AND (
+              transactions.rollback_snapshot_id = snapshots.id
+              OR (
+                transactions.rollback_snapshot_id IS NULL
+                AND transactions.transaction_type = snapshots.label
+                AND transactions.source_file IS NOT DISTINCT FROM snapshots.source_name
+                AND transactions.applied_at >= snapshots.created_at
+              )
+            )
+        )
+        ELSE snapshots.label <> 'pre_restore'
+      END AS restorable
+    FROM inventory_snapshots snapshots
+    JOIN visible_snapshot_ids visible ON visible.id = snapshots.id
+    ORDER BY snapshots.created_at DESC, snapshots.id DESC
+  `
 }
 
 async function ensureTables(sql) {
@@ -83,6 +169,7 @@ async function ensureTables(sql) {
       qty         INTEGER NOT NULL,
       source_file TEXT,
       applied_by  TEXT,
+      business_day DATE,
       applied_at  TIMESTAMPTZ DEFAULT NOW()
     )
   `
@@ -101,6 +188,7 @@ async function ensureTables(sql) {
   await sql`ALTER TABLE inventory_txn_rows ADD COLUMN IF NOT EXISTS transaction_id INTEGER`
   await sql`ALTER TABLE inventory_txn_rows ADD COLUMN IF NOT EXISTS store_name TEXT`
   await sql`ALTER TABLE inventory_txn_rows ADD COLUMN IF NOT EXISTS store_key TEXT`
+  await sql`ALTER TABLE inventory_txn_rows ADD COLUMN IF NOT EXISTS business_day DATE`
   await sql`
     UPDATE inventory_txn_rows rows
     SET transaction_id = (
@@ -253,22 +341,6 @@ async function ensureTables(sql) {
   `
 }
 
-async function saveSnapshot(sql, label, sourceName = '') {
-  const rows = await sql`SELECT style, color, size, quantity, sort_order FROM inventory_balance ORDER BY sort_order NULLS LAST, id`
-  const totalUnits = rows.reduce((s, r) => s + (r.quantity || 0), 0)
-  await sql`
-    INSERT INTO inventory_snapshots (label, source_name, data, total_rows, total_units)
-    VALUES (${label}, ${sourceName}, ${JSON.stringify(rows)}::jsonb, ${rows.length}, ${totalUnits})
-  `
-  // Keep only the most recent MAX_SNAPSHOTS
-  await sql`
-    DELETE FROM inventory_snapshots
-    WHERE id NOT IN (
-      SELECT id FROM inventory_snapshots ORDER BY created_at DESC LIMIT ${MAX_SNAPSHOTS}
-    )
-  `
-}
-
 function formatRows(rows) {
   return rows.map(r => ({
     id:       r.id,
@@ -298,11 +370,13 @@ export default async function handler(req, res) {
   try {
     const sql     = getDB()
     const secret  = getSecret()
-    const payload = verifyToken(req.headers.authorization, secret)
+    const payload = await authenticateUser(sql, req.headers.authorization, secret)
     if (!payload) return res.status(401).json({ error: 'Not authenticated' })
 
     const isAdmin = payload.role === 'admin'
     const action  = req.query.action
+
+    if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
 
     await ensureTables(sql)
 
@@ -322,25 +396,37 @@ export default async function handler(req, res) {
       const { rows, sourceName = '' } = req.body || {}
       if (!Array.isArray(rows)) return res.status(400).json({ error: 'rows array required' })
 
-      await saveSnapshot(sql, 'pre_init', sourceName)
-      await sql`DELETE FROM inventory_balance`
-
-      for (const [i, r] of rows.entries()) {
-        const style      = String(r.Style || r.style || '').trim()
-        const color      = String(r.Color || r.color || '').trim()
-        const size       = String(r.Size  || r.size  || '').trim()
-        const qty        = parseInt(r.Quantity || r.quantity || 0, 10) || 0
-        const sort_order = r.SortOrder !== undefined ? parseInt(r.SortOrder, 10) : i
-        if (!style || !color || !size) continue
-        await sql`
-          INSERT INTO inventory_balance (style, color, size, quantity, sort_order)
-          VALUES (${style}, ${color}, ${size}, ${qty}, ${sort_order})
-          ON CONFLICT (style, color, size)
-          DO UPDATE SET quantity = EXCLUDED.quantity, sort_order = EXCLUDED.sort_order, updated_at = NOW()
-        `
+      let importRows
+      try {
+        importRows = normalizeInventoryRows(rows)
+      } catch (error) {
+        return res.status(400).json({ error: error.message })
       }
-
-      const [stat] = await sql`SELECT COUNT(*)::int AS c, COALESCE(SUM(quantity),0)::int AS u FROM inventory_balance`
+      const importJson = JSON.stringify(importRows)
+      const results = await sql.transaction((txn) => [
+        txn`SELECT pg_advisory_xact_lock(hashtext('inventory-balance-write'))`,
+        txn`
+          INSERT INTO inventory_snapshots (label, source_name, data, total_rows, total_units)
+          SELECT
+            'pre_init', ${String(sourceName || '').slice(0, 500)},
+            COALESCE(jsonb_agg(jsonb_build_object(
+              'style', style, 'color', color, 'size', size, 'quantity', quantity,
+              'sort_order', sort_order
+            ) ORDER BY sort_order NULLS LAST, id), '[]'::jsonb),
+            COUNT(*)::int, COALESCE(SUM(quantity), 0)::int
+          FROM inventory_balance
+        `,
+        txn`DELETE FROM inventory_balance`,
+        txn`
+          INSERT INTO inventory_balance (style, color, size, quantity, sort_order)
+          SELECT imported.style, imported.color, imported.size, imported.quantity, imported.sort_order
+          FROM jsonb_to_recordset(${importJson}::jsonb)
+            AS imported(style TEXT, color TEXT, size TEXT, quantity INTEGER, sort_order INTEGER)
+        `,
+        trimInventorySnapshots(txn),
+        txn`SELECT COUNT(*)::int AS c, COALESCE(SUM(quantity),0)::int AS u FROM inventory_balance`,
+      ], { isolationLevel: 'Serializable' })
+      const [stat] = results[results.length - 1]
       return res.json({ ok: true, total_rows: stat.c, total_units: stat.u })
     }
 
@@ -427,43 +513,114 @@ export default async function handler(req, res) {
       const { rows } = req.body || {}
       if (!Array.isArray(rows)) return res.status(400).json({ error: 'rows required' })
 
-      let added = 0
-      for (const r of rows) {
-        const style      = String(r.Style || r.style || '').trim()
-        const color      = String(r.Color || r.color || '').trim()
-        const size       = String(r.Size  || r.size  || '').trim()
-        const qty        = parseInt(r.Quantity || r.quantity || 0, 10) || 0
-        const sort_order = r.SortOrder !== undefined ? parseInt(r.SortOrder, 10) : null
-        if (!style || !color || !size) continue
-        const result = await sql`
-          INSERT INTO inventory_balance (style, color, size, quantity, sort_order)
-          VALUES (${style}, ${color}, ${size}, ${qty}, ${sort_order})
-          ON CONFLICT (style, color, size)
-          DO UPDATE SET sort_order = COALESCE(EXCLUDED.sort_order, inventory_balance.sort_order)
-          RETURNING id
-        `
-        if (result.length) added++
+      let importRows
+      try {
+        importRows = normalizeInventoryRows(rows, { defaultSortOrder: false })
+      } catch (error) {
+        return res.status(400).json({ error: error.message })
       }
-      return res.json({ ok: true, added })
+      const results = await sql.transaction((txn) => [
+        txn`SELECT pg_advisory_xact_lock(hashtext('inventory-balance-write'))`,
+        txn`
+          WITH incoming AS (
+            SELECT *
+            FROM jsonb_to_recordset(${JSON.stringify(importRows)}::jsonb)
+              AS imported(style TEXT, color TEXT, size TEXT, quantity INTEGER, sort_order INTEGER)
+          ),
+          new_rows AS (
+            SELECT incoming.*
+            FROM incoming
+            WHERE NOT EXISTS (
+              SELECT 1
+              FROM inventory_balance inventory
+              WHERE LOWER(BTRIM(inventory.style)) = LOWER(BTRIM(incoming.style))
+                AND LOWER(BTRIM(inventory.color)) = LOWER(BTRIM(incoming.color))
+                AND CASE UPPER(BTRIM(inventory.size))
+                      WHEN '1XL' THEN '1X' WHEN '2XL' THEN '2X' WHEN '3XL' THEN '3X'
+                      ELSE UPPER(BTRIM(inventory.size))
+                    END = CASE UPPER(BTRIM(incoming.size))
+                      WHEN '1XL' THEN '1X' WHEN '2XL' THEN '2X' WHEN '3XL' THEN '3X'
+                      ELSE UPPER(BTRIM(incoming.size))
+                    END
+            )
+          ),
+          inserted AS (
+            INSERT INTO inventory_balance (style, color, size, quantity, sort_order)
+            SELECT style, color, size, quantity, sort_order FROM new_rows
+            ON CONFLICT (style, color, size) DO NOTHING
+            RETURNING id
+          )
+          SELECT COUNT(*)::int AS added FROM inserted
+        `,
+      ], { isolationLevel: 'Serializable' })
+      const added = Number(results[1]?.[0]?.added || 0)
+      return res.json({ ok: true, added, skipped: importRows.length - added })
     }
 
     // ── DELETE remove-rows — delete by ids ────────────────────────────────────
     if (req.method === 'DELETE' && action === 'remove-rows') {
       if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
-      const { ids } = req.body || {}
-      if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids required' })
+      let ids
+      try {
+        ids = normalizeInventoryRowIds(req.body?.ids)
+      } catch (error) {
+        return res.status(400).json({ error: error.message })
+      }
 
-      await saveSnapshot(sql, 'pre_remove')
-      await sql`DELETE FROM inventory_balance WHERE id = ANY(${ids}::int[])`
-      return res.json({ ok: true, removed: ids.length })
+      const results = await sql.transaction((txn) => [
+        txn`SELECT pg_advisory_xact_lock(hashtext('inventory-balance-write'))`,
+        txn`
+          INSERT INTO inventory_snapshots (label, source_name, data, total_rows, total_units)
+          SELECT
+            'pre_remove', '',
+            COALESCE(jsonb_agg(jsonb_build_object(
+              'style', style, 'color', color, 'size', size, 'quantity', quantity,
+              'sort_order', sort_order
+            ) ORDER BY sort_order NULLS LAST, id), '[]'::jsonb),
+            COUNT(*)::int, COALESCE(SUM(quantity), 0)::int
+          FROM inventory_balance
+        `,
+        txn`
+          WITH deleted AS (
+            DELETE FROM inventory_balance
+            WHERE id = ANY(${ids}::int[])
+            RETURNING id
+          )
+          SELECT COUNT(*)::int AS removed FROM deleted
+        `,
+        trimInventorySnapshots(txn),
+      ], { isolationLevel: 'Serializable' })
+      return res.json({ ok: true, removed: Number(results[2]?.[0]?.removed || 0) })
     }
 
     // ── POST reset — zero out all quantities ──────────────────────────────────
     if (req.method === 'POST' && action === 'reset') {
       if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
-      await saveSnapshot(sql, 'pre_reset')
-      await sql`UPDATE inventory_balance SET quantity = 0, updated_at = NOW()`
-      return res.json({ ok: true })
+      const results = await sql.transaction((txn) => [
+        txn`SELECT pg_advisory_xact_lock(hashtext('inventory-balance-write'))`,
+        txn`
+          INSERT INTO inventory_snapshots (label, source_name, data, total_rows, total_units)
+          SELECT
+            'pre_reset', '',
+            COALESCE(jsonb_agg(jsonb_build_object(
+              'style', style, 'color', color, 'size', size, 'quantity', quantity,
+              'sort_order', sort_order
+            ) ORDER BY sort_order NULLS LAST, id), '[]'::jsonb),
+            COUNT(*)::int, COALESCE(SUM(quantity), 0)::int
+          FROM inventory_balance
+        `,
+        txn`
+          WITH zeroed AS (
+            UPDATE inventory_balance
+            SET quantity = 0, updated_at = NOW()
+            WHERE quantity <> 0
+            RETURNING id
+          )
+          SELECT COUNT(*)::int AS zeroed FROM zeroed
+        `,
+        trimInventorySnapshots(txn),
+      ], { isolationLevel: 'Serializable' })
+      return res.json({ ok: true, zeroed: Number(results[2]?.[0]?.zeroed || 0) })
     }
 
     // ── POST apply — deduct (sales) or add (return) quantities ────────────────
@@ -471,6 +628,7 @@ export default async function handler(req, res) {
       if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
       const {
         filledRows = [],
+        movementRows: rawMovementRows = [],
         txnType = 'sales',
         sourceName = '',
         sourceHash: rawSourceHash = '',
@@ -573,7 +731,13 @@ export default async function handler(req, res) {
         LEFT JOIN inventory_balance inventory
           ON LOWER(BTRIM(inventory.style)) = LOWER(BTRIM(target.style))
          AND LOWER(BTRIM(inventory.color)) = LOWER(BTRIM(target.color))
-         AND LOWER(BTRIM(inventory.size)) = LOWER(BTRIM(target.size))
+         AND CASE UPPER(BTRIM(inventory.size))
+               WHEN '1XL' THEN '1X' WHEN '2XL' THEN '2X' WHEN '3XL' THEN '3X'
+               ELSE UPPER(BTRIM(inventory.size))
+             END = CASE UPPER(BTRIM(target.size))
+               WHEN '1XL' THEN '1X' WHEN '2XL' THEN '2X' WHEN '3XL' THEN '3X'
+               ELSE UPPER(BTRIM(target.size))
+             END
         GROUP BY target.target_index
         ORDER BY target.target_index
       `
@@ -591,6 +755,59 @@ export default async function handler(req, res) {
       applyRows = resolvedTargets.rows
       const existingTargets = applyRows.filter((row) => !row.allowCreate)
 
+      const applyTotals = new Map()
+      const applyTargets = new Map()
+      for (const row of applyRows) {
+        const key = inventoryIdentity(row.style, row.color, row.size)
+        applyTotals.set(key, (applyTotals.get(key) || 0) + row.qty)
+        applyTargets.set(key, row)
+      }
+      const movementInput = Array.isArray(rawMovementRows) && rawMovementRows.length
+        ? rawMovementRows
+        : applyRows.map((row) => ({ ...row, businessDay: '' }))
+      const movementGroups = new Map()
+      for (const raw of movementInput) {
+        const style = String(raw.STYLE || raw.style || '').trim()
+        const color = String(raw.COLOR || raw.color || '').trim()
+        const size = String(raw.SIZE || raw.size || '').trim()
+        const qty = Number(raw.QTY ?? raw.qty)
+        const businessDay = String(raw.businessDay || raw.business_day || '').trim()
+        if (
+          !style || !color || !size
+          || !Number.isSafeInteger(qty) || qty <= 0
+          || (businessDay && !/^\d{4}-\d{2}-\d{2}$/.test(businessDay))
+        ) {
+          return res.status(400).json({ error: 'Movement rows require a valid inventory target, positive whole quantity, and YYYY-MM-DD business date' })
+        }
+        const targetKey = inventoryIdentity(style, color, size)
+        const target = applyTargets.get(targetKey)
+        if (!target) {
+          return res.status(409).json({ error: `Movement date allocation does not match inventory target: ${style} / ${color} / ${size}` })
+        }
+        const groupKey = `${targetKey}\u241f${businessDay}`
+        const current = movementGroups.get(groupKey) || {
+          style: target.style,
+          color: target.color,
+          size: target.size,
+          qty: 0,
+          businessDay,
+        }
+        current.qty += qty
+        movementGroups.set(groupKey, current)
+      }
+      const movementRows = [...movementGroups.values()]
+      const movementTotals = new Map()
+      for (const row of movementRows) {
+        const key = inventoryIdentity(row.style, row.color, row.size)
+        movementTotals.set(key, (movementTotals.get(key) || 0) + row.qty)
+      }
+      if (
+        applyTotals.size !== movementTotals.size
+        || [...applyTotals].some(([key, qty]) => movementTotals.get(key) !== qty)
+      ) {
+        return res.status(409).json({ error: 'Business-date movement totals do not match the inventory update. Inventory was not changed.' })
+      }
+
       const appliedUnits = applyRows.reduce((sum, row) => sum + row.qty, 0)
       if (appliedUnits !== sourceUnits) {
         return res.status(409).json({
@@ -598,6 +815,7 @@ export default async function handler(req, res) {
         })
       }
       await sql.transaction((txn) => [
+        txn`SELECT pg_advisory_xact_lock(hashtext('inventory-balance-write'))`,
         ...(existingTargets.length ? [txn`
           WITH targets AS (
             SELECT * FROM jsonb_to_recordset(${JSON.stringify(existingTargets)}::jsonb)
@@ -641,7 +859,7 @@ export default async function handler(req, res) {
           )
           SELECT
             ${txnType}, ${sourceName}, ${sourceHash}, ${appliedUnits},
-            ${applyRows.length}, ${payload.username}, saved_snapshot.id,
+            ${movementRows.length}, ${payload.username}, saved_snapshot.id,
             ${store.name}, ${store.key}
           FROM saved_snapshot
         `,
@@ -680,23 +898,22 @@ export default async function handler(req, res) {
                 SET quantity = quantity + ${delta}, updated_at = NOW()
                 WHERE style = ${row.style} AND color = ${row.color} AND size = ${row.size}
               `
-          return [
-            update,
-            txn`
-              INSERT INTO inventory_txn_rows (
-                transaction_id, txn_type, style, color, size, qty, source_file, applied_by,
-                store_name, store_key
-              )
-              SELECT
-                transactions.id, ${txnType}, ${row.style}, ${row.color}, ${row.size},
-                ${row.qty}, ${sourceName}, ${payload.username}, ${store.name}, ${store.key}
-              FROM inventory_transactions transactions
-              WHERE transactions.transaction_type = ${txnType}
-                AND transactions.source_hash = ${sourceHash}
-                AND transactions.rolled_back_at IS NULL
-            `,
-          ]
+          return [update]
         }),
+        ...movementRows.map((row) => txn`
+          INSERT INTO inventory_txn_rows (
+            transaction_id, txn_type, style, color, size, qty, source_file, applied_by,
+            store_name, store_key, business_day
+          )
+          SELECT
+            transactions.id, ${txnType}, ${row.style}, ${row.color}, ${row.size},
+            ${row.qty}, ${sourceName}, ${payload.username}, ${store.name}, ${store.key},
+            ${row.businessDay || null}::date
+          FROM inventory_transactions transactions
+          WHERE transactions.transaction_type = ${txnType}
+            AND transactions.source_hash = ${sourceHash}
+            AND transactions.rolled_back_at IS NULL
+        `),
         ...(txnType === 'sales' ? [
           txn`
             UPDATE return_orders
@@ -711,12 +928,7 @@ export default async function handler(req, res) {
               AND inventory_status = 'pending'
           `,
         ] : []),
-        txn`
-          DELETE FROM inventory_snapshots
-          WHERE id NOT IN (
-            SELECT id FROM inventory_snapshots ORDER BY created_at DESC LIMIT ${MAX_SNAPSHOTS}
-          )
-        `,
+        trimInventorySnapshots(txn),
       ])
       return res.json({ ok: true, applied_units: appliedUnits })
     }
@@ -724,11 +936,12 @@ export default async function handler(req, res) {
     // ── GET movements — per-SKU dated flow for the 动销 view ─────────────────
     if (req.method === 'GET' && action === 'movements') {
       const days = Math.min(Math.max(parseInt(req.query.days, 10) || 30, 1), 365)
-      const from = new Date(Date.now() - days * 86400000).toISOString()
+      const fromDay = new Date(Date.now() - (days - 1) * 86400000).toISOString().slice(0, 10)
       const rows = await sql`
-        SELECT rows.txn_type, rows.style, rows.color, rows.size, rows.qty, rows.applied_at::date AS day
+        SELECT rows.txn_type, rows.style, rows.color, rows.size, rows.qty,
+               COALESCE(rows.business_day, rows.applied_at::date) AS day
         FROM inventory_txn_rows rows
-        WHERE rows.applied_at >= ${from}
+        WHERE COALESCE(rows.business_day, rows.applied_at::date) >= ${fromDay}::date
           AND NOT EXISTS (
             SELECT 1
             FROM inventory_transactions transactions
@@ -744,7 +957,7 @@ export default async function handler(req, res) {
                 )
               )
           )
-        ORDER BY rows.applied_at
+        ORDER BY COALESCE(rows.business_day, rows.applied_at::date), rows.applied_at
       `
       return res.json({ days, rows })
     }
@@ -766,35 +979,7 @@ export default async function handler(req, res) {
 
     // ── GET history — restorable snapshots ────────────────────────────────────
     if (req.method === 'GET' && action === 'history') {
-      const rows = await sql`
-        SELECT
-          snapshots.id,
-          snapshots.label,
-          snapshots.source_name,
-          snapshots.total_rows,
-          snapshots.total_units,
-          snapshots.created_at,
-          CASE
-            WHEN snapshots.label IN ('sales', 'return', 'adjustment') THEN EXISTS (
-              SELECT 1
-              FROM inventory_transactions transactions
-              WHERE transactions.rolled_back_at IS NULL
-                AND (
-                  transactions.rollback_snapshot_id = snapshots.id
-                  OR (
-                    transactions.rollback_snapshot_id IS NULL
-                    AND transactions.transaction_type = snapshots.label
-                    AND transactions.source_file IS NOT DISTINCT FROM snapshots.source_name
-                    AND transactions.applied_at >= snapshots.created_at
-                  )
-                )
-            )
-            ELSE snapshots.label <> 'pre_restore'
-          END AS restorable
-        FROM inventory_snapshots snapshots
-        ORDER BY snapshots.created_at DESC
-        LIMIT ${MAX_SNAPSHOTS}
-      `
+      const rows = await queryInventorySnapshotHistory(sql)
       return res.json({
         snapshots: rows.map(r => ({
           id:          r.id,
@@ -814,7 +999,7 @@ export default async function handler(req, res) {
       if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
       const snapId = parseInt(req.query.id, 10)
       if (!snapId) return res.status(400).json({ error: 'id required' })
-      const quantityOnly = req.query.mode === 'quantities'
+      const requestedRestoreMode = req.query.mode
 
       const [snap] = await sql`
         SELECT data, label, source_name, created_at
@@ -827,6 +1012,8 @@ export default async function handler(req, res) {
           error: 'Rollback backup points are audit-only and cannot be restored safely. Choose the original deduction, return, or inventory version instead.',
         })
       }
+      const snapshotRestoreMode = inventoryRestoreMode(snap.label)
+      const quantityOnly = inventoryRestoreUsesQuantities(snap.label, requestedRestoreMode)
       const isTransactionSnapshot = ['sales', 'return', 'adjustment'].includes(snap.label)
       const [rollbackTransaction] = isTransactionSnapshot
         ? await sql`
@@ -868,7 +1055,15 @@ export default async function handler(req, res) {
               )
             ORDER BY applied_at, id
           `
-        : []
+        : snapshotRestoreMode === 'full'
+          ? await sql`
+              SELECT id, source_hash
+              FROM inventory_transactions
+              WHERE rolled_back_at IS NULL
+                AND applied_at >= ${snap.created_at}
+              ORDER BY applied_at, id
+            `
+          : []
       const rollbackTransactionIds = rollbackTransactions.map((transaction) => Number(transaction.id))
       const salesSourceHashes = [...new Set(rollbackTransactions
         .map((transaction) => String(transaction.source_hash || ''))
@@ -893,6 +1088,7 @@ export default async function handler(req, res) {
 
       const totalUnits = restoreRows.reduce((sum, row) => sum + row.quantity, 0)
       const transactionResults = await sql.transaction((txn) => [
+        txn`SELECT pg_advisory_xact_lock(hashtext('inventory-balance-write'))`,
         txn`
           INSERT INTO inventory_snapshots (label, source_name, data, total_rows, total_units)
           SELECT
@@ -935,7 +1131,13 @@ export default async function handler(req, res) {
               `,
               txn`
                 UPDATE return_packages
-                SET status = 'pending',
+                SET status = CASE
+                      WHEN status IN ('discrepancy', 'rejected')
+                        OR escalated_at IS NOT NULL
+                        OR NULLIF(BTRIM(review_reason), '') IS NOT NULL
+                      THEN 'needs_review'
+                      ELSE 'pending'
+                    END,
                     actual_units = 0,
                     restock_units = 0,
                     flagged_not_ours = false,
@@ -1017,12 +1219,7 @@ export default async function handler(req, res) {
                 )
             `]
           : []),
-        txn`
-          DELETE FROM inventory_snapshots
-          WHERE id NOT IN (
-            SELECT id FROM inventory_snapshots ORDER BY created_at DESC LIMIT ${MAX_SNAPSHOTS}
-          )
-        `,
+        trimInventorySnapshots(txn),
         txn`
           SELECT COUNT(*)::int AS total_rows, COALESCE(SUM(quantity), 0)::int AS total_units
           FROM inventory_balance

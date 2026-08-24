@@ -11,6 +11,7 @@ import ReplenishmentPlan from '../components/ReplenishmentPlan.jsx'
 import { useToast } from '../hooks/useToast.js'
 import { useAuth } from '../context/AuthContext.jsx'
 import { parseCSV } from '../utils/autoDeductEngine.js'
+import { inventoryRestoreMode } from '../utils/inventoryRestoreMode.js'
 
 const BASE = '/api'
 const MAX_SNAPSHOTS = 20
@@ -47,13 +48,26 @@ async function parseFileRows(file) {
 }
 
 /** Normalise a row from any case convention into {Style, Color, Size, Quantity} */
-function normaliseRow(r) {
-  return {
-    Style:    String(r.Style    || r.style    || r.STYLE    || '').trim(),
-    Color:    String(r.Color    || r.color    || r.COLOR    || '').trim(),
-    Size:     String(r.Size     || r.size     || r.SIZE     || '').trim(),
-    Quantity: parseInt(r.Quantity ?? r.quantity ?? r.QUANTITY ?? 0, 10) || 0,
+function inventoryKey(row) {
+  const size = String(row.Size || '').trim().toUpperCase().replace(/^([123])XL$/, '$1X')
+  return [row.Style, row.Color, size].map((value) => String(value || '').trim().toLowerCase()).join('|||')
+}
+
+function normaliseRow(r, index = 0) {
+  const row = {
+    Style: String(r.Style ?? r.style ?? r.STYLE ?? '').trim(),
+    Color: String(r.Color ?? r.color ?? r.COLOR ?? '').trim(),
+    Size: String(r.Size ?? r.size ?? r.SIZE ?? '').trim(),
   }
+  if (!row.Style || !row.Color || !row.Size) {
+    throw new Error(`Excel row ${index + 2} requires Style, Color, and Size`)
+  }
+  const rawQuantity = r.Quantity ?? r.quantity ?? r.QUANTITY ?? 0
+  const quantity = rawQuantity === '' ? 0 : Number(rawQuantity)
+  if (!Number.isSafeInteger(quantity) || quantity < 0) {
+    throw new Error(`Excel row ${index + 2}: Quantity must be a whole number of 0 or more`)
+  }
+  return { ...row, Quantity: quantity }
 }
 
 function rowColor(row) {
@@ -171,16 +185,15 @@ function AddRowsModal({ onClose, onDone, currentRows, getToken }) {
     setLoading(true)
     try {
       const uploaded   = await parseFileRows(file)
-      const balanceSet = new Set(currentRows.map(r => `${r.Style}|||${r.Color}|||${r.Size}`))
+      const balanceMap = new Map(currentRows.map((row) => [inventoryKey(row), row]))
       const to_add        = []
       const already_exists = []
 
-      for (const raw of uploaded) {
-        const r = normaliseRow(raw)
-        if (!r.Style || !r.Color || !r.Size) continue
-        const key = `${r.Style}|||${r.Color}|||${r.Size}`
-        if (balanceSet.has(key)) {
-          const existing = currentRows.find(x => x.Style === r.Style && x.Color === r.Color && x.Size === r.Size)
+      for (const [index, raw] of uploaded.entries()) {
+        const r = normaliseRow(raw, index)
+        const key = inventoryKey(r)
+        if (balanceMap.has(key)) {
+          const existing = balanceMap.get(key)
           already_exists.push({ Style: r.Style, Color: r.Color, Size: r.Size, current_quantity: existing?.Quantity ?? 0 })
         } else {
           to_add.push({ Style: r.Style, Color: r.Color, Size: r.Size, Quantity: r.Quantity })
@@ -342,14 +355,13 @@ function RemoveRowsModal({ onClose, onDone, currentRows, getToken }) {
     setLoading(true)
     try {
       const uploaded   = await parseFileRows(file)
-      const balanceMap = new Map(currentRows.map(r => [`${r.Style}|||${r.Color}|||${r.Size}`, r]))
+      const balanceMap = new Map(currentRows.map((row) => [inventoryKey(row), row]))
       const to_remove = []
       const not_found  = []
 
-      for (const raw of uploaded) {
-        const r = normaliseRow(raw)
-        if (!r.Style || !r.Color || !r.Size) continue
-        const key   = `${r.Style}|||${r.Color}|||${r.Size}`
+      for (const [index, raw] of uploaded.entries()) {
+        const r = normaliseRow(raw, index)
+        const key = inventoryKey(r)
         const found = balanceMap.get(key)
         if (found) {
           to_remove.push(found) // already has id, Style, Color, Size, Quantity
@@ -553,14 +565,21 @@ function VersionHistory({ onRestore, getToken }) {
   }, [logOpen, getToken])
 
   const handleRestore = async (snap) => {
-    if (!window.confirm(
-      `Restore balance to the snapshot from ${snap.timestamp}?\n\n` +
-      `This will revert to ${snap.total_units.toLocaleString()} units across ${snap.total_rows.toLocaleString()} SKUs.`
-    )) return
+    const restoreMode = inventoryRestoreMode(snap.label)
+    const fullRestore = restoreMode === 'full'
+    const confirmation = fullRestore
+      ? `Restore the entire inventory version from ${snap.timestamp}?\n\n` +
+        `This whole-inventory restore replaces both quantities and the SKU list with ${snap.total_units.toLocaleString()} units across ${snap.total_rows.toLocaleString()} SKUs.\n` +
+        'Styles, colors, and sizes added after this version will be removed.'
+      : `Restore saved inventory quantities from ${snap.timestamp}?\n\n` +
+        `Saved quantities for ${snap.total_rows.toLocaleString()} SKU rows will be restored. ` +
+        'Styles, colors, and sizes added after this point will be kept.'
+    if (!window.confirm(confirmation)) return
 
     setRestoring(snap.id)
     try {
-      const res = await apiFetch(`${BASE}/inventory-balance?action=restore&id=${snap.id}`, {
+      const modeQuery = fullRestore ? '' : '&mode=quantities'
+      const res = await apiFetch(`${BASE}/inventory-balance?action=restore&id=${snap.id}${modeQuery}`, {
         method:  'POST',
         headers: authHeaders(getToken()),
       })
@@ -609,7 +628,7 @@ function VersionHistory({ onRestore, getToken }) {
         {snapOpen && (
           <div className="border-t border-slate-100 px-5 py-4">
             <p className="text-xs text-slate-400 mb-3">
-              The last {MAX_SNAPSHOTS} balance states are saved automatically before every change. Click <strong>Restore</strong> to roll back.
+              Daily updates restore quantities and keep SKUs added later. A whole-inventory restore is available only for versions saved before a full inventory replacement, and it replaces the SKU list too.
             </p>
 
             {loadingS ? (
@@ -644,7 +663,7 @@ function VersionHistory({ onRestore, getToken }) {
                       className="flex-shrink-0 flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       {restoring === snap.id ? <RefreshCw className="w-3 h-3 animate-spin" /> : null}
-                      Restore
+                      {inventoryRestoreMode(snap.label) === 'full' ? 'Restore All' : 'Restore Qty'}
                     </button>
                   </div>
                 ))}
@@ -728,7 +747,7 @@ function ImportModal({ onClose, onDone, getToken }) {
     setLoading(true)
     try {
       const uploaded = await parseFileRows(file)
-      const rows     = uploaded.map(normaliseRow).filter(r => r.Style && r.Color && r.Size)
+      const rows = uploaded.map(normaliseRow)
       if (!rows.length) throw new Error('No valid rows found in file')
 
       const data = await apiFetch(`${BASE}/inventory-balance?action=init`, {
@@ -821,7 +840,7 @@ function InitializePanel({ onDone, getToken }) {
     setLoading(true)
     try {
       const uploaded = await parseFileRows(file)
-      const rows     = uploaded.map(normaliseRow).filter(r => r.Style && r.Color && r.Size)
+      const rows = uploaded.map(normaliseRow)
       if (!rows.length) throw new Error('No valid rows found in file')
 
       const data = await apiFetch(`${BASE}/inventory-balance?action=init`, {

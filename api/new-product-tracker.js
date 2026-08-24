@@ -1,5 +1,7 @@
 import { neon } from '@neondatabase/serverless'
-import jwt from 'jsonwebtoken'
+import authentication from '../lib/authentication.cjs'
+
+const { authenticateUser } = authentication
 
 function getDB() {
   const url = process.env.DATABASE_URL
@@ -13,14 +15,21 @@ function getSecret() {
   return secret
 }
 
-function verifyToken(header, secret) {
-  if (!header?.startsWith('Bearer ')) return null
-  try { return jwt.verify(header.slice(7), secret) } catch { return null }
-}
-
 function dayString(value) {
   if (!value) return ''
   return value instanceof Date ? value.toISOString().slice(0, 10) : String(value).slice(0, 10)
+}
+
+function validDay(value) {
+  const day = dayString(value)
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return ''
+  const [year, month, date] = day.split('-').map(Number)
+  const checked = new Date(Date.UTC(year, month - 1, date))
+  return checked.getUTCFullYear() === year
+    && checked.getUTCMonth() === month - 1
+    && checked.getUTCDate() === date
+    ? day
+    : ''
 }
 
 async function ensureTables(sql) {
@@ -81,8 +90,9 @@ export default async function handler(req, res) {
 
   try {
     const sql = getDB()
-    const payload = verifyToken(req.headers.authorization, getSecret())
+    const payload = await authenticateUser(sql, req.headers.authorization, getSecret())
     if (!payload) return res.status(401).json({ error: 'Not authenticated' })
+    if (payload.role !== 'admin') return res.status(403).json({ error: 'Admin access required' })
     const username = payload.role === 'admin' ? 'admin' : payload.username
     const action = String(req.query.action || '')
     await ensureTables(sql)
@@ -116,7 +126,7 @@ export default async function handler(req, res) {
       const store = String(req.body?.store || '').trim()
       const spu = String(req.body?.spu || '').trim()
       const productName = String(req.body?.productName || '').trim()
-      const launchDate = dayString(req.body?.launchDate)
+      const launchDate = validDay(req.body?.launchDate)
       const initialRoas = Number(req.body?.initialRoas)
       if (!store || !spu || !launchDate) {
         return res.status(400).json({ error: '店铺、SPU 和上架日期为必填项' })
@@ -124,34 +134,64 @@ export default async function handler(req, res) {
       if (!Number.isFinite(initialRoas) || initialRoas <= 0) {
         return res.status(400).json({ error: '请填写大于 0 的目标 ROAS' })
       }
-      const duplicate = await sql`
-        SELECT id FROM new_product_trackers
-        WHERE username = ${username} AND LOWER(store) = LOWER(${store}) AND LOWER(spu) = LOWER(${spu})
-        LIMIT 1
-      `
-      if (duplicate.length) {
+      const results = await sql.transaction((txn) => [
+        txn`SELECT pg_advisory_xact_lock(hashtext('new-product-tracker-write'))`,
+        txn`
+          WITH inserted_tracker AS (
+            INSERT INTO new_product_trackers (
+              username, store, spu, product_name, launch_date
+            )
+            SELECT ${username}, ${store}, ${spu}, ${productName || null}, ${launchDate}
+            WHERE NOT EXISTS (
+              SELECT 1
+              FROM new_product_trackers
+              WHERE username = ${username}
+                AND LOWER(store) = LOWER(${store})
+                AND LOWER(spu) = LOWER(${spu})
+            )
+            RETURNING id, store, spu, product_name, launch_date, created_at, updated_at
+          ),
+          inserted_event AS (
+            INSERT INTO new_product_roas_events (
+              tracker_id, username, effective_date, roas, note
+            )
+            SELECT id, ${username}, ${launchDate}, ${initialRoas}, ${'初始目标'}
+            FROM inserted_tracker
+            RETURNING id, tracker_id, effective_date, roas, note, created_at
+          )
+          SELECT
+            tracker.*,
+            event.id AS event_id,
+            event.effective_date AS event_effective_date,
+            event.roas AS event_roas,
+            event.note AS event_note,
+            event.created_at AS event_created_at
+          FROM inserted_tracker tracker
+          JOIN inserted_event event ON event.tracker_id = tracker.id
+        `,
+      ])
+      const tracker = results[1][0]
+      if (!tracker) {
         return res.status(409).json({ error: '这个店铺的 SPU 已在追踪中；如需重新上架，请先删除旧追踪' })
       }
-      const rows = await sql`
-        INSERT INTO new_product_trackers (username, store, spu, product_name, launch_date)
-        VALUES (${username}, ${store}, ${spu}, ${productName || null}, ${launchDate})
-        RETURNING id, store, spu, product_name, launch_date, created_at, updated_at
-      `
-      const tracker = rows[0]
-      const eventRows = await sql`
-        INSERT INTO new_product_roas_events (tracker_id, username, effective_date, roas, note)
-        VALUES (${tracker.id}, ${username}, ${launchDate}, ${initialRoas}, ${'初始目标'})
-        RETURNING id, tracker_id, effective_date, roas, note, created_at
-      `
-      return res.status(201).json({ tracker: trackerJson(tracker, eventRows) })
+      return res.status(201).json({
+        tracker: trackerJson(tracker, [{
+          id: tracker.event_id,
+          effective_date: tracker.event_effective_date,
+          roas: tracker.event_roas,
+          note: tracker.event_note,
+          created_at: tracker.event_created_at,
+        }]),
+      })
     }
 
     if (req.method === 'POST' && action === 'save-roas') {
       const trackerId = Number(req.body?.trackerId)
-      const effectiveDate = dayString(req.body?.effectiveDate)
+      const effectiveDate = validDay(req.body?.effectiveDate)
       const roas = Number(req.body?.roas)
       const note = String(req.body?.note || '').trim()
-      if (!trackerId || !effectiveDate || !Number.isFinite(roas) || roas <= 0) {
+      if (!Number.isSafeInteger(trackerId) || trackerId <= 0
+        || !effectiveDate || !Number.isFinite(roas) || roas <= 0) {
         return res.status(400).json({ error: '追踪款、修改日期和目标 ROAS 均为必填项' })
       }
       const owned = await sql`
@@ -184,7 +224,7 @@ export default async function handler(req, res) {
 
     if (req.method === 'DELETE') {
       const id = Number(req.query.id)
-      if (!id) return res.status(400).json({ error: 'id is required' })
+      if (!Number.isSafeInteger(id) || id <= 0) return res.status(400).json({ error: 'id is required' })
       const rows = await sql`
         DELETE FROM new_product_trackers
         WHERE id = ${id} AND username = ${username}

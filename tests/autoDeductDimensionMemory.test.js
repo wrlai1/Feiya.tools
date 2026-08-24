@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { consolidateRows } from '../src/utils/consolidateEngine.js'
-import { aliasKey, fillTemplate } from '../src/utils/autoDeductEngine.js'
+import { aliasKey, fillTemplate, reviewAliasKey } from '../src/utils/autoDeductEngine.js'
 import { findAdditionalSizeMappings } from '../src/utils/autoDeductRules.js'
 
 test('TEMU quantity-only summary rows are not parsed as nameless products', () => {
@@ -17,8 +17,8 @@ test('TEMU quantity-only summary rows are not parsed as nameless products', () =
 
 test('one confirmed link applies to identical style color size rows from different combos', () => {
   const unmatchedRows = [
-    { style: 'M022', color: 'black', size: '2X', packCount: 1, parseIssue: 'sku_attribute_size_conflict' },
-    { style: 'M022', color: 'black', size: '2XL', packCount: 1, parseIssue: 'sku_attribute_color_conflict' },
+    { style: 'M022', color: 'black', size: '2X', packCount: 1, parseIssue: 'sku_attribute_size_conflict', sourceIssue: 'sku_attribute_size_conflict' },
+    { style: 'M022', color: 'black', size: '2XL', packCount: 1, parseIssue: 'sku_attribute_color_conflict', sourceIssue: 'sku_attribute_color_conflict' },
   ]
   const target = { STYLE: 'M022 PLUS', COLOR: 'BLACK', SIZE: '2X' }
 
@@ -31,30 +31,40 @@ test('one confirmed link applies to identical style color size rows from differe
   }), [{ index: 1, entry: target }])
 })
 
-test('a dimension-level confirmation resolves future source warnings', () => {
+test('a dimension-level confirmation resolves future source signatures', () => {
   const template = [{ STYLE: 'M022 PLUS', COLOR: 'BLACK', SIZE: '2X' }]
-  const source = [{
-    style: 'M022',
-    color: 'black',
-    size: '2X',
-    QTY: 3,
+  const source = {
+    style: 'M022', color: 'black', size: '2X', QTY: 3,
     parse_issue: 'sku_attribute_size_conflict',
-  }]
-  const result = fillTemplate(template, source, {
+    source_signature: '["different combo","black / xxl"]',
+  }
+  const aliases = {
     [aliasKey('M022', 'black', '2X')]: {
-      STYLE: 'M022 PLUS',
-      COLOR: 'BLACK',
-      SIZE: '2X',
-      _confirmed: true,
-      _confirmedDimensions: true,
+      STYLE: 'M022 PLUS', COLOR: 'BLACK', SIZE: '2X',
+      _confirmed: true, _confirmedDimensions: true,
     },
-  })
+  }
 
-  assert.deepEqual(
-    result.filledRows.filter((row) => row.QTY),
-    [{ STYLE: 'M022 PLUS', COLOR: 'BLACK', SIZE: '2X', QTY: 3 }],
-  )
+  const result = fillTemplate(template, [source], aliases)
   assert.equal(result.unmatchedRows.length, 0)
+  assert.equal(result.filledRows[0].QTY, 3)
+})
+
+test('compatible legacy review confirmations are reused by dimension', () => {
+  const template = [{ STYLE: 'M022 PLUS', COLOR: 'BLACK', SIZE: '2X' }]
+  const aliases = {
+    [reviewAliasKey('M022', 'black', '2X', 'old combo', 'sku_attribute_size_conflict')]: {
+      STYLE: 'M022 PLUS', COLOR: 'BLACK', SIZE: '2X',
+      _confirmed: true,
+    },
+  }
+  const result = fillTemplate(template, [{
+    style: 'M022', color: 'black', size: '2X', QTY: 1,
+    parse_issue: 'sku_attribute_color_conflict', source_signature: 'new combo',
+  }], aliases)
+
+  assert.equal(result.unmatchedRows.length, 0)
+  assert.equal(result.filledRows[0].QTY, 1)
 })
 
 test('a missing-style source shows its raw SKU and reuses a confirmed dimension mapping', () => {
@@ -63,12 +73,15 @@ test('a missing-style source shows its raw SKU and reuses a confirmed dimension 
     'Product Attribute': 'Green Teal / XS',
     Quantity: 1,
   }]).consolidated[0]
-  const template = [{ STYLE: '0015', COLOR: 'GREEN TEAL', SIZE: 'XS' }]
-  const first = fillTemplate(template, [source], {})
+  const first = fillTemplate([
+    { STYLE: '0015', COLOR: 'GREEN TEAL', SIZE: 'XS' },
+  ], [source], {})
 
   assert.equal(first.unmatchedRows[0].rawStyle, 'GreenTealXS')
 
-  const remembered = fillTemplate(template, [source], {
+  const remembered = fillTemplate([
+    { STYLE: '0015', COLOR: 'GREEN TEAL', SIZE: 'XS' },
+  ], [source], {
     [aliasKey('', source.color, source.size)]: {
       STYLE: '0015',
       COLOR: 'GREEN TEAL',

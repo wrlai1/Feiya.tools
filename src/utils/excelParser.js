@@ -11,10 +11,17 @@ const text = (value) => {
   return String(value).trim()
 }
 
-const number = (value) => {
+export const parseInventoryNumber = (value, context = '') => {
   if (value === '' || value == null) return 0
   const parsed = Number(String(value).replace(/,/g, ''))
-  return Number.isFinite(parsed) ? parsed : 0
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error(`${context ? `${context}: ` : ''}Boxes and Quantity must be whole numbers of 0 or more`)
+  }
+  return parsed
+}
+
+const summaryNumber = (value) => {
+  try { return parseInventoryNumber(value) } catch { return 0 }
 }
 
 const headerKey = (value) => text(value).toLowerCase().replace(/[\s.#_-]+/g, '')
@@ -66,8 +73,8 @@ function standardRows(sheetName, rows) {
       rack: text(get('rack')),
       style: text(get('style')),
       color: text(get('color')),
-      box: number(get('box')),
-      qty: number(get('qty')),
+      box: parseInventoryNumber(get('box'), `${sheetName} row ${start + offset + 1}, Boxes`),
+      qty: parseInventoryNumber(get('qty'), `${sheetName} row ${start + offset + 1}, Quantity`),
       fabric: text(get('fabric')),
       label: text(get('label')),
       sizes: text(get('sizes')),
@@ -80,10 +87,10 @@ function standardRows(sheetName, rows) {
 
   // Location Final has an authoritative totals row above its headers.
   if (headerIndex > 0 && parsed.length) {
-    const summary = rows.slice(0, headerIndex).reverse().find((row) => number(row[columns.box]) || number(row[columns.qty]))
+    const summary = rows.slice(0, headerIndex).reverse().find((row) => summaryNumber(row[columns.box]) || summaryNumber(row[columns.qty]))
     if (summary) {
-      parsed[0].sheetBoxTotal = number(summary[columns.box])
-      parsed[0].sheetQtyTotal = number(summary[columns.qty])
+      parsed[0].sheetBoxTotal = summaryNumber(summary[columns.box])
+      parsed[0].sheetQtyTotal = summaryNumber(summary[columns.qty])
     }
   }
   return parsed
@@ -116,8 +123,8 @@ function pendingRows(sheetName, rows) {
       po: text(get('po')),
       style: text(get('style')),
       pallet: text(get('pallet')),
-      box: number(get('box')),
-      qty: number(get('qty')),
+      box: parseInventoryNumber(get('box'), `${sheetName} row ${headerIndex + offset + 2}, Boxes`),
+      qty: parseInventoryNumber(get('qty'), `${sheetName} row ${headerIndex + offset + 2}, Quantity`),
       startDate: text(get('startDate')),
       cancelDate: text(get('cancelDate')),
       customer: text(get('customer')),

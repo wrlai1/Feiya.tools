@@ -253,7 +253,7 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
     for (const [i, row] of unmatchedRows.entries()) {
       const r = resolved[i]
       if (!r || r.type === 'skip') {
-        skipped.push({ style: row.style, color: row.color, size: row.size, qty: row.qty, packCount: row.packCount, parseIssue: row.parseIssue })
+        skipped.push({ style: row.style, color: row.color, size: row.size, qty: row.qty, packCount: row.packCount, businessDay: row.businessDay, parseIssue: row.parseIssue })
         continue
       }
       if (r.type === 'combo') {
@@ -269,6 +269,9 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
             size: row.size,
             packCount: confirmedPackCount,
             originalPackCount: row.packCount,
+            businessDay: row.businessDay,
+            sourceSignature: row.sourceSignature,
+            sourceIssue: row.sourceIssue,
             parseIssue: row.parseIssue,
           },
           _learnAlias: true,
@@ -285,6 +288,9 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
           style: row.style,
           color: row.color,
           size: row.size,
+          businessDay: row.businessDay,
+          sourceSignature: row.sourceSignature,
+          sourceIssue: row.sourceIssue,
           parseIssue: row.parseIssue,
         },
         _learnAlias: r.type === 'link' || r.type === 'create',

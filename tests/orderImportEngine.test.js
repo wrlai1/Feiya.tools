@@ -6,6 +6,7 @@ import { buildInventoryOrderClaims, parseOrderHistoryRows } from '../src/utils/o
 const require = createRequire(import.meta.url)
 const {
   normalizeInventoryQuantity,
+  normalizeInventoryRows,
   normalizeOrderClaims,
   orderClaimsToSqlRecords,
 } = require('../lib/inventoryTransactionSafety.cjs')
@@ -103,6 +104,21 @@ test('manual inventory quantities reject partial, negative, and non-numeric valu
   assert.throws(() => normalizeInventoryQuantity('12 boxes'), /whole number/)
   assert.throws(() => normalizeInventoryQuantity(1.5), /whole number/)
   assert.throws(() => normalizeInventoryQuantity(-1), /whole number/)
+})
+
+test('inventory imports reject partial quantities and normalized duplicate SKUs', () => {
+  assert.throws(() => normalizeInventoryRows([
+    { Style: '0015', Color: 'Dusty Blue', Size: 'M', Quantity: '12 boxes' },
+  ]), /row 2 Quantity/)
+
+  assert.throws(() => normalizeInventoryRows([
+    { Style: 'M022', Color: 'Brown', Size: '1XL', Quantity: 4 },
+    { Style: 'm022', Color: ' brown ', Size: '1X', Quantity: 5 },
+  ]), /rows 2 and 3 describe the same/)
+
+  assert.deepEqual(normalizeInventoryRows([
+    { STYLE: ' 0015 ', COLOR: ' Dusty Blue ', SIZE: 'M', QUANTITY: '12' },
+  ]), [{ style: '0015', color: 'Dusty Blue', size: 'M', quantity: 12, sort_order: 0 }])
 })
 
 test('uses daily fulfillment quantity and aggregates shipment references', () => {

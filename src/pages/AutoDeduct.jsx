@@ -18,6 +18,7 @@ import {
   normalizeStyleIdentity,
   parseCSV,
 } from '../utils/autoDeductEngine.js'
+import { fetchAliases, patchAliasesAndVerify } from '../utils/autoDeductAliases.js'
 import ConsolidateStep from '../components/ConsolidateStep.jsx'
 import { consolidateRows } from '../utils/consolidateEngine.js'
 import { buildInventoryOrderClaims, parseOrderHistoryRows } from '../utils/orderImportEngine.js'
@@ -212,6 +213,9 @@ export default function AutoDeduct() {
   const [templateMissing, setTemplateMissing] = useState(false)
   const [showSettings,    setShowSettings]    = useState(false)
   const [aliases,         setAliases]         = useState({})
+  const [aliasesLoading,  setAliasesLoading]  = useState(true)
+  const [aliasesSaving,   setAliasesSaving]   = useState(false)
+  const [aliasesError,    setAliasesError]    = useState(null)
   const [sourceHash,      setSourceHash]      = useState('')
   const [editingResolutions, setEditingResolutions] = useState(false)
   const [resolutionAliasKeys, setResolutionAliasKeys] = useState([])
@@ -276,6 +280,7 @@ export default function AutoDeduct() {
       targetColor: match.targetColor,
       targetSize: match.targetSize,
       qty: match.qty,
+      businessDay: match.businessDay || '',
       via: match.via,
     }))
     for (const extra of resolvedExtras || []) {
@@ -289,6 +294,7 @@ export default function AutoDeduct() {
             targetColor: component.COLOR,
             targetSize: component.SIZE,
             qty: extra.QTY * Math.max(1, parseInt(component.multiplier, 10) || 1),
+            businessDay: extra._source?.businessDay || '',
             via: 'manual combo',
           })
         }
@@ -301,12 +307,33 @@ export default function AutoDeduct() {
           targetColor: extra.COLOR,
           targetSize: extra.SIZE,
           qty: extra.QTY,
+          businessDay: extra._source?.businessDay || '',
           via: extra._isNew ? 'manual new' : 'manual',
         })
       }
     }
     return preview
   }, [result, resolvedExtras])
+
+  const businessMovementRows = useMemo(() => {
+    const groups = new Map()
+    for (const item of deductionPreview) {
+      const qty = Number(item.qty || 0)
+      if (!Number.isSafeInteger(qty) || qty <= 0) continue
+      const businessDay = /^\d{4}-\d{2}-\d{2}$/.test(item.businessDay || '') ? item.businessDay : ''
+      const key = [item.targetStyle, item.targetColor, item.targetSize, businessDay].join('\u241f')
+      const current = groups.get(key) || {
+        STYLE: item.targetStyle,
+        COLOR: item.targetColor,
+        SIZE: item.targetSize,
+        QTY: 0,
+        businessDay,
+      }
+      current.QTY += qty
+      groups.set(key, current)
+    }
+    return [...groups.values()]
+  }, [deductionPreview])
 
   const hasCrossStylePreview = deductionPreview.some((item) =>
     normalizeStyleIdentity(item.sourceStyle) !== normalizeStyleIdentity(item.targetStyle)
@@ -320,13 +347,29 @@ export default function AutoDeduct() {
       .catch(err => setConfigError(err.message))
   }, [getToken, isMock])
 
-  useEffect(() => {
-    if (isMock) return
-    fetch(`${BASE}/auto-deduct?action=aliases`, { headers: authHeaders(getToken()) })
-      .then(r => r.json())
-      .then(data => setAliases(data.aliases || {}))
-      .catch(() => setAliases({}))
+  const loadAliases = useCallback(async () => {
+    if (isMock) {
+      setAliasesLoading(false)
+      setAliasesError(null)
+      return
+    }
+    setAliasesLoading(true)
+    setAliasesError(null)
+    try {
+      const loaded = await fetchAliases(
+        fetch,
+        `${BASE}/auto-deduct?action=aliases`,
+        authHeaders(getToken()),
+      )
+      setAliases(loaded)
+    } catch (err) {
+      setAliasesError(err.message)
+    } finally {
+      setAliasesLoading(false)
+    }
   }, [getToken, isMock])
+
+  useEffect(() => { loadAliases() }, [loadAliases])
 
   const handleFile = useCallback((file) => {
     setSrcFile(file); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([]); setSourceHash(''); setEditingResolutions(false); setResolutionAliasKeys([]); setPreviewConfirmed(false); setOrderArchive(null)
@@ -341,6 +384,10 @@ export default function AutoDeduct() {
       return
     }
     if (!srcFile || processing) return
+    if (aliasesLoading || aliasesSaving || aliasesError) {
+      toast.error('Saved Inventory Target matches must load successfully before Auto Deduct can run', 'Auto Deduct Blocked')
+      return
+    }
     setProcessing(true); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([]); setEditingResolutions(false); setResolutionAliasKeys([]); setPreviewConfirmed(false)
     try {
       // 1. Fetch template from inventory balance (canonical SKU list)
@@ -392,23 +439,29 @@ export default function AutoDeduct() {
     } finally {
       setProcessing(false)
     }
-  }, [srcFile, processing, getToken, toast, aliases])
+  }, [srcFile, processing, getToken, toast, aliases, aliasesLoading, aliasesSaving, aliasesError])
 
   // Called by UnmatchedResolver when user finishes reviewing.
   // Skipped rows are NOT deducted, but they must stay visible on the Unmatched
   // sheet — a skip is "leave for later", never "silently discard".
   const saveAliases = useCallback(async ({ upserts = {}, deleteKeys = [] }) => {
-    if (isMock) return
-    const res = await fetch(`${BASE}/auto-deduct?action=patch-aliases`, {
-      method: 'POST',
-      headers: authHeaders(getToken(), true),
-      body: JSON.stringify({ upserts, deleteKeys }),
-    })
-    const data = await res.json()
-    if (!res.ok) throw new Error(data.error || 'Could not save learned matches')
-  }, [getToken, isMock])
+    if (isMock) {
+      const next = { ...aliases }
+      for (const key of deleteKeys) delete next[key]
+      return Object.assign(next, upserts)
+    }
+    return patchAliasesAndVerify(
+      fetch,
+      {
+        patch: `${BASE}/auto-deduct?action=patch-aliases`,
+        read: `${BASE}/auto-deduct?action=aliases`,
+      },
+      authHeaders(getToken(), true),
+      { upserts, deleteKeys },
+    )
+  }, [aliases, getToken, isMock])
 
-  const handleResolve = useCallback((items, skipped = []) => {
+  const handleResolve = useCallback(async (items, skipped = []) => {
     setResolvedExtras(items)
     setSkippedRows(skipped)
     setEditingResolutions(false)
@@ -416,23 +469,25 @@ export default function AutoDeduct() {
     const learned = {}
     for (const item of items) {
       if (!item._learnAlias || !item._source) continue
-      const isDimensionReview = Boolean(item._source.parseIssue)
+      const reviewIssues = String(item._source.sourceIssue || '').trim()
+      const isDimensionReview = Boolean(reviewIssues)
       // A human-confirmed link is stable at style+color level. Future sizes
       // reuse it only when every exact target size exists in inventory.
       if (item._isCombo) {
         const sourceSize = normalizeSize(item._source.size)
         const sourceComponents = item.components || []
         if (!isDimensionReview && sourceComponents.some((component) => normalizeSize(component.SIZE) !== sourceSize)) continue
-        const key = isDimensionReview
-          ? aliasKey(item._source.style, item._source.color, item._source.size)
-          : aliasKey(item._source.style, item._source.color)
-        learned[key] = {
-          components: sourceComponents.map((component) => ({
+        const components = sourceComponents.map((component) => ({
             STYLE: component.STYLE,
             COLOR: component.COLOR,
             ...(isDimensionReview ? { SIZE: component.SIZE } : {}),
             multiplier: Math.max(1, parseInt(component.multiplier, 10) || 1),
-          })),
+          }))
+        const key = isDimensionReview
+          ? aliasKey(item._source.style, item._source.color, item._source.size)
+          : aliasKey(item._source.style, item._source.color)
+        learned[key] = {
+          components,
           _confirmed: true,
           ...(isDimensionReview ? { _confirmedDimensions: true } : {}),
         }
@@ -465,6 +520,15 @@ export default function AutoDeduct() {
       const deleteKeys = new Set(resolutionAliasKeys)
       for (const key of resolutionAliasKeys) delete nextAliases[key]
       for (const [key, value] of Object.entries(learned)) {
+        if (value._confirmedDimensions) {
+          for (const existingKey of Object.keys(nextAliases)) {
+            if (existingKey.startsWith(`${key}::review::`)) {
+              deleteKeys.add(existingKey)
+              delete nextAliases[existingKey]
+            }
+          }
+          continue
+        }
         if (value._isNew || value.SIZE) continue
         for (const existingKey of Object.keys(nextAliases)) {
           if (existingKey.startsWith(`${key}::`)) {
@@ -473,17 +537,24 @@ export default function AutoDeduct() {
           }
         }
       }
-      Object.assign(nextAliases, learned)
-      setAliases(nextAliases)
-      setResolutionAliasKeys(Object.keys(learned))
-      saveAliases({ upserts: learned, deleteKeys: [...deleteKeys] })
-        .then(() => toast.success(
+      setAliasesSaving(true)
+      setAliasesError(null)
+      try {
+        const verifiedAliases = await saveAliases({ upserts: learned, deleteKeys: [...deleteKeys] })
+        setAliases(verifiedAliases)
+        setResolutionAliasKeys(Object.keys(learned))
+        toast.success(
           learnedCount
             ? `${learnedCount} match${learnedCount !== 1 ? 'es' : ''} remembered for next time`
             : 'Previous draft matches removed',
           'Matches Saved'
-        ))
-        .catch((err) => toast.error(err.message, 'Could Not Save Matches'))
+        )
+      } catch (err) {
+        setAliasesError(err.message)
+        toast.error(err.message, 'Could Not Verify Saved Matches')
+      } finally {
+        setAliasesSaving(false)
+      }
     }
     if (items.length > 0 || skipped.length > 0) {
       const parts = []
@@ -576,6 +647,7 @@ export default function AutoDeduct() {
         headers: authHeaders(getToken(), true),
         body:    JSON.stringify({
           filledRows:  mergedFilledRows,
+          movementRows: businessMovementRows,
           txnType,
           sourceName:  srcFile?.name || '',
           sourceHash,
@@ -596,7 +668,7 @@ export default function AutoDeduct() {
     } finally {
       setApplying(false)
     }
-  }, [archiveDailyOrders, mergedFilledRows, txnType, srcFile, sourceHash, orderArchive, orderClaims, orderImportIssueCount, expectedSourceUnits, inventoryApplyUnits, reconciliationMismatch, skippedUnits, applying, getToken, previewConfirmed, toast])
+  }, [archiveDailyOrders, mergedFilledRows, businessMovementRows, txnType, srcFile, sourceHash, orderArchive, orderClaims, orderImportIssueCount, expectedSourceUnits, inventoryApplyUnits, reconciliationMismatch, skippedUnits, applying, getToken, previewConfirmed, toast])
 
   const stats            = result?.stats
   const hasUnresolved    = result?.unmatchedRows?.length > 0 && resolvedExtras === null
@@ -656,6 +728,19 @@ export default function AutoDeduct() {
         </div>
       )}
 
+      {aliasesError && (
+        <div className="flex items-start gap-3 px-4 py-3 bg-red-50 border border-red-200 rounded-xl text-sm text-red-700">
+          <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
+          <div className="flex-1">
+            <p className="font-medium">Saved Inventory Target matches are unavailable</p>
+            <p className="mt-0.5">{aliasesError}. Auto Deduct is blocked to prevent incorrect matching.</p>
+          </div>
+          <button onClick={loadAliases} className="btn-secondary text-xs px-3 py-1.5">
+            Retry
+          </button>
+        </div>
+      )}
+
       {/* Template missing banner */}
       {!configError && templateMissing && (
         <div className="flex items-start gap-3 px-4 py-3 bg-amber-50 border border-amber-200 rounded-xl text-sm text-amber-800">
@@ -701,14 +786,31 @@ export default function AutoDeduct() {
           onClear={() => { setSrcFile(null); setResult(null); setApplied(false); setPreviewConfirmed(false); setOrderArchive(null) }}
         />
 
+        {!aliasesError && (
+          <div className={`flex items-center gap-2 text-xs ${aliasesLoading || aliasesSaving ? 'text-amber-700' : 'text-green-700'}`}>
+            {aliasesLoading || aliasesSaving
+              ? <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+              : <CheckCircle className="w-3.5 h-3.5" />}
+            <span>
+              {aliasesLoading
+                ? 'Loading saved Inventory Target matches…'
+                : aliasesSaving
+                  ? 'Saving and verifying Inventory Target matches…'
+                  : `${Object.keys(aliases).length.toLocaleString()} saved Inventory Target match${Object.keys(aliases).length === 1 ? '' : 'es'} loaded`}
+            </span>
+          </div>
+        )}
+
         {/* Run button */}
         <button
           onClick={handleRun}
-          disabled={!isMock && (!srcFile || processing || templateMissing)}
+          disabled={!isMock && (!srcFile || processing || templateMissing || aliasesLoading || aliasesSaving || aliasesError)}
           className="btn-primary w-full justify-center py-3 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {processing
             ? <><RefreshCw className="w-4 h-4 animate-spin" /> Processing…</>
+            : aliasesLoading || aliasesSaving
+              ? <><RefreshCw className="w-4 h-4 animate-spin" /> Verifying Saved Matches…</>
             : <><RefreshCw className="w-4 h-4" /> Run Auto-Fill</>}
         </button>
       </div>

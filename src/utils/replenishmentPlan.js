@@ -29,6 +29,32 @@ function todayKey(value) {
   return `${year}-${month}-${day}`
 }
 
+function historySummary(earliestDayNumber, activeDays, safeWindowDays, endDayNumber) {
+  const historySpanDays = earliestDayNumber == null
+    ? 0
+    : Math.min(safeWindowDays, endDayNumber - earliestDayNumber + 1)
+  const activeDayCount = activeDays.size
+  const activeDayRate = historySpanDays ? activeDayCount / historySpanDays : 0
+  const minimumHistoryDays = Math.min(7, safeWindowDays)
+  const confidence = historySpanDays === 0
+    ? 'none'
+    : historySpanDays < minimumHistoryDays || activeDayRate < 0.5
+      ? 'low'
+      : historySpanDays < safeWindowDays || activeDayRate < 0.8
+        ? 'medium'
+        : 'high'
+
+  return {
+    historySpanDays,
+    activeDayCount,
+    activeDayRate,
+    confidence,
+    firstDay: earliestDayNumber == null
+      ? ''
+      : new Date(earliestDayNumber * DAY_MS).toISOString().slice(0, 10),
+  }
+}
+
 export function replenishmentSkuKey(row) {
   return [
     normalizedPart(row?.Style ?? row?.style),
@@ -71,30 +97,33 @@ export function calculateReplenishmentPlan({
 
     const quantity = Number(movement.qty)
     if (!Number.isFinite(quantity) || quantity <= 0) continue
-    activeDays.add(movementDay)
-    earliestDayNumber = earliestDayNumber == null
-      ? movementDayNumber
-      : Math.min(earliestDayNumber, movementDayNumber)
-
     const key = replenishmentSkuKey(movement)
-    const totals = movementBySku.get(key) || { sales: 0, returns: 0 }
+    const totals = movementBySku.get(key) || {
+      sales: 0,
+      returns: 0,
+      salesDays: new Set(),
+      earliestSalesDayNumber: null,
+    }
     totals[movement.txn_type === 'sales' ? 'sales' : 'returns'] += quantity
+    if (movement.txn_type === 'sales') {
+      totals.salesDays.add(movementDay)
+      totals.earliestSalesDayNumber = totals.earliestSalesDayNumber == null
+        ? movementDayNumber
+        : Math.min(totals.earliestSalesDayNumber, movementDayNumber)
+      activeDays.add(movementDay)
+      earliestDayNumber = earliestDayNumber == null
+        ? movementDayNumber
+        : Math.min(earliestDayNumber, movementDayNumber)
+    }
     movementBySku.set(key, totals)
   }
 
-  const historySpanDays = earliestDayNumber == null
-    ? 0
-    : Math.min(safeWindowDays, endDayNumber - earliestDayNumber + 1)
-  const activeDayCount = activeDays.size
-  const activeDayRate = historySpanDays ? activeDayCount / historySpanDays : 0
-  const minimumHistoryDays = Math.min(7, safeWindowDays)
-  const confidence = historySpanDays === 0
-    ? 'none'
-    : historySpanDays < minimumHistoryDays || activeDayRate < 0.5
-      ? 'low'
-      : historySpanDays < safeWindowDays || activeDayRate < 0.8
-        ? 'medium'
-        : 'high'
+  const overallHistory = historySummary(
+    earliestDayNumber,
+    activeDays,
+    safeWindowDays,
+    endDayNumber,
+  )
 
   const inventoryBySku = new Map()
   for (const inventoryRow of inventoryRows || []) {
@@ -115,9 +144,22 @@ export function calculateReplenishmentPlan({
 
   const reorderDays = safeLeadDays + safeSafetyDays
   const rows = [...inventoryBySku.values()].map((inventoryRow) => {
-    const movement = movementBySku.get(inventoryRow.key) || { sales: 0, returns: 0 }
+    const movement = movementBySku.get(inventoryRow.key) || {
+      sales: 0,
+      returns: 0,
+      salesDays: new Set(),
+      earliestSalesDayNumber: null,
+    }
+    const skuHistory = historySummary(
+      movement.earliestSalesDayNumber,
+      movement.salesDays,
+      safeWindowDays,
+      endDayNumber,
+    )
     const netSales = movement.sales - movement.returns
-    const dailyNetSales = historySpanDays > 0 ? Math.max(0, netSales) / historySpanDays : 0
+    const dailyNetSales = skuHistory.historySpanDays > 0
+      ? Math.max(0, netSales) / skuHistory.historySpanDays
+      : 0
     const incoming = wholeNumber(incomingByKey?.[inventoryRow.key], 0, 0, 100000000)
     const inventoryPosition = inventoryRow.onHand + incoming
     const daysLeft = dailyNetSales > 0
@@ -152,6 +194,7 @@ export function calculateReplenishmentPlan({
       targetStock,
       recommendedQty,
       status,
+      ...skuHistory,
     }
   })
 
@@ -162,14 +205,8 @@ export function calculateReplenishmentPlan({
       leadDays: safeLeadDays,
       safetyDays: safeSafetyDays,
       targetDays: effectiveTargetDays,
-      historySpanDays,
-      activeDayCount,
-      activeDayRate,
-      confidence,
-      firstDay: earliestDayNumber == null
-        ? ''
-        : new Date(earliestDayNumber * DAY_MS).toISOString().slice(0, 10),
-      lastDay: historySpanDays ? endDay : '',
+      ...overallHistory,
+      lastDay: overallHistory.historySpanDays ? endDay : '',
     },
   }
 }

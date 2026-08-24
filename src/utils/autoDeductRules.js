@@ -41,6 +41,8 @@ export function findAdditionalSizeMappings({
   const targetStyle = normalizeStyleIdentity(targetEntry.STYLE)
   const targetColor = normalizeColor(targetEntry.COLOR)
   if (normalizeSize(targetEntry.SIZE) !== sourceSize) return []
+  const canReuseSiblingSizes = canReuseAcrossSizes(source.parseIssue)
+    && canReuseAcrossSizes(source.sourceIssue)
 
   return unmatchedRows.flatMap((row, index) => {
     if (
@@ -52,7 +54,13 @@ export function findAdditionalSizeMappings({
 
     const targetSize = normalizeSize(row.size)
     if (targetSize === sourceSize) return [{ index, entry: targetEntry }]
-    if (row.parseIssue !== source.parseIssue || !canReuseAcrossSizes(source.parseIssue) || !canReuseAcrossSizes(row.parseIssue)) return []
+    if (
+      !canReuseSiblingSizes
+      || row.parseIssue !== source.parseIssue
+      || row.sourceIssue !== source.sourceIssue
+      || !canReuseAcrossSizes(row.parseIssue)
+      || !canReuseAcrossSizes(row.sourceIssue)
+    ) return []
     const entry = templateRows.find((candidate) =>
       normalizeStyleIdentity(candidate.STYLE) === targetStyle &&
       normalizeColor(candidate.COLOR) === targetColor &&
@@ -72,7 +80,12 @@ export function findAdditionalComboSizeMappings({
   components,
 }) {
   const source = unmatchedRows[sourceIndex]
-  if (!source || !components?.length || !canReuseComboAcrossSizes(source.parseIssue)) return []
+  if (
+    !source
+    || !components?.length
+    || !canReuseComboAcrossSizes(source.parseIssue)
+    || !canReuseComboAcrossSizes(source.sourceIssue)
+  ) return []
 
   const sourceSize = normalizeSize(source.size)
   if (!sourceSize || components.some((component) => normalizeSize(component.SIZE) !== sourceSize)) return []
@@ -85,7 +98,9 @@ export function findAdditionalComboSizeMappings({
       index === sourceIndex
       || resolved[index]
       || row.parseIssue !== source.parseIssue
+      || row.sourceIssue !== source.sourceIssue
       || !canReuseComboAcrossSizes(row.parseIssue)
+      || !canReuseComboAcrossSizes(row.sourceIssue)
       || normalizeStyleIdentity(row.style) !== sourceStyle
       || sourceColorKey(row.color) !== sourceColor
     ) return []

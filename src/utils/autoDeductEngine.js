@@ -271,6 +271,16 @@ export function aliasKey(style, salesColor, size = '') {
   return normSize ? `${base}::${normSize}` : base
 }
 
+function normalizedIssues(value) {
+  return [...new Set(String(value || '').split(';').map((issue) => issue.trim()).filter(Boolean))]
+    .sort()
+    .join(';')
+}
+
+export function reviewAliasKey(style, salesColor, size, sourceSignature, issues) {
+  return `${aliasKey(style, salesColor, size)}::review::${encodeURIComponent(String(sourceSignature || ''))}::${encodeURIComponent(normalizedIssues(issues))}`
+}
+
 function asConfirmedAlias(value, keepSize = false) {
   if (!value || value._isNew) return null
   if (typeof value === 'string') return { COLOR: value, _confirmed: true }
@@ -291,7 +301,7 @@ function asConfirmedAlias(value, keepSize = false) {
 
 function inferConfirmedStyleColorAlias(aliases, baseKey) {
   const targets = Object.entries(aliases)
-    .filter(([key]) => key.startsWith(`${baseKey}::`))
+    .filter(([key]) => key.startsWith(`${baseKey}::`) && !key.includes('::review::'))
     .map(([, value]) => asConfirmedAlias(value))
     .filter(Boolean)
   if (!targets.length) return null
@@ -310,6 +320,27 @@ function inferConfirmedStyleColorAlias(aliases, baseKey) {
     return `single\u0000${String(target.STYLE || '')}\u0000${String(target.COLOR || '')}`
   }))
   return fingerprints.size === 1 ? targets[0] : null
+}
+
+function inferConfirmedDimensionReviewAlias(aliases, sizeKey) {
+  const targets = Object.entries(aliases)
+    .filter(([key]) => key.startsWith(`${sizeKey}::review::`))
+    .map(([, value]) => asConfirmedAlias(value, true))
+    .filter(Boolean)
+  if (!targets.length) return null
+
+  const fingerprints = new Set(targets.map((target) => {
+    if (Array.isArray(target.components)) {
+      return `combo\u0000${target.components.map((component) => [
+        component.STYLE,
+        component.COLOR,
+        normalizeSize(component.SIZE),
+        Math.max(1, parseInt(component.multiplier, 10) || 1),
+      ].join('\u0000')).sort().join('\u0001')}`
+    }
+    return `single\u0000${target.STYLE || ''}\u0000${target.COLOR || ''}\u0000${normalizeSize(target.SIZE)}`
+  }))
+  return fingerprints.size === 1 ? { ...targets[0], _confirmedDimensions: true } : null
 }
 
 /**
@@ -354,6 +385,8 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
     const color    = String(row.color || row.COLOR || '').trim()
     const rawSize  = String(row.size  || row.SIZE  || '').trim()
     const normSize = normalizeSize(rawSize)
+    const businessDay = String(row.business_day || row.businessDay || '').trim()
+    const sourceSignature = String(row.source_signature || row.sourceSignature || '').trim()
     const rawQty   = row.QTY ?? row.qty ?? 0
     const qty      = Number(rawQty)
 
@@ -398,6 +431,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
             targetStyle: targetRow.style,
             targetColor: targetRow.color,
             targetSize: targetRow.size,
+            businessDay,
             via: 'confirmed missing-style source',
           })
         })
@@ -411,6 +445,9 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
         size: normSize,
         qty,
         packCount: effectivePackCount,
+        businessDay,
+        sourceSignature,
+        sourceIssue,
         parseIssue: confirmed ? 'confirmed_mapping_size_missing' : sourceIssue,
       })
       return
@@ -421,15 +458,27 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
     if (routedStyle === null) {
       parseIssue = [...new Set([...parseIssue.split(';'), 'm022_size_unknown'].filter(Boolean))].join(';')
     }
+    const sourceIssue = parseIssue
     const matchStyle = routedStyle || style
     const normStyle = normalizeStyle(matchStyle)
     const key       = `${normStyle}||${normSize}`
     let candidates = buckets.get(key) || []
     const baseAliasKey = aliasKey(style, color)
+    const savedReviewAlias = parseIssue && sourceSignature
+      ? aliases[reviewAliasKey(style, color, normSize, sourceSignature, parseIssue)]
+      : null
+    const confirmedSourceReview = savedReviewAlias?._confirmed === true
+      && savedReviewAlias._sourceSignature === sourceSignature
+      && normalizedIssues(savedReviewAlias._confirmedIssues) === normalizedIssues(parseIssue)
     const savedSizeAlias = aliases[aliasKey(style, color, normSize)]
     const savedGeneralAlias = aliases[baseAliasKey]
-    let aliasTarget = asConfirmedAlias(savedSizeAlias, true)
+    const inferredDimensionReview = parseIssue
+      ? inferConfirmedDimensionReviewAlias(aliases, aliasKey(style, color, normSize))
+      : null
+    let aliasTarget = (confirmedSourceReview && (asConfirmedAlias(savedReviewAlias, true) || savedReviewAlias))
+      || asConfirmedAlias(savedSizeAlias, true)
       || savedSizeAlias
+      || inferredDimensionReview
       || asConfirmedAlias(savedGeneralAlias)
       || savedGeneralAlias
       || inferConfirmedStyleColorAlias(aliases, baseAliasKey)
@@ -455,7 +504,11 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
         && !confirmedStyleColorRule
     )
     if (aliasNeedsReview) {
-      unmatchedRows.push({ style, color, size: normSize, qty, packCount: effectivePackCount, parseIssue: parseIssue || 'confirmed_mapping_requires_review' })
+      unmatchedRows.push({
+        style, color, size: normSize, qty, packCount: effectivePackCount, businessDay, sourceSignature,
+        ...(sourceIssue ? { sourceIssue } : {}),
+        parseIssue: parseIssue || 'confirmed_mapping_requires_review',
+      })
       return
     }
 
@@ -500,6 +553,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
             targetStyle: matched.style,
             targetColor: matched.color,
             targetSize: matched.size,
+            businessDay,
             via: 'confirmed combo',
           })
         }
@@ -529,6 +583,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
           targetStyle: matched.style,
           targetColor: matched.color,
           targetSize: matched.size,
+          businessDay,
           via: 'confirmed',
         })
         return true
@@ -538,13 +593,15 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
 
     // A confirmed combo resolves only the known set/combo uncertainty. Other
     // parsing warnings still require a fresh human decision.
-    const comboResolvedIssue = confirmedDimensionReview || confirmedComboRule
+    const comboResolvedIssue = confirmedSourceReview || confirmedDimensionReview || (
+      confirmedComboRule
       && parseIssue
         .split(';')
         .filter(Boolean)
         .every((issue) => ['set_components_unknown', 'cross_style_combo', 'ambiguous_color_separator'].includes(issue))
+    )
     if (parseIssue && !comboResolvedIssue) {
-      unmatchedRows.push({ style, color, size: normSize, qty, packCount: effectivePackCount, parseIssue })
+      unmatchedRows.push({ style, color, size: normSize, qty, packCount: effectivePackCount, businessDay, sourceSignature, sourceIssue, parseIssue })
       return
     }
 
@@ -561,6 +618,9 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
         size: normSize,
         qty,
         packCount: effectivePackCount,
+        businessDay,
+        sourceSignature,
+        ...(sourceIssue ? { sourceIssue } : {}),
         parseIssue: target._isNew ? 'confirmed_new_target_missing' : 'confirmed_mapping_size_missing',
       })
       return
@@ -573,13 +633,20 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
         size: normSize,
         qty,
         packCount: effectivePackCount,
+        businessDay,
+        sourceSignature,
+        ...(sourceIssue ? { sourceIssue } : {}),
         parseIssue: hadLooseStyleCandidates ? 'style_identity_mismatch' : parseIssue,
       })
       return
     }
 
     if (!aliasTarget && new Set(candidates.map((candidate) => candidate.style)).size > 1) {
-      unmatchedRows.push({ style, color, size: normSize, qty, packCount: effectivePackCount, parseIssue: 'ambiguous_inventory_style' })
+      unmatchedRows.push({
+        style, color, size: normSize, qty, packCount: effectivePackCount, businessDay, sourceSignature,
+        ...(sourceIssue ? { sourceIssue } : {}),
+        parseIssue: 'ambiguous_inventory_style',
+      })
       return
     }
 
@@ -591,6 +658,9 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
         size: normSize,
         qty,
         packCount: effectivePackCount,
+        businessDay,
+        sourceSignature,
+        ...(sourceIssue ? { sourceIssue } : {}),
         parseIssue: target?._isNew ? 'confirmed_new_target_missing' : 'confirmed_mapping_size_missing',
       })
       return
@@ -608,7 +678,11 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
         ]),
     )
     if (exactTargets.size > 1) {
-      unmatchedRows.push({ style, color, size: normSize, qty, packCount, parseIssue: 'ambiguous_inventory_color' })
+      unmatchedRows.push({
+        style, color, size: normSize, qty, packCount, businessDay, sourceSignature,
+        ...(sourceIssue ? { sourceIssue } : {}),
+        parseIssue: 'ambiguous_inventory_color',
+      })
       return
     }
 
@@ -647,10 +721,15 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
         targetStyle: matched.style,
         targetColor: matched.color,
         targetSize: matched.size,
+        businessDay,
         via: chosenScore >= 0.999 ? 'exact' : `fuzzy ${chosenScore.toFixed(2)}`,
       })
     } else {
-      unmatchedRows.push({ style, color, size: normSize, qty, packCount, parseIssue })
+      unmatchedRows.push({
+        style, color, size: normSize, qty, packCount, businessDay, sourceSignature,
+        ...(sourceIssue ? { sourceIssue } : {}),
+        parseIssue,
+      })
     }
   })
 

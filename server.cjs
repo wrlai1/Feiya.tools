@@ -22,17 +22,39 @@ const PORT = 3001;
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
-let returnsHandlerPromise;
-app.all('/api/returns', async (req, res) => {
-  returnsHandlerPromise ||= import('./api/returns.js').then((module) => module.default);
-  return (await returnsHandlerPromise)(req, res);
-});
+// Local development uses the same handlers as production. The legacy route
+// implementations below remain temporarily for migration reference, but these
+// first-mounted routes are the executable source of truth.
+const apiHandlerPromises = new Map();
+function mountProductionHandler(route, modulePath) {
+  app.all(route, async (req, res, next) => {
+    try {
+      if (!apiHandlerPromises.has(modulePath)) {
+        apiHandlerPromises.set(modulePath, import(modulePath).then((module) => module.default));
+      }
+      return await (await apiHandlerPromises.get(modulePath))(req, res);
+    } catch (error) {
+      if (res.headersSent) return next(error);
+      console.error(`[${route}]`, error.message);
+      return res.status(500).json({ error: error.message });
+    }
+  });
+}
 
-let attendanceHandlerPromise;
-app.all('/api/attendance', async (req, res) => {
-  attendanceHandlerPromise ||= import('./api/attendance.js').then((module) => module.default);
-  return (await attendanceHandlerPromise)(req, res);
-});
+[
+  ['/api/auth', './api/auth.js'],
+  ['/api/users', './api/users.js'],
+  ['/api/app-data', './api/app-data.js'],
+  ['/api/custom-metrics', './api/custom-metrics.js'],
+  ['/api/analytics-store', './api/analytics-store.js'],
+  ['/api/new-product-tracker', './api/new-product-tracker.js'],
+  ['/api/chat-messages', './api/chat-messages.js'],
+  ['/api/auto-deduct', './api/auto-deduct.js'],
+  ['/api/inventory-balance', './api/inventory-balance.js'],
+  ['/api/timeclock', './api/timeclock.js'],
+  ['/api/attendance', './api/attendance.js'],
+  ['/api/returns', './api/returns.js'],
+].forEach(([route, modulePath]) => mountProductionHandler(route, modulePath));
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -74,13 +96,18 @@ async function ensureUsersTable(sql) {
 async function seedAdminIfNeeded(sql) {
   const rows = await sql`SELECT COUNT(*)::int AS count FROM users`;
   if (rows[0].count === 0) {
-    const hash = await bcrypt.hash('feiya2026', 10);
+    const password = String(process.env.INITIAL_ADMIN_PASSWORD || '');
+    if (password.length < 12) {
+      throw new Error('No users exist. Set INITIAL_ADMIN_PASSWORD to a private password of at least 12 characters.');
+    }
+    const username = String(process.env.INITIAL_ADMIN_USERNAME || 'admin').trim().toLowerCase();
+    const hash = await bcrypt.hash(password, 10);
     await sql`
       INSERT INTO users (username, password_hash, role, created_by)
-      VALUES ('admin', ${hash}, 'admin', 'system')
+      VALUES (${username}, ${hash}, 'admin', 'system')
       ON CONFLICT (username) DO NOTHING
     `;
-    console.log('  ✓ Seeded default admin user (admin / feiya2026)');
+    console.log('  ✓ Seeded the initial admin user from environment settings');
   }
 }
 
