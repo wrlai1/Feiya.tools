@@ -33,16 +33,16 @@ export function fetchInventory() {
   return request(`${BASE}/app-data?type=inventory`)
 }
 
-export function saveInventory(data, fileName = null) {
+export function saveInventory(data, fileName = null, expectedRevision = 0) {
   return request(`${BASE}/app-data`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: 'inventory', data, fileName, updatedAt: new Date().toISOString() }),
+    body: JSON.stringify({ type: 'inventory', data, fileName, expectedRevision }),
   })
 }
 
-export function clearInventory() {
-  return request(`${BASE}/app-data?type=inventory`, { method: 'DELETE' })
+export function clearInventory(expectedRevision = 0) {
+  return request(`${BASE}/app-data?type=inventory&expectedRevision=${expectedRevision}`, { method: 'DELETE' })
 }
 
 // ─── Tracking ─────────────────────────────────────────────────────────────────
