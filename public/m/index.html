@@ -16,9 +16,8 @@
        background:#f1f5f9;color:#0f172a;-webkit-font-smoothing:antialiased}
   .hide{display:none!important}
 
-  /* 顶栏 */
   header{position:sticky;top:0;z-index:10;background:#2563eb;color:#fff;
-         padding:calc(env(safe-area-inset-top) + 12px) 14px 10px}
+         padding:calc(env(safe-area-inset-top) + 12px) 14px 0}
   .bar{display:flex;align-items:center;gap:10px}
   .bar h1{font-size:17px;margin:0;font-weight:700;flex:1}
   .status{font-size:11px;opacity:.9;display:flex;align-items:center;gap:5px;margin-top:6px}
@@ -29,20 +28,30 @@
   .iconbtn:active{background:rgba(255,255,255,.32)}
   .iconbtn:disabled{opacity:.5}
 
-  /* 搜索 */
-  .searchwrap{padding:10px 14px 8px;background:#2563eb}
-  #q{width:100%;padding:13px 14px;font-size:17px;border:0;border-radius:12px;
-     background:#fff;color:#0f172a}
-  #q:focus{outline:2px solid #93c5fd}
-  .chips{display:flex;gap:6px;overflow-x:auto;padding:8px 14px;background:#fff;
-         border-bottom:1px solid #e2e8f0;scrollbar-width:none}
-  .chips::-webkit-scrollbar{display:none}
-  .chip{flex:none;padding:6px 12px;border-radius:999px;border:1px solid #cbd5e1;
-        background:#fff;color:#475569;font-size:13px;white-space:nowrap}
-  .chip.on{background:#eff6ff;border-color:#93c5fd;color:#1d4ed8;font-weight:600}
+  /* 数据源切换 */
+  .tabs{display:flex;gap:6px;margin-top:10px}
+  .tab{flex:1;padding:9px;border:0;border-radius:10px 10px 0 0;font-size:14px;font-weight:600;
+       background:rgba(255,255,255,.16);color:#dbeafe}
+  .tab.on{background:#f1f5f9;color:#1d4ed8}
 
-  /* 结果 */
-  main{padding:10px 12px calc(env(safe-area-inset-bottom) + 24px)}
+  .searchwrap{padding:10px 14px 10px;background:#f1f5f9}
+  #q{width:100%;padding:13px 14px;font-size:17px;border:1px solid #cbd5e1;border-radius:12px;background:#fff}
+  #q:focus{outline:2px solid #93c5fd;border-color:transparent}
+
+  .controls{display:flex;gap:8px;padding:0 14px 8px;background:#f1f5f9;align-items:center}
+  select{flex:1;padding:9px 10px;font-size:13px;border:1px solid #cbd5e1;border-radius:10px;
+         background:#fff;color:#334155;-webkit-appearance:none;appearance:none;
+         background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%2394a3b8'/%3E%3C/svg%3E");
+         background-repeat:no-repeat;background-position:right 11px center}
+
+  .chips{display:flex;gap:6px;overflow-x:auto;padding:0 14px 10px;background:#f1f5f9;scrollbar-width:none}
+  .chips::-webkit-scrollbar{display:none}
+  .chip{flex:none;padding:6px 13px;border-radius:999px;border:1px solid #cbd5e1;
+        background:#fff;color:#475569;font-size:13px;white-space:nowrap}
+  .chip.on{background:#2563eb;border-color:#2563eb;color:#fff;font-weight:600}
+  .chiplabel{flex:none;font-size:11px;color:#94a3b8;align-self:center;padding-right:2px}
+
+  main{padding:0 12px calc(env(safe-area-inset-bottom) + 24px)}
   .meta{font-size:12px;color:#64748b;padding:4px 4px 10px}
   .card{background:#fff;border-radius:14px;padding:13px 14px;margin-bottom:9px;
         box-shadow:0 1px 2px rgba(15,23,42,.07)}
@@ -50,19 +59,22 @@
   .rack{background:#f5f3ff;color:#6d28d9;font-weight:800;font-size:16px;
         padding:7px 11px;border-radius:10px;flex:none;letter-spacing:.3px}
   .rack.none{background:#f1f5f9;color:#94a3b8;font-weight:600;font-size:13px}
+  .sz{background:#ecfdf5;color:#047857;font-weight:800;font-size:15px;
+      padding:7px 11px;border-radius:10px;flex:none;min-width:52px;text-align:center}
   .titles{flex:1;min-width:0}
   .style{font-size:16px;font-weight:700;word-break:break-word}
   .color{font-size:13px;color:#64748b;margin-top:2px;word-break:break-word}
-  .nums{display:flex;gap:20px;border-top:1px solid #f1f5f9;padding-top:9px}
+  .nums{display:flex;gap:20px;border-top:1px solid #f1f5f9;padding-top:9px;align-items:center}
   .num b{display:block;font-size:19px;font-weight:800;line-height:1.15}
+  .num b.zero{color:#cbd5e1}
   .num span{font-size:11px;color:#94a3b8}
   .sheet{font-size:10px;color:#64748b;background:#f1f5f9;padding:3px 7px;
-         border-radius:6px;margin-left:auto;align-self:center}
+         border-radius:6px;margin-left:auto}
   .extra{font-size:12px;color:#64748b;margin-top:8px;padding-top:8px;
          border-top:1px solid #f1f5f9;word-break:break-word}
   .empty{text-align:center;color:#94a3b8;padding:56px 20px;font-size:15px;line-height:1.7}
+  mark{background:#fef08a;color:inherit;border-radius:2px;padding:0 1px}
 
-  /* 登录 */
   #login{padding:56px 24px;max-width:400px;margin:0 auto}
   #login h2{font-size:21px;margin:0 0 6px}
   #login p{color:#64748b;font-size:14px;margin:0 0 26px}
@@ -94,11 +106,21 @@
       <button class="iconbtn" id="out" title="退出">⏻</button>
     </div>
     <div class="status"><span class="dot" id="dot"></span><span id="statusText">—</span></div>
-    <div class="searchwrap">
-      <input id="q" placeholder="搜款号 / 颜色 / 库位…" autocapitalize="off" autocorrect="off" enterkeyhint="search">
+    <div class="tabs">
+      <button class="tab on" id="tabLoc" data-src="loc">库位 · 地点</button>
+      <button class="tab" id="tabBal" data-src="bal">可售 · 尺码</button>
     </div>
   </header>
-  <div class="chips" id="chips"></div>
+
+  <div class="searchwrap">
+    <input id="q" placeholder="搜款号 / 颜色…" autocapitalize="off" autocorrect="off" enterkeyhint="search">
+  </div>
+  <div class="controls">
+    <select id="sort"></select>
+    <select id="sheet" class="hide"></select>
+  </div>
+  <div class="chips hide" id="sizeChips"></div>
+
   <div class="banner hide" id="banner"></div>
   <main>
     <div class="meta" id="meta"></div>
@@ -109,12 +131,42 @@
 <script>
 (() => {
   'use strict'
-  const TOKEN='feiya_m_token', CACHE='feiya_m_inv', LIMIT=100
-  const $=id=>document.getElementById(id)
-  let rows=[], sheet='全部', shown=LIMIT, cachedAt=null, srcUpdated=null
+  const TOKEN='feiya_m_token', C_LOC='feiya_m_inv', C_BAL='feiya_m_bal', LIMIT=100
 
-  const token=()=>localStorage.getItem(TOKEN)
+  // 尺码自然顺序：XXS→XXL、加大码、数字码、petite
+  const SIZE_ORDER = ['XXS','XS','S','M','L','XL','XXL','1X','1XL','2X','2XL','3X','3XL',
+    'PS','PM','PL','PXL','2','4','6','8','10','12','14','16','18','20','22','24',
+    '6W','8W','10W','12W','14W','16W','18W','20W','22W','24W']
+  const sizeRank = s => {
+    const i = SIZE_ORDER.indexOf(String(s||'').trim().toUpperCase())
+    return i < 0 ? 999 : i
+  }
+
+  const SORTS = {
+    loc: [
+      ['qty-desc','数量：多 → 少'],['qty-asc','数量：少 → 多'],
+      ['style-asc','款号：A → Z'],['style-desc','款号：Z → A'],
+      ['rack-asc','库位：A → Z'],['rack-desc','库位：Z → A'],
+      ['box-desc','箱数：多 → 少'],
+    ],
+    bal: [
+      ['qty-desc','数量：多 → 少'],['qty-asc','数量：少 → 多'],
+      ['style-asc','款号：A → Z'],['style-desc','款号：Z → A'],
+      ['size-asc','尺码：小 → 大'],['size-desc','尺码：大 → 小'],
+      ['color-asc','颜色：A → Z'],
+    ],
+  }
+
+  const $=id=>document.getElementById(id)
   const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))
+  const token=()=>localStorage.getItem(TOKEN)
+
+  let src='loc', shown=LIMIT
+  let loc={rows:[],at:null}, bal={rows:[],at:null}
+  let sheet='全部', sizeSel='全部'
+  let sortBy={loc:'qty-desc',bal:'qty-desc'}
+
+  const cur=()=>src==='loc'?loc:bal
 
   function ago(ts){
     if(!ts) return '从未同步'
@@ -124,125 +176,205 @@
     if(s<86400) return `${Math.floor(s/3600)} 小时前同步`
     return `${Math.floor(s/86400)} 天前同步`
   }
+  function note(msg){ const b=$('banner'); b.textContent=msg||''; b.classList.toggle('hide',!msg) }
 
   // ── 缓存 ───────────────────────────────────────────────────────────────
-  function loadCache(){
-    try{
-      const c=JSON.parse(localStorage.getItem(CACHE)||'null')
-      if(c&&Array.isArray(c.rows)){ rows=c.rows; cachedAt=c.at; srcUpdated=c.updatedAt; return true }
-    }catch{}
-    return false
+  function loadCaches(){
+    try{ const c=JSON.parse(localStorage.getItem(C_LOC)||'null'); if(c?.rows) loc=c }catch{}
+    try{ const c=JSON.parse(localStorage.getItem(C_BAL)||'null'); if(c?.rows) bal=c }catch{}
   }
-  function saveCache(){
-    try{ localStorage.setItem(CACHE,JSON.stringify({rows,at:cachedAt,updatedAt:srcUpdated})) }
-    catch(e){ note('数据太大，本地只保留部分缓存') }
-  }
+  function save(key,obj){ try{ localStorage.setItem(key,JSON.stringify(obj)) }catch{ note('缓存空间不足，部分数据未保存') } }
 
-  // ── 同步 ───────────────────────────────────────────────────────────────
+  // ── 同步（两个数据源一起）────────────────────────────────────────────────
   async function sync(manual){
     if(!navigator.onLine){ if(manual) note('当前离线，显示的是上次同步的数据'); render(); return }
     $('sync').disabled=true; $('statusText').textContent='同步中…'
+    const auth={Authorization:'Bearer '+token()}
+    let failed=[]
     try{
-      const r=await fetch('/api/app-data?type=inventory',{headers:{Authorization:'Bearer '+token()}})
-      if(r.status===401){ logout(); return }
-      if(!r.ok) throw new Error('HTTP '+r.status)
-      const d=await r.json()
-      rows=Array.isArray(d.rows)?d.rows:[]
-      srcUpdated=d.updatedAt||null; cachedAt=Date.now()
-      saveCache(); note('')
-    }catch(e){
-      note('同步失败，显示上次数据 · '+e.message)
-    }finally{ $('sync').disabled=false; render() }
+      const [r1,r2]=await Promise.allSettled([
+        fetch('/api/app-data?type=inventory',{headers:auth}),
+        fetch('/api/inventory-balance?action=list',{headers:auth}),
+      ])
+      if(r1.status==='fulfilled'&&r1.value.status===401){ logout(); return }
+
+      if(r1.status==='fulfilled'&&r1.value.ok){
+        const d=await r1.value.json()
+        loc={rows:Array.isArray(d.rows)?d.rows:[],at:Date.now()}
+        save(C_LOC,loc)
+      } else failed.push('库位')
+
+      if(r2.status==='fulfilled'&&r2.value.ok){
+        const d=await r2.value.json()
+        bal={rows:(Array.isArray(d.rows)?d.rows:[]).map(r=>({
+          style:r.Style??r.style, color:r.Color??r.color,
+          size:r.Size??r.size, qty:Number(r.Quantity??r.quantity)||0,
+        })),at:Date.now()}
+        save(C_BAL,bal)
+      } else failed.push('可售库存')
+
+      note(failed.length?`${failed.join('、')}同步失败，显示上次数据`:'')
+    }catch(e){ note('同步失败，显示上次数据 · '+e.message) }
+    finally{ $('sync').disabled=false; drawFilters(); render() }
   }
 
-  function note(msg){
-    const b=$('banner')
-    b.textContent=msg||''
-    b.classList.toggle('hide',!msg)
+  // ── 筛选控件 ────────────────────────────────────────────────────────────
+  function drawSort(){
+    $('sort').innerHTML=SORTS[src].map(([v,l])=>
+      `<option value="${v}"${sortBy[src]===v?' selected':''}>${l}</option>`).join('')
+  }
+  function drawFilters(){
+    drawSort()
+    // 库位模式：分表下拉
+    const sel=$('sheet')
+    if(src==='loc'){
+      const list=['全部',...new Set(loc.rows.map(r=>r.sheet).filter(Boolean))]
+      if(list.length>2){
+        sel.classList.remove('hide')
+        if(!list.includes(sheet)) sheet='全部'
+        sel.innerHTML=list.map(s=>`<option${s===sheet?' selected':''}>${esc(s)}</option>`).join('')
+      } else { sel.classList.add('hide'); sheet='全部' }
+      $('sizeChips').classList.add('hide')
+    } else {
+      sel.classList.add('hide')
+      // 可售模式：尺码筛选 chips（按自然顺序）
+      const sizes=[...new Set(bal.rows.map(r=>r.size).filter(Boolean))]
+        .sort((a,b)=>sizeRank(a)-sizeRank(b)||String(a).localeCompare(String(b)))
+      if(sizes.length){
+        $('sizeChips').classList.remove('hide')
+        if(sizeSel!=='全部'&&!sizes.includes(sizeSel)) sizeSel='全部'
+        $('sizeChips').innerHTML='<span class="chiplabel">尺码</span>'+
+          ['全部',...sizes].map(s=>`<button class="chip${s===sizeSel?' on':''}" data-sz="${esc(s)}">${esc(s)}</button>`).join('')
+      } else $('sizeChips').classList.add('hide')
+    }
+    $('q').placeholder = src==='loc' ? '搜款号 / 颜色 / 库位…' : '搜款号 / 颜色…'
+  }
+
+  // ── 搜索 + 排序 ─────────────────────────────────────────────────────────
+  function terms(){ return $('q').value.trim().toLowerCase().split(/\s+/).filter(Boolean) }
+
+  function filtered(){
+    const t=terms()
+    if(src==='loc'){
+      let list=sheet==='全部'?loc.rows:loc.rows.filter(r=>r.sheet===sheet)
+      if(t.length) list=list.filter(r=>{
+        const hay=[r.rack,r.style,r.color,r.qty,r.box,r.sizes,r.fabric,r.label,r.company,r.customer,r.po,r.remark].join(' ').toLowerCase()
+        return t.every(x=>hay.includes(x))
+      })
+      return sortList(list)
+    }
+    let list=sizeSel==='全部'?bal.rows:bal.rows.filter(r=>String(r.size)===sizeSel)
+    if(t.length) list=list.filter(r=>{
+      // 款号/颜色用包含匹配；尺码要求完全相等，避免 "M" 命中 "melon"
+      const sty=String(r.style??'').toLowerCase(), col=String(r.color??'').toLowerCase()
+      const sz=String(r.size??'').toLowerCase()
+      return t.every(x=>sty.includes(x)||col.includes(x)||sz===x)
+    })
+    return sortList(list)
+  }
+
+  function sortList(list){
+    const [field,dir]=sortBy[src].split('-')
+    const m=dir==='asc'?1:-1
+    const txt=(r,f)=>String(r[f]??'')
+    return [...list].sort((a,b)=>{
+      if(field==='qty'||field==='box'){
+        const av=Number(a[field])||0, bv=Number(b[field])||0
+        if(av!==bv) return m*(av-bv)
+        return String(a.style??'').localeCompare(String(b.style??''),undefined,{numeric:true})
+      }
+      if(field==='size'){
+        const d=sizeRank(a.size)-sizeRank(b.size)
+        if(d) return m*d
+        return String(a.style??'').localeCompare(String(b.style??''),undefined,{numeric:true})
+      }
+      const c=txt(a,field).localeCompare(txt(b,field),undefined,{numeric:true,sensitivity:'base'})
+      if(c) return m*c
+      return String(a.style??'').localeCompare(String(b.style??''),undefined,{numeric:true})
+    })
+  }
+
+  function hl(text){
+    const t=terms(); let s=esc(text)
+    for(const x of t){
+      if(!x) continue
+      s=s.replace(new RegExp('('+x.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+')','ig'),'<mark>$1</mark>')
+    }
+    return s
   }
 
   // ── 渲染 ───────────────────────────────────────────────────────────────
-  function sheets(){
-    return ['全部',...[...new Set(rows.map(r=>r.sheet).filter(Boolean))]]
-  }
-  function drawChips(){
-    const list=sheets()
-    if(list.length<=2){ $('chips').classList.add('hide'); return }
-    $('chips').classList.remove('hide')
-    $('chips').innerHTML=list.map(s=>
-      `<button class="chip${s===sheet?' on':''}" data-s="${esc(s)}">${esc(s)}</button>`).join('')
-  }
-  function match(r,terms){
-    const hay=[r.rack,r.style,r.color,r.qty,r.box,r.sizes,r.fabric,r.label,r.company,r.customer,r.po,r.remark]
-      .join(' ').toLowerCase()
-    return terms.every(t=>hay.includes(t))
-  }
   function render(){
-    const terms=$('q').value.trim().toLowerCase().split(/\s+/).filter(Boolean)
-    let list=sheet==='全部'?rows:rows.filter(r=>r.sheet===sheet)
-    if(terms.length) list=list.filter(r=>match(r,terms))
-
     $('dot').className='dot'+(navigator.onLine?'':' off')
-    $('statusText').textContent=(navigator.onLine?'在线 · ':'离线 · ')+ago(cachedAt)
+    $('statusText').textContent=(navigator.onLine?'在线 · ':'离线 · ')+ago(cur().at)
 
-    const total=list.length
-    $('meta').textContent=rows.length
-      ? `${total.toLocaleString()} 条${terms.length?'（已筛选）':''}${total>shown?` · 显示前 ${shown}`:''}`
+    const list=filtered(), total=list.length, has=cur().rows.length
+    $('meta').textContent=has
+      ? `${total.toLocaleString()} 条${terms().length||sizeSel!=='全部'||sheet!=='全部'?'（已筛选）':''}${total>shown?` · 显示前 ${shown}`:''}`
       : ''
 
-    if(!rows.length){
+    if(!has){
       $('results').innerHTML=`<div class="empty">还没有数据${navigator.onLine?'<br>点右上角 ⟳ 同步':'<br>联网后点 ⟳ 同步'}</div>`
       return
     }
-    if(!total){ $('results').innerHTML=`<div class="empty">没找到匹配的库存<br><span style="font-size:13px">换个款号或颜色试试</span></div>`; return }
+    if(!total){ $('results').innerHTML=`<div class="empty">没找到匹配的库存<br><span style="font-size:13px">换个款号、颜色或尺码试试</span></div>`; return }
 
-    const html=list.slice(0,shown).map(r=>{
-      const rack=r.rack?`<div class="rack">${esc(r.rack)}</div>`:`<div class="rack none">无库位</div>`
-      const extra=[r.sizes&&`尺码：${esc(r.sizes)}`,r.fabric&&`面料：${esc(r.fabric)}`,
-                   r.company&&`公司：${esc(r.company)}`,r.remark&&`备注：${esc(r.remark)}`]
-                  .filter(Boolean).join(' · ')
-      return `<div class="card">
-        <div class="row1">${rack}
-          <div class="titles">
-            <div class="style">${esc(r.style||r.po||'—')}</div>
-            ${r.color?`<div class="color">${esc(r.color)}</div>`:''}
-          </div>
-        </div>
-        <div class="nums">
-          <div class="num"><b>${r.qty!=null&&r.qty!==''?esc(r.qty):'—'}</b><span>数量</span></div>
-          <div class="num"><b>${r.box!=null&&r.box!==''?esc(r.box):'—'}</b><span>箱数</span></div>
-          ${r.sheet?`<div class="sheet">${esc(r.sheet)}</div>`:''}
-        </div>
-        ${extra?`<div class="extra">${extra}</div>`:''}
-      </div>`
-    }).join('')
+    const html=list.slice(0,shown).map(r=>src==='loc'?cardLoc(r):cardBal(r)).join('')
     const more=total>shown?`<button class="chip" id="more" style="width:100%;padding:12px;margin-top:4px">加载更多（还有 ${total-shown} 条）</button>`:''
     $('results').innerHTML=html+more
     const mb=$('more'); if(mb) mb.onclick=()=>{ shown+=LIMIT; render() }
   }
 
+  function cardLoc(r){
+    const rack=r.rack?`<div class="rack">${hl(r.rack)}</div>`:`<div class="rack none">无库位</div>`
+    const extra=[r.sizes&&`尺码：${esc(r.sizes)}`,r.fabric&&`面料：${esc(r.fabric)}`,
+                 r.company&&`公司：${esc(r.company)}`,r.remark&&`备注：${esc(r.remark)}`].filter(Boolean).join(' · ')
+    return `<div class="card">
+      <div class="row1">${rack}
+        <div class="titles"><div class="style">${hl(r.style||r.po||'—')}</div>
+        ${r.color?`<div class="color">${hl(r.color)}</div>`:''}</div>
+      </div>
+      <div class="nums">
+        <div class="num"><b>${r.qty!=null&&r.qty!==''?esc(r.qty):'—'}</b><span>数量</span></div>
+        <div class="num"><b>${r.box!=null&&r.box!==''?esc(r.box):'—'}</b><span>箱数</span></div>
+        ${r.sheet?`<div class="sheet">${esc(r.sheet)}</div>`:''}
+      </div>
+      ${extra?`<div class="extra">${extra}</div>`:''}
+    </div>`
+  }
+
+  function cardBal(r){
+    return `<div class="card">
+      <div class="row1">
+        <div class="sz">${esc(r.size||'—')}</div>
+        <div class="titles"><div class="style">${hl(r.style)}</div>
+          <div class="color">${hl(r.color)}</div></div>
+      </div>
+      <div class="nums">
+        <div class="num"><b class="${r.qty>0?'':'zero'}">${r.qty.toLocaleString()}</b><span>可售数量</span></div>
+      </div>
+    </div>`
+  }
+
   // ── 登录/退出 ──────────────────────────────────────────────────────────
-  function showLogin(){ $('login').classList.remove('hide'); $('app').classList.add('hide') }
-  function showApp(){ $('login').classList.add('hide'); $('app').classList.remove('hide') }
+  const showLogin=()=>{ $('login').classList.remove('hide'); $('app').classList.add('hide') }
+  const showApp =()=>{ $('login').classList.add('hide'); $('app').classList.remove('hide') }
   function logout(){
-    localStorage.removeItem(TOKEN); localStorage.removeItem(CACHE)
-    rows=[]; cachedAt=null; showLogin()
+    localStorage.removeItem(TOKEN); localStorage.removeItem(C_LOC); localStorage.removeItem(C_BAL)
+    loc={rows:[],at:null}; bal={rows:[],at:null}; showLogin()
   }
   async function login(){
     const btn=$('loginBtn'), err=$('loginErr')
     err.textContent=''; btn.disabled=true; btn.textContent='登录中…'
     try{
-      const r=await fetch('/api/auth?action=login',{
-        method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({username:$('u').value.trim(),password:$('p').value})
-      })
+      const r=await fetch('/api/auth?action=login',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({username:$('u').value.trim(),password:$('p').value})})
       const d=await r.json().catch(()=>({}))
       if(!r.ok) throw new Error(d.error||'登录失败')
       localStorage.setItem(TOKEN,d.token)
       showApp(); await sync(false)
-    }catch(e){
-      err.textContent=navigator.onLine?e.message:'离线状态无法登录，请先联网登录一次'
-    }finally{ btn.disabled=false; btn.textContent='登录' }
+    }catch(e){ err.textContent=navigator.onLine?e.message:'离线状态无法登录，请先联网登录一次' }
+    finally{ btn.disabled=false; btn.textContent='登录' }
   }
 
   // ── 事件 ───────────────────────────────────────────────────────────────
@@ -250,18 +382,23 @@
   $('p').onkeydown=e=>{ if(e.key==='Enter') login() }
   $('sync').onclick=()=>sync(true)
   $('out').onclick=()=>{ if(confirm('退出登录？离线缓存也会清除。')) logout() }
+
   let t; $('q').oninput=()=>{ clearTimeout(t); t=setTimeout(()=>{shown=LIMIT;render()},130) }
-  $('chips').onclick=e=>{ const b=e.target.closest('.chip'); if(!b||!b.dataset.s) return
-    sheet=b.dataset.s; shown=LIMIT; drawChips(); render() }
+  $('sort').onchange=e=>{ sortBy[src]=e.target.value; shown=LIMIT; render() }
+  $('sheet').onchange=e=>{ sheet=e.target.value; shown=LIMIT; render() }
+  $('sizeChips').onclick=e=>{ const b=e.target.closest('.chip'); if(!b?.dataset.sz) return
+    sizeSel=b.dataset.sz; shown=LIMIT; drawFilters(); render() }
+  for(const id of ['tabLoc','tabBal']) $(id).onclick=()=>{
+    src=$(id).dataset.src; shown=LIMIT
+    $('tabLoc').classList.toggle('on',src==='loc'); $('tabBal').classList.toggle('on',src==='bal')
+    drawFilters(); render()
+  }
   addEventListener('online',()=>{ render(); sync(false) })
   addEventListener('offline',render)
 
-  // ── 启动：先显示缓存，再后台同步 ────────────────────────────────────────
-  if(!token()){ showLogin() }
-  else{
-    showApp(); loadCache(); drawChips(); render()
-    sync(false).then(drawChips)
-  }
+  // ── 启动 ───────────────────────────────────────────────────────────────
+  if(!token()) showLogin()
+  else{ showApp(); loadCaches(); drawFilters(); render(); sync(false) }
   if('serviceWorker' in navigator) addEventListener('load',()=>
     navigator.serviceWorker.register('/m/sw.js',{scope:'/m/'}).catch(()=>{}))
 })()
