@@ -17,6 +17,14 @@ function validDate(value) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(value || ''));
 }
 
+function guatemalaToday() {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Guatemala', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
 function settingsFromRow(row = {}) {
   return {
     timezone: row.timezone || DEFAULT_ATTENDANCE_SETTINGS.timezone,
@@ -41,6 +49,8 @@ function employeeFromRow(row) {
     dailyPayment: row.daily_payment == null ? null : Number(row.daily_payment),
     bonusEligible: Boolean(row.bonus_eligible),
     rateEffectiveFrom: row.rate_effective_from || null,
+    activeFrom: row.active_from || null,
+    active: row.active == null ? true : Boolean(row.active),
   };
 }
 
@@ -71,7 +81,42 @@ async function ensureTables(sql) {
       department TEXT,
       daily_payment NUMERIC(10,2),
       bonus_eligible BOOLEAN NOT NULL DEFAULT FALSE,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      active_from DATE,
+      archived_by TEXT,
+      archived_at TIMESTAMPTZ,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `;
+  await sql`ALTER TABLE attendance_employees ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE`;
+  await sql`ALTER TABLE attendance_employees ADD COLUMN IF NOT EXISTS active_from DATE`;
+  await sql`ALTER TABLE attendance_employees ADD COLUMN IF NOT EXISTS archived_by TEXT`;
+  await sql`ALTER TABLE attendance_employees ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ`;
+  await sql`
+    CREATE TABLE IF NOT EXISTS attendance_employee_history (
+      id BIGSERIAL PRIMARY KEY,
+      employee_code INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      department TEXT,
+      active_from DATE,
+      active_to DATE NOT NULL,
+      archived_by TEXT NOT NULL,
+      archived_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      reinstated_by TEXT,
+      reinstated_at TIMESTAMPTZ
+    )
+  `;
+  await sql`
+    CREATE TABLE IF NOT EXISTS attendance_edit_audit (
+      id BIGSERIAL PRIMARY KEY,
+      employee_code INTEGER NOT NULL,
+      work_date DATE,
+      edit_type TEXT NOT NULL,
+      before_value JSONB,
+      after_value JSONB,
+      reason TEXT,
+      edited_by TEXT NOT NULL,
+      edited_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `;
   await sql`
@@ -158,6 +203,18 @@ async function ensureTables(sql) {
   await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS date_schedules JSONB NOT NULL DEFAULT '[]'::jsonb`;
   await sql`ALTER TABLE attendance_punches ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE`;
   await sql`ALTER TABLE attendance_punches ADD COLUMN IF NOT EXISTS cleared_event_id BIGINT REFERENCES attendance_clear_events(id)`;
+  await sql`ALTER TABLE attendance_punches ALTER COLUMN import_id DROP NOT NULL`;
+  await sql`
+    UPDATE attendance_employees employee
+    SET active_from = first_punch.work_date
+    FROM (
+      SELECT employee_code, MIN(punched_at::date) AS work_date
+      FROM attendance_punches
+      GROUP BY employee_code
+    ) first_punch
+    WHERE employee.employee_code = first_punch.employee_code
+      AND employee.active_from IS NULL
+  `;
   await sql`
     UPDATE attendance_clear_events event
     SET punch_count = cleared.punch_count,
@@ -190,7 +247,7 @@ async function ensureTables(sql) {
 }
 
 async function loadDashboard(sql, from, to) {
-  const [settingsRows, punchRows, reviewRows, employeeRows, importRows, scheduleRows, clearRows] = await Promise.all([
+  const [settingsRows, punchRows, reviewRows, employeeRows, importRows, scheduleRows, clearRows, archivedRows] = await Promise.all([
     sql`SELECT * FROM attendance_settings WHERE id = 1`,
     sql`
       SELECT employee_code, name, department,
@@ -215,7 +272,7 @@ async function loadDashboard(sql, from, to) {
         WHERE effective_from <= CAST(${to} AS date)
         ORDER BY employee_code, effective_from DESC, id DESC
       )
-      SELECT e.employee_code, e.name, e.department,
+      SELECT e.employee_code, e.name, e.department, e.active, e.active_from::text,
              CASE
                WHEN r.employee_code IS NOT NULL THEN r.daily_payment
                WHEN EXISTS (SELECT 1 FROM attendance_employee_rates ar WHERE ar.employee_code = e.employee_code) THEN NULL
@@ -229,6 +286,13 @@ async function loadDashboard(sql, from, to) {
              r.effective_from::text AS rate_effective_from
       FROM attendance_employees e
       LEFT JOIN selected_rates r USING (employee_code)
+      WHERE (e.active AND (e.active_from IS NULL OR e.active_from <= CAST(${to} AS date)))
+         OR EXISTS (
+           SELECT 1 FROM attendance_employee_history history
+           WHERE history.employee_code = e.employee_code
+             AND history.active_from <= CAST(${to} AS date)
+             AND history.active_to >= CAST(${from} AS date)
+         )
       ORDER BY e.employee_code
     `,
     sql`
@@ -250,6 +314,12 @@ async function loadDashboard(sql, from, to) {
       FROM attendance_clear_events
       ORDER BY cleared_at DESC, id DESC
       LIMIT 20
+    `,
+    sql`
+      SELECT id, employee_code, name, department, active_from::text, active_to::text,
+             archived_by, archived_at, reinstated_by, reinstated_at
+      FROM attendance_employee_history
+      ORDER BY archived_at DESC, id DESC
     `,
   ]);
 
@@ -274,12 +344,32 @@ async function loadDashboard(sql, from, to) {
     updatedBy: row.updated_by,
     updatedAt: row.updated_at,
   }));
-  const employees = employeeRows.map(employeeFromRow);
+  const employees = employeeRows.map((row) => {
+    const historical = archivedRows.find((history) => (
+      Number(history.employee_code) === Number(row.employee_code)
+      && (!history.active_from || history.active_from <= to)
+      && history.active_to >= from
+    ));
+    if (historical && (!row.active || (row.active_from && row.active_from > to))) {
+      return employeeFromRow({
+        ...row,
+        name: historical.name,
+        department: historical.department,
+        active_from: historical.active_from,
+        active: false,
+      });
+    }
+    return employeeFromRow(row);
+  });
   const dateSchedules = new Map();
   for (const row of scheduleRows) {
     for (const schedule of row.date_schedules || []) dateSchedules.set(schedule.workDate, schedule);
   }
-  const days = calculateAttendanceDays(punches, settings, reviews, [...dateSchedules.values()]);
+  const employeeMap = new Map(employees.map((employee) => [employee.employeeCode, employee]));
+  const days = calculateAttendanceDays(punches, settings, reviews, [...dateSchedules.values()]).map((day) => {
+    const employee = employeeMap.get(day.employeeCode);
+    return employee ? { ...day, name: employee.name, department: employee.department } : day;
+  });
   return {
     from,
     to,
@@ -290,6 +380,18 @@ async function loadDashboard(sql, from, to) {
     summary: buildAttendanceSummary(days, employees),
     imports: importRows,
     clearEvents: clearRows,
+    archivedEmployees: archivedRows.map((row) => ({
+      id: Number(row.id),
+      employeeCode: Number(row.employee_code),
+      name: row.name,
+      department: row.department,
+      activeFrom: row.active_from || null,
+      activeTo: row.active_to,
+      archivedBy: row.archived_by,
+      archivedAt: row.archived_at,
+      reinstatedBy: row.reinstated_by,
+      reinstatedAt: row.reinstated_at,
+    })),
   };
 }
 
@@ -312,12 +414,18 @@ export default async function handler(req, res) {
     }
     await ensureTables(sql);
     const action = String(req.query.action || 'dashboard');
+    if (user.role !== 'admin' && !['dashboard', 'import'].includes(action)) {
+      return res.status(403).json({ error: 'Admin access required for Attendance Management' });
+    }
 
     if (req.method === 'GET' && action === 'dashboard') {
       const from = String(req.query.from || '');
       const to = String(req.query.to || '');
       if (!validDate(from) || !validDate(to) || from > to) return res.status(400).json({ error: 'Valid date range required' });
-      return res.status(200).json(await loadDashboard(sql, from, to));
+      const dashboard = await loadDashboard(sql, from, to);
+      if (user.role === 'admin') return res.status(200).json(dashboard);
+      const { employees, punches, days, summary } = dashboard;
+      return res.status(200).json({ from, to, employees, punches, days, summary });
     }
 
     if (req.method === 'GET' && action === 'clear-options') {
@@ -430,15 +538,55 @@ export default async function handler(req, res) {
         department: record.department,
       })));
       await sql`
-        INSERT INTO attendance_employees (employee_code, name, department)
-        SELECT employee_code, name, department
+        INSERT INTO attendance_employees (employee_code, name, department, active, active_from)
+        SELECT employee_code, name, department, TRUE, CAST(${dateFrom} AS date)
         FROM jsonb_to_recordset(${employeeJson}::jsonb)
           AS x(employee_code INTEGER, name TEXT, department TEXT)
         ON CONFLICT (employee_code) DO UPDATE SET
-          name = EXCLUDED.name,
+          name = CASE
+            WHEN attendance_employees.active OR NOT EXISTS (
+              SELECT 1 FROM attendance_employee_history history
+              WHERE history.employee_code = EXCLUDED.employee_code
+                AND history.active_to >= EXCLUDED.active_from
+            ) THEN EXCLUDED.name
+            ELSE attendance_employees.name
+          END,
           department = CASE
+            WHEN NOT attendance_employees.active AND EXISTS (
+              SELECT 1 FROM attendance_employee_history history
+              WHERE history.employee_code = EXCLUDED.employee_code
+                AND history.active_to >= EXCLUDED.active_from
+            ) THEN attendance_employees.department
             WHEN EXCLUDED.department = '' OR EXCLUDED.department ILIKE 'Not Set%' THEN attendance_employees.department
             ELSE EXCLUDED.department
+          END,
+          active = attendance_employees.active OR NOT EXISTS (
+            SELECT 1 FROM attendance_employee_history history
+            WHERE history.employee_code = EXCLUDED.employee_code
+              AND history.active_to >= EXCLUDED.active_from
+          ),
+          active_from = CASE
+            WHEN attendance_employees.active THEN COALESCE(attendance_employees.active_from, EXCLUDED.active_from)
+            WHEN NOT EXISTS (
+              SELECT 1 FROM attendance_employee_history history
+              WHERE history.employee_code = EXCLUDED.employee_code
+                AND history.active_to >= EXCLUDED.active_from
+            ) THEN EXCLUDED.active_from
+            ELSE attendance_employees.active_from
+          END,
+          archived_by = CASE
+            WHEN NOT EXISTS (
+              SELECT 1 FROM attendance_employee_history history
+              WHERE history.employee_code = EXCLUDED.employee_code
+                AND history.active_to >= EXCLUDED.active_from
+            ) THEN NULL ELSE attendance_employees.archived_by
+          END,
+          archived_at = CASE
+            WHEN NOT EXISTS (
+              SELECT 1 FROM attendance_employee_history history
+              WHERE history.employee_code = EXCLUDED.employee_code
+                AND history.active_to >= EXCLUDED.active_from
+            ) THEN NULL ELSE attendance_employees.archived_at
           END,
           updated_at = NOW()
       `;
@@ -646,9 +794,26 @@ export default async function handler(req, res) {
         return res.status(400).json({ error: 'Adjusted work time must be between 0 and 24 hours' });
       }
       await sql`
+        WITH previous AS (
+          SELECT to_jsonb(review.*) AS value
+          FROM attendance_day_reviews review
+          WHERE employee_code = ${employeeCode} AND work_date = CAST(${workDate} AS date)
+        ), audited AS (
+          INSERT INTO attendance_edit_audit (
+            employee_code, work_date, edit_type, before_value, after_value, reason, edited_by
+          ) VALUES (
+            ${employeeCode}, ${workDate}, 'hours_override',
+            (SELECT value FROM previous),
+            ${JSON.stringify({ adjustedMinutes, late, early, note })}::jsonb,
+            ${note || null}, ${user.username}
+          )
+          RETURNING id
+        )
         INSERT INTO attendance_day_reviews (
           employee_code, work_date, confirmed, adjusted_minutes, late, early, note, updated_by
-        ) VALUES (${employeeCode}, ${workDate}, TRUE, ${adjustedMinutes}, ${late}, ${early}, ${note || null}, ${user.username})
+        )
+        SELECT ${employeeCode}, ${workDate}, TRUE, ${adjustedMinutes}, ${late}, ${early}, ${note || null}, ${user.username}
+        FROM audited
         ON CONFLICT (employee_code, work_date) DO UPDATE SET
           confirmed = TRUE,
           adjusted_minutes = EXCLUDED.adjusted_minutes,
@@ -658,6 +823,177 @@ export default async function handler(req, res) {
           updated_by = EXCLUDED.updated_by,
           updated_at = NOW()
       `;
+      return res.status(200).json({ ok: true });
+    }
+
+    if (req.method === 'PATCH' && action === 'punches') {
+      const employeeCode = Number(req.body?.employeeCode);
+      const workDate = String(req.body?.workDate || '');
+      const reason = String(req.body?.reason || '').trim();
+      const submittedPunches = Array.isArray(req.body?.punches) ? req.body.punches.map(String) : [];
+      const timePattern = /^([01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/;
+      if (!Number.isSafeInteger(employeeCode) || !validDate(workDate)) {
+        return res.status(400).json({ error: 'Employee and date required' });
+      }
+      if (!reason) return res.status(400).json({ error: 'Reason is required for the audit trail' });
+      if (submittedPunches.length > 12 || submittedPunches.some((time) => !timePattern.test(time))) {
+        return res.status(400).json({ error: 'Punches must use HH:MM or HH:MM:SS' });
+      }
+      const normalizedPunches = [...new Set(submittedPunches.map((time) => (
+        `${workDate}T${time.length === 5 ? `${time}:00` : time}`
+      )))].sort();
+      if (normalizedPunches.length !== submittedPunches.length) {
+        return res.status(400).json({ error: 'Duplicate punch times are not allowed' });
+      }
+      const punchJson = JSON.stringify(normalizedPunches.map((punchedAt) => ({ punched_at: punchedAt })));
+      const result = await sql`
+        WITH originals AS MATERIALIZED (
+          SELECT id, employee_code, name, department,
+                 TO_CHAR(punched_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS punched_at,
+                 raw_timestamp, device_id, import_id
+          FROM attendance_punches
+          WHERE employee_code = ${employeeCode}
+            AND punched_at::date = CAST(${workDate} AS date)
+            AND active
+          ORDER BY punched_at
+        ), audited AS (
+          INSERT INTO attendance_edit_audit (
+            employee_code, work_date, edit_type, before_value, after_value, reason, edited_by
+          ) VALUES (
+            ${employeeCode}, ${workDate}, 'punches',
+            COALESCE((SELECT jsonb_agg(to_jsonb(originals)) FROM originals), '[]'::jsonb),
+            ${JSON.stringify(normalizedPunches)}::jsonb, ${reason}, ${user.username}
+          )
+          RETURNING id
+        ), deactivated AS (
+          UPDATE attendance_punches
+          SET active = FALSE
+          WHERE id IN (SELECT id FROM originals)
+            AND EXISTS (SELECT 1 FROM audited)
+          RETURNING id
+        ), identity AS (
+          SELECT employee.employee_code,
+                 COALESCE((SELECT name FROM originals LIMIT 1), employee.name) AS name,
+                 COALESCE((SELECT department FROM originals LIMIT 1), employee.department) AS department
+          FROM attendance_employees employee
+          WHERE employee.employee_code = ${employeeCode}
+        ), inserted AS (
+          INSERT INTO attendance_punches (
+            employee_code, name, department, punched_at, raw_timestamp, device_id, import_id
+          )
+          SELECT identity.employee_code, identity.name, identity.department,
+                 CAST(next_punch.punched_at AS timestamp), next_punch.punched_at, 0, NULL
+          FROM identity
+          CROSS JOIN jsonb_to_recordset(${punchJson}::jsonb) AS next_punch(punched_at TEXT)
+          CROSS JOIN (SELECT COUNT(*) FROM deactivated) dependency
+          RETURNING id
+        )
+        SELECT (SELECT COUNT(*)::int FROM originals) AS previous_count,
+               (SELECT COUNT(*)::int FROM inserted) AS inserted_count,
+               EXISTS (SELECT 1 FROM identity) AS employee_exists
+      `;
+      if (!result[0]?.employee_exists) return res.status(404).json({ error: 'Employee not found' });
+      return res.status(200).json({
+        ok: true,
+        previousPunches: Number(result[0].previous_count),
+        punches: Number(result[0].inserted_count),
+      });
+    }
+
+    if (req.method === 'PATCH' && action === 'employee-details') {
+      const employeeCode = Number(req.body?.employeeCode);
+      const name = String(req.body?.name || '').trim();
+      const department = String(req.body?.department || '').trim();
+      const reason = String(req.body?.reason || '').trim();
+      if (!Number.isSafeInteger(employeeCode) || !name) return res.status(400).json({ error: 'Employee and name required' });
+      if (!reason) return res.status(400).json({ error: 'Reason is required for the audit trail' });
+      const updated = await sql`
+        WITH previous AS (
+          SELECT employee_code, name, department
+          FROM attendance_employees
+          WHERE employee_code = ${employeeCode} AND active
+        ), audited AS (
+          INSERT INTO attendance_edit_audit (
+            employee_code, edit_type, before_value, after_value, reason, edited_by
+          )
+          SELECT ${employeeCode}, 'employee_details', to_jsonb(previous.*),
+                 ${JSON.stringify({ name, department })}::jsonb, ${reason}, ${user.username}
+          FROM previous
+          RETURNING id
+        )
+        UPDATE attendance_employees
+        SET name = ${name}, department = ${department || null}, updated_at = NOW()
+        WHERE employee_code = ${employeeCode} AND active
+          AND EXISTS (SELECT 1 FROM audited)
+        RETURNING employee_code
+      `;
+      if (!updated[0]) return res.status(404).json({ error: 'Active employee not found' });
+      return res.status(200).json({ ok: true });
+    }
+
+    if (req.method === 'POST' && action === 'archive-employee') {
+      const employeeCode = Number(req.body?.employeeCode);
+      const confirmation = String(req.body?.confirmation || '');
+      const activeTo = String(req.body?.activeTo || guatemalaToday());
+      if (!Number.isSafeInteger(employeeCode) || !validDate(activeTo)) return res.status(400).json({ error: 'Employee and final work date required' });
+      if (confirmation.toLowerCase() !== 'delete') return res.status(400).json({ error: 'Type delete to archive this employee' });
+      const archived = await sql`
+        WITH current_employee AS (
+          SELECT * FROM attendance_employees
+          WHERE employee_code = ${employeeCode} AND active
+        ), history AS (
+          INSERT INTO attendance_employee_history (
+            employee_code, name, department, active_from, active_to, archived_by
+          )
+          SELECT employee_code, name, department,
+                 COALESCE(active_from, CAST(${activeTo} AS date)), CAST(${activeTo} AS date), ${user.username}
+          FROM current_employee
+          WHERE COALESCE(active_from, CAST(${activeTo} AS date)) <= CAST(${activeTo} AS date)
+          RETURNING id
+        )
+        UPDATE attendance_employees
+        SET active = FALSE, archived_by = ${user.username}, archived_at = NOW(), updated_at = NOW()
+        WHERE employee_code = ${employeeCode}
+          AND EXISTS (SELECT 1 FROM history)
+        RETURNING employee_code
+      `;
+      if (!archived[0]) return res.status(409).json({ error: 'Employee is already archived or the final work date is before their start date' });
+      return res.status(200).json({ ok: true });
+    }
+
+    if (req.method === 'POST' && action === 'reinstate-employee') {
+      const historyId = Number(req.body?.historyId);
+      const activeFrom = String(req.body?.activeFrom || guatemalaToday());
+      if (!Number.isSafeInteger(historyId) || !validDate(activeFrom)) return res.status(400).json({ error: 'Archived employee and return date required' });
+      const reinstated = await sql`
+        WITH archived AS (
+          SELECT history.*
+          FROM attendance_employee_history history
+          LEFT JOIN attendance_employees employee USING (employee_code)
+          WHERE history.id = ${historyId}
+            AND history.reinstated_at IS NULL
+            AND (employee.employee_code IS NULL OR NOT employee.active)
+        ), restored_employee AS (
+          INSERT INTO attendance_employees (employee_code, name, department, active, active_from)
+          SELECT employee_code, name, department, TRUE, CAST(${activeFrom} AS date)
+          FROM archived
+          ON CONFLICT (employee_code) DO UPDATE SET
+            name = EXCLUDED.name,
+            department = EXCLUDED.department,
+            active = TRUE,
+            active_from = EXCLUDED.active_from,
+            archived_by = NULL,
+            archived_at = NULL,
+            updated_at = NOW()
+          RETURNING employee_code
+        )
+        UPDATE attendance_employee_history
+        SET reinstated_by = ${user.username}, reinstated_at = NOW()
+        WHERE id = ${historyId}
+          AND EXISTS (SELECT 1 FROM restored_employee)
+        RETURNING id
+      `;
+      if (!reinstated[0]) return res.status(409).json({ error: 'This employee cannot be reinstated because the ID is active or this archive was already restored' });
       return res.status(200).json({ ok: true });
     }
 

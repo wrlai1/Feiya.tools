@@ -305,6 +305,7 @@ export function calculateAttendanceDays(punches, settingsInput = {}, reviews = [
     )
     const flags = []
     if (inProgress) flags.push('in_progress')
+    if (manuallyConfirmed) flags.push('manually_adjusted')
     if (needsReview) flags.push('needs_review')
     if (needsReview && missingPunches && !isSaturday && punchCount >= 2) flags.push('missing_lunch')
     if (needsReview && possibleEarlyWork) flags.push('possible_early_work')

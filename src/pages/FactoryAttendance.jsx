@@ -1,11 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  AlertTriangle, CalendarDays, CheckCircle2, Clock3, Download,
+  AlertTriangle, Archive, CalendarDays, CheckCircle2, Download, Pencil,
   FileText, RefreshCw, RotateCcw, Save, Search, Settings, Trash2, Upload, Users, X,
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import { useToast } from '../hooks/useToast.js'
-import { attendancePunchLabel, formatMinutes, parseAttendanceFiles, payrollRangeForDate, standardMinutesForSchedule } from '../utils/factoryAttendance.js'
+import { attendancePunchLabel, formatMinutes, parseAttendanceFiles, payrollRangeForDate, payrollRangesBetween, standardMinutesForSchedule } from '../utils/factoryAttendance.js'
 import { buildAttendanceWorkbook } from '../utils/factoryAttendanceExcel.js'
 
 const BASE = '/api/attendance'
@@ -59,6 +59,7 @@ function Flag({ type }) {
     missing_lunch: ['Missing lunch punches', 'bg-red-100 text-red-700'],
     possible_early_work: ['Possible early work', 'bg-purple-100 text-purple-700'],
     possible_overtime: ['Possible overtime', 'bg-purple-100 text-purple-700'],
+    manually_adjusted: ['Manually adjusted', 'bg-blue-100 text-blue-700'],
   }
   const [label, color] = labels[type] || [type, 'bg-slate-100 text-slate-600']
   return <span className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${color}`}>{label}</span>
@@ -86,40 +87,85 @@ function SummaryCard({ label, value, helper, icon: Icon, color = 'blue' }) {
 function ReviewPanel({ day, onClose, onSave, saving }) {
   const [hours, setHours] = useState(day.workedMinutes == null ? '' : (day.workedMinutes / 60).toFixed(2))
   const [note, setNote] = useState(day.reviewNote || '')
-  const [late, setLate] = useState(day.possibleLate)
-  const [early, setEarly] = useState(day.punchCount > 1 && day.possibleEarly)
+  const [late, setLate] = useState(Boolean(day.manuallyConfirmed ? day.late : day.possibleLate))
+  const [early, setEarly] = useState(Boolean(day.manuallyConfirmed ? day.early : day.punchCount > 1 && day.possibleEarly))
+  const [punches, setPunches] = useState(day.punches.map((punch) => String(punch).slice(11, 19)).join(', '))
   return (
     <div className="rounded-xl border border-amber-200 bg-amber-50 p-4">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <p className="font-semibold text-slate-800">Confirm {day.name} · {day.workDate}</p>
+          <p className="font-semibold text-slate-800">Edit {day.name} · {day.workDate}</p>
           <div className="mt-2 flex flex-wrap gap-2">{day.punches.map((punch, index) => <span key={punch} className="rounded-lg bg-white px-2 py-1 text-xs text-slate-600"><span className="font-semibold">{attendancePunchLabel(day, index)}:</span> {timeOnly(punch)}</span>)}</div>
         </div>
         <button onClick={onClose} className="text-xs text-slate-500 hover:text-slate-800">Cancel</button>
       </div>
-      <div className="mt-3 grid gap-3 sm:grid-cols-[160px_1fr_auto]">
+      <div className="mt-3 grid gap-3 sm:grid-cols-2">
+        <label className="text-xs font-medium text-slate-600 sm:col-span-2">
+          Punch times
+          <input value={punches} onChange={(event) => setPunches(event.target.value)} placeholder="06:55:00, 12:00:00, 13:00:00, 17:05:00" className="input-base mt-1 w-full font-mono" />
+          <span className="mt-1 block font-normal text-slate-500">Separate times with commas. Original punches remain in the audit history.</span>
+        </label>
         <label className="text-xs font-medium text-slate-600">
-          Confirmed hours
+          Total hours override
           <input type="number" min="0" max="24" step="0.01" value={hours} onChange={(event) => setHours(event.target.value)} className="input-base mt-1 w-full" />
         </label>
         <label className="text-xs font-medium text-slate-600">
-          Reason / note
+          Reason / note (required)
           <input value={note} onChange={(event) => setNote(event.target.value)} placeholder="Required for audit trail" className="input-base mt-1 w-full" />
         </label>
-        <button disabled={saving || hours === '' || !note.trim()} onClick={() => onSave(Number(hours) * 60, note, { late, early })} className="btn-primary self-end disabled:opacity-50">
-          <CheckCircle2 className="h-4 w-4" /> Confirm
-        </button>
       </div>
-      <div className="mt-3 flex gap-5 text-sm text-slate-700">
+      <div className="mt-3 flex flex-wrap items-center gap-5 text-sm text-slate-700">
         <label className="flex items-center gap-2"><input type="checkbox" checked={late} onChange={(event) => setLate(event.target.checked)} /> Mark late</label>
         <label className="flex items-center gap-2"><input type="checkbox" checked={early} onChange={(event) => setEarly(event.target.checked)} /> Mark early</label>
+        <button disabled={saving || hours === '' || !note.trim()} onClick={() => onSave({
+          adjustedMinutes: Number(hours) * 60,
+          note,
+          late,
+          early,
+          punches: punches.split(',').map((value) => value.trim()).filter(Boolean),
+        })} className="btn-primary ml-auto disabled:opacity-50">
+          <CheckCircle2 className="h-4 w-4" /> Save changes
+        </button>
       </div>
     </div>
   )
 }
 
+function EmployeeEditModal({ employee, onClose, onSave, onAttendance, onAddAttendance, saving }) {
+  const [name, setName] = useState(employee.name || '')
+  const [department, setDepartment] = useState(employee.department || '')
+  const [reason, setReason] = useState('')
+  return <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4" onClick={() => !saving && onClose()}>
+    <div className="w-full max-w-md rounded-2xl bg-white p-5 shadow-2xl" onClick={(event) => event.stopPropagation()}>
+      <div className="flex items-start justify-between gap-4"><div><h3 className="font-semibold text-slate-800">Edit employee</h3><p className="text-xs text-slate-500">{payrollCode(employee.employeeCode)} · Active since {employee.activeFrom || 'first recorded punch'}</p></div><button onClick={onClose} disabled={saving} className="text-slate-400"><X className="h-4 w-4" /></button></div>
+      <div className="mt-4 space-y-3">
+        <label className="block text-xs font-medium text-slate-600">Name<input value={name} onChange={(event) => setName(event.target.value)} className="input-base mt-1 w-full" /></label>
+        <label className="block text-xs font-medium text-slate-600">Department<input value={department} onChange={(event) => setDepartment(event.target.value)} className="input-base mt-1 w-full" /></label>
+        <label className="block text-xs font-medium text-slate-600">Reason for change<input value={reason} onChange={(event) => setReason(event.target.value)} className="input-base mt-1 w-full" placeholder="Required for audit trail" /></label>
+      </div>
+      <div className="mt-4 grid gap-2 sm:grid-cols-2"><button onClick={onAttendance} disabled={saving} className="btn-secondary justify-center"><CalendarDays className="h-4 w-4" /> View attendance days</button><button onClick={onAddAttendance} disabled={saving} className="btn-secondary justify-center"><Pencil className="h-4 w-4" /> Add missing day</button></div>
+      <div className="mt-5 flex justify-end gap-2"><button onClick={onClose} disabled={saving} className="btn-secondary">Cancel</button><button onClick={() => onSave({ name, department, reason })} disabled={saving || !name.trim() || !reason.trim()} className="btn-primary disabled:opacity-40"><Save className="h-4 w-4" /> {saving ? 'Saving…' : 'Save profile'}</button></div>
+    </div>
+  </div>
+}
+
+function ArchiveEmployeeModal({ employee, today, onClose, onArchive, saving }) {
+  const [activeTo, setActiveTo] = useState(today)
+  const [confirmation, setConfirmation] = useState('')
+  return <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4" onClick={() => !saving && onClose()}>
+    <div className="w-full max-w-md rounded-2xl bg-white p-5 shadow-2xl" onClick={(event) => event.stopPropagation()}>
+      <h3 className="font-semibold text-slate-800">Archive {employee.name}?</h3>
+      <p className="mt-1 text-sm text-slate-500">Past punches and reports remain available. Employee ID {employee.employeeCode} can be assigned again after this final work date.</p>
+      <label className="mt-4 block text-xs font-medium text-slate-600">Final work date<input type="date" value={activeTo} onChange={(event) => setActiveTo(event.target.value)} className="input-base mt-1 w-full" /></label>
+      <label className="mt-3 block text-xs font-medium text-slate-600">Type delete to confirm<input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} className="input-base mt-1 w-full" autoComplete="off" /></label>
+      <div className="mt-5 flex justify-end gap-2"><button onClick={onClose} disabled={saving} className="btn-secondary">Cancel</button><button onClick={() => onArchive({ activeTo, confirmation })} disabled={saving || confirmation.toLowerCase() !== 'delete'} className="inline-flex items-center gap-2 rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"><Archive className="h-4 w-4" /> {saving ? 'Archiving…' : 'Archive employee'}</button></div>
+    </div>
+  </div>
+}
+
 export default function FactoryAttendance() {
   const { user, getToken } = useAuth()
+  const isAdmin = user?.role === 'admin'
   const toast = useToast()
   const today = useMemo(guatemalaDate, [])
   const initialRange = useMemo(() => payrollRangeForDate(today), [today])
@@ -132,6 +178,9 @@ export default function FactoryAttendance() {
   const [tab, setTab] = useState('summary')
   const [query, setQuery] = useState('')
   const [reviewDay, setReviewDay] = useState(null)
+  const [editEmployee, setEditEmployee] = useState(null)
+  const [archiveEmployee, setArchiveEmployee] = useState(null)
+  const [savingEmployee, setSavingEmployee] = useState(false)
   const [savingReview, setSavingReview] = useState(false)
   const [settingsForm, setSettingsForm] = useState(null)
   const [savingSettings, setSavingSettings] = useState(false)
@@ -210,18 +259,86 @@ export default function FactoryAttendance() {
     finally { setUploading(false) }
   }
 
-  const saveReview = async (adjustedMinutes, note, flags) => {
+  const saveReview = async ({ adjustedMinutes, note, late, early, punches }) => {
     setSavingReview(true)
     try {
+      const originalPunches = reviewDay.punches.map((punch) => String(punch).slice(11, 19))
+      if (JSON.stringify(originalPunches) !== JSON.stringify(punches)) {
+        await apiFetch('?action=punches', {
+          method: 'PATCH',
+          body: JSON.stringify({ employeeCode: reviewDay.employeeCode, workDate: reviewDay.workDate, punches, reason: note }),
+        }, getToken)
+      }
       await apiFetch('?action=review', {
         method: 'PATCH',
-        body: JSON.stringify({ employeeCode: reviewDay.employeeCode, workDate: reviewDay.workDate, adjustedMinutes, note, ...flags }),
+        body: JSON.stringify({ employeeCode: reviewDay.employeeCode, workDate: reviewDay.workDate, adjustedMinutes, note, late, early }),
       }, getToken)
-      toast.success('Attendance day confirmed')
+      toast.success('Attendance changes saved')
       setReviewDay(null)
       await load()
     } catch (error) { toast.error(error.message) }
     finally { setSavingReview(false) }
+  }
+
+  const saveEmployeeDetails = async (changes) => {
+    setSavingEmployee(true)
+    try {
+      await apiFetch('?action=employee-details', {
+        method: 'PATCH', body: JSON.stringify({ employeeCode: editEmployee.employeeCode, ...changes }),
+      }, getToken)
+      toast.success('Employee details updated')
+      setEditEmployee(null)
+      await load()
+    } catch (error) { toast.error(error.message) }
+    finally { setSavingEmployee(false) }
+  }
+
+  const archiveSelectedEmployee = async ({ activeTo, confirmation }) => {
+    setSavingEmployee(true)
+    try {
+      await apiFetch('?action=archive-employee', {
+        method: 'POST', body: JSON.stringify({ employeeCode: archiveEmployee.employeeCode, activeTo, confirmation }),
+      }, getToken)
+      toast.success('Employee archived; historical attendance was preserved')
+      setArchiveEmployee(null)
+      await load()
+    } catch (error) { toast.error(error.message) }
+    finally { setSavingEmployee(false) }
+  }
+
+  const reinstateEmployee = async (employee) => {
+    const activeFrom = window.prompt(`Return date for ${employee.name}`, today)
+    if (!activeFrom) return
+    setSavingEmployee(true)
+    try {
+      await apiFetch('?action=reinstate-employee', {
+        method: 'POST', body: JSON.stringify({ historyId: employee.id, activeFrom }),
+      }, getToken)
+      toast.success(`${employee.name} reinstated`)
+      await load()
+    } catch (error) { toast.error(error.message) }
+    finally { setSavingEmployee(false) }
+  }
+
+  const addAttendanceDay = (employee) => {
+    const workDate = window.prompt(`Work date for ${employee.name}`, today)
+    if (!workDate) return
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(workDate)) return toast.error('Use a valid date in YYYY-MM-DD format')
+    setEditEmployee(null)
+    setTab('daily')
+    setQuery(String(employee.employeeCode))
+    setReviewDay({
+      employeeCode: employee.employeeCode,
+      name: employee.name,
+      department: employee.department,
+      workDate,
+      punches: [],
+      punchCount: 0,
+      workedMinutes: 0,
+      possibleLate: false,
+      possibleEarly: false,
+      reviewNote: '',
+    })
   }
 
   const saveSettings = async () => {
@@ -237,7 +354,7 @@ export default function FactoryAttendance() {
   const filteredSummary = useMemo(() => {
     const search = query.trim().toLowerCase()
     const rows = (data?.summary || []).filter((row) => (
-      (!search || `${row.employeeCode} ${row.name} ${row.department}`.toLowerCase().includes(search))
+      (!search || `${row.employeeCode} ${payrollCode(row.employeeCode)} ${row.name} ${row.department}`.toLowerCase().includes(search))
       && (departmentFilter === 'all' || row.department === departmentFilter)
     ))
     return [...rows].sort((a, b) => {
@@ -252,7 +369,7 @@ export default function FactoryAttendance() {
   const filteredDays = useMemo(() => {
     const search = query.trim().toLowerCase()
     const rows = (data?.days || []).filter((row) => (
-      (!search || `${row.employeeCode} ${row.name} ${row.department} ${row.workDate}`.toLowerCase().includes(search))
+      (!search || `${row.employeeCode} ${payrollCode(row.employeeCode)} ${row.name} ${row.department} ${row.workDate}`.toLowerCase().includes(search))
       && (dailyFlag === 'all' || row.flags.includes(dailyFlag))
     ))
     return [...rows].sort((a, b) => {
@@ -264,6 +381,12 @@ export default function FactoryAttendance() {
       return compareText(b.workDate, a.workDate)
     })
   }, [dailyFlag, dailySort, data?.days, query])
+  const filteredArchived = useMemo(() => {
+    const search = query.trim().toLowerCase()
+    return (data?.archivedEmployees || []).filter((row) => (
+      !search || `${row.employeeCode} ${payrollCode(row.employeeCode)} ${row.name} ${row.department}`.toLowerCase().includes(search)
+    ))
+  }, [data?.archivedEmployees, query])
 
   const sortedImports = useMemo(() => [...(data?.imports || [])].sort((a, b) => (
     importSort === 'oldest'
@@ -276,6 +399,25 @@ export default function FactoryAttendance() {
     .filter((item) => !item.reverted_at)
     .sort((a, b) => new Date(b.uploaded_at) - new Date(a.uploaded_at))[0]?.id, [sortedImports])
   const departments = useMemo(() => [...new Set((data?.summary || []).map((row) => row.department).filter(Boolean))].sort(compareText), [data?.summary])
+  const payrollOptions = useMemo(() => {
+    const current = { start: initialRange.start, end: today < initialRange.end ? today : initialRange.end }
+    const ranges = new Map()
+    for (const item of data?.imports || []) {
+      if (!item.date_from || !item.date_to) continue
+      for (const uploadedRange of payrollRangesBetween(item.date_from, item.date_to)) {
+        const range = { start: uploadedRange.payrollStart, end: uploadedRange.payrollEnd }
+        const key = `${range.start}|${range.end}`
+        if (range.start !== initialRange.start || range.end !== initialRange.end) ranges.set(key, range)
+      }
+    }
+    return [
+      { value: 'current', label: `Current payroll · ${current.start}—${current.end}`, ...current },
+      ...[...ranges.entries()]
+        .sort(([left], [right]) => right.localeCompare(left))
+        .map(([value, range]) => ({ value, label: `${range.start}—${range.end}`, ...range })),
+    ]
+  }, [data?.imports, initialRange.end, initialRange.start, today])
+  const selectedPayroll = payrollOptions.find((option) => option.start === from && option.end === to)?.value || 'custom'
   const latestActiveClearId = useMemo(() => (data?.clearEvents || []).find((event) => !event.restored_at)?.id, [data?.clearEvents])
 
   const rollbackImport = async (item) => {
@@ -374,11 +516,9 @@ export default function FactoryAttendance() {
     finally { setExporting('') }
   }
 
-  const totalMinutes = (data?.summary || []).reduce((sum, row) => sum + row.totalMinutes, 0)
-  const attendanceDays = (data?.summary || []).reduce((sum, row) => sum + row.attendanceDays, 0)
   const pending = (data?.days || []).filter((day) => day.needsReview).length
   const tabs = [
-    ['summary', 'Attendance Summary'], ['daily', 'Daily Review'], ['imports', 'Import History'],
+    ['summary', 'Attendance Summary'], ['daily', 'Daily Review'], ['imports', 'Import History'], ['archived', 'Archived Employees'],
     ...(user?.role === 'admin' ? [['settings', 'Settings']] : []),
   ]
 
@@ -390,8 +530,14 @@ export default function FactoryAttendance() {
           <p className="mt-1 text-sm text-slate-500">Guatemala time · Payroll periods: 6–20 and 21–5</p>
         </div>
         {!showManagement ? (
+          isAdmin ?
           <button onClick={() => setShowManagement(true)} className="btn-secondary"><Settings className="h-4 w-4" /> Attendance Management</button>
+          : null
         ) : <div className="flex flex-wrap items-end gap-2">
+          <label className="text-xs font-medium text-slate-500">Payroll period<select value={selectedPayroll} onChange={(event) => {
+            const option = payrollOptions.find((item) => item.value === event.target.value)
+            if (option) { setFrom(option.start); setTo(option.end) }
+          }} className="input-base mt-1 block min-w-64"><option value="custom">Custom range</option>{payrollOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
           <label className="text-xs font-medium text-slate-500">From<input type="date" value={from} onChange={(event) => setFrom(event.target.value)} className="input-base mt-1 block" /></label>
           <label className="text-xs font-medium text-slate-500">To<input type="date" value={to} onChange={(event) => setTo(event.target.value)} className="input-base mt-1 block" /></label>
           <button onClick={() => { setFrom(initialRange.start); setTo(today < initialRange.end ? today : initialRange.end) }} className="btn-secondary"><CalendarDays className="h-4 w-4" /> Current payroll</button>
@@ -401,6 +547,9 @@ export default function FactoryAttendance() {
           <button onClick={exportAttendanceReport} disabled={!data || exporting} className="btn-primary"><Download className="h-4 w-4" /> {exporting ? 'Preparing…' : 'Download Attendance Excel'}</button>
         </div>}
       </div>
+
+      {editEmployee && <EmployeeEditModal employee={editEmployee} onClose={() => setEditEmployee(null)} onSave={saveEmployeeDetails} onAttendance={() => { setQuery(String(editEmployee.employeeCode)); setTab('daily'); setEditEmployee(null) }} onAddAttendance={() => addAttendanceDay(editEmployee)} saving={savingEmployee} />}
+      {archiveEmployee && <ArchiveEmployeeModal employee={archiveEmployee} today={today} onClose={() => setArchiveEmployee(null)} onArchive={archiveSelectedEmployee} saving={savingEmployee} />}
 
       {showClearPanel && <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4" onClick={() => !clearingData && setShowClearPanel(false)}>
         <div className="max-h-[calc(100dvh-2rem)] w-full max-w-lg overflow-y-auto rounded-2xl bg-white shadow-2xl" onClick={(event) => event.stopPropagation()}>
@@ -454,14 +603,12 @@ export default function FactoryAttendance() {
       </details>}
 
       {lastUpload && !showManagement && <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-5">
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between"><div><p className="text-lg font-bold text-emerald-900">Attendance is ready</p><p className="mt-1 text-sm text-emerald-800">{lastUpload.reportFrom}—{lastUpload.reportTo} · {lastUpload.sourceFiles?.length || 1} machine file(s) · {data?.summary?.length || 0} employees · {lastUpload.inserted} new punches · {lastUpload.duplicates} duplicates · {pending} need review</p><p className="mt-1 text-xs text-emerald-700">Download the simple hours-and-days Excel. Incomplete punch days are marked red for review.</p></div><div className="flex flex-wrap gap-2"><button onClick={exportAttendanceReport} disabled={exporting || loading || rollingBack} className="btn-primary disabled:opacity-50"><Download className="h-4 w-4" /> {exporting ? 'Preparing…' : 'Download Attendance Excel'}</button>{pending > 0 && <button onClick={() => { setShowManagement(true); setTab('daily'); setDailyFlag('needs_review') }} className="btn-secondary text-red-600"><AlertTriangle className="h-4 w-4" /> Review exceptions</button>}{!lastUpload.exactFileDuplicate && <button onClick={() => rollbackImport({ id: lastUpload.importId, file_name: lastUpload.sourceFiles?.join(', ') || 'this upload' })} disabled={rollingBack || exporting || loading} className="btn-secondary text-red-600 disabled:opacity-50"><RotateCcw className={`h-4 w-4 ${rollingBack ? 'animate-spin' : ''}`} /> {rollingBack ? 'Removing…' : 'Undo this upload'}</button>}</div></div>
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between"><div><p className="text-lg font-bold text-emerald-900">Attendance is ready</p><p className="mt-1 text-sm text-emerald-800">{lastUpload.reportFrom}—{lastUpload.reportTo} · {lastUpload.sourceFiles?.length || 1} machine file(s) · {data?.summary?.length || 0} employees · {lastUpload.inserted} new punches · {lastUpload.duplicates} duplicates · {pending} need review</p><p className="mt-1 text-xs text-emerald-700">Download the simple hours-and-days Excel. Incomplete punch days are marked red for review.</p></div><div className="flex flex-wrap gap-2"><button onClick={exportAttendanceReport} disabled={exporting || loading || rollingBack} className="btn-primary disabled:opacity-50"><Download className="h-4 w-4" /> {exporting ? 'Preparing…' : 'Download Attendance Excel'}</button>{isAdmin && pending > 0 && <button onClick={() => { setShowManagement(true); setTab('daily'); setDailyFlag('needs_review') }} className="btn-secondary text-red-600"><AlertTriangle className="h-4 w-4" /> Review exceptions</button>}{isAdmin && !lastUpload.exactFileDuplicate && <button onClick={() => rollbackImport({ id: lastUpload.importId, file_name: lastUpload.sourceFiles?.join(', ') || 'this upload' })} disabled={rollingBack || exporting || loading} className="btn-secondary text-red-600 disabled:opacity-50"><RotateCcw className={`h-4 w-4 ${rollingBack ? 'animate-spin' : ''}`} /> {rollingBack ? 'Removing…' : 'Undo this upload'}</button>}</div></div>
       </div>}
 
-      {showManagement && <>
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      {isAdmin && showManagement && <>
+      <div className="grid gap-3 sm:grid-cols-2">
         <SummaryCard label="Employees" value={data?.summary?.length || 0} helper="Registered attendance employees" icon={Users} />
-        <SummaryCard label="Attendance days" value={attendanceDays} helper="At least one complete in/out pair" icon={CheckCircle2} color="green" />
-        <SummaryCard label="Total worked" value={formatMinutes(totalMinutes)} helper={`${from} through ${to}`} icon={Clock3} color="amber" />
         <SummaryCard label="Needs review" value={pending} helper="Weekdays need 4 punches; Saturday needs 2 or 4" icon={AlertTriangle} color={pending ? 'red' : 'green'} />
       </div>
 
@@ -470,9 +617,9 @@ export default function FactoryAttendance() {
           {tabs.map(([value, label]) => <button key={value} onClick={() => setTab(value)} className={`rounded-lg px-3 py-2 text-sm font-medium ${tab === value ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}>{label}</button>)}
         </div>
         <div className="flex flex-wrap gap-2">
-          {(tab === 'summary' || tab === 'daily') && <div className="relative"><Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search employee" className="input-base pl-9" /></div>}
+          {(tab === 'summary' || tab === 'daily' || tab === 'archived') && <div className="relative"><Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search name or employee ID" className="input-base pl-9" /></div>}
           {tab === 'summary' && <><select value={departmentFilter} onChange={(event) => setDepartmentFilter(event.target.value)} className="input-base"><option value="all">All departments</option>{departments.map((department) => <option key={department} value={department}>{department}</option>)}</select><select value={summarySort} onChange={(event) => setSummarySort(event.target.value)} className="input-base"><option value="name-asc">Name A–Z</option><option value="name-desc">Name Z–A</option><option value="hours-desc">Hours high–low</option><option value="hours-asc">Hours low–high</option><option value="days-desc">Days high–low</option><option value="review-desc">Reviews high–low</option></select></>}
-          {tab === 'daily' && <><select value={dailyFlag} onChange={(event) => setDailyFlag(event.target.value)} className="input-base"><option value="all">All statuses</option><option value="in_progress">In progress</option><option value="needs_review">Needs review</option><option value="missing_lunch">Missing lunch punches</option><option value="possible_overtime">Possible overtime</option><option value="possible_early_work">Possible early work</option><option value="late">Late</option><option value="early">Early</option><option value="below_standard">Under hours</option></select><select value={dailySort} onChange={(event) => setDailySort(event.target.value)} className="input-base"><option value="date-desc">Date newest</option><option value="date-asc">Date oldest</option><option value="name-asc">Name A–Z</option><option value="name-desc">Name Z–A</option><option value="hours-desc">Hours high–low</option><option value="punches-desc">Punches high–low</option></select></>}
+          {tab === 'daily' && <><select value={dailyFlag} onChange={(event) => setDailyFlag(event.target.value)} className="input-base"><option value="all">All statuses</option><option value="in_progress">In progress</option><option value="needs_review">Needs review</option><option value="manually_adjusted">Manually adjusted</option><option value="missing_lunch">Missing lunch punches</option><option value="possible_overtime">Possible overtime</option><option value="possible_early_work">Possible early work</option><option value="late">Late</option><option value="early">Early</option><option value="below_standard">Under hours</option></select><select value={dailySort} onChange={(event) => setDailySort(event.target.value)} className="input-base"><option value="date-desc">Date newest</option><option value="date-asc">Date oldest</option><option value="name-asc">Name A–Z</option><option value="name-desc">Name Z–A</option><option value="hours-desc">Hours high–low</option><option value="punches-desc">Punches high–low</option></select></>}
           {tab === 'imports' && <select value={importSort} onChange={(event) => setImportSort(event.target.value)} className="input-base"><option value="newest">Newest version</option><option value="oldest">Oldest version</option><option value="duplicates-desc">Duplicates high–low</option></select>}
         </div>
       </div>
@@ -481,12 +628,13 @@ export default function FactoryAttendance() {
 
       {!loading && tab === 'summary' && (
         <div className="card overflow-x-auto">
-          <table className="min-w-[760px] w-full text-sm"><thead><tr className="border-b border-slate-200 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
-            {['ID / Employee', 'Attendance Days', 'Confirmed Days', 'Total Hours', 'Late', 'Early', 'Needs Review'].map((label) => <th key={label} className="px-3 py-3 font-semibold">{label}</th>)}
+          <table className="min-w-[900px] w-full text-sm"><thead><tr className="border-b border-slate-200 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+            {['ID / Employee', 'Attendance Days', 'Confirmed Days', 'Total Hours', 'Late', 'Early', 'Needs Review', 'Actions'].map((label) => <th key={label} className="px-3 py-3 font-semibold">{label}</th>)}
           </tr></thead><tbody className="divide-y divide-slate-100">{filteredSummary.map((row) => <tr key={row.employeeCode} className="hover:bg-slate-50">
             <td className="px-3 py-3"><p className="font-medium text-slate-800">{row.name}</p><p className="text-xs text-slate-400">{payrollCode(row.employeeCode)} · {row.department || 'No department'}</p></td>
             <td className="px-3 py-3">{row.attendanceDays}</td><td className="px-3 py-3">{row.workdays}</td><td className="px-3 py-3 font-semibold">{formatMinutes(row.totalMinutes)}</td>
             <td className="px-3 py-3">{row.lateDays}</td><td className="px-3 py-3">{row.earlyDays}</td><td className="px-3 py-3">{row.reviewDays}</td>
+            <td className="px-3 py-3">{(() => { const employee = data.employees.find((item) => item.employeeCode === row.employeeCode) || row; return employee.active === false ? <span className="text-xs text-slate-400">Archived record</span> : <div className="flex gap-2"><button onClick={() => setEditEmployee(employee)} className="text-xs font-semibold text-blue-600"><Pencil className="mr-1 inline h-3.5 w-3.5" />Edit</button><button onClick={() => setArchiveEmployee(employee)} className="text-xs font-semibold text-red-600"><Archive className="mr-1 inline h-3.5 w-3.5" />Archive</button></div> })()}</td>
           </tr>)}</tbody></table>
         </div>
       )}
@@ -499,8 +647,15 @@ export default function FactoryAttendance() {
           <td className="px-3 py-3 font-medium">{day.workDate}<p className="text-xs font-normal text-slate-400">Ends {day.scheduledEnd || '—'}</p></td><td className="px-3 py-3"><p className="font-medium text-slate-800">{day.name}</p><p className="text-xs text-slate-400">{day.employeeCode}</p></td>
           <td className="px-3 py-3">{day.punchCount}<p className="text-xs text-slate-400">{day.punches.map(timeOnly).join(' · ')}</p></td><td className="px-3 py-3">{timeOnly(day.firstPunch)}</td><td className="px-3 py-3">{timeOnly(day.lastPunch)}</td>
           <td className="px-3 py-3 font-semibold">{formatMinutes(day.workedMinutes)}</td><td className="px-3 py-3"><div className="flex flex-wrap gap-1">{day.flags.length ? day.flags.map((flag) => <Flag key={flag} type={flag} />) : <span className="text-xs text-emerald-600">OK</span>}</div></td>
-          <td className="px-3 py-3">{day.needsReview && <button onClick={() => setReviewDay(day)} className="text-xs font-semibold text-blue-600 hover:text-blue-800">Review</button>}</td>
+          <td className="px-3 py-3"><button onClick={() => setReviewDay(day)} className="text-xs font-semibold text-blue-600 hover:text-blue-800"><Pencil className="mr-1 inline h-3.5 w-3.5" />{day.needsReview ? 'Review / Edit' : 'Edit'}</button></td>
         </tr>)}</tbody></table></div>
+      </div>}
+
+      {!loading && tab === 'archived' && <div className="card overflow-x-auto">
+        <div className="border-b border-slate-100 px-4 py-3"><h3 className="font-semibold text-slate-800">Archived employees</h3><p className="text-xs text-slate-500">Historical punches remain attached to the employee and employment dates. Reinstate is available only while the employee ID is not active.</p></div>
+        <table className="min-w-[850px] w-full text-sm"><thead><tr className="border-b border-slate-200 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">{['ID / Employee', 'Department', 'Employment period', 'Archived by', 'Status', 'Action'].map((label) => <th key={label} className="px-3 py-3 font-semibold">{label}</th>)}</tr></thead>
+          <tbody className="divide-y divide-slate-100">{filteredArchived.map((employee) => <tr key={employee.id} className="hover:bg-slate-50"><td className="px-3 py-3"><p className="font-medium text-slate-800">{employee.name}</p><p className="text-xs text-slate-400">{payrollCode(employee.employeeCode)}</p></td><td className="px-3 py-3">{employee.department || '—'}</td><td className="px-3 py-3">{employee.activeFrom || 'Unknown'}—{employee.activeTo}</td><td className="px-3 py-3">{employee.archivedBy}<p className="text-xs text-slate-400">{new Date(employee.archivedAt).toLocaleString()}</p></td><td className="px-3 py-3">{employee.reinstatedAt ? <span className="text-xs font-semibold text-emerald-600">Reinstated {new Date(employee.reinstatedAt).toLocaleDateString()}</span> : <span className="text-xs font-semibold text-slate-500">Archived</span>}</td><td className="px-3 py-3">{!employee.reinstatedAt && <button onClick={() => reinstateEmployee(employee)} disabled={savingEmployee} className="btn-secondary px-3 py-1.5 text-xs disabled:opacity-40"><RotateCcw className="h-3.5 w-3.5" /> Reinstate</button>}</td></tr>)}{!filteredArchived.length && <tr><td colSpan="6" className="px-4 py-12 text-center text-sm text-slate-400">No archived employees match this search.</td></tr>}</tbody>
+        </table>
       </div>}
 
       {!loading && tab === 'imports' && <div className="space-y-4">

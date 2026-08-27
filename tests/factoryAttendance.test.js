@@ -26,6 +26,25 @@ test('labels known and uncertain punch roles clearly', () => {
   assert.equal(attendancePunchLabel({ punches: ['a'] }, 0), 'Only Punch')
 })
 
+test('marks an administrator hours override as manually adjusted', () => {
+  const [day] = calculateAttendanceDays([
+    { employeeCode: 5, name: 'Angelica', department: 'Inspection', punchedAt: '2026-08-18T07:00:00' },
+    { employeeCode: 5, name: 'Angelica', department: 'Inspection', punchedAt: '2026-08-18T18:00:00' },
+  ], {}, [{
+    employeeCode: 5,
+    workDate: '2026-08-18',
+    confirmed: true,
+    adjustedMinutes: 570,
+    late: false,
+    early: false,
+    note: 'Administrator correction',
+  }], [], new Date('2026-08-19T18:00:00Z'))
+
+  assert.equal(day.workedMinutes, 570)
+  assert.equal(day.manuallyConfirmed, true)
+  assert.equal(day.flags.includes('manually_adjusted'), true)
+})
+
 test('attendance summary counts complete pairs but excludes unconfirmed hours', () => {
   const employees = [
     { employeeCode: 5, name: 'Angelica', department: 'Inspection' },
