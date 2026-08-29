@@ -180,6 +180,34 @@ function restoreSnapshotQueries(txn, username, snapshot) {
     }
   }
 
+  if (snapshot.type === 'day-batch') {
+    const store = String(snapshot.store || '').trim()
+    const targetDays = [...new Set((Array.isArray(snapshot.targetDays) ? snapshot.targetDays : []).map(strictDay).filter(Boolean))]
+    const previous = (Array.isArray(snapshot.previous) ? snapshot.previous : [])
+      .map((item) => ({
+        day: strictDay(item?.day),
+        fileName: item?.fileName || null,
+        rows: Array.isArray(item?.rows) ? item.rows : [],
+      }))
+      .filter((item) => item.day)
+    if (!store || !targetDays.length) return { queries: [], restored: 0 }
+    const queries = [txn`
+      DELETE FROM analytics_store_days
+      WHERE username = ${username} AND store = ${store}
+        AND day IN (SELECT value::date FROM jsonb_array_elements_text(${JSON.stringify(targetDays)}::jsonb))
+    `]
+    if (previous.length) {
+      const json = JSON.stringify(previous)
+      queries.push(txn`
+        INSERT INTO analytics_store_days (username, store, day, file_name, rows, updated_at)
+        SELECT ${username}, ${store}, (item->>'day')::date, NULLIF(item->>'fileName', ''),
+               COALESCE(item->'rows', '[]'::jsonb), NOW()
+        FROM jsonb_array_elements(${json}::jsonb) AS item
+      `)
+    }
+    return { queries, restored: previous.length }
+  }
+
   if (snapshot.type === 'products') {
     const store = String(snapshot.store || '').trim()
     if (!store) return { queries: [], restored: 0 }
@@ -415,7 +443,9 @@ export default async function handler(req, res) {
           VALUES (
             ${username}, ${actor}, ${name}, 'save-products', ${`Saved ${normalizedProducts.length} product catalog rows`},
             jsonb_build_object(
-              'store', ${name}, 'fileName', ${fileName || null}, 'count', ${normalizedProducts.length},
+              'store', ${name}::text,
+              'fileName', ${fileName || null}::text,
+              'count', ${normalizedProducts.length}::int,
               'newCount', (
                 SELECT COUNT(*) FROM jsonb_array_elements(${json}::jsonb) AS item
                 WHERE NOT EXISTS (
@@ -442,7 +472,7 @@ export default async function handler(req, res) {
               ), '[]'::jsonb)
             ),
             jsonb_build_object(
-              'type', 'products', 'store', ${name},
+              'type', 'products', 'store', ${name}::text,
               'products', COALESCE((
                 SELECT jsonb_agg(jsonb_build_object(
                   'spu', spu, 'data', data, 'fileName', file_name
@@ -485,9 +515,9 @@ export default async function handler(req, res) {
           INSERT INTO analytics_store_events (username, actor, store, action, summary, details, snapshot)
           VALUES (
             ${username}, ${actor}, ${name}, 'save-settings', ${`Saved analytics settings for ${name}`},
-            jsonb_build_object('store', ${name}),
+            jsonb_build_object('store', ${name}::text),
             jsonb_build_object(
-              'type', 'settings', 'store', ${name},
+              'type', 'settings', 'store', ${name}::text,
               'previous', (
                 SELECT jsonb_build_object('data', data)
                 FROM analytics_store_settings
@@ -522,11 +552,11 @@ export default async function handler(req, res) {
           VALUES (
             ${username}, ${actor}, ${name}, 'save-day', ${`Saved ${rows.length} rows for ${name} on ${normalizedDay}`},
             jsonb_build_object(
-              'store', ${name}, 'day', ${normalizedDay},
-              'fileName', ${fileName || null}, 'rows', ${rows.length}
+              'store', ${name}::text, 'day', ${normalizedDay}::text,
+              'fileName', ${fileName || null}::text, 'rows', ${rows.length}::int
             ),
             jsonb_build_object(
-              'type', 'day', 'store', ${name}, 'day', ${normalizedDay},
+              'type', 'day', 'store', ${name}::text, 'day', ${normalizedDay}::text,
               'previous', (
                 SELECT jsonb_build_object(
                   'day', TO_CHAR(day, 'YYYY-MM-DD'), 'fileName', file_name, 'rows', rows
@@ -547,6 +577,68 @@ export default async function handler(req, res) {
         `,
       ], { isolationLevel: 'Serializable' })
       return res.json({ ok: true })
+    }
+
+    if (req.method === 'POST' && action === 'save-days') {
+      const { store, days } = req.body || {}
+      const name = String(store || '').trim()
+      const normalizedDays = (Array.isArray(days) ? days : []).map((item) => ({
+        day: strictDay(item?.day),
+        fileName: String(item?.fileName || '').trim() || null,
+        rows: Array.isArray(item?.rows) ? item.rows : null,
+      }))
+      if (!name || !normalizedDays.length || normalizedDays.length > 30
+        || normalizedDays.some((item) => !item.day || !item.rows)) {
+        return res.status(400).json({ error: 'store and between 1 and 30 valid daily files are required' })
+      }
+      if (new Set(normalizedDays.map((item) => item.day)).size !== normalizedDays.length) {
+        return res.status(400).json({ error: 'Each day may appear only once in a batch' })
+      }
+      const json = JSON.stringify(normalizedDays)
+      const totalRows = normalizedDays.reduce((sum, item) => sum + item.rows.length, 0)
+      await sql.transaction((txn) => [
+        txn`SELECT pg_advisory_xact_lock(hashtext('analytics-store-write'))`,
+        txn`
+          INSERT INTO analytics_store_events (username, actor, store, action, summary, details, snapshot)
+          VALUES (
+            ${username}, ${actor}, ${name}, 'save-days',
+            ${`Saved ${totalRows} rows across ${normalizedDays.length} days for ${name}`},
+            jsonb_build_object(
+              'store', ${name}::text, 'days', ${normalizedDays.length}::int, 'rows', ${totalRows}::int
+            ),
+            jsonb_build_object(
+              'type', 'day-batch', 'store', ${name}::text,
+              'targetDays', (
+                SELECT jsonb_agg(item->>'day' ORDER BY item->>'day')
+                FROM jsonb_array_elements(${json}::jsonb) AS item
+              ),
+              'previous', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                  'day', TO_CHAR(saved.day, 'YYYY-MM-DD'),
+                  'fileName', saved.file_name,
+                  'rows', saved.rows
+                ) ORDER BY saved.day)
+                FROM analytics_store_days saved
+                WHERE saved.username = ${username} AND saved.store = ${name}
+                  AND saved.day IN (
+                    SELECT (item->>'day')::date
+                    FROM jsonb_array_elements(${json}::jsonb) AS item
+                  )
+              ), '[]'::jsonb)
+            )
+          )
+        `,
+        txn`INSERT INTO analytics_stores (username, name) VALUES (${username}, ${name}) ON CONFLICT DO NOTHING`,
+        txn`
+          INSERT INTO analytics_store_days (username, store, day, file_name, rows, updated_at)
+          SELECT ${username}, ${name}, (item->>'day')::date, NULLIF(item->>'fileName', ''),
+                 COALESCE(item->'rows', '[]'::jsonb), NOW()
+          FROM jsonb_array_elements(${json}::jsonb) AS item
+          ON CONFLICT (username, store, day)
+          DO UPDATE SET rows = EXCLUDED.rows, file_name = EXCLUDED.file_name, updated_at = NOW()
+        `,
+      ], { isolationLevel: 'Serializable' })
+      return res.json({ ok: true, days: normalizedDays.length, rows: totalRows })
     }
 
     if (req.method === 'GET' && action === 'range') {

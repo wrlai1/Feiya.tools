@@ -135,6 +135,13 @@ export function saveStoreDay(store, day, fileName, rows) {
   })
 }
 
+export function saveStoreDays(store, days) {
+  return request(`${BASE}/analytics-store?action=save-days`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ store, days }),
+  })
+}
+
 export function fetchStoreRange(store, from, to) {
   return request(`${BASE}/analytics-store?action=range&store=${encodeURIComponent(store)}&from=${from}&to=${to}`)
 }

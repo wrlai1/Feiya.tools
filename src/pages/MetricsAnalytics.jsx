@@ -13,13 +13,14 @@ import KPICard from '../components/KPICard.jsx'
 import { useToast } from '../hooks/useToast.js'
 import { parseCSV } from '../utils/autoDeductEngine.js'
 import {
-  fetchStores, createStore, deleteStore, saveStoreDay, fetchStoreRange, deleteStoreRange,
+  fetchStores, createStore, deleteStore, saveStoreDays, fetchStoreRange, deleteStoreRange,
   fetchStoreProducts, saveStoreProducts, fetchAnalyticsSettings, saveAnalyticsSettings,
   fetchAnalyticsEvents, restoreAnalyticsEvent, fetchDailyLogs, saveDailyLog as saveDailyLogApi,
 } from '../utils/api.js'
 import { formatISODate, loadSalesSummary } from '../utils/salesSummary.js'
 import MovementAnalytics from '../components/MovementAnalytics.jsx'
 import { buildSmartDecisions } from '../utils/smartDecisionEngine.js'
+import { chunkAnalyticsDays, groupPerformanceReportsByDay, performanceDateRangeFromFileName } from '../utils/analyticsUpload.js'
 
 const todayISO = () => {
   const d = new Date()
@@ -260,11 +261,7 @@ async function readSheetRows(file) {
 }
 
 function dateRangeFromFileName(name) {
-  const dates = String(name).match(/\d{4}-\d{2}-\d{2}/g) || []
-  if (dates.length >= 2) {
-    return { start: dates[dates.length - 2], end: dates[dates.length - 1] }
-  }
-  return { start: todayISO(), end: todayISO() }
+  return performanceDateRangeFromFileName(name, todayISO())
 }
 
 async function parseProductPlan(file) {
@@ -304,10 +301,10 @@ async function parseProductPlan(file) {
   return rows
 }
 
-async function parsePerformanceFile(file) {
-  const exchangeRate = await fetchCnyToUsdRate()
+async function parsePerformanceFile(file, sharedExchangeRate = null) {
+  const exchangeRate = sharedExchangeRate || await fetchCnyToUsdRate()
   const raw = await readSheetRows(file)
-  const { start, end } = dateRangeFromFileName(file.name)
+  const { start, end, detected } = dateRangeFromFileName(file.name)
   const rows = raw
     .filter((r) => !isSummaryRow(r))
     .map((r) => {
@@ -359,7 +356,29 @@ async function parsePerformanceFile(file) {
     })
     .filter(Boolean)
   if (!rows.length) throw new Error('没有找到带 SPU ID 的商品推广数据')
-  return { rows, start, end, fileName: file.name, currencySummary: summarizeCurrencies(rows, exchangeRate) }
+  return { rows, start, end, dateDetected: detected, fileName: file.name, currencySummary: summarizeCurrencies(rows, exchangeRate) }
+}
+
+async function parsePerformanceFiles(selectedFiles) {
+  const files = [...(selectedFiles || [])]
+  if (!files.length || files.length > 30) throw new Error('请选择 1 到 30 个每日表现文件')
+  const exchangeRate = await fetchCnyToUsdRate()
+  const reports = await Promise.all(files.map((file) => parsePerformanceFile(file, exchangeRate)))
+  const missingDates = reports.filter((report) => !report.dateDetected).map((report) => report.fileName)
+  if (files.length > 1 && missingDates.length) {
+    throw new Error(`多文件上传需要文件名包含日期（YYYY-MM-DD、YYYYMMDD 或 MM-DD-YYYY）：${missingDates.slice(0, 3).join(', ')}${missingDates.length > 3 ? '…' : ''}`)
+  }
+  const days = groupPerformanceReportsByDay(reports)
+  const rows = days.flatMap((entry) => entry.rows)
+  return {
+    rows,
+    days,
+    start: days[0].day,
+    end: days.at(-1).day,
+    fileName: files.length === 1 ? files[0].name : `${files.length} files`,
+    sourceFiles: files.map((file) => file.name),
+    currencySummary: summarizeCurrencies(rows, exchangeRate),
+  }
 }
 
 function sum(rows, key) {
@@ -1328,33 +1347,49 @@ export default function MetricsAnalytics() {
     }
   }
 
-  const handlePerformanceUpload = async (file) => {
+  const handlePerformanceUpload = async (files) => {
     try {
-      const report = await parsePerformanceFile(file)
+      const report = await parsePerformanceFiles(files)
       setDraftReport(report)
       setUploadConflict(null)
       setUploadDate(report.start === report.end ? report.start : report.end || todayISO())
-      toast.success(`${report.rows.length} 个商品 · ${report.start} 到 ${report.end}`, '表现数据已读取')
+      toast.success(`${report.sourceFiles.length} 个文件 · ${report.days.length} 天 · ${report.rows.length} 行`, '表现数据已读取')
     } catch (err) {
       toast.error(err.message, '表现数据读取失败')
     }
   }
 
-  const addDraftSpuToCatalog = async (group) => {
+  const addDraftSpuToCatalog = async (group, draft) => {
     const product = {
       ...blankProduct(activeStore),
-      spu: group.spu,
-      productName: group.productName || group.spu,
+      spu: normalizeId(draft?.spu || group.spu),
+      sku: normalizeId(draft?.sku),
+      productName: String(draft?.productName || group.productName || group.spu).trim(),
       notes: `Added from performance upload ${draftReport?.fileName || ''}`.trim(),
     }
-    await handleSaveProduct(product)
+    const saved = await handleSaveProduct(product)
+    if (!saved) return
+    setDraftReport((prev) => {
+      if (!prev) return prev
+      const replace = (row) => normalizeId(row.spu) === normalizeId(group.spu)
+        ? { ...row, spu: product.spu, productName: row.productName || product.productName }
+        : row
+      return {
+        ...prev,
+        rows: prev.rows.map(replace),
+        days: prev.days.map((entry) => ({ ...entry, rows: entry.rows.map(replace) })),
+      }
+    })
   }
 
   const removeDraftSpu = (spu) => {
     setDraftReport((prev) => {
       if (!prev) return prev
       const rows = prev.rows.filter((row) => normalizeId(row.spu) !== normalizeId(spu))
-      return { ...prev, rows }
+      const days = prev.days
+        .map((entry) => ({ ...entry, rows: entry.rows.filter((row) => normalizeId(row.spu) !== normalizeId(spu)) }))
+        .filter((entry) => entry.rows.length)
+      return { ...prev, rows, days, start: days[0]?.day || prev.start, end: days.at(-1)?.day || prev.end }
     })
     toast.info(`${spu} 已从本次上传删除`, '上传数据已更新')
   }
@@ -1371,7 +1406,13 @@ export default function MetricsAnalytics() {
       const rows = prev.rows.map((row) => normalizeId(row.spu) === normalizeId(fromSpu)
         ? { ...row, spu: product.spu, productName: row.productName || product.productName }
         : row)
-      return { ...prev, rows }
+      const days = prev.days.map((entry) => ({
+        ...entry,
+        rows: entry.rows.map((row) => normalizeId(row.spu) === normalizeId(fromSpu)
+          ? { ...row, spu: product.spu, productName: row.productName || product.productName }
+          : row),
+      }))
+      return { ...prev, rows, days }
     })
     toast.success(`${fromSpu} 已改成 ${product.spu}`, '上传 SPU 已修改')
   }
@@ -1386,33 +1427,67 @@ export default function MetricsAnalytics() {
       toast.error(`还有 ${unmatchedDraftSpus.length} 个 SPU 没有匹配产品档案，请先添加、修改或删除。`, '不能保存每日数据')
       return
     }
-    const saveDate = uploadDate || todayISO()
     try {
-      const existing = await fetchStoreRange(activeStore, saveDate, saveDate).catch(() => ({ rows: [] }))
-      const existingRows = Array.isArray(existing.rows) ? existing.rows : []
-      const hasExisting = existingRows.length > 0
-      if (hasExisting && !saveMode) {
+      const draftDays = draftReport.days.length === 1
+        ? [{ ...draftReport.days[0], day: uploadDate || draftReport.days[0].day }]
+        : draftReport.days
+      const firstDay = draftDays[0].day
+      const lastDay = draftDays.at(-1).day
+      const existing = await fetchStoreRange(activeStore, firstDay, lastDay).catch(() => ({ rows: [] }))
+      const existingByDay = new Map()
+      for (const row of Array.isArray(existing.rows) ? existing.rows : []) {
+        const day = String(row.date || '').slice(0, 10)
+        if (!existingByDay.has(day)) existingByDay.set(day, [])
+        existingByDay.get(day).push(row)
+      }
+      const conflictDays = draftDays.filter((entry) => existingByDay.get(entry.day)?.length)
+      if (conflictDays.length && !saveMode) {
         setUploadConflict({
           store: activeStore,
-          day: saveDate,
-          existingRows: existingRows.length,
-          newRows: draftReport.rows.length,
+          from: conflictDays[0].day,
+          to: conflictDays.at(-1).day,
+          days: conflictDays.length,
+          existingRows: conflictDays.reduce((sum, entry) => sum + existingByDay.get(entry.day).length, 0),
+          newRows: conflictDays.reduce((sum, entry) => sum + entry.rows.length, 0),
         })
         return
       }
       const mode = saveMode || 'overwrite'
-      const nextRows = draftReport.rows.map((r) => ({ ...r, date: saveDate, reportDate: saveDate }))
-      const rows = mode === 'append' ? [...existingRows, ...nextRows] : nextRows
-      await saveStoreDay(activeStore, saveDate, draftReport.fileName, rows)
-      toast.success(`${rows.length} 行保存到 ${activeStore} (${saveDate})`, mode === 'append' ? '已加到原有数据' : '每日数据已保存')
+      const days = draftDays.map((entry) => {
+        const nextRows = entry.rows.map((row) => ({ ...row, date: entry.day, reportDate: entry.day }))
+        const previousRows = existingByDay.get(entry.day) || []
+        return {
+          day: entry.day,
+          fileName: entry.fileName,
+          rows: mode === 'append' ? [...previousRows, ...nextRows] : nextRows,
+          newRows: nextRows.length,
+          previousRows: previousRows.length,
+        }
+      })
+      const payloadDays = days.map(({ day, fileName, rows }) => ({ day, fileName, rows }))
+      const batches = chunkAnalyticsDays(payloadDays)
+      let savedBatchDays = 0
+      try {
+        for (const batch of batches) {
+          await saveStoreDays(activeStore, batch)
+          savedBatchDays += batch.length
+        }
+      } catch (error) {
+        if (savedBatchDays) throw new Error(`${savedBatchDays} 天已保存，剩余批次失败：${error.message}`)
+        throw error
+      }
+      const savedRows = days.reduce((sum, entry) => sum + entry.rows.length, 0)
+      const previousRows = days.reduce((sum, entry) => sum + entry.previousRows, 0)
+      toast.success(`${days.length} 天 · ${savedRows} 行已保存到 ${activeStore}`, mode === 'append' ? '已加到原有数据' : '每日数据已保存')
       setUploadSummary({
         store: activeStore,
-        day: saveDate,
+        day: days.length === 1 ? days[0].day : `${days[0].day}—${days.at(-1).day}`,
+        days: days.length,
         mode,
         fileName: draftReport.fileName,
-        newRows: nextRows.length,
-        previousRows: existingRows.length,
-        savedRows: rows.length,
+        newRows: days.reduce((sum, entry) => sum + entry.newRows, 0),
+        previousRows,
+        savedRows,
         currencySummary: draftReport.currencySummary,
         unmatched: unmatchedDraftSpus.length,
       })
@@ -1847,14 +1922,14 @@ export default function MetricsAnalytics() {
           <div className="flex items-center justify-between mb-3">
             <div>
               <h2 className="font-semibold text-slate-800">2. 每日表现数据</h2>
-              <p className="text-xs text-slate-400 mt-0.5">上传后先检查 SPU 是否能匹配产品档案。</p>
+              <p className="text-xs text-slate-400 mt-0.5">可一次选择最多 30 个每日文件；系统按文件日期分别保存。</p>
             </div>
             {draftReport && <span className="text-xs text-blue-600">{draftReport.start} to {draftReport.end}</span>}
           </div>
-          <FileUploadZone compact onFile={handlePerformanceUpload} accept=".csv,.xlsx,.xls" label="Upload 商品推广数据" acceptedTypes="CSV, XLSX" />
+          <FileUploadZone compact multiple onFile={handlePerformanceUpload} accept=".csv,.xlsx,.xls" label="Upload 商品推广数据（可多选）" sublabel="一次选择 1–30 个每日文件" acceptedTypes="CSV, XLSX" />
           {draftReport && (
             <div className="mt-3 flex flex-wrap items-center gap-2">
-              <span className="text-xs text-slate-500">{draftReport.rows.length} rows from {draftReport.fileName}</span>
+              <span className="text-xs text-slate-500">{draftReport.sourceFiles.length} files · {draftReport.days.length} days · {draftReport.rows.length} rows</span>
               {draftReport.currencySummary && (
                 <span className="text-xs text-blue-600 bg-blue-50 rounded-lg px-2 py-1">
                   Currency: {draftReport.currencySummary.primary === 'CNY'
@@ -1864,24 +1939,22 @@ export default function MetricsAnalytics() {
                       : `Mixed · RMB -> USD @ ${Number(draftReport.currencySummary.cnyToUsd).toFixed(4)} (${draftReport.currencySummary.rateSource}${draftReport.currencySummary.rateFallback ? ' fallback' : ''})`}
                 </span>
               )}
-              <label className="inline-flex items-center gap-1.5 text-xs text-slate-500">
+              {draftReport.days.length === 1 && <label className="inline-flex items-center gap-1.5 text-xs text-slate-500">
                 保存日期
                 <input type="date" className="metric-input !py-1" value={uploadDate} onChange={(e) => { setUploadDate(e.target.value); setUploadConflict(null) }} />
-              </label>
+              </label>}
               <button onClick={() => saveDraft()} disabled={!activeStore || unmatchedDraftSpus.length > 0} className="btn-primary text-xs px-3 py-1.5 disabled:opacity-40"><Save className="w-3.5 h-3.5" /> Save to {activeStore || 'store'}</button>
               <button onClick={() => { setDraftReport(null); setUploadConflict(null) }} className="btn-secondary text-xs px-3 py-1.5">Clear preview</button>
-              {draftReport.start !== draftReport.end && (
-                <span className="inline-flex items-center gap-1 text-xs text-amber-600"><AlertTriangle className="w-3.5 h-3.5" /> 这是区间报表，请确认保存日期。</span>
-              )}
+              {draftReport.days.length > 1 && <span className="inline-flex items-center gap-1 text-xs text-emerald-700"><CheckCircle className="w-3.5 h-3.5" /> 将分别保存到 {draftReport.start}—{draftReport.end}</span>}
             </div>
           )}
           {draftReport && uploadConflict && (
             <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3">
               <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
                 <div>
-                  <p className="text-sm font-semibold text-amber-800">这一天已经有数据</p>
+                  <p className="text-sm font-semibold text-amber-800">{uploadConflict.days} 天已经有数据</p>
                   <p className="text-xs text-amber-700 mt-0.5">
-                    {uploadConflict.store} · {uploadConflict.day} 已有 {uploadConflict.existingRows} 行；这次上传 {uploadConflict.newRows} 行。
+                    {uploadConflict.store} · {uploadConflict.from}{uploadConflict.from !== uploadConflict.to ? `—${uploadConflict.to}` : ''} 已有 {uploadConflict.existingRows} 行；这次上传 {uploadConflict.newRows} 行。
                   </p>
                 </div>
                 <div className="flex flex-wrap gap-2">
@@ -2289,7 +2362,23 @@ function FloatingStoreSwitcher({ stores, activeStore, setActiveStore, summary, l
 
 function PerformanceSpuReconcile({ groups, catalogChoices, onAdd, onRemove, onRename }) {
   const [targets, setTargets] = useState({})
+  const [newProducts, setNewProducts] = useState({})
+  const [savingSpu, setSavingSpu] = useState('')
   const setTarget = (spu, value) => setTargets((prev) => ({ ...prev, [spu]: value }))
+  const startCreate = (group) => setNewProducts((prev) => ({
+    ...prev,
+    [group.spu]: prev[group.spu] || { spu: group.spu, sku: '', productName: group.productName || '' },
+  }))
+  const setNewField = (sourceSpu, key, value) => setNewProducts((prev) => ({
+    ...prev,
+    [sourceSpu]: { ...prev[sourceSpu], [key]: value },
+  }))
+  const saveNew = async (group) => {
+    const draft = newProducts[group.spu]
+    if (!normalizeId(draft?.spu)) return
+    setSavingSpu(group.spu)
+    try { await onAdd(group, draft) } finally { setSavingSpu('') }
+  }
   return (
     <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50/70 p-4">
       <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-3">
@@ -2324,7 +2413,8 @@ function PerformanceSpuReconcile({ groups, catalogChoices, onAdd, onRemove, onRe
           </thead>
           <tbody className="divide-y divide-amber-100">
             {groups.map((group) => (
-              <tr key={group.spu} className="align-top">
+              <React.Fragment key={group.spu}>
+              <tr className="align-top">
                 <td className="py-3 pr-4 font-semibold text-amber-900">{group.spu}</td>
                 <td className="py-3 pr-4 min-w-48 text-amber-900/80">{group.productName || '-'}</td>
                 <td className="py-3 pr-4 text-right text-amber-900/80">{count(group.rows)}</td>
@@ -2344,11 +2434,23 @@ function PerformanceSpuReconcile({ groups, catalogChoices, onAdd, onRemove, onRe
                 </td>
                 <td className="py-3 pr-4">
                   <div className="flex flex-wrap gap-2">
-                    <button onClick={() => onAdd(group)} className="btn-secondary text-xs px-3 py-1.5">加入档案</button>
+                    <button onClick={() => startCreate(group)} className="btn-secondary text-xs px-3 py-1.5">创建新 SPU/SKU</button>
                     <button onClick={() => onRemove(group.spu)} className="btn-secondary text-xs px-3 py-1.5 text-red-600">从上传删除</button>
                   </div>
                 </td>
               </tr>
+              {newProducts[group.spu] && <tr className="bg-white/70">
+                <td colSpan="7" className="p-3">
+                  <div className="grid gap-2 md:grid-cols-[1fr_1fr_2fr_auto_auto] md:items-end">
+                    <label className="text-xs font-medium text-amber-800">New SPU<input className="metric-input mt-1 w-full bg-white" value={newProducts[group.spu].spu} onChange={(event) => setNewField(group.spu, 'spu', event.target.value)} /></label>
+                    <label className="text-xs font-medium text-amber-800">SKU (optional)<input className="metric-input mt-1 w-full bg-white" value={newProducts[group.spu].sku} onChange={(event) => setNewField(group.spu, 'sku', event.target.value)} /></label>
+                    <label className="text-xs font-medium text-amber-800">Product name<input className="metric-input mt-1 w-full bg-white" value={newProducts[group.spu].productName} onChange={(event) => setNewField(group.spu, 'productName', event.target.value)} /></label>
+                    <button onClick={() => saveNew(group)} disabled={savingSpu === group.spu || !normalizeId(newProducts[group.spu].spu)} className="btn-primary justify-center text-xs disabled:opacity-40"><Save className="h-3.5 w-3.5" /> {savingSpu === group.spu ? 'Saving…' : 'Save & match'}</button>
+                    <button onClick={() => setNewProducts((prev) => { const next = { ...prev }; delete next[group.spu]; return next })} disabled={savingSpu === group.spu} className="btn-secondary justify-center text-xs">Cancel</button>
+                  </div>
+                </td>
+              </tr>}
+              </React.Fragment>
             ))}
           </tbody>
         </table>
@@ -3422,7 +3524,7 @@ function UploadSummaryCard({ summary, onClear }) {
         <div>
           <p className="text-sm font-semibold text-emerald-800">Upload saved</p>
           <p className="text-xs text-emerald-700 mt-0.5">
-            {summary.store} · {summary.day} · {summary.mode === 'append' ? 'Append' : '覆盖'} · {summary.savedRows} rows saved
+            {summary.store} · {summary.day} · {summary.days || 1} day{(summary.days || 1) === 1 ? '' : 's'} · {summary.mode === 'append' ? 'Append' : '覆盖'} · {summary.savedRows} rows saved
           </p>
         </div>
         <button onClick={onClear} className="btn-secondary text-xs px-3 py-1.5">Dismiss</button>
