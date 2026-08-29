@@ -6,15 +6,16 @@ function validDay(value) {
 export function performanceDateRangeFromFileName(name, fallbackDay) {
   const source = String(name || '')
   const dates = []
-  const addDate = (year, month, day) => {
+  const addDate = (year, month, day, index) => {
     const value = `${year}-${month}-${day}`
-    if (validDay(value) && !dates.includes(value)) dates.push(value)
+    if (validDay(value)) dates.push({ value, index })
   }
-  for (const match of source.matchAll(/(20\d{2})[-_.](\d{2})[-_.](\d{2})/g)) addDate(match[1], match[2], match[3])
-  for (const match of source.matchAll(/(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)/g)) addDate(match[1], match[2], match[3])
-  for (const match of source.matchAll(/(?<!\d)(\d{2})[-_.](\d{2})[-_.](20\d{2})(?!\d)/g)) addDate(match[3], match[1], match[2])
-  if (dates.length >= 2) return { start: dates.at(-2), end: dates.at(-1), detected: true }
-  if (dates.length === 1) return { start: dates[0], end: dates[0], detected: true }
+  for (const match of source.matchAll(/(20\d{2})[-_.](\d{2})[-_.](\d{2})/g)) addDate(match[1], match[2], match[3], match.index)
+  for (const match of source.matchAll(/(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)/g)) addDate(match[1], match[2], match[3], match.index)
+  for (const match of source.matchAll(/(?<!\d)(\d{2})[-_.](\d{2})[-_.](20\d{2})(?!\d)/g)) addDate(match[3], match[1], match[2], match.index)
+  dates.sort((left, right) => left.index - right.index)
+  if (dates.length >= 2) return { start: dates.at(-2).value, end: dates.at(-1).value, detected: true }
+  if (dates.length === 1) return { start: dates[0].value, end: dates[0].value, detected: true }
   return { start: fallbackDay, end: fallbackDay, detected: false }
 }
 

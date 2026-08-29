@@ -13,6 +13,23 @@ test('performance file names recognize common daily date formats', () => {
   assert.equal(performanceDateRangeFromFileName('report.xlsx', '2026-08-29').detected, false)
 })
 
+test('performance file names use the final two date occurrences', () => {
+  assert.deepEqual(
+    performanceDateRangeFromFileName(
+      '商品推广_商品数据详情2026-08-30 04_22_2026-07-31-2026-07-31.xlsx',
+      '2026-08-29',
+    ),
+    { start: '2026-07-31', end: '2026-07-31', detected: true },
+  )
+  assert.deepEqual(
+    performanceDateRangeFromFileName(
+      '商品推广_商品数据详情2026-08-30 04_22_2026-07-30-2026-07-31.xlsx',
+      '2026-08-29',
+    ),
+    { start: '2026-07-30', end: '2026-07-31', detected: true },
+  )
+})
+
 test('multiple performance files are grouped and ordered by their own day', () => {
   const days = groupPerformanceReportsByDay([
     { start: '2026-08-02', end: '2026-08-02', fileName: 'b.xlsx', rows: [{ spu: 'B' }] },
