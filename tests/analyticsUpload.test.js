@@ -2,7 +2,14 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 
-import { chunkAnalyticsDays, groupPerformanceReportsByDay, performanceDateRangeFromFileName } from '../src/utils/analyticsUpload.js'
+import {
+  analyticsCoverageDays,
+  chunkAnalyticsDays,
+  dailyAnalyticsRows,
+  findAnalyticsOverlaps,
+  groupPerformanceReportsByDay,
+  performanceDateRangeFromFileName,
+} from '../src/utils/analyticsUpload.js'
 
 test('performance file names recognize common daily date formats', () => {
   assert.deepEqual(performanceDateRangeFromFileName('report_2026-08-01.xlsx', '2026-08-29'), {
@@ -41,6 +48,42 @@ test('multiple performance files are grouped and ordered by their own day', () =
   assert.equal(days[1].fileName, 'b.xlsx, b-2.xlsx')
 })
 
+test('range reports remain one period aggregate instead of becoming the final day', () => {
+  const [period] = groupPerformanceReportsByDay([
+    { start: '2026-07-30', end: '2026-07-31', fileName: 'range.xlsx', rows: [{ spu: 'A' }] },
+  ])
+  assert.deepEqual(period, {
+    day: '2026-07-31',
+    periodStart: '2026-07-30',
+    periodEnd: '2026-07-31',
+    kind: 'period',
+    rows: [{ spu: 'A' }],
+    fileNames: ['range.xlsx'],
+    fileName: 'range.xlsx',
+  })
+  assert.deepEqual(dailyAnalyticsRows([
+    { units: 10, periodStart: '2026-07-30', periodEnd: '2026-07-31' },
+    { units: 4, periodStart: '2026-08-01', periodEnd: '2026-08-01' },
+  ]), [{ units: 4, periodStart: '2026-08-01', periodEnd: '2026-08-01' }])
+})
+
+test('period coverage is separate from true daily uploads and overlap checks include both', () => {
+  const coverage = analyticsCoverageDays(
+    [{ day: '2026-07-30' }],
+    [{ periodStart: '2026-07-30', periodEnd: '2026-08-01' }],
+    '2026-07-30',
+    '2026-08-02',
+  )
+  assert.deepEqual([...coverage.daily], ['2026-07-30'])
+  assert.deepEqual([...coverage.period], ['2026-07-31', '2026-08-01'])
+  assert.equal(coverage.covered.has('2026-08-02'), false)
+  assert.equal(findAnalyticsOverlaps(
+    [{ periodStart: '2026-08-01', periodEnd: '2026-08-02' }],
+    [{ day: '2026-07-31' }],
+    [{ periodStart: '2026-07-30', periodEnd: '2026-08-01' }],
+  ).length, 1)
+})
+
 test('large multi-day uploads are split without separating a single day', () => {
   const days = [
     { day: '2026-08-01', rows: [{ value: 'a'.repeat(30) }] },
@@ -70,11 +113,14 @@ test('analytics batch uploads send each daily file in one request', async () => 
   }
   assert.equal(request.url, '/api/analytics-store?action=save-days')
   assert.deepEqual(JSON.parse(request.options.body), {
-    store: 'Garden', days: [{ day: '2026-08-01', fileName: 'a.xlsx', rows: [{ spu: 'A' }] }],
+    store: 'Garden', days: [{ day: '2026-08-01', fileName: 'a.xlsx', rows: [{ spu: 'A' }] }], replaceOverlaps: false,
   })
 })
 
 test('analytics JSON event parameters have explicit PostgreSQL types', async () => {
   const source = await readFile(new URL('../api/analytics-store.js', import.meta.url), 'utf8')
   assert.match(source, /'store', \$\{name\}::text,[\s\S]*'fileName', \$\{fileName \|\| null\}::text,[\s\S]*'count', \$\{normalizedProducts\.length\}::int/)
+  assert.match(source, /CREATE TABLE IF NOT EXISTS analytics_store_periods/)
+  assert.match(source, /dataKind: 'period'/)
+  assert.match(source, /async function restoreSnapshot\(sql, username, snapshot\)/)
 })

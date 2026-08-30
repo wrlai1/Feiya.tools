@@ -1,6 +1,5 @@
 // api/analytics-store.js
-// Per-account stores + their daily analytics data (Analytics page).
-// One saved upload = one day of data for one store.
+// Per-account stores + daily and aggregate-period analytics data (Analytics page).
 //
 //   GET    ?action=stores                    — list this user's stores (+ day counts / range)
 //   POST   ?action=create-store  {name}      — create an empty store
@@ -68,6 +67,18 @@ async function ensureTables(sql) {
       rows       JSONB NOT NULL,
       updated_at TIMESTAMPTZ DEFAULT NOW(),
       PRIMARY KEY (username, store, day)
+    )
+  `
+  await sql`
+    CREATE TABLE IF NOT EXISTS analytics_store_periods (
+      username     TEXT NOT NULL,
+      store        TEXT NOT NULL,
+      period_start DATE NOT NULL,
+      period_end   DATE NOT NULL,
+      file_name    TEXT,
+      rows         JSONB NOT NULL,
+      updated_at   TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (username, store, period_start, period_end)
     )
   `
   await sql`
@@ -156,6 +167,63 @@ function restoreSnapshotQueries(txn, username, snapshot) {
       `],
       restored: days.length,
     }
+  }
+
+  if (snapshot.type === 'periods') {
+    const store = String(snapshot.store || '').trim()
+    const periods = (Array.isArray(snapshot.periods) ? snapshot.periods : [])
+      .map((item) => ({
+        periodStart: strictDay(item?.periodStart),
+        periodEnd: strictDay(item?.periodEnd),
+        fileName: item?.fileName || null,
+        rows: Array.isArray(item?.rows) ? item.rows : [],
+      }))
+      .filter((item) => item.periodStart && item.periodEnd && item.periodStart < item.periodEnd)
+    if (!store || !periods.length) return { queries: [], restored: 0 }
+    const json = JSON.stringify(periods)
+    return {
+      queries: [txn`
+        INSERT INTO analytics_store_periods
+          (username, store, period_start, period_end, file_name, rows, updated_at)
+        SELECT ${username}, ${store}, (item->>'periodStart')::date, (item->>'periodEnd')::date,
+               NULLIF(item->>'fileName', ''), COALESCE(item->'rows', '[]'::jsonb), NOW()
+        FROM jsonb_array_elements(${json}::jsonb) AS item
+        ON CONFLICT (username, store, period_start, period_end)
+        DO UPDATE SET rows = EXCLUDED.rows, file_name = EXCLUDED.file_name, updated_at = NOW()
+      `],
+      restored: periods.length,
+    }
+  }
+
+  if (snapshot.type === 'analytics-data-batch') {
+    const store = String(snapshot.store || '').trim()
+    if (!store) return { queries: [], restored: 0 }
+    const targetDays = [...new Set((snapshot.targetDays || []).map(strictDay).filter(Boolean))]
+    const targetPeriods = (snapshot.targetPeriods || [])
+      .map((item) => ({ periodStart: strictDay(item?.periodStart), periodEnd: strictDay(item?.periodEnd) }))
+      .filter((item) => item.periodStart && item.periodEnd)
+    const queries = []
+    if (targetDays.length) {
+      queries.push(txn`
+        DELETE FROM analytics_store_days
+        WHERE username = ${username} AND store = ${store}
+          AND day IN (SELECT value::date FROM jsonb_array_elements_text(${JSON.stringify(targetDays)}::jsonb))
+      `)
+    }
+    if (targetPeriods.length) {
+      queries.push(txn`
+        DELETE FROM analytics_store_periods
+        WHERE username = ${username} AND store = ${store}
+          AND (period_start, period_end) IN (
+            SELECT (item->>'periodStart')::date, (item->>'periodEnd')::date
+            FROM jsonb_array_elements(${JSON.stringify(targetPeriods)}::jsonb) AS item
+          )
+      `)
+    }
+    const previousDays = restoreSnapshotQueries(txn, username, { type: 'days', store, days: snapshot.previousDays || [] })
+    const previousPeriods = restoreSnapshotQueries(txn, username, { type: 'periods', store, periods: snapshot.previousPeriods || [] })
+    queries.push(...previousDays.queries, ...previousPeriods.queries)
+    return { queries, restored: previousDays.restored + previousPeriods.restored }
   }
 
   if (snapshot.type === 'day') {
@@ -281,6 +349,7 @@ function restoreSnapshotQueries(txn, username, snapshot) {
     const queries = [txn`INSERT INTO analytics_stores (username, name) VALUES (${username}, ${store}) ON CONFLICT DO NOTHING`]
     const children = [
       { type: 'days', store, days: snapshot.days || [] },
+      { type: 'periods', store, periods: snapshot.periods || [] },
       { type: 'products', store, products: snapshot.products || [] },
       { type: 'logs', store, logs: snapshot.logs || [] },
     ]
@@ -290,6 +359,19 @@ function restoreSnapshotQueries(txn, username, snapshot) {
   }
 
   return { queries: [], restored: 0 }
+}
+
+async function restoreSnapshot(sql, username, snapshot) {
+  let restored = 0
+  await sql.transaction((txn) => {
+    const result = restoreSnapshotQueries(txn, username, snapshot)
+    restored = result.restored
+    return [
+      txn`SELECT pg_advisory_xact_lock(hashtext('analytics-store-write'))`,
+      ...result.queries,
+    ]
+  }, { isolationLevel: 'Serializable' })
+  return { restored }
 }
 
 export default async function handler(req, res) {
@@ -311,13 +393,24 @@ export default async function handler(req, res) {
     if (req.method === 'GET' && action === 'stores') {
       const rows = await sql`
         SELECT s.name,
-               COUNT(d.day)::int AS days,
-               MIN(d.day) AS first_day,
-               MAX(d.day) AS last_day
+               (SELECT COUNT(*)::int FROM analytics_store_days d
+                WHERE d.username = s.username AND d.store = s.name) AS days,
+               (SELECT COUNT(*)::int FROM analytics_store_periods p
+                WHERE p.username = s.username AND p.store = s.name) AS periods,
+               (SELECT MAX(d.day) FROM analytics_store_days d
+                WHERE d.username = s.username AND d.store = s.name) AS last_daily_day,
+               (SELECT MAX(p.period_end) FROM analytics_store_periods p
+                WHERE p.username = s.username AND p.store = s.name) AS last_period_end,
+               LEAST(
+                 (SELECT MIN(d.day) FROM analytics_store_days d WHERE d.username = s.username AND d.store = s.name),
+                 (SELECT MIN(p.period_start) FROM analytics_store_periods p WHERE p.username = s.username AND p.store = s.name)
+               ) AS first_day,
+               GREATEST(
+                 (SELECT MAX(d.day) FROM analytics_store_days d WHERE d.username = s.username AND d.store = s.name),
+                 (SELECT MAX(p.period_end) FROM analytics_store_periods p WHERE p.username = s.username AND p.store = s.name)
+               ) AS last_day
         FROM analytics_stores s
-        LEFT JOIN analytics_store_days d ON d.username = s.username AND d.store = s.name
         WHERE s.username = ${username}
-        GROUP BY s.name
         ORDER BY s.name
       `
       return res.json({ stores: rows })
@@ -361,6 +454,7 @@ export default async function handler(req, res) {
             jsonb_build_object(
               'store', ${name},
               'days', (SELECT COUNT(*) FROM analytics_store_days WHERE username = ${username} AND store = ${name}),
+              'periods', (SELECT COUNT(*) FROM analytics_store_periods WHERE username = ${username} AND store = ${name}),
               'products', (SELECT COUNT(*) FROM analytics_store_products WHERE username = ${username} AND store = ${name}),
               'logs', (SELECT COUNT(*) FROM analytics_daily_logs WHERE username = ${username} AND store = ${name})
             ),
@@ -372,6 +466,14 @@ export default async function handler(req, res) {
                   'day', TO_CHAR(day, 'YYYY-MM-DD'), 'fileName', file_name, 'rows', rows
                 ) ORDER BY day)
                 FROM analytics_store_days WHERE username = ${username} AND store = ${name}
+              ), '[]'::jsonb),
+              'periods', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                  'periodStart', TO_CHAR(period_start, 'YYYY-MM-DD'),
+                  'periodEnd', TO_CHAR(period_end, 'YYYY-MM-DD'),
+                  'fileName', file_name, 'rows', rows
+                ) ORDER BY period_start, period_end)
+                FROM analytics_store_periods WHERE username = ${username} AND store = ${name}
               ), '[]'::jsonb),
               'products', COALESCE((
                 SELECT jsonb_agg(jsonb_build_object(
@@ -398,12 +500,13 @@ export default async function handler(req, res) {
           RETURNING id
         `,
         txn`DELETE FROM analytics_store_days WHERE username = ${username} AND store = ${name}`,
+        txn`DELETE FROM analytics_store_periods WHERE username = ${username} AND store = ${name}`,
         txn`DELETE FROM analytics_store_products WHERE username = ${username} AND store = ${name}`,
         txn`DELETE FROM analytics_store_settings WHERE username = ${username} AND store = ${name}`,
         txn`DELETE FROM analytics_daily_logs WHERE username = ${username} AND store = ${name}`,
         txn`DELETE FROM analytics_stores WHERE username = ${username} AND name = ${name} RETURNING name`,
       ], { isolationLevel: 'Serializable' })
-      if (!results[6].length) return res.status(404).json({ error: 'Store not found' })
+      if (!results[7].length) return res.status(404).json({ error: 'Store not found' })
       return res.json({ ok: true })
     }
 
@@ -580,39 +683,87 @@ export default async function handler(req, res) {
     }
 
     if (req.method === 'POST' && action === 'save-days') {
-      const { store, days } = req.body || {}
+      const { store, days, replaceOverlaps = false } = req.body || {}
       const name = String(store || '').trim()
       const normalizedDays = (Array.isArray(days) ? days : []).map((item) => ({
-        day: strictDay(item?.day),
+        periodStart: strictDay(item?.periodStart || item?.day),
+        periodEnd: strictDay(item?.periodEnd || item?.day),
         fileName: String(item?.fileName || '').trim() || null,
         rows: Array.isArray(item?.rows) ? item.rows : null,
+      })).map((item) => ({
+        ...item,
+        day: item.periodEnd,
+        kind: item.periodStart === item.periodEnd ? 'daily' : 'period',
       }))
       if (!name || !normalizedDays.length || normalizedDays.length > 30
-        || normalizedDays.some((item) => !item.day || !item.rows)) {
-        return res.status(400).json({ error: 'store and between 1 and 30 valid daily files are required' })
+        || normalizedDays.some((item) => !item.periodStart || !item.periodEnd || item.periodStart > item.periodEnd || !item.rows)) {
+        return res.status(400).json({ error: 'store and between 1 and 30 valid analytics files are required' })
       }
-      if (new Set(normalizedDays.map((item) => item.day)).size !== normalizedDays.length) {
-        return res.status(400).json({ error: 'Each day may appear only once in a batch' })
+      for (let index = 0; index < normalizedDays.length; index += 1) {
+        for (let other = index + 1; other < normalizedDays.length; other += 1) {
+          const left = normalizedDays[index]
+          const right = normalizedDays[other]
+          if (left.periodStart <= right.periodEnd && left.periodEnd >= right.periodStart) {
+            return res.status(400).json({ error: 'Uploaded analytics files contain overlapping date ranges' })
+          }
+        }
       }
       const json = JSON.stringify(normalizedDays)
       const totalRows = normalizedDays.reduce((sum, item) => sum + item.rows.length, 0)
+      if (!replaceOverlaps) {
+        const conflicts = await sql`
+          SELECT
+            EXISTS (
+              SELECT 1 FROM analytics_store_days saved
+              JOIN jsonb_array_elements(${json}::jsonb) item
+                ON saved.day BETWEEN (item->>'periodStart')::date AND (item->>'periodEnd')::date
+              WHERE saved.username = ${username} AND saved.store = ${name}
+                AND NOT (item->>'kind' = 'daily' AND saved.day = (item->>'periodStart')::date)
+            ) OR EXISTS (
+              SELECT 1 FROM analytics_store_periods saved
+              JOIN jsonb_array_elements(${json}::jsonb) item
+                ON saved.period_start <= (item->>'periodEnd')::date
+               AND saved.period_end >= (item->>'periodStart')::date
+              WHERE saved.username = ${username} AND saved.store = ${name}
+                AND NOT (
+                  item->>'kind' = 'period'
+                  AND saved.period_start = (item->>'periodStart')::date
+                  AND saved.period_end = (item->>'periodEnd')::date
+                )
+            ) AS overlap
+        `
+        if (conflicts[0]?.overlap) {
+          return res.status(409).json({ error: 'This upload overlaps saved daily or period data. Confirm overwrite first.' })
+        }
+      }
       await sql.transaction((txn) => [
         txn`SELECT pg_advisory_xact_lock(hashtext('analytics-store-write'))`,
         txn`
           INSERT INTO analytics_store_events (username, actor, store, action, summary, details, snapshot)
           VALUES (
             ${username}, ${actor}, ${name}, 'save-days',
-            ${`Saved ${totalRows} rows across ${normalizedDays.length} days for ${name}`},
+            ${`Saved ${totalRows} rows across ${normalizedDays.length} analytics files for ${name}`},
             jsonb_build_object(
-              'store', ${name}::text, 'days', ${normalizedDays.length}::int, 'rows', ${totalRows}::int
+              'store', ${name}::text,
+              'days', ${normalizedDays.filter((item) => item.kind === 'daily').length}::int,
+              'periods', ${normalizedDays.filter((item) => item.kind === 'period').length}::int,
+              'rows', ${totalRows}::int
             ),
             jsonb_build_object(
-              'type', 'day-batch', 'store', ${name}::text,
+              'type', 'analytics-data-batch', 'store', ${name}::text,
               'targetDays', (
                 SELECT jsonb_agg(item->>'day' ORDER BY item->>'day')
                 FROM jsonb_array_elements(${json}::jsonb) AS item
+                WHERE item->>'kind' = 'daily'
               ),
-              'previous', COALESCE((
+              'targetPeriods', (
+                SELECT jsonb_agg(jsonb_build_object(
+                  'periodStart', item->>'periodStart', 'periodEnd', item->>'periodEnd'
+                ) ORDER BY item->>'periodStart', item->>'periodEnd')
+                FROM jsonb_array_elements(${json}::jsonb) AS item
+                WHERE item->>'kind' = 'period'
+              ),
+              'previousDays', COALESCE((
                 SELECT jsonb_agg(jsonb_build_object(
                   'day', TO_CHAR(saved.day, 'YYYY-MM-DD'),
                   'fileName', saved.file_name,
@@ -620,9 +771,24 @@ export default async function handler(req, res) {
                 ) ORDER BY saved.day)
                 FROM analytics_store_days saved
                 WHERE saved.username = ${username} AND saved.store = ${name}
-                  AND saved.day IN (
-                    SELECT (item->>'day')::date
-                    FROM jsonb_array_elements(${json}::jsonb) AS item
+                  AND EXISTS (
+                    SELECT 1 FROM jsonb_array_elements(${json}::jsonb) AS item
+                    WHERE saved.day BETWEEN (item->>'periodStart')::date AND (item->>'periodEnd')::date
+                  )
+              ), '[]'::jsonb),
+              'previousPeriods', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                  'periodStart', TO_CHAR(saved.period_start, 'YYYY-MM-DD'),
+                  'periodEnd', TO_CHAR(saved.period_end, 'YYYY-MM-DD'),
+                  'fileName', saved.file_name,
+                  'rows', saved.rows
+                ) ORDER BY saved.period_start, saved.period_end)
+                FROM analytics_store_periods saved
+                WHERE saved.username = ${username} AND saved.store = ${name}
+                  AND EXISTS (
+                    SELECT 1 FROM jsonb_array_elements(${json}::jsonb) AS item
+                    WHERE saved.period_start <= (item->>'periodEnd')::date
+                      AND saved.period_end >= (item->>'periodStart')::date
                   )
               ), '[]'::jsonb)
             )
@@ -630,15 +796,50 @@ export default async function handler(req, res) {
         `,
         txn`INSERT INTO analytics_stores (username, name) VALUES (${username}, ${name}) ON CONFLICT DO NOTHING`,
         txn`
+          DELETE FROM analytics_store_days saved
+          WHERE ${Boolean(replaceOverlaps)}::boolean
+            AND saved.username = ${username} AND saved.store = ${name}
+            AND EXISTS (
+              SELECT 1 FROM jsonb_array_elements(${json}::jsonb) AS item
+              WHERE saved.day BETWEEN (item->>'periodStart')::date AND (item->>'periodEnd')::date
+            )
+        `,
+        txn`
+          DELETE FROM analytics_store_periods saved
+          WHERE ${Boolean(replaceOverlaps)}::boolean
+            AND saved.username = ${username} AND saved.store = ${name}
+            AND EXISTS (
+              SELECT 1 FROM jsonb_array_elements(${json}::jsonb) AS item
+              WHERE saved.period_start <= (item->>'periodEnd')::date
+                AND saved.period_end >= (item->>'periodStart')::date
+            )
+        `,
+        txn`
           INSERT INTO analytics_store_days (username, store, day, file_name, rows, updated_at)
           SELECT ${username}, ${name}, (item->>'day')::date, NULLIF(item->>'fileName', ''),
                  COALESCE(item->'rows', '[]'::jsonb), NOW()
           FROM jsonb_array_elements(${json}::jsonb) AS item
+          WHERE item->>'kind' = 'daily'
           ON CONFLICT (username, store, day)
           DO UPDATE SET rows = EXCLUDED.rows, file_name = EXCLUDED.file_name, updated_at = NOW()
         `,
+        txn`
+          INSERT INTO analytics_store_periods
+            (username, store, period_start, period_end, file_name, rows, updated_at)
+          SELECT ${username}, ${name}, (item->>'periodStart')::date, (item->>'periodEnd')::date,
+                 NULLIF(item->>'fileName', ''), COALESCE(item->'rows', '[]'::jsonb), NOW()
+          FROM jsonb_array_elements(${json}::jsonb) AS item
+          WHERE item->>'kind' = 'period'
+          ON CONFLICT (username, store, period_start, period_end)
+          DO UPDATE SET rows = EXCLUDED.rows, file_name = EXCLUDED.file_name, updated_at = NOW()
+        `,
       ], { isolationLevel: 'Serializable' })
-      return res.json({ ok: true, days: normalizedDays.length, rows: totalRows })
+      return res.json({
+        ok: true,
+        days: normalizedDays.filter((item) => item.kind === 'daily').length,
+        periods: normalizedDays.filter((item) => item.kind === 'period').length,
+        rows: totalRows,
+      })
     }
 
     if (req.method === 'GET' && action === 'range') {
@@ -651,17 +852,42 @@ export default async function handler(req, res) {
         WHERE username = ${username} AND store = ${store} AND day >= ${from} AND day <= ${to}
         ORDER BY day
       `
-      // Flatten every day's rows, tagging each with its date so callers can group
-      // by product (window totals) or by date (a trend within the window).
+      const periods = await sql`
+        SELECT period_start, period_end, file_name, rows FROM analytics_store_periods
+        WHERE username = ${username} AND store = ${store}
+          AND period_start <= ${to} AND period_end >= ${from}
+        ORDER BY period_start, period_end
+      `
+      // Daily rows power trends. Fully-contained aggregate periods join range
+      // totals, but remain tagged so daily analysis can exclude them.
       const rows = []
       const summary = []
       for (const d of days) {
         const dayStr = d.day instanceof Date ? d.day.toISOString().slice(0, 10) : String(d.day).slice(0, 10)
         const dayRows = Array.isArray(d.rows) ? d.rows : []
         summary.push({ day: dayStr, fileName: d.file_name, rowCount: dayRows.length })
-        for (const r of dayRows) rows.push({ ...r, date: dayStr })
+        for (const r of dayRows) rows.push({ ...r, date: dayStr, dataKind: 'daily', periodStart: dayStr, periodEnd: dayStr })
       }
-      return res.json({ days: summary, rows })
+      const periodSummary = []
+      for (const period of periods) {
+        const periodStart = dayString(period.period_start)
+        const periodEnd = dayString(period.period_end)
+        const includedInTotals = periodStart >= from && periodEnd <= to
+        const periodRows = Array.isArray(period.rows) ? period.rows : []
+        periodSummary.push({
+          periodStart,
+          periodEnd,
+          fileName: period.file_name,
+          rowCount: periodRows.length,
+          includedInTotals,
+        })
+        if (includedInTotals) {
+          for (const r of periodRows) {
+            rows.push({ ...r, date: periodEnd, dataKind: 'period', periodStart, periodEnd })
+          }
+        }
+      }
+      return res.json({ days: summary, periods: periodSummary, rows })
     }
 
     if (req.method === 'GET' && action === 'daily-logs') {
@@ -721,48 +947,89 @@ export default async function handler(req, res) {
 
     if (req.method === 'DELETE' && action === 'delete-day') {
       const store = String(req.query.store || '').trim()
-      const day   = req.query.day
+      const day = strictDay(req.query.day)
       if (!store || !day) return res.status(400).json({ error: 'store and day are required' })
       const dayRows = await sql`
         SELECT day, file_name, rows FROM analytics_store_days
         WHERE username = ${username} AND store = ${store} AND day = ${day}
       `
+      const periodRows = await sql`
+        SELECT period_start, period_end, file_name, rows FROM analytics_store_periods
+        WHERE username = ${username} AND store = ${store}
+          AND period_start <= ${day} AND period_end >= ${day}
+      `
       await sql`DELETE FROM analytics_store_days WHERE username = ${username} AND store = ${store} AND day = ${day}`
+      await sql`
+        DELETE FROM analytics_store_periods
+        WHERE username = ${username} AND store = ${store}
+          AND period_start <= ${day} AND period_end >= ${day}
+      `
       const snapshotDays = dayRows.map((d) => ({ day: dayString(d.day), fileName: d.file_name, rows: Array.isArray(d.rows) ? d.rows : [] }))
+      const snapshotPeriods = periodRows.map((period) => ({
+        periodStart: dayString(period.period_start),
+        periodEnd: dayString(period.period_end),
+        fileName: period.file_name,
+        rows: Array.isArray(period.rows) ? period.rows : [],
+      }))
       await recordEvent(sql, username, actor, store, 'delete-day', `Deleted ${store} data on ${day}`, {
         store,
         from: day,
         to: day,
         days: snapshotDays.length,
-        rows: snapshotDays.reduce((total, d) => total + d.rows.length, 0),
-      }, { type: 'days', store, days: snapshotDays })
+        periods: snapshotPeriods.length,
+        rows: [...snapshotDays, ...snapshotPeriods].reduce((total, item) => total + item.rows.length, 0),
+      }, {
+        type: 'analytics-data-batch', store, targetDays: [], targetPeriods: [],
+        previousDays: snapshotDays, previousPeriods: snapshotPeriods,
+      })
       return res.json({ ok: true })
     }
 
     if (req.method === 'DELETE' && action === 'delete-range') {
       const store = String(req.query.store || '').trim()
-      const from  = req.query.from
-      const to    = req.query.to
-      if (!store || !from || !to) return res.status(400).json({ error: 'store, from and to are required' })
+      const from = strictDay(req.query.from)
+      const to = strictDay(req.query.to)
+      if (!store || !from || !to || from > to) return res.status(400).json({ error: 'store, from and to are required' })
       const dayRows = await sql`
         SELECT day, file_name, rows FROM analytics_store_days
         WHERE username = ${username} AND store = ${store} AND day >= ${from} AND day <= ${to}
         ORDER BY day
       `
+      const periodRows = await sql`
+        SELECT period_start, period_end, file_name, rows FROM analytics_store_periods
+        WHERE username = ${username} AND store = ${store}
+          AND period_start <= ${to} AND period_end >= ${from}
+        ORDER BY period_start, period_end
+      `
       const snapshotDays = dayRows.map((d) => ({ day: dayString(d.day), fileName: d.file_name, rows: Array.isArray(d.rows) ? d.rows : [] }))
+      const snapshotPeriods = periodRows.map((period) => ({
+        periodStart: dayString(period.period_start),
+        periodEnd: dayString(period.period_end),
+        fileName: period.file_name,
+        rows: Array.isArray(period.rows) ? period.rows : [],
+      }))
       await sql`
         DELETE FROM analytics_store_days
         WHERE username = ${username} AND store = ${store} AND day >= ${from} AND day <= ${to}
       `
-      const rowCount = snapshotDays.reduce((total, d) => total + d.rows.length, 0)
-      await recordEvent(sql, username, actor, store, 'delete-range', `Deleted ${snapshotDays.length} saved days from ${store}`, {
+      await sql`
+        DELETE FROM analytics_store_periods
+        WHERE username = ${username} AND store = ${store}
+          AND period_start <= ${to} AND period_end >= ${from}
+      `
+      const rowCount = [...snapshotDays, ...snapshotPeriods].reduce((total, item) => total + item.rows.length, 0)
+      await recordEvent(sql, username, actor, store, 'delete-range', `Deleted ${snapshotDays.length} saved days and ${snapshotPeriods.length} periods from ${store}`, {
         store,
         from,
         to,
         days: snapshotDays.length,
+        periods: snapshotPeriods.length,
         rows: rowCount,
-      }, { type: 'days', store, days: snapshotDays })
-      return res.json({ ok: true, days: snapshotDays.length, rows: rowCount })
+      }, {
+        type: 'analytics-data-batch', store, targetDays: [], targetPeriods: [],
+        previousDays: snapshotDays, previousPeriods: snapshotPeriods,
+      })
+      return res.json({ ok: true, days: snapshotDays.length, periods: snapshotPeriods.length, rows: rowCount })
     }
 
     if (req.method === 'GET' && action === 'events') {

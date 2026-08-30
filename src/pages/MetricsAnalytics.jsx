@@ -20,7 +20,15 @@ import {
 import { formatISODate, loadSalesSummary } from '../utils/salesSummary.js'
 import MovementAnalytics from '../components/MovementAnalytics.jsx'
 import { buildSmartDecisions } from '../utils/smartDecisionEngine.js'
-import { chunkAnalyticsDays, groupPerformanceReportsByDay, performanceDateRangeFromFileName } from '../utils/analyticsUpload.js'
+import {
+  analyticsCoverageDays,
+  chunkAnalyticsDays,
+  dailyAnalyticsRows,
+  findAnalyticsOverlaps,
+  groupPerformanceReportsByDay,
+  isAggregatePeriod,
+  performanceDateRangeFromFileName,
+} from '../utils/analyticsUpload.js'
 
 const todayISO = () => {
   const d = new Date()
@@ -373,8 +381,8 @@ async function parsePerformanceFiles(selectedFiles) {
   return {
     rows,
     days,
-    start: days[0].day,
-    end: days.at(-1).day,
+    start: days[0].periodStart,
+    end: days.at(-1).periodEnd,
     fileName: files.length === 1 ? files[0].name : `${files.length} files`,
     sourceFiles: files.map((file) => file.name),
     currencySummary: summarizeCurrencies(rows, exchangeRate),
@@ -439,7 +447,7 @@ function aggregateBySpu(rows, products, settings = DEFAULT_TARGETS) {
       costRatio: revenue ? spend / revenue : null,
       cpa: orders ? spend / orders : null,
       grossProfitEstimate,
-      daysSeen: new Set(group.map((r) => r.date || r.periodEnd).filter(Boolean)).size,
+      daysSeen: new Set(dailyAnalyticsRows(group).map((r) => r.date || r.periodEnd).filter(Boolean)).size,
     }
     return { ...out, ...diagnoseProduct(out, settings) }
   }).sort((a, b) => (b.units || 0) - (a.units || 0))
@@ -680,7 +688,7 @@ function normalizeProductDraft(draft, store) {
 
 function daySeries(rows, products = []) {
   const days = new Map()
-  for (const r of rows) {
+  for (const r of dailyAnalyticsRows(rows)) {
     const day = r.date || r.periodEnd || todayISO()
     if (!days.has(day)) days.set(day, [])
     days.get(day).push(r)
@@ -739,10 +747,10 @@ function dateSpan(from, to, maxDays = 62) {
   return out
 }
 
-function missingDaysInRange(range, savedDays) {
+function missingDaysInRange(range, savedDays, periods = []) {
   const days = dateSpan(range.from, range.to, 62)
-  const saved = new Set((savedDays || []).map((d) => d.day))
-  return days.filter((day) => !saved.has(day))
+  const coverage = analyticsCoverageDays(savedDays, periods, range.from, range.to)
+  return days.filter((day) => !coverage.covered.has(day))
 }
 
 function loadSavedAnalyticsViews() {
@@ -770,10 +778,12 @@ export default function MetricsAnalytics() {
   const [products, setProducts] = useState([])
   const [storeRows, setStoreRows] = useState([])
   const [storeDays, setStoreDays] = useState([])
+  const [storePeriods, setStorePeriods] = useState([])
   const [dailyLogs, setDailyLogs] = useState([])
   const [dailyLogSaving, setDailyLogSaving] = useState(false)
   const [previousStoreRows, setPreviousStoreRows] = useState([])
   const [previousStoreDays, setPreviousStoreDays] = useState(null)
+  const [previousStorePeriods, setPreviousStorePeriods] = useState(null)
   const [draftReport, setDraftReport] = useState(null)
   const [uploadDate, setUploadDate] = useState(todayISO())
   const [timeframe, setTimeframe] = useState('7d')
@@ -879,7 +889,7 @@ export default function MetricsAnalytics() {
   }, [activeStore])
 
   const loadWindow = useCallback(async () => {
-    if (!activeStore) { setStoreRows([]); setStoreDays([]); setDailyLogs([]); return }
+    if (!activeStore) { setStoreRows([]); setStoreDays([]); setStorePeriods([]); setDailyLogs([]); return }
     const { from, to } = timeframeRange(timeframe, customFrom, customTo, activeDataDay)
     if (!from || !to) return
     setLoading(true)
@@ -890,10 +900,11 @@ export default function MetricsAnalytics() {
       ])
       setStoreRows(res.rows || [])
       setStoreDays(res.days || [])
+      setStorePeriods(res.periods || [])
       setDailyLogs(logRes.logs || [])
     } catch (err) {
       toast.error(err.message, '表现数据读取失败')
-      setStoreRows([]); setStoreDays([]); setDailyLogs([])
+      setStoreRows([]); setStoreDays([]); setStorePeriods([]); setDailyLogs([])
     } finally {
       setLoading(false)
     }
@@ -939,21 +950,25 @@ export default function MetricsAnalytics() {
     if (!activeStore || !previousRange.from || !previousRange.to) {
       setPreviousStoreRows([])
       setPreviousStoreDays(null)
+      setPreviousStorePeriods(null)
       return () => { cancelled = true }
     }
     setPreviousStoreRows([])
     setPreviousStoreDays(null)
+    setPreviousStorePeriods(null)
     fetchStoreRange(activeStore, previousRange.from, previousRange.to)
       .then((res) => {
         if (!cancelled) {
           setPreviousStoreRows(res.rows || [])
           setPreviousStoreDays(res.days || [])
+          setPreviousStorePeriods(res.periods || [])
         }
       })
       .catch(() => {
         if (!cancelled) {
           setPreviousStoreRows([])
           setPreviousStoreDays([])
+          setPreviousStorePeriods([])
         }
       })
     return () => { cancelled = true }
@@ -990,6 +1005,7 @@ export default function MetricsAnalytics() {
     [draftReport, products],
   )
   const totals = useMemo(() => aggregateTotals(visibleRows, products), [visibleRows, products])
+  const storedRangeTotals = useMemo(() => aggregateTotals(storeRows, products), [storeRows, products])
   const productRows = useMemo(() => aggregateBySpu(visibleRows, products, targets), [visibleRows, products, targets])
   const previousProductRows = useMemo(
     () => aggregateBySpu(previousStoreRows, products, targets),
@@ -1039,13 +1055,15 @@ export default function MetricsAnalytics() {
       previousProducts: previousProductRows,
       crossStoreProducts,
       activeStore,
-      missingDays: missingDaysInRange(currentRange, storeDays),
-      previousMissingDays: previousStoreDays === null ? null : missingDaysInRange(previousRange, previousStoreDays),
+      missingDays: missingDaysInRange(currentRange, storeDays, storePeriods),
+      previousMissingDays: previousStoreDays === null || previousStorePeriods === null
+        ? null
+        : missingDaysInRange(previousRange, previousStoreDays, previousStorePeriods),
       totals,
       trends,
       settings: targets,
     }),
-    [productRows, previousProductRows, crossStoreProducts, activeStore, totals, trends, storeDays, previousStoreDays, currentRange, previousRange, targets],
+    [productRows, previousProductRows, crossStoreProducts, activeStore, totals, trends, storeDays, storePeriods, previousStoreDays, previousStorePeriods, currentRange, previousRange, targets],
   )
   const relationPoints = useMemo(() => productRows
     .map((p) => ({ ...p, x: p[metricX], y: p.units }))
@@ -1070,14 +1088,18 @@ export default function MetricsAnalytics() {
     () => dateSpan(currentRange.from, currentRange.to, 62),
     [currentRange],
   )
-  const savedDaysInRange = useMemo(
-    () => new Set(storeDays.map((day) => day.day)),
-    [storeDays],
+  const coverageInRange = useMemo(
+    () => analyticsCoverageDays(storeDays, storePeriods, currentRange.from, currentRange.to),
+    [storeDays, storePeriods, currentRange],
   )
-  const missingDaysCount = rangeDays.filter((day) => !savedDaysInRange.has(day)).length
+  const missingDaysCount = rangeDays.filter((day) => !coverageInRange.covered.has(day)).length
+  const periodCoveredDaysCount = coverageInRange.period.size
   const activeStoreRecord = stores.find((store) => store.name === activeStore)
   const latestSavedDay = String(activeStoreRecord?.last_day || '').slice(0, 10)
-  const latestRangeUpload = storeDays[storeDays.length - 1]
+  const latestRangeUpload = [
+    ...storeDays.map((item) => ({ ...item, sourceDay: item.day })),
+    ...storePeriods.map((item) => ({ ...item, sourceDay: item.periodEnd })),
+  ].sort((left, right) => left.sourceDay.localeCompare(right.sourceDay)).at(-1)
   const rawDataAgeDays = latestSavedDay
     ? Math.floor((Date.parse(todayISO()) - Date.parse(latestSavedDay)) / 86400000)
     : null
@@ -1173,8 +1195,8 @@ export default function MetricsAnalytics() {
           const rangeRows = rangeRes.rows || []
           const totalsForStore = aggregateTotals(rangeRows, storeProducts)
           const productsForStore = aggregateBySpu(rangeRows, storeProducts, targets)
-          const saved = new Set((rangeRes.days || []).map((d) => d.day))
-          const missing = rangeDays.filter((day) => !saved.has(day))
+          const coverage = analyticsCoverageDays(rangeRes.days || [], rangeRes.periods || [], from, to)
+          const missing = rangeDays.filter((day) => !coverage.covered.has(day))
           const attention = productsForStore.filter((p) => p.status === 'bad' || p.decision === '点击有，转化弱' || p.decision === '花费无单，控预算').length
           return {
             health: {
@@ -1353,7 +1375,9 @@ export default function MetricsAnalytics() {
       setDraftReport(report)
       setUploadConflict(null)
       setUploadDate(report.start === report.end ? report.start : report.end || todayISO())
-      toast.success(`${report.sourceFiles.length} 个文件 · ${report.days.length} 天 · ${report.rows.length} 行`, '表现数据已读取')
+      const dailyCount = report.days.filter((entry) => entry.kind === 'daily').length
+      const periodCount = report.days.filter((entry) => entry.kind === 'period').length
+      toast.success(`${report.sourceFiles.length} 个文件 · ${dailyCount} 个单日${periodCount ? ` · ${periodCount} 个周期` : ''} · ${report.rows.length} 行`, '表现数据已读取')
     } catch (err) {
       toast.error(err.message, '表现数据读取失败')
     }
@@ -1389,7 +1413,7 @@ export default function MetricsAnalytics() {
       const days = prev.days
         .map((entry) => ({ ...entry, rows: entry.rows.filter((row) => normalizeId(row.spu) !== normalizeId(spu)) }))
         .filter((entry) => entry.rows.length)
-      return { ...prev, rows, days, start: days[0]?.day || prev.start, end: days.at(-1)?.day || prev.end }
+      return { ...prev, rows, days, start: days[0]?.periodStart || prev.start, end: days.at(-1)?.periodEnd || prev.end }
     })
     toast.info(`${spu} 已从本次上传删除`, '上传数据已更新')
   }
@@ -1428,48 +1452,77 @@ export default function MetricsAnalytics() {
       return
     }
     try {
-      const draftDays = draftReport.days.length === 1
-        ? [{ ...draftReport.days[0], day: uploadDate || draftReport.days[0].day }]
+      const isSingleDaily = draftReport.days.length === 1 && draftReport.days[0].kind === 'daily'
+      const draftDays = isSingleDaily
+        ? [{
+          ...draftReport.days[0],
+          day: uploadDate || draftReport.days[0].day,
+          periodStart: uploadDate || draftReport.days[0].day,
+          periodEnd: uploadDate || draftReport.days[0].day,
+        }]
         : draftReport.days
-      const firstDay = draftDays[0].day
-      const lastDay = draftDays.at(-1).day
-      const existing = await fetchStoreRange(activeStore, firstDay, lastDay).catch(() => ({ rows: [] }))
+      const firstDay = draftDays.map((entry) => entry.periodStart).sort()[0]
+      const lastDay = draftDays.map((entry) => entry.periodEnd).sort().at(-1)
+      const existing = await fetchStoreRange(activeStore, firstDay, lastDay).catch(() => ({ rows: [], days: [], periods: [] }))
       const existingByDay = new Map()
-      for (const row of Array.isArray(existing.rows) ? existing.rows : []) {
+      for (const row of dailyAnalyticsRows(existing.rows || [])) {
         const day = String(row.date || '').slice(0, 10)
         if (!existingByDay.has(day)) existingByDay.set(day, [])
         existingByDay.get(day).push(row)
       }
-      const conflictDays = draftDays.filter((entry) => existingByDay.get(entry.day)?.length)
-      if (conflictDays.length && !saveMode) {
+      const conflictEntries = findAnalyticsOverlaps(draftDays, existing.days || [], existing.periods || [])
+      const hasPeriodOverlap = conflictEntries.some((entry) => entry.kind === 'period')
+        || (existing.periods || []).some((period) => conflictEntries.some((entry) => (
+          period.periodStart <= entry.periodEnd && period.periodEnd >= entry.periodStart
+        )))
+      if (conflictEntries.length && !saveMode) {
         setUploadConflict({
           store: activeStore,
-          from: conflictDays[0].day,
-          to: conflictDays.at(-1).day,
-          days: conflictDays.length,
-          existingRows: conflictDays.reduce((sum, entry) => sum + existingByDay.get(entry.day).length, 0),
-          newRows: conflictDays.reduce((sum, entry) => sum + entry.rows.length, 0),
+          from: conflictEntries.map((entry) => entry.periodStart).sort()[0],
+          to: conflictEntries.map((entry) => entry.periodEnd).sort().at(-1),
+          days: conflictEntries.length,
+          existingRows: (existing.days || []).reduce((sum, item) => sum + Number(item.rowCount || 0), 0)
+            + (existing.periods || []).reduce((sum, item) => sum + Number(item.rowCount || 0), 0),
+          newRows: conflictEntries.reduce((sum, entry) => sum + entry.rows.length, 0),
+          hasPeriodOverlap,
         })
         return
       }
       const mode = saveMode || 'overwrite'
+      if (mode === 'append' && hasPeriodOverlap) {
+        toast.error('周期汇总不能追加到重叠数据；请选择覆盖或取消。', '不能 Append')
+        return
+      }
       const days = draftDays.map((entry) => {
-        const nextRows = entry.rows.map((row) => ({ ...row, date: entry.day, reportDate: entry.day }))
-        const previousRows = existingByDay.get(entry.day) || []
+        const aggregatePeriod = entry.kind === 'period'
+        const nextRows = entry.rows.map((row) => ({
+          ...row,
+          date: entry.periodEnd,
+          reportDate: entry.periodEnd,
+          dataKind: aggregatePeriod ? 'period' : 'daily',
+          periodStart: entry.periodStart,
+          periodEnd: entry.periodEnd,
+        }))
+        const previousRows = aggregatePeriod ? [] : existingByDay.get(entry.day) || []
         return {
           day: entry.day,
+          kind: entry.kind,
+          periodStart: entry.periodStart,
+          periodEnd: entry.periodEnd,
           fileName: entry.fileName,
           rows: mode === 'append' ? [...previousRows, ...nextRows] : nextRows,
           newRows: nextRows.length,
           previousRows: previousRows.length,
         }
       })
-      const payloadDays = days.map(({ day, fileName, rows }) => ({ day, fileName, rows }))
+      const payloadDays = days.map(({ day, kind, periodStart, periodEnd, fileName, rows }) => ({
+        day, kind, periodStart, periodEnd, fileName, rows,
+      }))
       const batches = chunkAnalyticsDays(payloadDays)
       let savedBatchDays = 0
       try {
         for (const batch of batches) {
-          await saveStoreDays(activeStore, batch)
+          await saveStoreDays(activeStore, batch, mode === 'overwrite' && conflictEntries.length > 0)
           savedBatchDays += batch.length
         }
       } catch (error) {
@@ -1478,11 +1531,14 @@ export default function MetricsAnalytics() {
       }
       const savedRows = days.reduce((sum, entry) => sum + entry.rows.length, 0)
       const previousRows = days.reduce((sum, entry) => sum + entry.previousRows, 0)
-      toast.success(`${days.length} 天 · ${savedRows} 行已保存到 ${activeStore}`, mode === 'append' ? '已加到原有数据' : '每日数据已保存')
+      const dailyCount = days.filter((entry) => entry.kind === 'daily').length
+      const periodCount = days.filter((entry) => entry.kind === 'period').length
+      toast.success(`${dailyCount} 个单日${periodCount ? ` · ${periodCount} 个周期汇总` : ''} · ${savedRows} 行已保存到 ${activeStore}`, mode === 'append' ? '已加到原有数据' : '表现数据已保存')
       setUploadSummary({
         store: activeStore,
         day: days.length === 1 ? days[0].day : `${days[0].day}—${days.at(-1).day}`,
-        days: days.length,
+        days: dailyCount,
+        periods: periodCount,
         mode,
         fileName: draftReport.fileName,
         newRows: days.reduce((sum, entry) => sum + entry.newRows, 0),
@@ -1523,7 +1579,7 @@ export default function MetricsAnalytics() {
       await loadWindow()
       await reloadStores()
       await loadAnalyticsEvents()
-      toast.success(`${res.days || 0} 个日期、${res.rows || 0} 行已删除，可在 Operation Log 恢复`, '数据已删除')
+      toast.success(`${res.days || 0} 个单日、${res.periods || 0} 个重叠周期、${res.rows || 0} 行已删除，可在 Operation Log 恢复`, '数据已删除')
     } catch (err) {
       toast.error(err.message, '删除失败')
     }
@@ -1665,7 +1721,8 @@ export default function MetricsAnalytics() {
           latestSavedDay={latestSavedDay}
           latestSource={latestRangeUpload?.fileName || ''}
           dataAgeDays={dataAgeDays}
-          savedDays={savedDaysInRange.size}
+          savedDays={coverageInRange.daily.size}
+          periodCoveredDays={periodCoveredDaysCount}
           expectedDays={rangeDays.length}
           missingDays={missingDaysCount}
           draftReport={draftReport}
@@ -1696,6 +1753,8 @@ export default function MetricsAnalytics() {
           activeStore={activeStore}
           loading={loading}
           storeDays={storeDays}
+          storePeriods={storePeriods}
+          rangeTotals={storedRangeTotals}
           anchorDay={activeDataDay}
           dailyLogs={dailyLogs}
           dailyStats={dailyStats}
@@ -1921,15 +1980,18 @@ export default function MetricsAnalytics() {
         <div className="card p-4">
           <div className="flex items-center justify-between mb-3">
             <div>
-              <h2 className="font-semibold text-slate-800">2. 每日表现数据</h2>
-              <p className="text-xs text-slate-400 mt-0.5">可一次选择最多 30 个每日文件；系统按文件日期分别保存。</p>
+              <h2 className="font-semibold text-slate-800">2. 表现数据</h2>
+              <p className="text-xs text-slate-400 mt-0.5">单日文件用于每日趋势；跨日文件保存为周期汇总，不会伪装成某一天。</p>
             </div>
             {draftReport && <span className="text-xs text-blue-600">{draftReport.start} to {draftReport.end}</span>}
           </div>
-          <FileUploadZone compact multiple onFile={handlePerformanceUpload} accept=".csv,.xlsx,.xls" label="Upload 商品推广数据（可多选）" sublabel="一次选择 1–30 个每日文件" acceptedTypes="CSV, XLSX" />
+          <FileUploadZone compact multiple onFile={handlePerformanceUpload} accept=".csv,.xlsx,.xls" label="Upload 商品推广数据（可多选）" sublabel="一次选择 1–30 个单日或周期文件" acceptedTypes="CSV, XLSX" />
           {draftReport && (
             <div className="mt-3 flex flex-wrap items-center gap-2">
-              <span className="text-xs text-slate-500">{draftReport.sourceFiles.length} files · {draftReport.days.length} days · {draftReport.rows.length} rows</span>
+              <span className="text-xs text-slate-500">
+                {draftReport.sourceFiles.length} files · {draftReport.days.filter((entry) => entry.kind === 'daily').length} daily
+                {draftReport.days.some((entry) => entry.kind === 'period') ? ` · ${draftReport.days.filter((entry) => entry.kind === 'period').length} period` : ''} · {draftReport.rows.length} rows
+              </span>
               {draftReport.currencySummary && (
                 <span className="text-xs text-blue-600 bg-blue-50 rounded-lg px-2 py-1">
                   Currency: {draftReport.currencySummary.primary === 'CNY'
@@ -1939,31 +2001,31 @@ export default function MetricsAnalytics() {
                       : `Mixed · RMB -> USD @ ${Number(draftReport.currencySummary.cnyToUsd).toFixed(4)} (${draftReport.currencySummary.rateSource}${draftReport.currencySummary.rateFallback ? ' fallback' : ''})`}
                 </span>
               )}
-              {draftReport.days.length === 1 && <label className="inline-flex items-center gap-1.5 text-xs text-slate-500">
+              {draftReport.days.length === 1 && draftReport.days[0].kind === 'daily' && <label className="inline-flex items-center gap-1.5 text-xs text-slate-500">
                 保存日期
                 <input type="date" className="metric-input !py-1" value={uploadDate} onChange={(e) => { setUploadDate(e.target.value); setUploadConflict(null) }} />
               </label>}
               <button onClick={() => saveDraft()} disabled={!activeStore || unmatchedDraftSpus.length > 0} className="btn-primary text-xs px-3 py-1.5 disabled:opacity-40"><Save className="w-3.5 h-3.5" /> Save to {activeStore || 'store'}</button>
               <button onClick={() => { setDraftReport(null); setUploadConflict(null) }} className="btn-secondary text-xs px-3 py-1.5">Clear preview</button>
-              {draftReport.days.length > 1 && <span className="inline-flex items-center gap-1 text-xs text-emerald-700"><CheckCircle className="w-3.5 h-3.5" /> 将分别保存到 {draftReport.start}—{draftReport.end}</span>}
+              {draftReport.days.some((entry) => entry.kind === 'period') && <span className="inline-flex items-center gap-1 text-xs text-amber-700"><AlertTriangle className="w-3.5 h-3.5" /> 跨日汇总只进入区间总计，不进入每日趋势</span>}
+              {draftReport.days.length > 1 && draftReport.days.every((entry) => entry.kind === 'daily') && <span className="inline-flex items-center gap-1 text-xs text-emerald-700"><CheckCircle className="w-3.5 h-3.5" /> 将分别保存到 {draftReport.start}—{draftReport.end}</span>}
             </div>
           )}
           {draftReport && uploadConflict && (
             <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3">
               <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
                 <div>
-                  <p className="text-sm font-semibold text-amber-800">{uploadConflict.days} 天已经有数据</p>
+                  <p className="text-sm font-semibold text-amber-800">上传范围与已有数据重叠</p>
                   <p className="text-xs text-amber-700 mt-0.5">
                     {uploadConflict.store} · {uploadConflict.from}{uploadConflict.from !== uploadConflict.to ? `—${uploadConflict.to}` : ''} 已有 {uploadConflict.existingRows} 行；这次上传 {uploadConflict.newRows} 行。
                   </p>
+                  {uploadConflict.hasPeriodOverlap && <p className="mt-1 text-xs font-medium text-amber-800">选择覆盖会删除所有与这个日期范围重叠的单日数据或周期汇总，避免重复计算。</p>}
                 </div>
                 <div className="flex flex-wrap gap-2">
                   <button onClick={() => saveDraft('overwrite')} className="btn-primary text-xs px-3 py-1.5">
                     覆盖
                   </button>
-                  <button onClick={() => saveDraft('append')} className="btn-secondary text-xs px-3 py-1.5">
-                    Append
-                  </button>
+                  {!uploadConflict.hasPeriodOverlap && <button onClick={() => saveDraft('append')} className="btn-secondary text-xs px-3 py-1.5">Append</button>}
                   <button onClick={() => setUploadConflict(null)} className="btn-secondary text-xs px-3 py-1.5">
                     取消
                   </button>
@@ -2141,13 +2203,16 @@ function DataStatusBanner({
   latestSource,
   dataAgeDays,
   savedDays,
+  periodCoveredDays,
   expectedDays,
   missingDays,
   draftReport,
 }) {
   const isPreview = Boolean(draftReport)
   const hasSavedData = Boolean(latestSavedDay)
-  const isComplete = expectedDays > 0 && missingDays === 0
+  const coveredDays = savedDays + periodCoveredDays
+  const hasPeriodCoverage = periodCoveredDays > 0
+  const isComplete = expectedDays > 0 && missingDays === 0 && !hasPeriodCoverage
   const isFresh = dataAgeDays != null && dataAgeDays <= 1
   const tone = isPreview
     ? 'border-blue-200 bg-blue-50/70'
@@ -2165,8 +2230,10 @@ function DataStatusBanner({
       ? '先创建或选择店铺'
       : !hasSavedData
         ? '这个店铺还没有已保存的表现数据'
-        : savedDays === 0
+        : coveredDays === 0
           ? '所选时间范围没有已保存数据'
+          : hasPeriodCoverage
+            ? '区间包含周期汇总，逐日趋势不完整'
           : isComplete && isFresh
             ? '数据已更新且范围完整'
             : '数据需要检查'
@@ -2176,9 +2243,9 @@ function DataStatusBanner({
       ? '创建店铺后即可上传 SPU 档案和每日表现数据。'
       : !hasSavedData
         ? '先上传每日表现数据；上传后会先预览并检查 SPU，再由你确认保存。'
-        : savedDays === 0
+        : coveredDays === 0
           ? `最近保存日期是 ${formatISODate(latestSavedDay)}。请调整时间范围，或上传缺少的日期。`
-          : `${savedDays}/${expectedDays || 0} 天有数据${missingDays ? `，缺少 ${missingDays} 天` : ''}。`
+          : `${savedDays} 天有逐日数据${periodCoveredDays ? `，${periodCoveredDays} 天只有周期汇总` : ''}${missingDays ? `，另缺少 ${missingDays} 天` : ''}。周期汇总会进入区间总计，但不会进入每日趋势。`
 
   return (
     <section className={`rounded-xl border px-4 py-3 ${tone}`}>
@@ -2200,8 +2267,8 @@ function DataStatusBanner({
           />
           <StatusMini
             label="Completeness"
-            value={expectedDays ? `${savedDays}/${expectedDays} days` : 'Choose range'}
-            note={expectedDays ? missingDays ? `${missingDays} missing` : 'Complete' : '—'}
+            value={expectedDays ? `${savedDays} daily / ${expectedDays}` : 'Choose range'}
+            note={expectedDays ? periodCoveredDays ? `${periodCoveredDays} period-only` : missingDays ? `${missingDays} missing` : 'Complete' : '—'}
           />
           <StatusMini
             label={isPreview ? 'Preview source' : 'Latest source in range'}
@@ -2210,11 +2277,11 @@ function DataStatusBanner({
           />
         </div>
       </div>
-      {(!activeStore || (!isPreview && (!hasSavedData || savedDays === 0))) && (
+      {(!activeStore || (!isPreview && (!hasSavedData || coveredDays === 0))) && (
         <div className="mt-3 flex flex-wrap gap-2 border-t border-black/5 pt-3">
           {!activeStore && <a href="#analytics-stores" className="btn-primary text-xs">Create or select store</a>}
           {activeStore && <a href="#analytics-uploads" className="btn-primary text-xs">Upload performance data</a>}
-          {activeStore && hasSavedData && savedDays === 0 && <a href="#analytics-performance" className="btn-secondary text-xs">Review selected range</a>}
+          {activeStore && hasSavedData && coveredDays === 0 && <a href="#analytics-performance" className="btn-secondary text-xs">Review selected range</a>}
         </div>
       )}
     </section>
@@ -2654,6 +2721,8 @@ function DateRangeControl({
   activeStore,
   loading,
   storeDays,
+  storePeriods,
+  rangeTotals,
   anchorDay,
   dailyLogs,
   dailyStats,
@@ -2665,11 +2734,13 @@ function DateRangeControl({
   const range = timeframeRange(timeframe, customFrom, customTo, anchorDay)
   const days = dateSpan(range.from, range.to, 62)
   const savedDayMap = new Map((storeDays || []).map((d) => [d.day, d]))
+  const coverage = analyticsCoverageDays(storeDays, storePeriods, range.from, range.to)
+  const periodForDay = (day) => (storePeriods || []).find((period) => period.periodStart <= day && period.periodEnd >= day)
   const logMap = new Map((dailyLogs || []).map((item) => [item.day, item]))
-  const missingCount = days.filter((day) => !savedDayMap.has(day)).length
+  const missingCount = days.filter((day) => !coverage.covered.has(day)).length
   const loggedDays = days.filter((day) => logMap.get(day)?.note)
-  const summaryUnits = days.reduce((total, day) => total + (Number(dailyStats?.[day]?.units) || 0), 0)
-  const summaryRevenue = days.reduce((total, day) => total + (Number(dailyStats?.[day]?.revenue) || 0), 0)
+  const summaryUnits = Number(rangeTotals?.units) || 0
+  const summaryRevenue = Number(rangeTotals?.revenue) || 0
   const recentLogs = loggedDays.slice(-3).reverse()
   const logImpacts = loggedDays.map((day) => {
     const nextDay = addDaysISO(day, 1)
@@ -2733,7 +2804,7 @@ function DateRangeControl({
           </p>
           {days.length > 0 && (
             <p className="text-xs text-slate-400 mt-0.5">
-              {savedDayMap.size} 天已上传 · {missingCount} 天需要补
+              {coverage.daily.size} 天逐日数据{coverage.period.size ? ` · ${coverage.period.size} 天只有周期汇总` : ''} · {missingCount} 天需要补
             </p>
           )}
         </div>
@@ -2767,6 +2838,7 @@ function DateRangeControl({
           <div className="grid grid-cols-7 gap-1.5">
             {days.map((day, index) => {
               const saved = savedDayMap.get(day)
+              const period = !saved ? periodForDay(day) : null
               const log = logMap.get(day)
               const stats = dailyStats?.[day]
               const isLatest = day === anchorDay
@@ -2782,6 +2854,8 @@ function DateRangeControl({
                     className={`min-h-12 w-full rounded-md border px-1.5 py-1 text-left text-xs transition ${
                       saved
                         ? 'border-blue-200 bg-blue-50 text-blue-700 hover:border-blue-300'
+                        : period
+                          ? 'border-amber-200 bg-amber-50 text-amber-700 hover:border-amber-300'
                         : 'border-slate-200 bg-slate-100 text-slate-400 hover:border-slate-300'
                     } ${isLatest ? 'ring-1 ring-blue-400' : ''}`}
                   >
@@ -2790,16 +2864,19 @@ function DateRangeControl({
                       {log?.note && <NotebookPen className="h-3 w-3 text-amber-500" />}
                     </span>
                     <span className="mt-1 block truncate text-[10px]">
-                      {saved ? `销量 ${count(stats?.units || 0)}` : 'No data'}
+                      {saved ? `销量 ${count(stats?.units || 0)}` : period ? 'Period total only' : 'No data'}
                     </span>
                   </button>
                   <div className={`pointer-events-none absolute top-full z-30 w-64 pt-1 opacity-0 transition group-hover:pointer-events-auto group-hover:opacity-100 ${index % 7 >= 5 ? 'right-0' : 'left-0'}`}>
                     <div className="rounded-lg border border-slate-200 bg-white p-3 text-left shadow-xl">
                       <div className="flex items-center justify-between gap-2">
                         <span className="text-xs font-semibold text-slate-700">{formatISODate(day)}</span>
-                        <span className="text-[10px] text-slate-400">{saved ? '已上传数据' : '未上传数据'}</span>
+                        <span className="text-[10px] text-slate-400">{saved ? '已上传逐日数据' : period ? '只有周期汇总' : '未上传数据'}</span>
                       </div>
-                      <div className="mt-2 grid grid-cols-2 gap-2">
+                      {period && <p className="mt-2 rounded-md bg-amber-50 px-2 py-1.5 text-[10px] leading-4 text-amber-700">
+                        {period.periodStart}—{period.periodEnd} 的合计已保存，但原文件没有逐日明细，因此这一天不显示销量趋势。
+                      </p>}
+                      {!period && <div className="mt-2 grid grid-cols-2 gap-2">
                         <div className="rounded-md bg-blue-50 px-2 py-1.5">
                           <div className="text-[10px] text-blue-500">销量</div>
                           <div className="text-sm font-semibold text-blue-700">{count(stats?.units || 0)}</div>
@@ -2808,7 +2885,7 @@ function DateRangeControl({
                           <div className="text-[10px] text-emerald-500">销售额</div>
                           <div className="text-sm font-semibold text-emerald-700">{money(stats?.revenue || 0)}</div>
                         </div>
-                      </div>
+                      </div>}
                       <div className="mt-2 rounded-md bg-amber-50 px-2 py-2">
                         <div className="text-[10px] font-medium text-amber-600">Daily Log</div>
                         {log?.tags?.length > 0 && (
@@ -3524,7 +3601,7 @@ function UploadSummaryCard({ summary, onClear }) {
         <div>
           <p className="text-sm font-semibold text-emerald-800">Upload saved</p>
           <p className="text-xs text-emerald-700 mt-0.5">
-            {summary.store} · {summary.day} · {summary.days || 1} day{(summary.days || 1) === 1 ? '' : 's'} · {summary.mode === 'append' ? 'Append' : '覆盖'} · {summary.savedRows} rows saved
+            {summary.store} · {summary.day} · {summary.days || 0} daily{summary.periods ? ` · ${summary.periods} period` : ''} · {summary.mode === 'append' ? 'Append' : '覆盖'} · {summary.savedRows} rows saved
           </p>
         </div>
         <button onClick={onClear} className="btn-secondary text-xs px-3 py-1.5">Dismiss</button>

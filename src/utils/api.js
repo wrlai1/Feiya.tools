@@ -135,10 +135,10 @@ export function saveStoreDay(store, day, fileName, rows) {
   })
 }
 
-export function saveStoreDays(store, days) {
+export function saveStoreDays(store, days, replaceOverlaps = false) {
   return request(`${BASE}/analytics-store?action=save-days`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ store, days }),
+    body: JSON.stringify({ store, days, replaceOverlaps }),
   })
 }
 

@@ -76,7 +76,7 @@ function buildCenterItems(stores, trackers, availability) {
   const statuses = []
   const normalizedStores = stores.map((store) => ({
     ...store,
-    lastDay: isoDay(store.last_day || store.lastDay),
+    lastDay: isoDay(store.last_daily_day || store.lastDailyDay || store.lastDay),
   }))
   const latestStoreDay = normalizedStores
     .map((store) => store.lastDay)

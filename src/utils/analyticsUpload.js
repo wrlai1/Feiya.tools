@@ -20,17 +20,66 @@ export function performanceDateRangeFromFileName(name, fallbackDay) {
 }
 
 export function groupPerformanceReportsByDay(reports) {
-  const dayMap = new Map()
+  const entryMap = new Map()
   for (const report of reports || []) {
-    const day = report.end || report.start
-    if (!dayMap.has(day)) dayMap.set(day, { day, rows: [], fileNames: [] })
-    const entry = dayMap.get(day)
+    const periodStart = report.start || report.end
+    const periodEnd = report.end || report.start
+    const kind = periodStart === periodEnd ? 'daily' : 'period'
+    const key = `${kind}|${periodStart}|${periodEnd}`
+    if (!entryMap.has(key)) {
+      entryMap.set(key, {
+        day: periodEnd,
+        periodStart,
+        periodEnd,
+        kind,
+        rows: [],
+        fileNames: [],
+      })
+    }
+    const entry = entryMap.get(key)
     entry.rows.push(...(report.rows || []))
     entry.fileNames.push(report.fileName)
   }
-  return [...dayMap.values()]
-    .sort((left, right) => left.day.localeCompare(right.day))
+  return [...entryMap.values()]
+    .sort((left, right) => left.periodStart.localeCompare(right.periodStart) || left.periodEnd.localeCompare(right.periodEnd))
     .map((entry) => ({ ...entry, fileName: entry.fileNames.join(', ') }))
+}
+
+export function isAggregatePeriod(value) {
+  const start = String(value?.periodStart || '')
+  const end = String(value?.periodEnd || '')
+  return Boolean(value?.dataKind === 'period' || value?.kind === 'period' || (start && end && start !== end))
+}
+
+export function dailyAnalyticsRows(rows) {
+  return (rows || []).filter((row) => !isAggregatePeriod(row))
+}
+
+export function analyticsCoverageDays(savedDays, periods, from, to) {
+  const daily = new Set((savedDays || []).map((item) => item.day).filter(Boolean))
+  const period = new Set()
+  for (const item of periods || []) {
+    let day = item.periodStart
+    const end = item.periodEnd
+    while (day && end && day <= end) {
+      if ((!from || day >= from) && (!to || day <= to) && !daily.has(day)) period.add(day)
+      const date = new Date(`${day}T00:00:00Z`)
+      date.setUTCDate(date.getUTCDate() + 1)
+      day = date.toISOString().slice(0, 10)
+    }
+  }
+  return { daily, period, covered: new Set([...daily, ...period]) }
+}
+
+export function findAnalyticsOverlaps(entries, savedDays, periods) {
+  const dailyDays = new Set((savedDays || []).map((item) => item.day).filter(Boolean))
+  const existingPeriods = periods || []
+  return (entries || []).filter((entry) => {
+    const start = entry.periodStart || entry.day
+    const end = entry.periodEnd || entry.day
+    if ([...dailyDays].some((day) => day >= start && day <= end)) return true
+    return existingPeriods.some((period) => period.periodStart <= end && period.periodEnd >= start)
+  })
 }
 
 export function chunkAnalyticsDays(days, maxBytes = 2_500_000) {

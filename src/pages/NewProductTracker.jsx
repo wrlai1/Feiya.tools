@@ -12,6 +12,7 @@ import {
   createNewProductTracker, deleteNewProductTracker, fetchNewProductTrackers,
   fetchStoreProducts, fetchStoreRange, fetchStores, saveNewProductRoas,
 } from '../utils/api.js'
+import { dailyAnalyticsRows } from '../utils/analyticsUpload.js'
 import { useToast } from '../hooks/useToast.js'
 
 const DAY_MS = 86400000
@@ -314,7 +315,7 @@ function productMatch(tracker, products) {
 
 function buildDailyRows(tracker, storeData) {
   const products = storeData?.products || []
-  const allRows = storeData?.rows || []
+  const allRows = dailyAnalyticsRows(storeData?.rows || [])
   const uploadedDays = new Set(storeData?.days || [])
   const { product, ids } = productMatch(tracker, products)
   const multiplier = Math.max(number(product?.unitMultiplier) || 1, 1)
