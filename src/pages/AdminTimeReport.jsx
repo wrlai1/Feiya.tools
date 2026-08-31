@@ -5,7 +5,7 @@ import {
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import {
-  calcHours, calcHoursInRange, formatHours, filterToday, filterThisWeek,
+  calcCompletedHoursInRange, formatHours,
   groupByUser, isMissedPunch, getStatus, toLocalDateTimeInput,
   STATUS_LABEL, PUNCH_LABEL,
 } from '../utils/timeCalc.js'
@@ -134,9 +134,15 @@ function UserCard({ username, punches: initial, token, onPunchesChange }) {
 
   const status  = getStatus(punches)
   const missed  = isMissedPunch(punches)
-  const total   = formatHours(calcHours(punches))
-  const today   = formatHours(calcHours(filterToday(punches)))
-  const week    = formatHours(calcHours(filterThisWeek(punches)))
+  const nowMs = Date.now()
+  const todayStart = new Date(nowMs)
+  todayStart.setHours(0, 0, 0, 0)
+  const weekStart = new Date(nowMs)
+  weekStart.setDate(weekStart.getDate() - weekStart.getDay())
+  weekStart.setHours(0, 0, 0, 0)
+  const total = formatHours(calcCompletedHoursInRange(punches, -Infinity, nowMs))
+  const today = formatHours(calcCompletedHoursInRange(punches, todayStart.getTime(), nowMs))
+  const week = formatHours(calcCompletedHoursInRange(punches, weekStart.getTime(), nowMs))
 
   const handleUpdated = (updated) => {
     const next = punches.map(p => p.id === updated.id ? updated : p)
@@ -277,7 +283,7 @@ function exportCSV(punches, contextPunches, from, to) {
   const rangeEndMs = new Date(to).getTime()
   const summaryRows = Object.entries(byUser).map(([u, ps]) => ({
     username: u,
-    hours: calcHoursInRange(ps, rangeStartMs, rangeEndMs),
+    hours: calcCompletedHoursInRange(ps, rangeStartMs, rangeEndMs),
   }))
 
   let csv = 'PUNCH LOG EXPORT\n'
@@ -353,7 +359,10 @@ export default function AdminTimeReport() {
   }
 
   const allPunches = Object.values(userMap).flat()
-  const totalHours = Object.values(userMap).reduce((sum, ps) => sum + calcHours(ps), 0)
+  const totalHours = Object.values(userMap).reduce(
+    (sum, ps) => sum + calcCompletedHoursInRange(ps, -Infinity, Date.now()),
+    0,
+  )
   const userCount  = Object.keys(userMap).length
 
   return (
@@ -402,6 +411,7 @@ export default function AdminTimeReport() {
         <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-4 text-center">
           <p className="text-xs text-slate-400 uppercase tracking-wide mb-1">Total Hours</p>
           <p className="text-2xl font-bold text-slate-800">{formatHours(totalHours)}</p>
+          <p className="mt-1 text-[11px] text-slate-400">Completed shifts only</p>
         </div>
         <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-4 text-center">
           <p className="text-xs text-slate-400 uppercase tracking-wide mb-1">Total Punches</p>

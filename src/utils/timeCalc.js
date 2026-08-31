@@ -25,7 +25,7 @@ export function getLastClockIn(punches) {
  * range is applied so a clock-in before midnight still contributes work after
  * midnight. An open shift is counted through rangeEndMs.
  */
-export function calcHoursInRange(punches, rangeStartMs, rangeEndMs) {
+function calculateHoursInRange(punches, rangeStartMs, rangeEndMs, includeOpenShift) {
   const startMs = Number.isFinite(rangeStartMs) ? rangeStartMs : -Infinity
   const endMs = Number.isFinite(rangeEndMs) ? rangeEndMs : Date.now()
   if (endMs <= startMs) return 0
@@ -36,6 +36,7 @@ export function calcHoursInRange(punches, rangeStartMs, rangeEndMs) {
     .sort((a, b) => a.time - b.time)
 
   let totalMs = 0
+  let shiftMs = 0
   let onShift = false
   let workingFromMs = null
   let firstPunchIndex = 0
@@ -61,17 +62,18 @@ export function calcHoursInRange(punches, rangeStartMs, rangeEndMs) {
   const addWorkedInterval = (fromMs, toMs) => {
     const clippedStart = Math.max(fromMs, startMs)
     const clippedEnd = Math.min(toMs, endMs)
-    if (clippedEnd > clippedStart) totalMs += clippedEnd - clippedStart
+    if (clippedEnd > clippedStart) shiftMs += clippedEnd - clippedStart
   }
 
   for (let index = firstPunchIndex; index < sortedPunches.length; index += 1) {
     const { punch, time } = sortedPunches[index]
     switch (punch.type) {
       case 'clock_in':
-        if (!onShift) {
-          onShift = true
-          workingFromMs = time
-        }
+        // A new clock-in starts a new shift. If the previous shift never had a
+        // clock-out, discard it instead of bridging multiple days of work.
+        onShift = true
+        shiftMs = 0
+        workingFromMs = time
         break
       case 'break_start':
         if (onShift && workingFromMs != null) {
@@ -85,6 +87,8 @@ export function calcHoursInRange(punches, rangeStartMs, rangeEndMs) {
       case 'clock_out':
         if (onShift) {
           if (workingFromMs != null) addWorkedInterval(workingFromMs, time)
+          totalMs += shiftMs
+          shiftMs = 0
           onShift = false
           workingFromMs = null
         }
@@ -92,9 +96,21 @@ export function calcHoursInRange(punches, rangeStartMs, rangeEndMs) {
     }
   }
 
-  if (onShift && workingFromMs != null) addWorkedInterval(workingFromMs, endMs)
+  if (onShift && includeOpenShift) {
+    if (workingFromMs != null) addWorkedInterval(workingFromMs, endMs)
+    totalMs += shiftMs
+  }
 
   return totalMs / 3_600_000
+}
+
+export function calcHoursInRange(punches, rangeStartMs, rangeEndMs) {
+  return calculateHoursInRange(punches, rangeStartMs, rangeEndMs, true)
+}
+
+/** Payroll/report hours count only shifts that have a matching clock-out. */
+export function calcCompletedHoursInRange(punches, rangeStartMs, rangeEndMs) {
+  return calculateHoursInRange(punches, rangeStartMs, rangeEndMs, false)
 }
 
 /** Total worked hours from an array of punches (includes ongoing shift). */
@@ -108,8 +124,9 @@ export function calcHours(punches, nowMs = Date.now()) {
 
 export function formatHours(h) {
   if (!h || h < 0) return '0h 0m'
-  const hours = Math.floor(h)
-  const mins  = Math.round((h - hours) * 60)
+  const totalMinutes = Math.round(h * 60)
+  const hours = Math.floor(totalMinutes / 60)
+  const mins = totalMinutes % 60
   if (hours === 0) return `${mins}m`
   return `${hours}h ${mins}m`
 }
