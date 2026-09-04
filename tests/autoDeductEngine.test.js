@@ -1215,6 +1215,53 @@ test('SKU return manifests group tracking and retain store-facing return details
   assert.equal(result.packages[0].carrier, 'UPS')
 })
 
+test('SKU return manifests cap duplicate and oversized rows to the original order quantity', () => {
+  const catalog = [{
+    store_name: 'Garden',
+    store_key: 'garden',
+    sku_id: 'SKU-LAVENDER-XL',
+    sku_code: '0015lavander XL',
+    status: 'ready',
+    components: [{ style: '5010015', color: 'Lavander', size: 'XL', qty: 1 }],
+  }]
+  const orders = [{
+    order_number: 'PO-LAVENDER',
+    store_name: 'Garden',
+    store_key: 'garden',
+    items: [{ sku_id: 'SKU-LAVENDER-XL', quantity: 1 }],
+  }]
+  const result = parseSkuReturnManifestRows([
+    {
+      '订单号 PO': 'PO-LAVENDER-D01',
+      'SKU ID': 'SKU-LAVENDER-XL',
+      Quantity: 1,
+      '运单号 Tracking Number': 'RETURN-DUPLICATE',
+    },
+    {
+      '订单号 PO': 'PO-LAVENDER',
+      'SKU ID': 'SKU-LAVENDER-XL',
+      Quantity: 1,
+      '运单号 Tracking Number': 'RETURN-DUPLICATE',
+    },
+    {
+      '订单号 PO': 'PO-LAVENDER',
+      'SKU ID': 'SKU-LAVENDER-XL',
+      Quantity: 3,
+      '运单号 Tracking Number': 'RETURN-OVERSIZED',
+    },
+  ], catalog, orders)
+
+  assert.equal(result.needsReview.length, 0)
+  assert.deepEqual(result.packages.map((pkg) => [
+    pkg.tracking,
+    pkg.expectedUnits,
+    pkg.items[0].sourceQty,
+  ]), [
+    ['RETURN-DUPLICATE', 1, 1],
+    ['RETURN-OVERSIZED', 1, 1],
+  ])
+})
+
 test('one combined return manifest assigns each tracking to its SKU catalog store', () => {
   const rows = [
     { 'SKU ID': 'GARDEN-SKU', '运单号 Tracking Number': 'TRACK-GARDEN' },

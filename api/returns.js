@@ -3,6 +3,7 @@ import authentication from '../lib/authentication.cjs'
 import inventoryTargetResolution from '../lib/inventoryTargetResolution.cjs'
 import returnPackageSafety from '../lib/returnPackageSafety.cjs'
 import { summarizeReturnInspection } from '../src/utils/returnInspection.js'
+import { limitReturnPackageQuantities } from '../src/utils/returnOrderQuantity.js'
 
 const { resolveInventoryTargets } = inventoryTargetResolution
 const { authenticateUser } = authentication
@@ -1398,7 +1399,29 @@ export default async function handler(req, res) {
         WHERE packages.status <> 'pending'
       `
       const finalKeys = new Set(finalPackages.map((pkg) => pkg.tracking_key))
-      const importable = packages.filter((pkg) => !finalKeys.has(pkg.tracking_key))
+      let importable = packages.filter((pkg) => !finalKeys.has(pkg.tracking_key))
+      const orderKeys = [...new Set(importable.flatMap((pkg) => pkg.order_numbers)
+        .map(normalizeOrderNumber).filter(Boolean))]
+      let correctedPackages = 0
+      if (orderKeys.length) {
+        const quantityOrders = await sql`
+          WITH wanted AS (
+            SELECT value #>> '{}' AS order_key
+            FROM jsonb_array_elements(${JSON.stringify(orderKeys)}::jsonb)
+          )
+          SELECT orders.order_key, orders.store_key,
+            jsonb_agg(jsonb_build_object(
+              'sku_id', items.sku_id, 'sku_code', items.sku_code, 'quantity', items.quantity
+            )) AS items
+          FROM return_orders orders
+          JOIN wanted USING (order_key)
+          JOIN return_order_items items ON items.order_id = orders.id
+          GROUP BY orders.id
+        `
+        const limited = limitReturnPackageQuantities(importable, quantityOrders)
+        correctedPackages = limited.filter((pkg, index) => pkg !== importable[index]).length
+        importable = limited
+      }
 
       if (importable.length) {
         const manifest = JSON.stringify(importable)
@@ -1507,6 +1530,7 @@ export default async function handler(req, res) {
       return res.json({
         ok: true,
         imported_packages: importable.length,
+        corrected_packages: correctedPackages,
         review_packages: importable.filter((pkg) => pkg.status === 'needs_review').length,
         imported_units: importable.reduce((sum, pkg) => sum + pkg.expected_units, 0),
         skipped_received: finalKeys.size,

@@ -1,5 +1,6 @@
 import { consolidateRows } from './consolidateEngine.js'
 import { fillTemplate } from './autoDeductEngine.js'
+import { orderSkuQuantity } from './returnOrderQuantity.js'
 
 const TRACKING_ALIASES = [
   'Tracking', 'Tracking Number', 'Tracking No', 'Return Tracking',
@@ -400,6 +401,14 @@ function resolvedHistoricalOrder(orderMatches, group) {
   return { order: null, issue: 'order_store_ambiguous' }
 }
 
+function historicalOrderSkuQuantity(orders, orderNumber, group, skuId, skuCode) {
+  const orderKey = normalizeOrderNumber(orderNumber)
+  if (!orderKey) return null
+  const { order } = resolvedHistoricalOrder(orders.get(orderKey), group)
+  if (!order) return null
+  return orderSkuQuantity(order, skuId, skuCode)
+}
+
 export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders = []) {
   if (!Array.isArray(rows) || !rows.length) throw new Error('Return file is empty')
   const trackingKey = findKey(rows[0], TRACKING_ALIASES)
@@ -472,6 +481,7 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
       candidateOrders: [],
       review: [],
       unresolvedSkus: new Map(),
+      explicitOrderSkuQuantities: new Map(),
       stores: new Map(explicitStoresByTracking.get(tracking) || []),
     }
     if (orderNumber) group.orders.add(orderNumber)
@@ -610,6 +620,20 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
       const catalogResolution = resolvedCatalogProduct(catalog, skuId)
       const product = matchingOrderCatalogProduct(orders, orderNumber, group, skuId)
         || catalogResolution.product
+      const orderKey = normalizeOrderNumber(orderNumber)
+      const orderQuantity = historicalOrderSkuQuantity(
+        orders, orderNumber, group, skuId, product?.sku_code || product?.skuCode,
+      )
+      const usageKey = `${orderKey}\u241f${skuId}`
+      const usedQuantity = group.explicitOrderSkuQuantities.get(usageKey) || 0
+      const effectiveQuantity = orderQuantity == null
+        ? quantity
+        : Math.min(quantity, Math.max(orderQuantity - usedQuantity, 0))
+      if (!effectiveQuantity) {
+        groups.set(tracking, group)
+        return
+      }
+      group.explicitOrderSkuQuantities.set(usageKey, usedQuantity + effectiveQuantity)
       const productIssue = product ? '' : catalogResolution.issue
       if (!product) {
         group.review.push({
@@ -630,7 +654,7 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
         addUnresolvedSku(group, {
           skuId,
           skuCode: product.sku_code || product.skuCode,
-          quantity,
+          quantity: effectiveQuantity,
           issue: product.issue || 'sku_mapping_needs_review',
         })
         group.review.push({
@@ -648,8 +672,8 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
             style: component.style,
             color: component.color,
             size: component.size,
-            expectedQty: Number(component.qty || 1) * quantity,
-            sourceQty: quantity,
+            expectedQty: Number(component.qty || 1) * effectiveQuantity,
+            sourceQty: effectiveQuantity,
           })
         })
       }
