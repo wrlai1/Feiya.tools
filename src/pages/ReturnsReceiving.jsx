@@ -526,6 +526,37 @@ export default function ReturnsReceiving() {
     lookup(value)
   }, [lookup])
 
+  const startManualReturn = async () => {
+    if (!isAdmin || !orderOnly || loading) return
+    setLoading(true)
+    try {
+      const res = await fetch(`${BASE}/returns?action=manual-create`, {
+        method: 'POST',
+        headers: headers(getToken, true),
+        body: JSON.stringify({
+          orderNumber: orderOnly.order_number,
+          storeName: orderOnly.store_name,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not start manual return')
+      const next = data.package
+      setPkg(next)
+      setOrderOnly(null)
+      setTracking(next.tracking_number)
+      setCounts({})
+      setAdminSelections({})
+      setCounted(false)
+      setRemark('')
+      toast.success('Choose the products and quantities that were returned.', 'Manual Return Started')
+      await loadRecent()
+    } catch (error) {
+      toast.error(error.message, 'Could Not Start Manual Return')
+    } finally {
+      setLoading(false)
+    }
+  }
+
   useEffect(() => {
     const unresolvedSkus = pkg?.review_data?.unresolvedSkus || []
     const needsOrderItemMapping = Boolean(
@@ -1280,9 +1311,25 @@ export default function ReturnsReceiving() {
           {orderOnly && (
             <div className="card p-4 sm:p-5">
               <OrderDetails order={orderOnly} />
-              <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
-                This finds the original order only. Scan or upload the return Tracking before receiving inventory.
-              </div>
+              {isAdmin ? (
+                <div className="mt-3 rounded-xl border border-blue-200 bg-blue-50 p-3">
+                  <p className="text-sm text-blue-900">
+                    No tracking number? Start a manual return and choose the products actually returned.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={startManualReturn}
+                    disabled={loading}
+                    className="btn-primary mt-3 min-h-11 w-full sm:w-auto"
+                  >
+                    Start Manual Return / 手动退货
+                  </button>
+                </div>
+              ) : (
+                <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                  Ask an administrator to start a manual return for this order.
+                </div>
+              )}
             </div>
           )}
 

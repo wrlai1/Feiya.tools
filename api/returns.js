@@ -1315,6 +1315,51 @@ export default async function handler(req, res) {
       return res.json({ order: orders[0], matches: orders.length })
     }
 
+    if (req.method === 'POST' && action === 'manual-create') {
+      if (payload.role !== 'admin') return res.status(403).json({ error: 'Admin access required' })
+      const orderNumber = cleanText(req.body?.orderNumber, 100)
+      const orderKey = normalizeOrderNumber(orderNumber)
+      if (!orderKey) return res.status(400).json({ error: 'orderNumber required' })
+      const storeValue = cleanText(req.body?.storeName, 100)
+      const storeKey = storeValue ? normalizeStore(storeValue).key : ''
+      const orders = storeKey
+        ? await loadOrdersWithCombinedFallback(sql, storeKey, [orderNumber])
+        : await loadOrdersByKeys(sql, '', [orderNumber])
+      if (!orders.length) return res.status(404).json({ error: 'Order is not in the uploaded history' })
+      if (!storeKey && new Set(orders.map((order) => order.store_key)).size > 1) {
+        return res.status(409).json({
+          error: 'This order number exists in more than one store. Choose a store.',
+          stores: [...new Set(orders.map((order) => order.store_name))],
+        })
+      }
+      const order = orders[0]
+      if (!order.items?.length) return res.status(409).json({ error: 'This order has no products' })
+      const suffix = crypto.randomUUID().replace(/-/g, '').slice(0, 10).toUpperCase()
+      const trackingNumber = `MANUAL-${orderKey}-${suffix}`
+      const reviewData = JSON.stringify({
+        unresolvedSkus: [],
+        blockingIssues: [],
+        workerInspection: null,
+        manualReturn: {
+          orderNumber: order.order_number,
+          createdBy: payload.username,
+          createdAt: new Date().toISOString(),
+        },
+      })
+      await sql`
+        INSERT INTO return_packages (
+          tracking_number, tracking_key, source_file, status, store_name, store_key,
+          order_numbers, expected_units, uploaded_by, requires_item_resolution,
+          review_reason, review_data
+        ) VALUES (
+          ${trackingNumber}, ${normalizeTracking(trackingNumber)}, 'Manual PO Return', 'pending',
+          ${order.store_name}, ${order.store_key}, ${JSON.stringify([order.order_number])}::jsonb,
+          0, ${payload.username}, true, 'manual_po_return', ${reviewData}::jsonb
+        )
+      `
+      return res.json({ ok: true, package: await loadPackage(sql, normalizeTracking(trackingNumber)) })
+    }
+
     if (req.method === 'POST' && action === 'orders-lookup') {
       if (payload.role !== 'admin') return res.status(403).json({ error: 'Admin access required' })
       const store = normalizeStore(req.body?.storeName)
