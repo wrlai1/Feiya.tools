@@ -5,13 +5,16 @@ import {
   Pencil, Plus, Minus,
 } from 'lucide-react'
 import DataTable from '../components/DataTable.jsx'
+import DailyStyleReport from '../components/DailyStyleReport.jsx'
 import FileUploadZone from '../components/FileUploadZone.jsx'
+import ReplenishmentPlan from '../components/ReplenishmentPlan.jsx'
 import { useToast } from '../hooks/useToast.js'
 import { useAuth } from '../context/AuthContext.jsx'
 import { parseCSV } from '../utils/autoDeductEngine.js'
+import { inventoryRestoreMode } from '../utils/inventoryRestoreMode.js'
 
 const BASE = '/api'
-const MAX_SNAPSHOTS = 5
+const MAX_SNAPSHOTS = 20
 
 function authHeaders(token, json = false) {
   const h = { Authorization: `Bearer ${token}` }
@@ -45,13 +48,26 @@ async function parseFileRows(file) {
 }
 
 /** Normalise a row from any case convention into {Style, Color, Size, Quantity} */
-function normaliseRow(r) {
-  return {
-    Style:    String(r.Style    || r.style    || r.STYLE    || '').trim(),
-    Color:    String(r.Color    || r.color    || r.COLOR    || '').trim(),
-    Size:     String(r.Size     || r.size     || r.SIZE     || '').trim(),
-    Quantity: parseInt(r.Quantity ?? r.quantity ?? r.QUANTITY ?? 0, 10) || 0,
+function inventoryKey(row) {
+  const size = String(row.Size || '').trim().toUpperCase().replace(/^([123])XL$/, '$1X')
+  return [row.Style, row.Color, size].map((value) => String(value || '').trim().toLowerCase()).join('|||')
+}
+
+function normaliseRow(r, index = 0) {
+  const row = {
+    Style: String(r.Style ?? r.style ?? r.STYLE ?? '').trim(),
+    Color: String(r.Color ?? r.color ?? r.COLOR ?? '').trim(),
+    Size: String(r.Size ?? r.size ?? r.SIZE ?? '').trim(),
   }
+  if (!row.Style || !row.Color || !row.Size) {
+    throw new Error(`Excel row ${index + 2} requires Style, Color, and Size`)
+  }
+  const rawQuantity = r.Quantity ?? r.quantity ?? r.QUANTITY ?? 0
+  const quantity = rawQuantity === '' ? 0 : Number(rawQuantity)
+  if (!Number.isSafeInteger(quantity) || quantity < 0) {
+    throw new Error(`Excel row ${index + 2}: Quantity must be a whole number of 0 or more`)
+  }
+  return { ...row, Quantity: quantity }
 }
 
 function rowColor(row) {
@@ -64,24 +80,28 @@ function rowColor(row) {
 // ── Edit Quantity Modal ────────────────────────────────────────────────────────
 function EditQtyModal({ row, onClose, onDone, getToken }) {
   const [qty,     setQty]     = useState(String(row.Quantity ?? 0))
+  const [reason,  setReason]  = useState('')
   const [loading, setLoading] = useState(false)
   const toast = useToast()
 
   const handleSave = async () => {
-    const n = parseInt(qty, 10)
-    if (isNaN(n)) { toast.error('Please enter a valid number'); return }
+    const n = Number(qty)
+    if (!Number.isSafeInteger(n) || n < 0) {
+      toast.error('Quantity must be a whole number of 0 or more')
+      return
+    }
     setLoading(true)
     try {
       const data = await apiFetch(`${BASE}/inventory-balance?action=edit&id=${row.id}`, {
         method:  'PATCH',
         headers: authHeaders(getToken(), true),
-        body:    JSON.stringify({ quantity: n }),
+        body:    JSON.stringify({ quantity: n, reason }),
       })
       toast.success(
         `${row.Style} / ${row.Color} / ${row.Size}: ${data.old_quantity} → ${data.new_quantity}`,
         'Quantity Updated'
       )
-      onDone()
+      onDone({ id: row.id, quantity: Number(data.new_quantity) })
       onClose()
     } catch (err) {
       toast.error(err.message, 'Update Failed')
@@ -112,6 +132,8 @@ function EditQtyModal({ row, onClose, onDone, getToken }) {
           <label className="block text-xs font-medium text-slate-500 mb-1.5">New Quantity</label>
           <input
             type="number"
+            min="0"
+            step="1"
             value={qty}
             onChange={(e) => setQty(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleSave()}
@@ -119,6 +141,19 @@ function EditQtyModal({ row, onClose, onDone, getToken }) {
             autoFocus
           />
           <p className="text-xs text-slate-400 mt-1">Current: {row.Quantity}</p>
+        </div>
+
+        <div>
+          <label className="block text-xs font-medium text-slate-500 mb-1.5">Reason / Remark (optional)</label>
+          <input
+            type="text"
+            value={reason}
+            maxLength={300}
+            onChange={(event) => setReason(event.target.value)}
+            placeholder="Example: Physical count correction"
+            className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+          />
+          <p className="mt-1.5 text-xs text-slate-400">The old value, new value, user, and remark will be kept in the audit history.</p>
         </div>
 
         <div className="flex gap-2">
@@ -150,16 +185,15 @@ function AddRowsModal({ onClose, onDone, currentRows, getToken }) {
     setLoading(true)
     try {
       const uploaded   = await parseFileRows(file)
-      const balanceSet = new Set(currentRows.map(r => `${r.Style}|||${r.Color}|||${r.Size}`))
+      const balanceMap = new Map(currentRows.map((row) => [inventoryKey(row), row]))
       const to_add        = []
       const already_exists = []
 
-      for (const raw of uploaded) {
-        const r = normaliseRow(raw)
-        if (!r.Style || !r.Color || !r.Size) continue
-        const key = `${r.Style}|||${r.Color}|||${r.Size}`
-        if (balanceSet.has(key)) {
-          const existing = currentRows.find(x => x.Style === r.Style && x.Color === r.Color && x.Size === r.Size)
+      for (const [index, raw] of uploaded.entries()) {
+        const r = normaliseRow(raw, index)
+        const key = inventoryKey(r)
+        if (balanceMap.has(key)) {
+          const existing = balanceMap.get(key)
           already_exists.push({ Style: r.Style, Color: r.Color, Size: r.Size, current_quantity: existing?.Quantity ?? 0 })
         } else {
           to_add.push({ Style: r.Style, Color: r.Color, Size: r.Size, Quantity: r.Quantity })
@@ -321,14 +355,13 @@ function RemoveRowsModal({ onClose, onDone, currentRows, getToken }) {
     setLoading(true)
     try {
       const uploaded   = await parseFileRows(file)
-      const balanceMap = new Map(currentRows.map(r => [`${r.Style}|||${r.Color}|||${r.Size}`, r]))
+      const balanceMap = new Map(currentRows.map((row) => [inventoryKey(row), row]))
       const to_remove = []
       const not_found  = []
 
-      for (const raw of uploaded) {
-        const r = normaliseRow(raw)
-        if (!r.Style || !r.Color || !r.Size) continue
-        const key   = `${r.Style}|||${r.Color}|||${r.Size}`
+      for (const [index, raw] of uploaded.entries()) {
+        const r = normaliseRow(raw, index)
+        const key = inventoryKey(r)
         const found = balanceMap.get(key)
         if (found) {
           to_remove.push(found) // already has id, Style, Color, Size, Quantity
@@ -515,7 +548,9 @@ function VersionHistory({ onRestore, getToken }) {
     if (!snapOpen) return
     setLoadingS(true)
     apiFetch(`${BASE}/inventory-balance?action=history`, { headers: authHeaders(getToken()) })
-      .then((d) => setSnapshots(d.snapshots || []))
+      .then((d) => setSnapshots((d.snapshots || []).filter((snapshot) =>
+        snapshot.label !== 'pre_restore' && snapshot.restorable !== false
+      )))
       .catch(() => {})
       .finally(() => setLoadingS(false))
   }, [snapOpen, getToken])
@@ -530,15 +565,21 @@ function VersionHistory({ onRestore, getToken }) {
   }, [logOpen, getToken])
 
   const handleRestore = async (snap) => {
-    if (!window.confirm(
-      `Restore balance to the snapshot from ${snap.timestamp}?\n\n` +
-      `This will revert to ${snap.total_units.toLocaleString()} units across ${snap.total_rows.toLocaleString()} SKUs.\n\n` +
-      `Your current balance will be saved as a backup first.`
-    )) return
+    const restoreMode = inventoryRestoreMode(snap.label)
+    const fullRestore = restoreMode === 'full'
+    const confirmation = fullRestore
+      ? `Restore the entire inventory version from ${snap.timestamp}?\n\n` +
+        `This whole-inventory restore replaces both quantities and the SKU list with ${snap.total_units.toLocaleString()} units across ${snap.total_rows.toLocaleString()} SKUs.\n` +
+        'Styles, colors, and sizes added after this version will be removed.'
+      : `Restore saved inventory quantities from ${snap.timestamp}?\n\n` +
+        `Saved quantities for ${snap.total_rows.toLocaleString()} SKU rows will be restored. ` +
+        'Styles, colors, and sizes added after this point will be kept.'
+    if (!window.confirm(confirmation)) return
 
     setRestoring(snap.id)
     try {
-      const res = await apiFetch(`${BASE}/inventory-balance?action=restore&id=${snap.id}`, {
+      const modeQuery = fullRestore ? '' : '&mode=quantities'
+      const res = await apiFetch(`${BASE}/inventory-balance?action=restore&id=${snap.id}${modeQuery}`, {
         method:  'POST',
         headers: authHeaders(getToken()),
       })
@@ -548,7 +589,9 @@ function VersionHistory({ onRestore, getToken }) {
       )
       onRestore()
       const d = await apiFetch(`${BASE}/inventory-balance?action=history`, { headers: authHeaders(getToken()) })
-      setSnapshots(d.snapshots || [])
+      setSnapshots((d.snapshots || []).filter((snapshot) =>
+        snapshot.label !== 'pre_restore' && snapshot.restorable !== false
+      ))
     } catch (err) {
       toast.error(err.message, 'Restore Failed')
     } finally {
@@ -559,9 +602,9 @@ function VersionHistory({ onRestore, getToken }) {
   const labelColors = {
     sales:       'bg-orange-100 text-orange-700',
     return:      'bg-green-100 text-green-700',
+    adjustment:  'bg-amber-100 text-amber-700',
     pre_init:    'bg-blue-100 text-blue-700',
     pre_reset:   'bg-red-100 text-red-700',
-    pre_restore: 'bg-purple-100 text-purple-700',
     pre_remove:  'bg-rose-100 text-rose-700',
   }
 
@@ -585,7 +628,7 @@ function VersionHistory({ onRestore, getToken }) {
         {snapOpen && (
           <div className="border-t border-slate-100 px-5 py-4">
             <p className="text-xs text-slate-400 mb-3">
-              The last {MAX_SNAPSHOTS} balance states are saved automatically before every change. Click <strong>Restore</strong> to roll back.
+              Daily updates restore quantities and keep SKUs added later. A whole-inventory restore is available only for versions saved before a full inventory replacement, and it replaces the SKU list too.
             </p>
 
             {loadingS ? (
@@ -620,7 +663,7 @@ function VersionHistory({ onRestore, getToken }) {
                       className="flex-shrink-0 flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       {restoring === snap.id ? <RefreshCw className="w-3 h-3 animate-spin" /> : null}
-                      Restore
+                      {inventoryRestoreMode(snap.label) === 'full' ? 'Restore All' : 'Restore Qty'}
                     </button>
                   </div>
                 ))}
@@ -654,7 +697,11 @@ function VersionHistory({ onRestore, getToken }) {
                   <div key={i} className="flex items-center justify-between text-sm py-2 border-b border-slate-50 last:border-0">
                     <div className="flex items-center gap-2.5">
                       <span className={`w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 ${
-                        t.transaction_type === 'sales' ? 'bg-orange-100 text-orange-600' : 'bg-green-100 text-green-600'
+                        t.transaction_type === 'sales'
+                          ? 'bg-orange-100 text-orange-600'
+                          : t.transaction_type === 'return'
+                            ? 'bg-green-100 text-green-600'
+                            : 'bg-amber-100 text-amber-600'
                       }`}>
                         {t.transaction_type === 'sales'
                           ? <XCircle    className="w-3.5 h-3.5" />
@@ -666,8 +713,15 @@ function VersionHistory({ onRestore, getToken }) {
                       </div>
                     </div>
                     <div className="text-right flex-shrink-0 ml-4">
-                      <p className={`font-semibold ${t.transaction_type === 'sales' ? 'text-orange-600' : 'text-green-600'}`}>
-                        {t.transaction_type === 'sales' ? '−' : '+'}{(t.applied_units || 0).toLocaleString()} units
+                      <p className={`font-semibold ${
+                        t.transaction_type === 'sales'
+                          ? 'text-orange-600'
+                          : t.transaction_type === 'return'
+                            ? 'text-green-600'
+                            : 'text-amber-600'
+                      }`}>
+                        {t.transaction_type === 'sales' ? '−' : t.transaction_type === 'return' ? '+' : '±'}
+                        {(t.applied_units || 0).toLocaleString()} units
                       </p>
                       <p className="text-xs text-slate-400 capitalize">{t.transaction_type}</p>
                     </div>
@@ -693,7 +747,7 @@ function ImportModal({ onClose, onDone, getToken }) {
     setLoading(true)
     try {
       const uploaded = await parseFileRows(file)
-      const rows     = uploaded.map(normaliseRow).filter(r => r.Style && r.Color && r.Size)
+      const rows = uploaded.map(normaliseRow)
       if (!rows.length) throw new Error('No valid rows found in file')
 
       const data = await apiFetch(`${BASE}/inventory-balance?action=init`, {
@@ -786,7 +840,7 @@ function InitializePanel({ onDone, getToken }) {
     setLoading(true)
     try {
       const uploaded = await parseFileRows(file)
-      const rows     = uploaded.map(normaliseRow).filter(r => r.Style && r.Color && r.Size)
+      const rows = uploaded.map(normaliseRow)
       if (!rows.length) throw new Error('No valid rows found in file')
 
       const data = await apiFetch(`${BASE}/inventory-balance?action=init`, {
@@ -842,7 +896,7 @@ function InitializePanel({ onDone, getToken }) {
 
 // ── Main page ─────────────────────────────────────────────────────────────────
 export default function StockManagement() {
-  const { getToken } = useAuth()
+  const { getToken, user } = useAuth()
   const [balanceData,    setBalanceData]    = useState(null)
   const [loading,        setLoading]        = useState(true)
   const [inputValue,     setInputValue]     = useState('')
@@ -855,6 +909,7 @@ export default function StockManagement() {
   const [showAddRows,    setShowAddRows]    = useState(false)
   const [showRemoveRows, setShowRemoveRows] = useState(false)
   const [editTarget,     setEditTarget]     = useState(null)
+  const [activeView,     setActiveView]     = useState('balance')
   const toast = useToast()
 
   const COLUMNS = useMemo(() => [
@@ -904,6 +959,24 @@ export default function StockManagement() {
   }, [getToken])
 
   useEffect(() => { loadBalance() }, [loadBalance])
+
+  const handleQuantityUpdated = useCallback(({ id, quantity }) => {
+    setBalanceData((current) => {
+      if (!current?.rows) return current
+
+      const rows = current.rows.map((row) =>
+        row.id === id ? { ...row, Quantity: quantity } : row
+      )
+
+      return {
+        ...current,
+        rows,
+        total_units: rows.reduce((sum, row) => sum + (Number(row.Quantity) || 0), 0),
+        skus_in_stock: rows.filter((row) => Number(row.Quantity) > 0).length,
+        skus_zero: rows.filter((row) => Number(row.Quantity) <= 0).length,
+      }
+    })
+  }, [])
 
   const handleReset = useCallback(async () => {
     if (!window.confirm('Reset all quantities to zero? This cannot be undone.')) return
@@ -996,7 +1069,12 @@ export default function StockManagement() {
         <RemoveRowsModal onClose={() => setShowRemoveRows(false)} onDone={loadBalance} currentRows={allRows} getToken={getToken} />
       )}
       {editTarget && (
-        <EditQtyModal row={editTarget} onClose={() => setEditTarget(null)} onDone={loadBalance} getToken={getToken} />
+        <EditQtyModal
+          row={editTarget}
+          onClose={() => setEditTarget(null)}
+          onDone={handleQuantityUpdated}
+          getToken={getToken}
+        />
       )}
 
       {/* Header */}
@@ -1004,15 +1082,20 @@ export default function StockManagement() {
         <div className="flex-1">
           <h2 className="text-xl font-bold text-slate-800">Stock Management</h2>
           <p className="text-sm text-slate-500 mt-0.5">
-            Real-time inventory balance — updated every time you run Auto Deduct
+            {activeView === 'balance'
+              ? 'Real-time inventory balance — updated every time you run Auto Deduct'
+              : activeView === 'daily-report'
+                ? 'One-style daily inventory, sales comparison, and days-of-stock report'
+                : 'Factory replenishment suggestions based on real inventory movement'}
           </p>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <button onClick={() => setShowImport(true)} className="btn-secondary text-sm">
-            <FileUp className="w-4 h-4" />
-            Import Update
-          </button>
-          {initialized && (
+        {activeView === 'balance' && (
+          <div className="flex flex-wrap items-center gap-2">
+            <button onClick={() => setShowImport(true)} className="btn-secondary text-sm">
+              <FileUp className="w-4 h-4" />
+              Import Update
+            </button>
+            {initialized && (
             <>
               <button onClick={() => setShowAddRows(true)} className="btn-secondary text-sm">
                 <Plus className="w-4 h-4" />
@@ -1035,8 +1118,9 @@ export default function StockManagement() {
                 Export CSV
               </button>
             </>
-          )}
-        </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Not initialized → show init panel */}
@@ -1044,98 +1128,130 @@ export default function StockManagement() {
         <InitializePanel onDone={loadBalance} getToken={getToken} />
       ) : (
         <>
-          {/* Stats */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-            <StatCard
-              label="Total Units"     value={balanceData.total_units}
-              icon={Boxes}            iconBg="bg-blue-100"   iconColor="text-blue-600"
-            />
-            <StatCard
-              label="SKUs with Stock" value={balanceData.skus_in_stock}
-              icon={CheckCircle}      iconBg="bg-green-100"  iconColor="text-green-600"
-            />
-            <StatCard
-              label="Low Stock (< 5)"
-              value={allRows.filter(r => Number(r.Quantity) > 0 && Number(r.Quantity) < 5).length}
-              icon={AlertTriangle}    iconBg="bg-yellow-100" iconColor="text-yellow-600"
-            />
-            <StatCard
-              label="Out of Stock"    value={balanceData.skus_zero}
-              icon={XCircle}          iconBg="bg-red-100"    iconColor="text-red-600"
-            />
+          <div className="flex w-full rounded-xl bg-slate-100 p-1 sm:w-fit">
+            {[
+              ['balance', 'Inventory Balance'],
+              ['daily-report', 'Daily Style Report'],
+              ['replenishment', 'Replenishment Plan'],
+            ].map(([value, label]) => (
+              <button
+                key={value}
+                onClick={() => setActiveView(value)}
+                className={`flex-1 rounded-lg px-4 py-2 text-sm font-medium transition-all sm:flex-none ${
+                  activeView === value
+                    ? 'bg-white text-slate-900 shadow-sm'
+                    : 'text-slate-500 hover:text-slate-700'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
           </div>
 
-          {/* Search + filter */}
-          <div className="card p-5 space-y-4">
-            <div className="flex flex-col sm:flex-row gap-3">
-              <div className="relative flex-1">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
-                <input
-                  type="text"
-                  placeholder="Search by Style, Color or Size…"
-                  value={inputValue}
-                  onChange={(e) => {
-                    const v = e.target.value
-                    setInputValue(v)
-                    startTransition(() => setSearchQuery(v))
-                  }}
-                  className="input-base pl-9"
+          {activeView === 'replenishment' ? (
+            <ReplenishmentPlan
+              inventoryRows={allRows}
+              storageOwner={user?.username || user?.name || 'admin'}
+            />
+          ) : activeView === 'daily-report' ? (
+            <DailyStyleReport inventoryRows={allRows} />
+          ) : (
+            <>
+              {/* Stats */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <StatCard
+                  label="Total Units"     value={balanceData.total_units}
+                  icon={Boxes}            iconBg="bg-blue-100"   iconColor="text-blue-600"
+                />
+                <StatCard
+                  label="SKUs with Stock" value={balanceData.skus_in_stock}
+                  icon={CheckCircle}      iconBg="bg-green-100"  iconColor="text-green-600"
+                />
+                <StatCard
+                  label="Low Stock (< 5)"
+                  value={allRows.filter(r => Number(r.Quantity) > 0 && Number(r.Quantity) < 5).length}
+                  icon={AlertTriangle}    iconBg="bg-yellow-100" iconColor="text-yellow-600"
+                />
+                <StatCard
+                  label="Out of Stock"    value={balanceData.skus_zero}
+                  icon={XCircle}          iconBg="bg-red-100"    iconColor="text-red-600"
                 />
               </div>
 
-              <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-xl flex-shrink-0">
-                {[
-                  { id: 'all',  label: 'All' },
-                  { id: 'low',  label: 'Low (< 5)' },
-                  { id: 'zero', label: 'Out of Stock' },
-                ].map(({ id, label }) => (
-                  <button key={id} onClick={() => setFilter(id)}
-                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
-                      filter === id ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'
-                    }`}
-                  >
-                    {label}
-                  </button>
-                ))}
+              {/* Search + filter */}
+              <div className="card p-5 space-y-4">
+                <div className="flex flex-col sm:flex-row gap-3">
+                  <div className="relative flex-1">
+                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                    <input
+                      type="text"
+                      placeholder="Search by Style, Color or Size…"
+                      value={inputValue}
+                      onChange={(e) => {
+                        const v = e.target.value
+                        setInputValue(v)
+                        startTransition(() => setSearchQuery(v))
+                      }}
+                      className="input-base pl-9"
+                    />
+                  </div>
+
+                  <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-xl flex-shrink-0">
+                    {[
+                      { id: 'all',  label: 'All' },
+                      { id: 'low',  label: 'Low (< 5)' },
+                      { id: 'zero', label: 'Out of Stock' },
+                    ].map(({ id, label }) => (
+                      <button key={id} onClick={() => setFilter(id)}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
+                          filter === id ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {(inputValue || filter !== 'all') && (
+                  <div className="flex items-center gap-2 text-xs text-slate-500">
+                    <span className="bg-blue-100 text-blue-700 px-2.5 py-1 rounded-full font-medium">
+                      {isPending ? '…' : `${displayRows.length.toLocaleString()} results`}
+                    </span>
+                    <button
+                      onClick={() => { setInputValue(''); startTransition(() => setSearchQuery('')); setFilter('all') }}
+                      className="text-slate-400 hover:text-slate-600"
+                    >
+                      Clear filters
+                    </button>
+                  </div>
+                )}
+
+                {/* Legend */}
+                <div className="flex items-center gap-4 text-xs text-slate-500">
+                  <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-red-200" />Out of stock (≤ 0)</span>
+                  <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-yellow-200" />Low stock (&lt; 5)</span>
+                  <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-green-100" />In stock (≥ 5)</span>
+                </div>
+
+                <DataTable
+                  data={displayRows}
+                  columns={COLUMNS}
+                  pageSize={50}
+                  resetPageKey={`${searchQuery}\u0000${filter}`}
+                  rowClassName={rowColor}
+                  emptyMessage={
+                    searchQuery || filter !== 'all'
+                      ? 'No rows match the current filters'
+                      : 'No balance data'
+                  }
+                />
               </div>
-            </div>
 
-            {(inputValue || filter !== 'all') && (
-              <div className="flex items-center gap-2 text-xs text-slate-500">
-                <span className="bg-blue-100 text-blue-700 px-2.5 py-1 rounded-full font-medium">
-                  {isPending ? '…' : `${displayRows.length.toLocaleString()} results`}
-                </span>
-                <button
-                  onClick={() => { setInputValue(''); startTransition(() => setSearchQuery('')); setFilter('all') }}
-                  className="text-slate-400 hover:text-slate-600"
-                >
-                  Clear filters
-                </button>
-              </div>
-            )}
-
-            {/* Legend */}
-            <div className="flex items-center gap-4 text-xs text-slate-500">
-              <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-red-200" />Out of stock (≤ 0)</span>
-              <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-yellow-200" />Low stock (&lt; 5)</span>
-              <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-green-100" />In stock (≥ 5)</span>
-            </div>
-
-            <DataTable
-              data={displayRows}
-              columns={COLUMNS}
-              pageSize={50}
-              rowClassName={rowColor}
-              emptyMessage={
-                searchQuery || filter !== 'all'
-                  ? 'No rows match the current filters'
-                  : 'No balance data'
-              }
-            />
-          </div>
-
-          {/* Version history + transaction log */}
-          <VersionHistory onRestore={loadBalance} getToken={getToken} />
+              {/* Version history + transaction log */}
+              <VersionHistory onRestore={loadBalance} getToken={getToken} />
+            </>
+          )}
         </>
       )}
     </div>

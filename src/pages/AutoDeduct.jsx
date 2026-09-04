@@ -1,15 +1,30 @@
 import React, { useState, useCallback, useEffect, useMemo } from 'react'
+import { Link } from 'react-router-dom'
 import {
   Minus, TrendingUp, RefreshCw, FileDown,
-  CheckCircle, AlertTriangle, Settings, X, Upload, AlertCircle,
+  CheckCircle, AlertTriangle, Settings, X, Upload, AlertCircle, History,
 } from 'lucide-react'
 import FileUploadZone from '../components/FileUploadZone.jsx'
 import UnmatchedResolver from '../components/UnmatchedResolver.jsx'
 import { useToast } from '../hooks/useToast.js'
 import { useAuth } from '../context/AuthContext.jsx'
-import { parseCSV, fillTemplate, generateExcel, aliasKey } from '../utils/autoDeductEngine.js'
+import {
+  aliasKey,
+  calculateResolvedSourceUnits,
+  countSkippedUnits,
+  fillTemplate,
+  generateExcel,
+  normalizeSize,
+  normalizeStyleIdentity,
+  parseCSV,
+} from '../utils/autoDeductEngine.js'
+import { fetchAliases, patchAliasesAndVerify } from '../utils/autoDeductAliases.js'
+import ConsolidateStep from '../components/ConsolidateStep.jsx'
+import { consolidateRows } from '../utils/consolidateEngine.js'
+import { buildInventoryOrderClaims, parseOrderHistoryRows } from '../utils/orderImportEngine.js'
 
 const BASE = '/api'
+const COMBINED_STORE = 'All Stores'
 
 function authHeaders(token, json = false) {
   const h = { Authorization: `Bearer ${token}` }
@@ -198,6 +213,14 @@ export default function AutoDeduct() {
   const [templateMissing, setTemplateMissing] = useState(false)
   const [showSettings,    setShowSettings]    = useState(false)
   const [aliases,         setAliases]         = useState({})
+  const [aliasesLoading,  setAliasesLoading]  = useState(true)
+  const [aliasesSaving,   setAliasesSaving]   = useState(false)
+  const [aliasesError,    setAliasesError]    = useState(null)
+  const [sourceHash,      setSourceHash]      = useState('')
+  const [editingResolutions, setEditingResolutions] = useState(false)
+  const [resolutionAliasKeys, setResolutionAliasKeys] = useState([])
+  const [previewConfirmed, setPreviewConfirmed] = useState(false)
+  const [orderArchive, setOrderArchive] = useState(null)
   const toast = useToast()
 
   // Merge resolver output into filledRows:
@@ -211,13 +234,15 @@ export default function AutoDeduct() {
       if (extra._isCombo && Array.isArray(extra.components)) {
         for (const component of extra.components) {
           const found = rows.find(r => r.STYLE === component.STYLE && r.COLOR === component.COLOR && r.SIZE === component.SIZE)
-          if (found) found.QTY = (found.QTY || 0) + extra.QTY
-          else rows.push({ STYLE: component.STYLE, COLOR: component.COLOR, SIZE: component.SIZE, QTY: extra.QTY })
+          const multiplier = Math.max(1, parseInt(component.multiplier, 10) || 1)
+          const componentQty = extra.QTY * multiplier
+          if (found) found.QTY = (found.QTY || 0) + componentQty
+          else rows.push({ STYLE: component.STYLE, COLOR: component.COLOR, SIZE: component.SIZE, QTY: componentQty })
         }
         continue
       }
       if (extra._isNew) {
-        rows.push({ STYLE: extra.STYLE, COLOR: extra.COLOR, SIZE: extra.SIZE, QTY: extra.QTY })
+        rows.push({ STYLE: extra.STYLE, COLOR: extra.COLOR, SIZE: extra.SIZE, QTY: extra.QTY, allowCreate: true })
       } else {
         const found = rows.find(r => r.STYLE === extra.STYLE && r.COLOR === extra.COLOR && r.SIZE === extra.SIZE)
         if (found) found.QTY = (found.QTY || 0) + extra.QTY
@@ -226,6 +251,93 @@ export default function AutoDeduct() {
     }
     return rows
   }, [result, resolvedExtras])
+  const skippedUnits = useMemo(() => countSkippedUnits(skippedRows), [skippedRows])
+  const orderClaims = useMemo(
+    () => buildInventoryOrderClaims(orderArchive?.orders || []),
+    [orderArchive],
+  )
+  const orderImportIssueCount = Number(orderArchive?.skippedRows?.length || 0)
+    + Number(orderArchive?.conflicts?.length || 0)
+  const expectedSourceUnits = useMemo(
+    () => calculateResolvedSourceUnits(result?.stats?.src_total || 0, resolvedExtras || []),
+    [result, resolvedExtras],
+  )
+  const inventoryApplyUnits = useMemo(
+    () => mergedFilledRows.reduce((sum, row) => sum + (Number(row.QTY) || 0), 0),
+    [mergedFilledRows],
+  )
+  const allReviewRowsHandled = !result?.unmatchedRows?.length || resolvedExtras !== null
+  const reconciliationMismatch = Boolean(result)
+    && allReviewRowsHandled
+    && inventoryApplyUnits + skippedUnits !== expectedSourceUnits
+
+  const deductionPreview = useMemo(() => {
+    const preview = (result?.matchLog || []).map((match) => ({
+      sourceStyle: match.style,
+      sourceColor: match.salesColor,
+      sourceSize: match.size,
+      targetStyle: match.targetStyle,
+      targetColor: match.targetColor,
+      targetSize: match.targetSize,
+      qty: match.qty,
+      businessDay: match.businessDay || '',
+      via: match.via,
+    }))
+    for (const extra of resolvedExtras || []) {
+      if (extra._isCombo && Array.isArray(extra.components)) {
+        for (const component of extra.components) {
+          preview.push({
+            sourceStyle: extra._source?.style,
+            sourceColor: extra._source?.color,
+            sourceSize: extra._source?.size,
+            targetStyle: component.STYLE,
+            targetColor: component.COLOR,
+            targetSize: component.SIZE,
+            qty: extra.QTY * Math.max(1, parseInt(component.multiplier, 10) || 1),
+            businessDay: extra._source?.businessDay || '',
+            via: 'manual combo',
+          })
+        }
+      } else {
+        preview.push({
+          sourceStyle: extra._source?.style,
+          sourceColor: extra._source?.color,
+          sourceSize: extra._source?.size,
+          targetStyle: extra.STYLE,
+          targetColor: extra.COLOR,
+          targetSize: extra.SIZE,
+          qty: extra.QTY,
+          businessDay: extra._source?.businessDay || '',
+          via: extra._isNew ? 'manual new' : 'manual',
+        })
+      }
+    }
+    return preview
+  }, [result, resolvedExtras])
+
+  const businessMovementRows = useMemo(() => {
+    const groups = new Map()
+    for (const item of deductionPreview) {
+      const qty = Number(item.qty || 0)
+      if (!Number.isSafeInteger(qty) || qty <= 0) continue
+      const businessDay = /^\d{4}-\d{2}-\d{2}$/.test(item.businessDay || '') ? item.businessDay : ''
+      const key = [item.targetStyle, item.targetColor, item.targetSize, businessDay].join('\u241f')
+      const current = groups.get(key) || {
+        STYLE: item.targetStyle,
+        COLOR: item.targetColor,
+        SIZE: item.targetSize,
+        QTY: 0,
+        businessDay,
+      }
+      current.QTY += qty
+      groups.set(key, current)
+    }
+    return [...groups.values()]
+  }, [deductionPreview])
+
+  const hasCrossStylePreview = deductionPreview.some((item) =>
+    normalizeStyleIdentity(item.sourceStyle) !== normalizeStyleIdentity(item.targetStyle)
+  )
 
   useEffect(() => {
     if (isMock) { setTemplateRows(MOCK_TEMPLATE); return }
@@ -235,28 +347,48 @@ export default function AutoDeduct() {
       .catch(err => setConfigError(err.message))
   }, [getToken, isMock])
 
-  useEffect(() => {
-    if (isMock) return
-    fetch(`${BASE}/auto-deduct?action=aliases`, { headers: authHeaders(getToken()) })
-      .then(r => r.json())
-      .then(data => setAliases(data.aliases || {}))
-      .catch(() => setAliases({}))
+  const loadAliases = useCallback(async () => {
+    if (isMock) {
+      setAliasesLoading(false)
+      setAliasesError(null)
+      return
+    }
+    setAliasesLoading(true)
+    setAliasesError(null)
+    try {
+      const loaded = await fetchAliases(
+        fetch,
+        `${BASE}/auto-deduct?action=aliases`,
+        authHeaders(getToken()),
+      )
+      setAliases(loaded)
+    } catch (err) {
+      setAliasesError(err.message)
+    } finally {
+      setAliasesLoading(false)
+    }
   }, [getToken, isMock])
 
+  useEffect(() => { loadAliases() }, [loadAliases])
+
   const handleFile = useCallback((file) => {
-    setSrcFile(file); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([])
+    setSrcFile(file); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([]); setSourceHash(''); setEditingResolutions(false); setResolutionAliasKeys([]); setPreviewConfirmed(false); setOrderArchive(null)
   }, [])
 
   const handleRun = useCallback(async () => {
     if (isMock) {
       setResult(MOCK_RESULT)
       setTemplateRows(MOCK_TEMPLATE)
-      setApplied(false); setResolvedExtras(null); setSkippedRows([])
+      setApplied(false); setResolvedExtras(null); setSkippedRows([]); setEditingResolutions(false); setResolutionAliasKeys([]); setPreviewConfirmed(false)
       toast.info('3 rows need review', 'Mock Run Complete')
       return
     }
     if (!srcFile || processing) return
-    setProcessing(true); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([])
+    if (aliasesLoading || aliasesSaving || aliasesError) {
+      toast.error('Saved Inventory Target matches must load successfully before Auto Deduct can run', 'Auto Deduct Blocked')
+      return
+    }
+    setProcessing(true); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([]); setEditingResolutions(false); setResolutionAliasKeys([]); setPreviewConfirmed(false)
     try {
       // 1. Fetch template from inventory balance (canonical SKU list)
       const tRes  = await fetch(`${BASE}/inventory-balance?action=list`, { headers: authHeaders(getToken()) })
@@ -265,9 +397,24 @@ export default function AutoDeduct() {
       const tRows = (tData.rows || []).map(r => ({ STYLE: r.Style, COLOR: r.Color, SIZE: r.Size }))
       setTemplateRows(tRows)
 
-      // 2. Parse sales CSV client-side
-      const salesText = await srcFile.text()
-      const salesRows = parseCSV(salesText)
+      // 2. Parse either a consolidated CSV or a raw TEMU workbook.
+      const bytes = await srcFile.arrayBuffer()
+      const digest = await crypto.subtle.digest('SHA-256', bytes)
+      setSourceHash([...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join(''))
+
+      let salesRows
+      if (/\.csv$/i.test(srcFile.name)) {
+        salesRows = parseCSV(new TextDecoder().decode(bytes))
+        setOrderArchive(null)
+      } else {
+        const XLSX = await import('xlsx')
+        const wb = XLSX.read(bytes, { type: 'array' })
+        const sheetName = wb.SheetNames.find(name => name.trim().toUpperCase() === 'TEMU-STYLES') || wb.SheetNames[0]
+        const rawRows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { raw: false, defval: '' })
+        const parsedOrders = parseOrderHistoryRows(rawRows)
+        setOrderArchive(parsedOrders)
+        salesRows = consolidateRows(rawRows).consolidated
+      }
 
       // 3. Match & fill — pure JS, no server needed
       const engineResult = fillTemplate(tRows, salesRows, aliases)
@@ -292,51 +439,122 @@ export default function AutoDeduct() {
     } finally {
       setProcessing(false)
     }
-  }, [srcFile, processing, getToken, toast, aliases])
+  }, [srcFile, processing, getToken, toast, aliases, aliasesLoading, aliasesSaving, aliasesError])
 
   // Called by UnmatchedResolver when user finishes reviewing.
   // Skipped rows are NOT deducted, but they must stay visible on the Unmatched
   // sheet — a skip is "leave for later", never "silently discard".
-  const saveAliases = useCallback(async (nextAliases) => {
-    if (isMock) return
-    const res = await fetch(`${BASE}/auto-deduct?action=save-aliases`, {
-      method: 'POST',
-      headers: authHeaders(getToken(), true),
-      body: JSON.stringify({ aliases: nextAliases }),
-    })
-    const data = await res.json()
-    if (!res.ok) throw new Error(data.error || 'Could not save learned matches')
-  }, [getToken, isMock])
+  const saveAliases = useCallback(async ({ upserts = {}, deleteKeys = [] }) => {
+    if (isMock) {
+      const next = { ...aliases }
+      for (const key of deleteKeys) delete next[key]
+      return Object.assign(next, upserts)
+    }
+    return patchAliasesAndVerify(
+      fetch,
+      {
+        patch: `${BASE}/auto-deduct?action=patch-aliases`,
+        read: `${BASE}/auto-deduct?action=aliases`,
+      },
+      authHeaders(getToken(), true),
+      { upserts, deleteKeys },
+    )
+  }, [aliases, getToken, isMock])
 
-  const handleResolve = useCallback((items, skipped = []) => {
+  const handleResolve = useCallback(async (items, skipped = []) => {
     setResolvedExtras(items)
     setSkippedRows(skipped)
+    setEditingResolutions(false)
+    setPreviewConfirmed(false)
     const learned = {}
     for (const item of items) {
       if (!item._learnAlias || !item._source) continue
-      const aliasValue = item._isCombo
-        ? { components: item.components || [] }
-        : {
+      const reviewIssues = String(item._source.sourceIssue || '').trim()
+      const isDimensionReview = Boolean(reviewIssues)
+      // A human-confirmed link is stable at style+color level. Future sizes
+      // reuse it only when every exact target size exists in inventory.
+      if (item._isCombo) {
+        const sourceSize = normalizeSize(item._source.size)
+        const sourceComponents = item.components || []
+        if (!isDimensionReview && sourceComponents.some((component) => normalizeSize(component.SIZE) !== sourceSize)) continue
+        const components = sourceComponents.map((component) => ({
+            STYLE: component.STYLE,
+            COLOR: component.COLOR,
+            ...(isDimensionReview ? { SIZE: component.SIZE } : {}),
+            multiplier: Math.max(1, parseInt(component.multiplier, 10) || 1),
+          }))
+        const key = isDimensionReview
+          ? aliasKey(item._source.style, item._source.color, item._source.size)
+          : aliasKey(item._source.style, item._source.color)
+        learned[key] = {
+          components,
+          _confirmed: true,
+          ...(isDimensionReview ? { _confirmedDimensions: true } : {}),
+        }
+        continue
+      }
+      const aliasValue = {
           STYLE: item.STYLE,
           COLOR: item.COLOR,
-          SIZE: item.SIZE,
           _isNew: !!item._isNew,
+          _confirmed: true,
         }
-      if (!item._isCombo || !item._source.size) {
-        learned[aliasKey(item._source.style, item._source.color)] = {
+      if (isDimensionReview) {
+        learned[aliasKey(item._source.style, item._source.color, item._source.size)] = {
           ...aliasValue,
-          SIZE: undefined,
+          SIZE: item.SIZE,
+          _confirmedDimensions: true,
+        }
+      } else if (item._isNew) {
+        learned[aliasKey(item._source.style, item._source.color, item._source.size)] = {
+          ...aliasValue,
+          SIZE: item.SIZE,
+        }
+      } else {
+        learned[aliasKey(item._source.style, item._source.color)] = aliasValue
+      }
+    }
+    const learnedCount = Object.keys(learned).length
+    if (learnedCount || resolutionAliasKeys.length) {
+      const nextAliases = { ...aliases }
+      const deleteKeys = new Set(resolutionAliasKeys)
+      for (const key of resolutionAliasKeys) delete nextAliases[key]
+      for (const [key, value] of Object.entries(learned)) {
+        if (value._confirmedDimensions) {
+          for (const existingKey of Object.keys(nextAliases)) {
+            if (existingKey.startsWith(`${key}::review::`)) {
+              deleteKeys.add(existingKey)
+              delete nextAliases[existingKey]
+            }
+          }
+          continue
+        }
+        if (value._isNew || value.SIZE) continue
+        for (const existingKey of Object.keys(nextAliases)) {
+          if (existingKey.startsWith(`${key}::`)) {
+            deleteKeys.add(existingKey)
+            delete nextAliases[existingKey]
+          }
         }
       }
-      learned[aliasKey(item._source.style, item._source.color, item._source.size)] = aliasValue
-    }
-    const learnedCount = items.filter((item) => item._learnAlias && item._source).length
-    if (learnedCount) {
-      const nextAliases = { ...aliases, ...learned }
-      setAliases(nextAliases)
-      saveAliases(nextAliases)
-        .then(() => toast.success(`${learnedCount} match${learnedCount !== 1 ? 'es' : ''} remembered for next time`, 'Matches Saved'))
-        .catch((err) => toast.error(err.message, 'Could Not Save Matches'))
+      setAliasesSaving(true)
+      setAliasesError(null)
+      try {
+        const verifiedAliases = await saveAliases({ upserts: learned, deleteKeys: [...deleteKeys] })
+        setAliases(verifiedAliases)
+        setResolutionAliasKeys(Object.keys(learned))
+        toast.success(
+          learnedCount
+            ? `${learnedCount} match${learnedCount !== 1 ? 'es' : ''} remembered for next time`
+            : 'Previous draft matches removed',
+          'Matches Saved'
+        )
+      } catch (err) {
+        setAliasesError(err.message)
+        toast.error(err.message, 'Could Not Verify Saved Matches')
+      } finally {
+        setAliasesSaving(false)
+      }
     }
     if (items.length > 0 || skipped.length > 0) {
       const parts = []
@@ -344,7 +562,7 @@ export default function AutoDeduct() {
       if (skipped.length) parts.push(`${skipped.length} skipped (kept on Unmatched sheet)`)
       toast.success(parts.join(' · '), 'Ready to Download')
     }
-  }, [aliases, saveAliases, toast])
+  }, [aliases, resolutionAliasKeys, saveAliases, toast])
 
   const handleDownload = useCallback(async () => {
     if (!result) return
@@ -359,17 +577,83 @@ export default function AutoDeduct() {
     }
   }, [result, resolvedExtras, skippedRows, mergedFilledRows, srcFile, toast])
 
+  const archiveDailyOrders = useCallback(async () => {
+    if (txnType !== 'sales' || !orderArchive?.orders?.length) return { conflicts: [] }
+    const conflicts = []
+    for (let index = 0; index < orderArchive.orders.length; index += 500) {
+      const res = await fetch(`${BASE}/returns?action=orders-import`, {
+        method: 'POST',
+        headers: authHeaders(getToken(), true),
+        body: JSON.stringify({
+          storeName: COMBINED_STORE,
+          sourceFile: srcFile?.name || '',
+          sourceHash,
+          batchIndex: Math.floor(index / 500),
+          inventoryStatus: 'pending',
+          orders: orderArchive.orders.slice(index, index + 500),
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not archive daily orders')
+      conflicts.push(...(data.conflicts || []))
+    }
+    return { conflicts }
+  }, [getToken, orderArchive, sourceHash, srcFile, txnType])
+
   const handleApply = useCallback(async () => {
     if (!mergedFilledRows.length || applying) return
+    if (skippedUnits > 0) {
+      toast.error(
+        `${skippedUnits.toLocaleString()} physical units are still skipped. Resolve every row before applying.`,
+        'Partial Deduction Blocked'
+      )
+      return
+    }
+    if (reconciliationMismatch) {
+      toast.error(
+        `Source has ${expectedSourceUnits.toLocaleString()} physical units, but ${inventoryApplyUnits.toLocaleString()} are ready to apply. Inventory was not changed.`,
+        'Quantity Mismatch'
+      )
+      return
+    }
+    if (txnType === 'sales' && orderImportIssueCount > 0) {
+      toast.error(
+        `${orderImportIssueCount.toLocaleString()} order row(s) have missing or conflicting identity data. Inventory was not changed.`,
+        'Order Review Required'
+      )
+      return
+    }
+    if (txnType === 'sales' && !orderClaims.length) {
+      toast.error(
+        'Use the raw TEMU workbook with order numbers. Consolidated CSV files cannot safely prevent duplicate deductions.',
+        'Order Numbers Required'
+      )
+      return
+    }
+    if (!previewConfirmed) {
+      toast.error('Review the source-to-inventory preview and confirm it before applying.', 'Review Required')
+      return
+    }
     setApplying(true)
     try {
+      const archived = await archiveDailyOrders()
+      if (archived.conflicts.length) {
+        throw new Error(
+          `${archived.conflicts.length} order item(s) conflict with the saved order history. Inventory was not changed; review the order data before applying.`
+        )
+      }
       const res = await fetch(`${BASE}/inventory-balance?action=apply`, {
         method:  'POST',
         headers: authHeaders(getToken(), true),
         body:    JSON.stringify({
           filledRows:  mergedFilledRows,
+          movementRows: businessMovementRows,
           txnType,
           sourceName:  srcFile?.name || '',
+          sourceHash,
+          orderClaims,
+          sourceUnits: expectedSourceUnits,
+          storeName: COMBINED_STORE,
         }),
       })
       const data = await res.json()
@@ -384,10 +668,27 @@ export default function AutoDeduct() {
     } finally {
       setApplying(false)
     }
-  }, [mergedFilledRows, txnType, srcFile, applying, getToken, toast])
+  }, [archiveDailyOrders, mergedFilledRows, businessMovementRows, txnType, srcFile, sourceHash, orderArchive, orderClaims, orderImportIssueCount, expectedSourceUnits, inventoryApplyUnits, reconciliationMismatch, skippedUnits, applying, getToken, previewConfirmed, toast])
 
   const stats            = result?.stats
   const hasUnresolved    = result?.unmatchedRows?.length > 0 && resolvedExtras === null
+  const hasReviewRows    = result?.unmatchedRows?.length > 0
+  const showResolver     = hasReviewRows && (hasUnresolved || editingResolutions)
+  const isReconciled = Boolean(result)
+    && allReviewRowsHandled
+    && skippedUnits === 0
+    && !reconciliationMismatch
+  const applyBlockReason = skippedUnits > 0
+    ? `Resolve the ${skippedUnits.toLocaleString()} skipped physical units before applying.`
+    : reconciliationMismatch
+      ? `Source total is ${expectedSourceUnits.toLocaleString()}, but ${inventoryApplyUnits.toLocaleString()} physical units are ready to apply.`
+    : txnType === 'sales' && orderImportIssueCount > 0
+      ? `Review ${orderImportIssueCount.toLocaleString()} order row(s) with missing or conflicting identity data before applying.`
+    : txnType === 'sales' && !orderClaims.length
+      ? 'Sales deductions require the raw TEMU workbook with order numbers; CSV files are download-only.'
+    : !previewConfirmed
+      ? 'Check the review box above before applying.'
+      : ''
 
   return (
     <div className="space-y-6 max-w-4xl">
@@ -404,13 +705,19 @@ export default function AutoDeduct() {
         <div>
           <h2 className="text-xl font-bold text-slate-800">Auto Deduct</h2>
           <p className="text-sm text-slate-500 mt-0.5">
-            Upload a consolidated sales CSV — matches against your template and fills quantities
+            Strict mode: only exact or previously confirmed matches are automatic; everything else requires your choice
           </p>
         </div>
-        <button onClick={() => setShowSettings(true)} className="btn-secondary text-sm">
-          <Settings className="w-4 h-4" />
-          Settings
-        </button>
+        <div className="flex items-center gap-2">
+          <Link to="/auto-deduct/history" className="btn-secondary text-sm">
+            <History className="w-4 h-4" />
+            History
+          </Link>
+          <button onClick={() => setShowSettings(true)} className="btn-secondary text-sm">
+            <Settings className="w-4 h-4" />
+            Settings
+          </button>
+        </div>
       </div>
 
       {/* Error banner */}
@@ -418,6 +725,19 @@ export default function AutoDeduct() {
         <div className="flex items-start gap-3 px-4 py-3 bg-red-50 border border-red-200 rounded-xl text-sm text-red-700">
           <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
           <p>{configError}</p>
+        </div>
+      )}
+
+      {aliasesError && (
+        <div className="flex items-start gap-3 px-4 py-3 bg-red-50 border border-red-200 rounded-xl text-sm text-red-700">
+          <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
+          <div className="flex-1">
+            <p className="font-medium">Saved Inventory Target matches are unavailable</p>
+            <p className="mt-0.5">{aliasesError}. Auto Deduct is blocked to prevent incorrect matching.</p>
+          </div>
+          <button onClick={loadAliases} className="btn-secondary text-xs px-3 py-1.5">
+            Retry
+          </button>
         </div>
       )}
 
@@ -434,6 +754,9 @@ export default function AutoDeduct() {
         </div>
       )}
 
+      {/* 第一步（可选）：原始导出 → consolidated CSV */}
+      <ConsolidateStep />
+
       {/* Upload card */}
       <div className="card p-5 space-y-4">
         {/* Transaction type */}
@@ -442,7 +765,7 @@ export default function AutoDeduct() {
             { id: 'sales',  label: 'Sales — Deduct',    icon: Minus,       active: 'text-orange-600' },
             { id: 'return', label: 'Return — Add Back', icon: TrendingUp,  active: 'text-green-600'  },
           ].map(({ id, label, icon: Icon, active }) => (
-            <button key={id} onClick={() => setTxnType(id)}
+            <button key={id} onClick={() => { setTxnType(id); setPreviewConfirmed(false) }}
               className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${
                 txnType === id ? `bg-white shadow-sm ${active}` : 'text-slate-500 hover:text-slate-700'
               }`}>
@@ -455,22 +778,39 @@ export default function AutoDeduct() {
         {/* File upload */}
         <FileUploadZone
           onFile={handleFile}
-          accept=".csv"
-          acceptedTypes="CSV"
-          label="Drag & drop consolidated / return CSV here"
-          sublabel="Columns: style, color, size, QTY"
+          accept=".csv,.xlsx,.xls"
+          acceptedTypes="CSV, XLSX"
+          label="Drag & drop TEMU order / consolidated file here"
+          sublabel="Raw TEMU workbook is required for sales deductions; CSV is preview/download only"
           currentFile={srcFile}
-          onClear={() => { setSrcFile(null); setResult(null); setApplied(false) }}
+          onClear={() => { setSrcFile(null); setResult(null); setApplied(false); setPreviewConfirmed(false); setOrderArchive(null) }}
         />
+
+        {!aliasesError && (
+          <div className={`flex items-center gap-2 text-xs ${aliasesLoading || aliasesSaving ? 'text-amber-700' : 'text-green-700'}`}>
+            {aliasesLoading || aliasesSaving
+              ? <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+              : <CheckCircle className="w-3.5 h-3.5" />}
+            <span>
+              {aliasesLoading
+                ? 'Loading saved Inventory Target matches…'
+                : aliasesSaving
+                  ? 'Saving and verifying Inventory Target matches…'
+                  : `${Object.keys(aliases).length.toLocaleString()} saved Inventory Target match${Object.keys(aliases).length === 1 ? '' : 'es'} loaded`}
+            </span>
+          </div>
+        )}
 
         {/* Run button */}
         <button
           onClick={handleRun}
-          disabled={!isMock && (!srcFile || processing || templateMissing)}
+          disabled={!isMock && (!srcFile || processing || templateMissing || aliasesLoading || aliasesSaving || aliasesError)}
           className="btn-primary w-full justify-center py-3 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {processing
             ? <><RefreshCw className="w-4 h-4 animate-spin" /> Processing…</>
+            : aliasesLoading || aliasesSaving
+              ? <><RefreshCw className="w-4 h-4 animate-spin" /> Verifying Saved Matches…</>
             : <><RefreshCw className="w-4 h-4" /> Run Auto-Fill</>}
         </button>
       </div>
@@ -480,35 +820,131 @@ export default function AutoDeduct() {
         <>
           {/* Stats row */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-            <StatCard label="Source Total"  value={stats.src_total}    color="slate" />
+            <StatCard label={stats.has_unknown_unit_counts ? 'Known Units (minimum)' : 'Source Total'} value={stats.src_total} color="slate" />
             <StatCard label="Matched"       value={stats.filled_total} color="green" />
             <StatCard label="Unmatched"     value={stats.append_total} color={stats.append_total > 0 ? 'yellow' : 'slate'} />
             <div className="card px-4 py-3 flex items-center gap-2.5">
-              {stats.reconciled_total === stats.src_total
+              {isReconciled
                 ? <CheckCircle  className="w-5 h-5 text-green-500 flex-shrink-0" />
                 : <AlertTriangle className="w-5 h-5 text-yellow-500 flex-shrink-0" />}
               <div>
-                <p className={`text-sm font-bold ${stats.reconciled_total === stats.src_total ? 'text-green-600' : 'text-yellow-600'}`}>
-                  {stats.reconciled_total === stats.src_total ? 'Reconciled ✓' : 'Mismatch'}
+                <p className={`text-sm font-bold ${isReconciled ? 'text-green-600' : 'text-yellow-600'}`}>
+                  {isReconciled ? 'Reconciled ✓' : skippedUnits > 0 ? 'Partial — blocked' : 'Mismatch'}
                 </p>
                 <p className="text-xs text-slate-500">Status</p>
               </div>
             </div>
           </div>
 
+          {stats.has_unknown_unit_counts && (
+            <div className="flex items-start gap-3 px-4 py-3 bg-amber-50 border border-amber-200 rounded-xl text-sm text-amber-800">
+              <AlertTriangle className="w-5 h-5 flex-shrink-0 mt-0.5" />
+              <p>Some set contents are not confirmed, so this is only the known minimum. Those rows must be completed in the review section before their units can be deducted.</p>
+            </div>
+          )}
+
           {/* Resolver — shown when there are unmatched rows and user hasn't resolved yet */}
-          {hasUnresolved && (
-            <UnmatchedResolver
-              unmatchedRows={result.unmatchedRows}
-              templateRows={templateRows}
-              onDone={handleResolve}
-            />
+          {hasReviewRows && (
+            <div className={showResolver ? '' : 'hidden'}>
+              <UnmatchedResolver
+                unmatchedRows={result.unmatchedRows}
+                templateRows={templateRows}
+                onDone={handleResolve}
+              />
+            </div>
           )}
 
           {/* Actions — shown after resolver is done (or if no unmatched rows) */}
-          {(!hasUnresolved) && (
+          {(!hasUnresolved && !editingResolutions) && (
           <div className="card p-5 space-y-3">
             <h3 className="font-medium text-slate-700 text-sm">Actions</h3>
+
+            <div className="rounded-xl bg-slate-50 px-4 py-3 text-sm text-slate-600">
+              Inventory units to {txnType === 'sales' ? 'deduct' : 'add back'}: <strong className="text-slate-800">{inventoryApplyUnits.toLocaleString()}</strong>
+              {skippedUnits > 0 && <span className="ml-2 font-semibold text-red-600">· {skippedUnits.toLocaleString()} skipped physical unit(s) must be resolved</span>}
+            </div>
+            {reconciliationMismatch && (
+              <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">
+                Quantity mismatch: source file contains {expectedSourceUnits.toLocaleString()} physical units, but {inventoryApplyUnits.toLocaleString()} are ready to apply.
+              </div>
+            )}
+            {txnType === 'sales' && orderArchive?.orders?.length > 0 && (
+              <div className="rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm text-indigo-800">
+                {orderArchive.stats.orderCount.toLocaleString()} orders will also be saved in the{' '}
+                <strong>shared All Stores order history</strong>.
+                Inventory rollback will not delete them.
+              </div>
+            )}
+            {txnType === 'sales' && orderImportIssueCount > 0 && (
+              <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">
+                Order import blocked: {Number(orderArchive?.skippedRows?.length || 0).toLocaleString()} incomplete row(s) and {Number(orderArchive?.conflicts?.length || 0).toLocaleString()} conflicting row(s) must be corrected in the source workbook.
+              </div>
+            )}
+
+            <details defaultOpen={hasCrossStylePreview} className="overflow-hidden rounded-xl border border-slate-200">
+              <summary className="cursor-pointer bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-700">
+                Review source → inventory targets ({deductionPreview.length.toLocaleString()} mappings)
+              </summary>
+              <div className="max-h-80 overflow-auto">
+                <table className="w-full min-w-[760px] text-left text-xs">
+                  <thead className="sticky top-0 bg-white text-slate-400">
+                    <tr className="border-b border-slate-100">
+                      <th className="px-3 py-2 font-semibold">Source</th>
+                      <th className="px-3 py-2 font-semibold">Inventory target</th>
+                      <th className="px-3 py-2 text-right font-semibold">Qty</th>
+                      <th className="px-3 py-2 font-semibold">Method</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {deductionPreview.map((item, index) => {
+                      const sourceStyle = normalizeStyleIdentity(item.sourceStyle)
+                      const targetStyle = normalizeStyleIdentity(item.targetStyle)
+                      const crossStyle = sourceStyle !== targetStyle
+                      return (
+                        <tr key={`${index}-${item.sourceStyle}-${item.sourceColor}-${item.sourceSize}`} className={crossStyle ? 'bg-red-50' : ''}>
+                          <td className="px-3 py-2 text-slate-600">
+                            <span className="font-mono font-semibold text-slate-800">{item.sourceStyle || '—'}</span>
+                            <span className="mx-1 text-slate-300">/</span>{item.sourceColor || '—'}
+                            <span className="mx-1 text-slate-300">/</span>{item.sourceSize || '—'}
+                          </td>
+                          <td className="px-3 py-2 text-slate-600">
+                            <span className="font-mono font-semibold text-slate-800">{item.targetStyle || '—'}</span>
+                            <span className="mx-1 text-slate-300">/</span>{item.targetColor || '—'}
+                            <span className="mx-1 text-slate-300">/</span>{item.targetSize || '—'}
+                            {crossStyle && <span className="ml-2 rounded-full bg-red-100 px-2 py-0.5 font-bold text-red-700">Cross-style</span>}
+                          </td>
+                          <td className="px-3 py-2 text-right font-bold tabular-nums text-slate-800">{Number(item.qty || 0).toLocaleString()}</td>
+                          <td className="px-3 py-2 text-slate-500">{item.via}</td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </details>
+
+            {hasCrossStylePreview && (
+              <div className="flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                Cross-style manual links are highlighted above. Confirm that every target style is intentional before applying.
+              </div>
+            )}
+
+            <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm text-indigo-900">
+              <input
+                type="checkbox"
+                checked={previewConfirmed}
+                onChange={(event) => setPreviewConfirmed(event.target.checked)}
+                className="mt-0.5 h-4 w-4 rounded border-indigo-300 text-indigo-600"
+              />
+              <span>I reviewed the target style, color, size, and quantity for these mappings.</span>
+            </label>
+
+            {hasReviewRows && !applied && (
+              <button onClick={() => { setEditingResolutions(true); setPreviewConfirmed(false) }} className="btn-secondary w-full justify-center py-2.5">
+                Review / Edit Resolutions
+              </button>
+            )}
 
             <button onClick={handleDownload} className="btn-primary w-full justify-center py-2.5">
               <FileDown className="w-4 h-4" />
@@ -521,24 +957,33 @@ export default function AutoDeduct() {
                 Transaction logged successfully
               </div>
             ) : (
-              <button
-                onClick={handleApply}
-                disabled={applying}
-                className={`w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
-                  txnType === 'sales'
-                    ? 'bg-orange-100 hover:bg-orange-200 text-orange-700'
-                    : 'bg-green-100 hover:bg-green-200 text-green-700'
-                }`}
-              >
-                {applying
-                  ? <RefreshCw className="w-4 h-4 animate-spin" />
-                  : txnType === 'sales' ? <Minus className="w-4 h-4" /> : <TrendingUp className="w-4 h-4" />}
-                {applying
-                  ? 'Logging…'
-                  : txnType === 'sales'
-                  ? 'Log as Deducted from Inventory'
-                  : 'Log as Returned to Inventory'}
-              </button>
+              <>
+                {applyBlockReason && (
+                  <div id="apply-block-reason" className="flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm font-semibold text-red-700">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                    {applyBlockReason}
+                  </div>
+                )}
+                <button
+                  onClick={handleApply}
+                  disabled={applying || Boolean(applyBlockReason)}
+                  aria-describedby={applyBlockReason ? 'apply-block-reason' : undefined}
+                  className={`w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+                    txnType === 'sales'
+                      ? 'bg-orange-100 hover:bg-orange-200 text-orange-700'
+                      : 'bg-green-100 hover:bg-green-200 text-green-700'
+                  }`}
+                >
+                  {applying
+                    ? <RefreshCw className="w-4 h-4 animate-spin" />
+                    : txnType === 'sales' ? <Minus className="w-4 h-4" /> : <TrendingUp className="w-4 h-4" />}
+                  {applying
+                    ? 'Logging…'
+                    : txnType === 'sales'
+                      ? 'Log as Deducted from Inventory'
+                      : 'Log as Returned to Inventory'}
+                </button>
+              </>
             )}
           </div>
           )}

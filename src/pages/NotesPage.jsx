@@ -7,10 +7,8 @@ import {
   Check,
   X,
   MessageSquare,
-  User,
   RefreshCw,
 } from 'lucide-react'
-import { useLocalStorage } from '../hooks/useLocalStorage.js'
 import { useToast } from '../hooks/useToast.js'
 import { relativeTime } from '../utils/dateUtils.js'
 import { fetchMessages, sendMessage, editMessage, deleteMessage } from '../utils/api.js'
@@ -155,49 +153,6 @@ function MessageBubble({ note, isOwn, onEdit, onDelete }) {
   )
 }
 
-function JoinModal({ onJoin }) {
-  const [name, setName] = useState('')
-
-  const handleSubmit = (e) => {
-    e.preventDefault()
-    const trimmed = name.trim()
-    if (!trimmed) return
-    onJoin(trimmed)
-  }
-
-  return (
-    <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-      <div className="card max-w-sm w-full p-8 text-center">
-        <div className="w-16 h-16 bg-purple-100 rounded-2xl flex items-center justify-center mx-auto mb-4">
-          <MessageSquare className="w-8 h-8 text-purple-600" />
-        </div>
-        <h3 className="text-lg font-bold text-slate-800 mb-1">Join the chat</h3>
-        <p className="text-sm text-slate-500 mb-6">
-          Enter your name to start adding notes for the team
-        </p>
-        <form onSubmit={handleSubmit} className="space-y-3">
-          <input
-            type="text"
-            placeholder="Your name"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            className="input-base text-center text-base"
-            autoFocus
-            maxLength={40}
-          />
-          <button
-            type="submit"
-            disabled={!name.trim()}
-            className="btn-primary w-full justify-center disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            Join
-          </button>
-        </form>
-      </div>
-    </div>
-  )
-}
-
 // Normalize a DB row → internal note shape
 function toNote(row) {
   return {
@@ -212,12 +167,7 @@ function toNote(row) {
 export default function NotesPage() {
   const { user } = useAuth()
   const [notes, setNotes] = useState([])
-  const [currentUser, setCurrentUser] = useLocalStorage('feiya_notes_user', null)
-
-  // Auto-set username from logged-in account
-  useEffect(() => {
-    if (user?.username && !currentUser) setCurrentUser(user.username)
-  }, [user, currentUser, setCurrentUser])
+  const currentUser = user?.username || ''
   const [inputText, setInputText] = useState('')
   const [isSending, setIsSending] = useState(false)
   const messagesEndRef = useRef(null)
@@ -250,8 +200,6 @@ export default function NotesPage() {
     }
   }, [])
 
-  const handleJoin = useCallback((name) => setCurrentUser(name), [setCurrentUser])
-
   const handleSend = useCallback(async () => {
     const text = inputText.trim()
     if (!text || !currentUser || isSending) return
@@ -259,7 +207,7 @@ export default function NotesPage() {
     setIsSending(true)
     setInputText('')
     try {
-      const row = await sendMessage(currentUser, text)
+      const row = await sendMessage(text)
       setNotes((prev) => [...prev, toNote(row)])
     } catch (err) {
       toast.error(err.message, 'Send Failed')
@@ -310,10 +258,6 @@ export default function NotesPage() {
     }
   }
 
-  if (!currentUser) {
-    return <JoinModal onJoin={handleJoin} />
-  }
-
   return (
     <div className="max-w-3xl mx-auto flex flex-col" style={{ height: 'calc(100vh - 8rem)' }}>
       {/* Header */}
@@ -334,10 +278,6 @@ export default function NotesPage() {
           <button onClick={handleExport} className="btn-secondary text-xs" disabled={notes.length === 0}>
             <Download className="w-3.5 h-3.5" />
             Export
-          </button>
-          <button onClick={() => setCurrentUser(null)} className="btn-ghost text-xs">
-            <User className="w-3.5 h-3.5" />
-            Change name
           </button>
         </div>
       </div>
