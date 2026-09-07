@@ -1312,7 +1312,40 @@ export default async function handler(req, res) {
           stores: [...new Set(orders.map((order) => order.store_name))],
         })
       }
-      return res.json({ order: orders[0], matches: orders.length })
+      const order = orders[0]
+      const returnHistory = await sql`
+        SELECT
+          packages.id, packages.tracking_number, packages.status,
+          packages.expected_units, packages.actual_units, packages.restock_units,
+          packages.uploaded_at, packages.confirmed_at,
+          COALESCE((
+            SELECT jsonb_agg(jsonb_build_object(
+              'sku_code', items.sku_code,
+              'style', items.style,
+              'color', items.color,
+              'size', items.size,
+              'expected_qty', items.expected_qty,
+              'actual_qty', items.actual_qty
+            ) ORDER BY items.id)
+            FROM return_package_items items
+            WHERE items.package_id = packages.id
+          ), '[]'::jsonb) AS items
+        FROM return_packages packages
+        WHERE EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements_text(packages.order_numbers) entry(value)
+          WHERE REGEXP_REPLACE(
+            UPPER(REPLACE(entry.value, ' ', '')), '-D[0-9]+$', ''
+          ) = ${orderKey}
+        )
+          AND (
+            ${order.store_key === COMBINED_ORDER_STORE_KEY}
+            OR packages.store_key = ${order.store_key}
+          )
+        ORDER BY packages.uploaded_at DESC, packages.id DESC
+        LIMIT 50
+      `
+      return res.json({ order, returns: returnHistory, matches: orders.length })
     }
 
     if (req.method === 'POST' && action === 'manual-create') {

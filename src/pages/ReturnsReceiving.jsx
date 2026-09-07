@@ -488,7 +488,7 @@ export default function ReturnsReceiving() {
           return
         }
         if (!orderRes.ok) throw new Error(orderData.error || data.error || 'Return package or order not found')
-        setOrderOnly(orderData.order)
+        setOrderOnly({ ...orderData.order, return_history: orderData.returns || [] })
         setTracking(orderData.order.order_number)
         return
       }
@@ -1311,10 +1311,59 @@ export default function ReturnsReceiving() {
           {orderOnly && (
             <div className="card p-4 sm:p-5">
               <OrderDetails order={orderOnly} />
+              {orderOnly.return_history?.length > 0 && (
+                <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50 p-3">
+                  <p className="font-semibold text-emerald-950">
+                    Existing returns / 已有退货 ({orderOnly.return_history.length})
+                  </p>
+                  <p className="mt-1 text-xs text-emerald-800">
+                    Check these records before starting another manual return.
+                  </p>
+                  <div className="mt-3 space-y-2">
+                    {orderOnly.return_history.map((item) => (
+                      <button
+                        key={item.id}
+                        type="button"
+                        onClick={() => lookup(item.tracking_number)}
+                        className="w-full rounded-lg border border-emerald-200 bg-white p-3 text-left hover:bg-emerald-50"
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="break-all text-sm font-semibold text-slate-800">
+                            {item.tracking_number}
+                          </span>
+                          <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${statusBadge(item.status)}`}>
+                            {statusLabel(item.status)}
+                          </span>
+                        </div>
+                        <p className="mt-1 text-xs text-slate-500">
+                          {Number(item.actual_units || 0)} received · {Number(item.restock_units || 0)} restocked
+                          {' / '}{Number(item.expected_units || 0)} expected
+                          {' · '}{new Date(item.confirmed_at || item.uploaded_at).toLocaleString()}
+                        </p>
+                        {item.items?.length > 0 && (
+                          <p className="mt-1 text-xs text-slate-500">
+                            {item.items.map((line) => (
+                              `${line.sku_code || line.style} / ${line.color} / ${line.size} ×${
+                                Number(line.actual_qty ?? line.expected_qty ?? 0)
+                              }`
+                            )).join(' · ')}
+                          </p>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
               {isAdmin ? (
-                <div className="mt-3 rounded-xl border border-blue-200 bg-blue-50 p-3">
+                <div className={`mt-3 rounded-xl border p-3 ${
+                  orderOnly.return_history?.length
+                    ? 'border-amber-200 bg-amber-50'
+                    : 'border-blue-200 bg-blue-50'
+                }`}>
                   <p className="text-sm text-blue-900">
-                    No tracking number? Start a manual return and choose the products actually returned.
+                    {orderOnly.return_history?.length
+                      ? 'This order already has a return record. Start another only for a separate or partial return.'
+                      : 'No tracking number? Start a manual return and choose the products actually returned.'}
                   </p>
                   <button
                     type="button"
