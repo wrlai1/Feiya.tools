@@ -51,6 +51,7 @@ function mountProductionHandler(route, modulePath) {
   ['/api/chat-messages', './api/chat-messages.js'],
   ['/api/auto-deduct', './api/auto-deduct.js'],
   ['/api/inventory-balance', './api/inventory-balance.js'],
+  ['/api/inventory-email', './api/inventory-email.js'],
   ['/api/timeclock', './api/timeclock.js'],
   ['/api/attendance', './api/attendance.js'],
   ['/api/returns', './api/returns.js'],

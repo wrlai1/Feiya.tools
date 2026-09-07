@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState, useTransition } from 
 import {
   Archive, Boxes, CalendarClock, CheckCircle2, ChevronRight,
   AlertCircle, Download, Eye, FileSpreadsheet, Layers3, Link2, MapPin,
-  Minus, PackageCheck, Pencil, Plus, RefreshCw, Search, Trash2,
+  Mail, Minus, PackageCheck, Pencil, Plus, RefreshCw, Search, Send, Trash2,
   Upload, Warehouse, X,
 } from 'lucide-react'
 import FileUploadZone from '../components/FileUploadZone.jsx'
@@ -271,6 +271,115 @@ function InventoryEditor({ row, isNew, saving, onClose, onSave }) {
   )
 }
 
+function DailyInventoryEmailPanel() {
+  const { getToken } = useAuth()
+  const toast = useToast()
+  const [open, setOpen] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [sending, setSending] = useState(false)
+  const [recipients, setRecipients] = useState('')
+  const [styles, setStyles] = useState('')
+  const [sendHour, setSendHour] = useState(9)
+  const [enabled, setEnabled] = useState(false)
+  const [availableStyles, setAvailableStyles] = useState([])
+  const [runs, setRuns] = useState([])
+  const [system, setSystem] = useState({ emailConfigured: false, cronConfigured: false })
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const response = await fetch('/api/inventory-email', { headers: { Authorization: `Bearer ${getToken()}` } })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.error || 'Could not load email settings')
+      setRecipients((data.settings?.recipients || []).join(', '))
+      setStyles((data.settings?.styles || []).join(', '))
+      setSendHour(Number(data.settings?.sendHour ?? 9))
+      setEnabled(Boolean(data.settings?.enabled))
+      setAvailableStyles(data.availableStyles || [])
+      setRuns(data.runs || [])
+      setSystem({ emailConfigured: data.emailConfigured, cronConfigured: data.cronConfigured })
+    } catch (error) {
+      toast.error(error.message, 'Email Settings')
+    } finally {
+      setLoading(false)
+    }
+  }, [getToken, toast])
+
+  useEffect(() => { if (open) load() }, [open, load])
+
+  const payload = () => ({ enabled, recipients, styles, sendHour })
+  const save = async (action = '') => {
+    action === 'send-test' ? setSending(true) : setSaving(true)
+    try {
+      const response = await fetch(`/api/inventory-email${action ? `?action=${action}` : ''}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${getToken()}` },
+        body: JSON.stringify(payload()),
+      })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.error || 'Could not save email settings')
+      toast.success(action === 'send-test' ? 'Test inventory email sent.' : 'Daily inventory email settings saved.', action === 'send-test' ? 'Email Sent' : 'Settings Saved')
+      await load()
+    } catch (error) {
+      toast.error(error.message, action === 'send-test' ? 'Could Not Send' : 'Could Not Save')
+    } finally {
+      setSaving(false)
+      setSending(false)
+    }
+  }
+
+  const selectedStyles = new Set(styles.split(/[\n,;]+/).map((value) => value.trim().toUpperCase()).filter(Boolean))
+  const toggleStyle = (style) => {
+    const next = new Set(selectedStyles)
+    const key = style.toUpperCase()
+    next.has(key) ? next.delete(key) : next.add(key)
+    setStyles([...next].join(', '))
+  }
+
+  return (
+    <section className="overflow-hidden rounded-3xl border border-indigo-100 bg-white shadow-sm">
+      <button type="button" onClick={() => setOpen((value) => !value)} className="flex w-full items-center justify-between gap-4 p-5 text-left hover:bg-indigo-50/40">
+        <div className="flex min-w-0 items-center gap-3">
+          <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-indigo-100 text-indigo-700"><Mail className="h-5 w-5" /></span>
+          <div><h2 className="font-bold text-slate-900">Daily Inventory Email</h2><p className="mt-0.5 text-sm text-slate-500">Choose styles, recipients and the daily send time.</p></div>
+        </div>
+        <ChevronRight className={`h-5 w-5 shrink-0 text-slate-400 transition ${open ? 'rotate-90' : ''}`} />
+      </button>
+      {open && <div className="border-t border-slate-100 p-5">
+        {loading ? <div className="flex items-center justify-center py-10 text-sm text-indigo-600"><RefreshCw className="mr-2 h-4 w-4 animate-spin" />Loading settings…</div> : <div className="space-y-5">
+          <div className="flex flex-wrap gap-2 text-xs font-semibold">
+            <span className={`rounded-full px-3 py-1 ${system.emailConfigured ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-800'}`}>Email service: {system.emailConfigured ? 'Ready' : 'Needs setup'}</span>
+            <span className={`rounded-full px-3 py-1 ${system.cronConfigured ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-800'}`}>Daily scheduler: {system.cronConfigured ? 'Ready' : 'Needs setup'}</span>
+            <span className="rounded-full bg-slate-100 px-3 py-1 text-slate-600">Eastern Time</span>
+          </div>
+          <label className="flex items-center justify-between gap-4 rounded-2xl border border-slate-200 p-4"><span><span className="block text-sm font-bold text-slate-800">Enable daily email</span><span className="mt-0.5 block text-xs text-slate-500">The report sends once during the selected hour.</span></span><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} className="h-5 w-5 accent-indigo-600" /></label>
+          <div className="grid gap-4 lg:grid-cols-2">
+            <label className="text-sm font-bold text-slate-700">Recipients
+              <textarea value={recipients} onChange={(event) => setRecipients(event.target.value)} rows={3} placeholder="name@company.com, manager@company.com" className="mt-2 w-full rounded-2xl border border-slate-200 px-4 py-3 text-sm font-normal outline-none focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100" />
+              <span className="mt-1 block text-xs font-normal text-slate-400">Separate multiple addresses with commas.</span>
+            </label>
+            <label className="text-sm font-bold text-slate-700">Send time
+              <select value={sendHour} onChange={(event) => setSendHour(Number(event.target.value))} className="mt-2 w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-normal outline-none focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100">
+                {Array.from({ length: 24 }, (_, hour) => <option key={hour} value={hour}>{new Date(2000, 0, 1, hour).toLocaleTimeString('en-US', { hour: 'numeric' })} Eastern</option>)}
+              </select>
+            </label>
+          </div>
+          <label className="block text-sm font-bold text-slate-700">Styles to monitor
+            <textarea value={styles} onChange={(event) => setStyles(event.target.value)} rows={2} placeholder="50199, 50210" className="mt-2 w-full rounded-2xl border border-slate-200 px-4 py-3 text-sm font-normal uppercase outline-none focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100" />
+          </label>
+          {!!availableStyles.length && <div><p className="mb-2 text-xs font-bold uppercase tracking-wider text-slate-400">Available styles</p><div className="flex max-h-32 flex-wrap gap-2 overflow-y-auto">{availableStyles.map((style) => <button key={style} type="button" onClick={() => toggleStyle(style)} className={`rounded-full border px-3 py-1.5 text-xs font-semibold ${selectedStyles.has(style.toUpperCase()) ? 'border-indigo-600 bg-indigo-600 text-white' : 'border-slate-200 text-slate-600 hover:border-indigo-300'}`}>{style}</button>)}</div></div>}
+          <div className="flex flex-wrap justify-end gap-2 border-t border-slate-100 pt-5">
+            <button type="button" disabled={sending || saving || !system.emailConfigured} onClick={() => save('send-test')} className="inline-flex items-center gap-2 rounded-xl border border-indigo-200 px-4 py-2.5 text-sm font-bold text-indigo-700 hover:bg-indigo-50 disabled:opacity-40"><Send className="h-4 w-4" />{sending ? 'Sending…' : 'Send Test Now'}</button>
+            <button type="button" disabled={saving || sending} onClick={() => save()} className="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-bold text-white hover:bg-indigo-700 disabled:opacity-50">{saving && <RefreshCw className="h-4 w-4 animate-spin" />}{saving ? 'Saving…' : 'Save Settings'}</button>
+          </div>
+          {!!runs.length && <div><h3 className="mb-2 text-xs font-bold uppercase tracking-wider text-slate-400">Recent deliveries</h3><div className="divide-y divide-slate-100 rounded-2xl border border-slate-200">{runs.slice(0, 5).map((run) => <div key={`${run.report_date}-${run.created_at}`} className="flex items-center justify-between gap-3 px-4 py-3 text-sm"><span className="text-slate-600">{String(run.report_date).slice(0, 10)} · {(run.recipients || []).join(', ')}</span><span className={`shrink-0 rounded-full px-2 py-1 text-xs font-bold ${run.status === 'sent' ? 'bg-emerald-100 text-emerald-700' : run.status === 'failed' ? 'bg-red-100 text-red-700' : 'bg-amber-100 text-amber-700'}`}>{run.status}</span></div>)}</div></div>}
+        </div>}
+      </div>}
+    </section>
+  )
+}
+
 export default function InventoryCheck() {
   const { user } = useAuth()
   const canEdit = userHasPermission(user, INVENTORY_CHECK_EDIT)
@@ -514,6 +623,8 @@ export default function InventoryCheck() {
       </section>
 
       {apiError && <div className="flex items-center gap-3 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700"><AlertCircle className="h-4 w-4" />The database is temporarily unavailable: {apiError}</div>}
+
+      {user?.role === 'admin' && <DailyInventoryEmailPanel />}
 
       {canEdit && showUpload && (
         <section className="rounded-3xl border border-indigo-100 bg-white p-5 shadow-lg shadow-indigo-950/5">
