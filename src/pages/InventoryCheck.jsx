@@ -280,6 +280,7 @@ function DailyInventoryEmailPanel() {
   const [sending, setSending] = useState(false)
   const [recipients, setRecipients] = useState('')
   const [styles, setStyles] = useState('')
+  const [sendHour, setSendHour] = useState(9)
   const [enabled, setEnabled] = useState(false)
   const [availableStyles, setAvailableStyles] = useState([])
   const [runs, setRuns] = useState([])
@@ -293,6 +294,7 @@ function DailyInventoryEmailPanel() {
       if (!response.ok) throw new Error(data.error || 'Could not load email settings')
       setRecipients((data.settings?.recipients || []).join(', '))
       setStyles((data.settings?.styles || []).join(', '))
+      setSendHour(Number(data.settings?.sendHour ?? 9))
       setEnabled(Boolean(data.settings?.enabled))
       setAvailableStyles(data.availableStyles || [])
       setRuns(data.runs || [])
@@ -306,7 +308,7 @@ function DailyInventoryEmailPanel() {
 
   useEffect(() => { if (open) load() }, [open, load])
 
-  const payload = () => ({ enabled, recipients, styles, sendHour: 9 })
+  const payload = () => ({ enabled, recipients, styles, sendHour })
   const save = async (action = '') => {
     action === 'send-test' ? setSending(true) : setSaving(true)
     try {
@@ -358,7 +360,12 @@ function DailyInventoryEmailPanel() {
               <textarea value={recipients} onChange={(event) => setRecipients(event.target.value)} rows={3} placeholder="name@company.com, manager@company.com" className="mt-2 w-full rounded-2xl border border-slate-200 px-4 py-3 text-sm font-normal outline-none focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100" />
               <span className="mt-1 block text-xs font-normal text-slate-400">Separate multiple addresses with commas.</span>
             </label>
-            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4"><p className="text-sm font-bold text-slate-700">Send time</p><p className="mt-2 text-lg font-black text-indigo-700">9:00 AM</p><p className="mt-1 text-xs text-slate-500">New York time, including daylight saving time.</p></div>
+            <label className="text-sm font-bold text-slate-700">Send time
+              <select value={sendHour} onChange={(event) => setSendHour(Number(event.target.value))} className="mt-2 w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-normal outline-none focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100">
+                {Array.from({ length: 24 }, (_, hour) => <option key={hour} value={hour}>{new Date(2000, 0, 1, hour).toLocaleTimeString('en-US', { hour: 'numeric' })} Eastern</option>)}
+              </select>
+              <span className="mt-1 block text-xs font-normal text-slate-400">Vercel sends during the selected hour.</span>
+            </label>
           </div>
           <label className="block text-sm font-bold text-slate-700">Styles to monitor
             <textarea value={styles} onChange={(event) => setStyles(event.target.value)} rows={2} placeholder="50199, 50210" className="mt-2 w-full rounded-2xl border border-slate-200 px-4 py-3 text-sm font-normal uppercase outline-none focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100" />
