@@ -288,7 +288,7 @@ function DailyInventoryEmailPanel() {
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const response = await fetch('/api/inventory-email', { headers: { Authorization: `Bearer ${getToken()}` } })
+      const response = await fetch('/api/inventory-balance?action=email-settings', { headers: { Authorization: `Bearer ${getToken()}` } })
       const data = await response.json()
       if (!response.ok) throw new Error(data.error || 'Could not load email settings')
       setRecipients((data.settings?.recipients || []).join(', '))
@@ -310,7 +310,8 @@ function DailyInventoryEmailPanel() {
   const save = async (action = '') => {
     action === 'send-test' ? setSending(true) : setSaving(true)
     try {
-      const response = await fetch(`/api/inventory-email${action ? `?action=${action}` : ''}`, {
+      const apiAction = action === 'send-test' ? 'email-send-test' : 'email-settings'
+      const response = await fetch(`/api/inventory-balance?action=${apiAction}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${getToken()}` },
         body: JSON.stringify(payload()),

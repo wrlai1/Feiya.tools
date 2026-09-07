@@ -2,8 +2,8 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "crons": [
-    { "path": "/api/inventory-email?action=cron&slot=daylight", "schedule": "5 13 * * *" },
-    { "path": "/api/inventory-email?action=cron&slot=standard", "schedule": "5 14 * * *" }
+    { "path": "/api/inventory-balance?action=email-cron&slot=daylight", "schedule": "5 13 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=standard", "schedule": "5 14 * * *" }
   ],
   "rewrites": [
     { "source": "/((?!api/).*)", "destination": "/index.html" }
