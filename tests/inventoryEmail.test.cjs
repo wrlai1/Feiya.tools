@@ -1,7 +1,7 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const ExcelJS = require('exceljs')
-const { buildInventoryEmail, buildInventoryWorkbook, localDateParts, normalizeSettings, previousDate } = require('../lib/inventoryEmail.cjs')
+const { buildInventoryEmail, buildInventoryWorkbook, localDateParts, normalizeSettings, previousDate, shouldSendDailyReport } = require('../lib/inventoryEmail.cjs')
 
 test('normalizes comma separated recipients and styles', () => {
   assert.deepEqual(normalizeSettings({ enabled: true, recipients: 'A@EXAMPLE.COM, b@example.com', styles: '50199, 50200', sendHour: 8 }), {
@@ -24,6 +24,12 @@ test('builds totals and escapes inventory content', () => {
 test('uses New York local date and previous calendar date', () => {
   assert.deepEqual(localDateParts(new Date('2026-01-01T04:30:00Z')), { date: '2025-12-31', hour: 23 })
   assert.equal(previousDate('2026-03-01'), '2026-02-28')
+})
+
+test('allows a later cron invocation to catch up a missed daily report', () => {
+  assert.equal(shouldSendDailyReport(8, 9), false)
+  assert.equal(shouldSendDailyReport(9, 9), true)
+  assert.equal(shouldSendDailyReport(10, 9), true)
 })
 
 test('builds one formatted worksheet per style with stock alerts', async () => {
