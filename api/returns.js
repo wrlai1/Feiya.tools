@@ -2972,9 +2972,19 @@ export default async function handler(req, res) {
           JOIN catalog_counts counts USING (sku_id)
           WHERE counts.match_count = 1
         ),
+        sku_identity_catalog AS (
+          SELECT
+            LOWER(BTRIM(sku_code)) AS sku_code_key,
+            MIN(sku_id) AS sku_id
+          FROM return_product_catalog
+          WHERE NULLIF(BTRIM(sku_code), '') IS NOT NULL
+            AND NULLIF(BTRIM(sku_id), '') IS NOT NULL
+          GROUP BY LOWER(BTRIM(sku_code))
+          HAVING COUNT(DISTINCT sku_id) = 1
+        ),
         sales_items AS (
           SELECT
-            items.resolved_sku_id AS sku_id,
+            COALESCE(identity.sku_id, items.resolved_sku_id) AS sku_id,
             COALESCE(
               NULLIF(BTRIM(catalog.sku_code), ''),
               NULLIF(BTRIM(items.sku_code), '')
@@ -3003,7 +3013,10 @@ export default async function handler(req, res) {
                 OR catalog.store_key = items.order_store_key
               ) AS physical_mapping_ready
           FROM canonical_order_items items
-          LEFT JOIN unique_catalog catalog ON catalog.sku_id = items.resolved_sku_id
+          LEFT JOIN sku_identity_catalog identity
+            ON identity.sku_code_key = LOWER(BTRIM(items.sku_code))
+          LEFT JOIN unique_catalog catalog
+            ON catalog.sku_id = COALESCE(identity.sku_id, items.resolved_sku_id)
         ),
         physical_sales AS (
           SELECT
