@@ -3050,15 +3050,13 @@ export default async function handler(req, res) {
         ),
         sku_product_sales AS (
           SELECT
-            store_key,
-            MIN(store_name) AS store_name,
             sku_id,
             MIN(sku_code) AS sku_code,
             MIN(product_name) AS product_name,
             COALESCE(SUM(quantity), 0)::int AS sold_product_units
           FROM sales_items
           WHERE NULLIF(BTRIM(sku_id), '') IS NOT NULL
-          GROUP BY store_key, sku_id
+          GROUP BY sku_id
         ),
         sku_product_returns AS (
           SELECT
@@ -3097,15 +3095,14 @@ export default async function handler(req, res) {
         ),
         sku_product_return_totals AS (
           SELECT
-            store_key,
-            MIN(store_name) AS store_name,
             sku_id,
+            STRING_AGG(DISTINCT store_name, ', ' ORDER BY store_name) AS store_names,
             MIN(sku_code) AS sku_code,
             COALESCE(SUM(returned_product_units) FILTER (WHERE has_source_qty), 0)::int
               AS returned_product_units,
             BOOL_AND(has_source_qty) AS return_coverage_complete
           FROM sku_product_returns
-          GROUP BY store_key, sku_id
+          GROUP BY sku_id
         ),
         store_keys AS (
           SELECT store_key FROM package_returns
@@ -3158,15 +3155,26 @@ export default async function handler(req, res) {
           LEFT JOIN product_returns returned_products USING (store_key)
         ),
         sku_product_keys AS (
-          SELECT store_key, sku_id FROM sku_product_sales
+          SELECT sku_id FROM sku_product_sales
           UNION
-          SELECT store_key, sku_id FROM sku_product_return_totals
+          SELECT sku_id FROM sku_product_return_totals
+        ),
+        sku_catalog_display AS (
+          SELECT
+            sku_id,
+            MIN(sku_code) AS sku_code,
+            CASE
+              WHEN COUNT(DISTINCT components::text) = 1
+              THEN (ARRAY_AGG(components ORDER BY store_key))[1]
+              ELSE '[]'::jsonb
+            END AS components
+          FROM return_product_catalog
+          GROUP BY sku_id
         ),
         sku_product_output AS (
           SELECT
-            keys.store_key,
-            COALESCE(sales.store_name, returned.store_name, catalog.store_name, 'Unassigned')
-              AS store_name,
+            'all-stores'::text AS store_key,
+            COALESCE(returned.store_names, 'All Stores') AS store_name,
             keys.sku_id,
             COALESCE(sales.sku_code, returned.sku_code, catalog.sku_code) AS sku_code,
             sales.product_name,
@@ -3188,9 +3196,9 @@ export default async function handler(req, res) {
               ELSE NULL
             END AS return_rate
           FROM sku_product_keys keys
-          LEFT JOIN sku_product_sales sales USING (store_key, sku_id)
-          LEFT JOIN sku_product_return_totals returned USING (store_key, sku_id)
-          LEFT JOIN return_product_catalog catalog USING (store_key, sku_id)
+          LEFT JOIN sku_product_sales sales USING (sku_id)
+          LEFT JOIN sku_product_return_totals returned USING (sku_id)
+          LEFT JOIN sku_catalog_display catalog USING (sku_id)
           WHERE COALESCE(sales.sold_product_units, 0) > 0
              OR COALESCE(returned.returned_product_units, 0) > 0
              OR COALESCE(returned.return_coverage_complete, true) = false
