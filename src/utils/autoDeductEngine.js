@@ -22,8 +22,15 @@ const COLOR_ALIASES = {
   pinkarrow:   'fuschia',
 }
 
-/** Normalize a color string for fuzzy comparison */
+/** Stable color identity used by exact matches and learned mappings. */
 export function normalizeColor(s) {
+  return String(s)
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '')
+}
+
+/** Looser color key used only to rank review candidates, never to auto-apply. */
+function normalizeFuzzyColor(s) {
   const base = String(s)
     .toLowerCase()
     .replace(/#\s*\d+/g, '')     // remove numeric codes: #2, #1827, #32, "# 51"
@@ -46,6 +53,17 @@ export function normalizeStyle(s) {
 }
 
 /**
+ * Conservative style identity used before any automatic deduction.
+ * Case and spacing are presentation differences; punctuation remains meaningful.
+ */
+export function normalizeStyleIdentity(s) {
+  return String(s)
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '')
+}
+
+/**
  * Normalize a size string.
  * Also maps plus-size variants: 1XL → 1X, 2XL → 2X, 3XL → 3X
  * so sales and template entries match regardless of which convention is used.
@@ -56,6 +74,49 @@ export function normalizeSize(s) {
     .toUpperCase()
     .replace(/\s+/g, '')
     .replace(/^([123])XL$/, '$1X')   // 1XL→1X, 2XL→2X, 3XL→3X
+}
+
+export function countSkippedUnits(rows) {
+  return (rows || []).reduce((sum, row) => {
+    const qty = Number(row?.qty || 0)
+    const packCount = Math.max(1, parseInt(row?.packCount || row?.pack_count, 10) || 1)
+    return sum + qty * packCount
+  }, 0)
+}
+
+export function calculateResolvedSourceUnits(baseSourceUnits, resolvedItems = []) {
+  return (resolvedItems || []).reduce((total, item) => {
+    const source = item?._source
+    if (!item?._isCombo || !source) return total
+    const componentPackCount = (item.components || []).reduce((sum, component) =>
+      sum + Math.max(1, parseInt(component?.multiplier, 10) || 1), 0)
+    const confirmedPackCount = componentPackCount
+      || Math.max(1, parseInt(source.packCount, 10) || 1)
+    const originalPackCount = Math.max(1, parseInt(source.originalPackCount, 10) || confirmedPackCount)
+    return total + (Number(item.QTY) || 0) * (confirmedPackCount - originalPackCount)
+  }, Number(baseSourceUnits) || 0)
+}
+
+const M022_MISSY_SIZES = new Set(['S', 'M', 'L', 'XL'])
+const M022_PETITE_SIZES = new Set(['PS', 'PM', 'PL', 'PXL'])
+const M022_PLUS_SIZES = new Set(['1X', '2X', '3X'])
+const KNOWN_INVENTORY_STYLE_ROUTES = new Map([
+  ['0015', '5010015'],
+  ['0071', '5020071'],
+])
+
+export function m022InventoryStyle(style, normalizedSize) {
+  if (normalizeStyleIdentity(style) !== 'm022') return ''
+  if (M022_MISSY_SIZES.has(normalizedSize)) return 'M022 Missy'
+  if (M022_PETITE_SIZES.has(normalizedSize)) return 'M022 Petite'
+  if (M022_PLUS_SIZES.has(normalizedSize)) return 'M022 PLUS'
+  return null
+}
+
+export function routedInventoryStyle(style, normalizedSize) {
+  const m022Style = m022InventoryStyle(style, normalizedSize)
+  if (m022Style !== '') return m022Style
+  return KNOWN_INVENTORY_STYLE_ROUTES.get(normalizeStyleIdentity(style)) || ''
 }
 
 // ── Fuzzy helpers ─────────────────────────────────────────────────────────────
@@ -86,8 +147,7 @@ function lcsLength(a, b) {
 function colorTokens(raw) {
   return String(raw)
     .toLowerCase()
-    .replace(/#\s*\d+/g, ' ')    // remove numeric codes
-    .replace(/[^a-z\s]/g, ' ')  // non-alpha → space
+    .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/)
     .map(t => t.trim())
     .filter(t => t.length >= 2) // keep 2+ char tokens (catches "tr", "nv" etc.)
@@ -96,7 +156,7 @@ function colorTokens(raw) {
 // ── Color scoring ─────────────────────────────────────────────────────────────
 
 /** A match is only accepted (auto-filled) when its color score reaches this. */
-export const MATCH_THRESHOLD = 0.9
+export const MATCH_THRESHOLD = 1
 
 /**
  * Pattern / print qualifier words. When a SINGLE-token sales color (e.g. "black")
@@ -126,10 +186,12 @@ const PATTERN_WORDS = new Set([
  *   5. Proportional substring                                   → < threshold
  */
 function colorScore(templateColor, salesColor) {
-  const tc = normalizeColor(templateColor)
-  const sc = normalizeColor(salesColor)
+  const exactTemplate = normalizeColor(templateColor)
+  const exactSales = normalizeColor(salesColor)
+  const tc = normalizeFuzzyColor(templateColor)
+  const sc = normalizeFuzzyColor(salesColor)
   if (!tc || !sc) return 0
-  if (tc === sc) return 1.0                            // exact (handles spacing/concat/#)
+  if (exactTemplate && exactTemplate === exactSales) return 1.0
 
   // "near" = same word or a spelling typo (similar length) — NOT subsequence
   // containment, else short words like "blue" match anything holding b-l-u-e
@@ -204,9 +266,81 @@ export function parseCSV(text) {
 
 /** Build the lookup key for a learned alias: style + sales-color + optional size. */
 export function aliasKey(style, salesColor, size = '') {
-  const base = `${normalizeStyle(style)}::${normalizeColor(salesColor)}`
+  const base = `${normalizeStyleIdentity(style)}::${normalizeColor(salesColor)}`
   const normSize = normalizeSize(size)
   return normSize ? `${base}::${normSize}` : base
+}
+
+function normalizedIssues(value) {
+  return [...new Set(String(value || '').split(';').map((issue) => issue.trim()).filter(Boolean))]
+    .sort()
+    .join(';')
+}
+
+export function reviewAliasKey(style, salesColor, size, sourceSignature, issues) {
+  return `${aliasKey(style, salesColor, size)}::review::${encodeURIComponent(String(sourceSignature || ''))}::${encodeURIComponent(normalizedIssues(issues))}`
+}
+
+function asConfirmedAlias(value, keepSize = false) {
+  if (!value || value._isNew) return null
+  if (typeof value === 'string') return { COLOR: value, _confirmed: true }
+  if (Array.isArray(value.components) && value.components.length) {
+    return {
+      ...value,
+      components: value.components.map((component) => ({
+        STYLE: component.STYLE,
+        COLOR: component.COLOR,
+        SIZE: keepSize ? component.SIZE : undefined,
+        multiplier: Math.max(1, parseInt(component.multiplier, 10) || 1),
+      })),
+      _confirmed: true,
+    }
+  }
+  return { ...value, SIZE: keepSize ? value.SIZE : undefined, _confirmed: true }
+}
+
+function inferConfirmedStyleColorAlias(aliases, baseKey) {
+  const targets = Object.entries(aliases)
+    .filter(([key]) => key.startsWith(`${baseKey}::`) && !key.includes('::review::'))
+    .map(([, value]) => asConfirmedAlias(value))
+    .filter(Boolean)
+  if (!targets.length) return null
+
+  const fingerprints = new Set(targets.map((target) => {
+    if (Array.isArray(target.components)) {
+      const components = target.components
+        .map((component) => [
+          String(component.STYLE || ''),
+          String(component.COLOR || ''),
+          Math.max(1, parseInt(component.multiplier, 10) || 1),
+        ].join('\u0000'))
+        .sort()
+      return `combo\u0000${components.join('\u0001')}`
+    }
+    return `single\u0000${String(target.STYLE || '')}\u0000${String(target.COLOR || '')}`
+  }))
+  return fingerprints.size === 1 ? targets[0] : null
+}
+
+function inferConfirmedDimensionReviewAlias(aliases, sizeKey) {
+  const targets = Object.entries(aliases)
+    .filter(([key]) => key.startsWith(`${sizeKey}::review::`))
+    .map(([, value]) => asConfirmedAlias(value, true))
+    .filter(Boolean)
+  if (!targets.length) return null
+
+  const fingerprints = new Set(targets.map((target) => {
+    if (Array.isArray(target.components)) {
+      return `combo\u0000${target.components.map((component) => [
+        component.STYLE,
+        component.COLOR,
+        normalizeSize(component.SIZE),
+        Math.max(1, parseInt(component.multiplier, 10) || 1),
+      ].join('\u0000')).sort().join('\u0001')}`
+    }
+    return `single\u0000${target.STYLE || ''}\u0000${target.COLOR || ''}\u0000${normalizeSize(target.SIZE)}`
+  }))
+  return fingerprints.size === 1 ? { ...targets[0], _confirmedDimensions: true } : null
 }
 
 /**
@@ -214,11 +348,9 @@ export function aliasKey(style, salesColor, size = '') {
  *
  * @param {Array}  templateRows  - parsed template CSV rows {STYLE, COLOR, SIZE}
  * @param {Array}  salesRows     - parsed sales CSV rows {style, color, size, QTY}
- * @param {Object} aliases       - learned style-scoped overrides, keyed by aliasKey():
- *                                 { "<normStyle>::<normSalesColor>": "<template COLOR>" }.
- *                                 A hit forces the row to that template color, skipping
- *                                 fuzzy scoring entirely. Style-scoped on purpose — "mid"
- *                                 means MID DENIM for one style, MEDIUM for another.
+ * @param {Object} aliases       - human-confirmed overrides. A style+color rule
+ *                                 reuses the current source size only when that
+ *                                 exact target size exists in inventory.
  * @returns {{ filledRows, unmatchedRows, stats }}
  */
 export function fillTemplate(templateRows, salesRows, aliases = {}) {
@@ -245,113 +377,313 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
   let srcTotal    = 0
   let filledTotal = 0
   const unmatchedRows = []
-  const matchLog      = []   // non-exact auto-matches, for human spot-checking
+  const matchLog      = []   // previously confirmed aliases used in this run
 
   salesRows.forEach(row => {
     const style    = String(row.style || row.STYLE || '').trim()
+    const rawStyle = String(row.raw_style || row.rawStyle || '').trim()
     const color    = String(row.color || row.COLOR || '').trim()
     const rawSize  = String(row.size  || row.SIZE  || '').trim()
-    const qty      = parseInt(row.QTY || row.qty || 0, 10) || 0
+    const normSize = normalizeSize(rawSize)
+    const businessDay = String(row.business_day || row.businessDay || '').trim()
+    const sourceSignature = String(row.source_signature || row.sourceSignature || '').trim()
+    const rawQty   = row.QTY ?? row.qty ?? 0
+    const qty      = Number(rawQty)
 
-    if (!style || !qty) return
-    srcTotal += qty
+    if (!Number.isSafeInteger(qty) || qty < 0) {
+      throw new Error(`Invalid quantity "${rawQty}" for ${style || 'unknown style'}. Use a whole number of units.`)
+    }
+    if (!qty) return
+    const packCount = Math.max(1, parseInt(row.pack_count || row.packCount, 10) || 1)
+    let parseIssue = String(row.parse_issue || row.parseIssue || '')
+    if (!style) {
+      const sourceIssue = parseIssue || 'missing_style'
+      const remembered = aliases[aliasKey('', color, normSize)]
+      const confirmed = remembered?._confirmed === true && remembered?._confirmedDimensions === true
+      const targets = confirmed
+        ? (Array.isArray(remembered.components) ? remembered.components : [remembered])
+        : []
+      const targetRows = targets.map((target) => {
+        const targetSize = normalizeSize(target.SIZE || normSize)
+        const matches = entries.filter((entry) =>
+          normalizeStyleIdentity(entry.style) === normalizeStyleIdentity(target.STYLE)
+          && normalizeColor(entry.color) === normalizeColor(target.COLOR)
+          && normalizeSize(entry.size) === targetSize
+        )
+        return matches.length === 1 ? matches[0] : null
+      })
+      const effectivePackCount = targets.length
+        ? targets.reduce((sum, target) => sum + Math.max(1, parseInt(target.multiplier, 10) || 1), 0)
+        : packCount
+      srcTotal += qty * effectivePackCount
 
-    const normStyle = normalizeStyle(style)
-    const normSize  = normalizeSize(rawSize)
+      if (confirmed && targetRows.length && targetRows.every(Boolean)) {
+        targetRows.forEach((targetRow, index) => {
+          const multiplier = Math.max(1, parseInt(targets[index].multiplier, 10) || 1)
+          const componentQty = qty * multiplier
+          targetRow.qty += componentQty
+          filledTotal += componentQty
+          matchLog.push({
+            style: rawStyle,
+            salesColor: color,
+            size: normSize,
+            qty: componentQty,
+            targetStyle: targetRow.style,
+            targetColor: targetRow.color,
+            targetSize: targetRow.size,
+            businessDay,
+            via: 'confirmed missing-style source',
+          })
+        })
+        return
+      }
+
+      unmatchedRows.push({
+        style,
+        rawStyle,
+        color,
+        size: normSize,
+        qty,
+        packCount: effectivePackCount,
+        businessDay,
+        sourceSignature,
+        sourceIssue,
+        parseIssue: confirmed ? 'confirmed_mapping_size_missing' : sourceIssue,
+      })
+      return
+    }
+    // Consolidated rows already contain warehouse sizes. Petite conversion must
+    // happen exactly once in consolidateRows, never again during matching.
+    const routedStyle = routedInventoryStyle(style, normSize)
+    if (routedStyle === null) {
+      parseIssue = [...new Set([...parseIssue.split(';'), 'm022_size_unknown'].filter(Boolean))].join(';')
+    }
+    const sourceIssue = parseIssue
+    const matchStyle = routedStyle || style
+    const normStyle = normalizeStyle(matchStyle)
     const key       = `${normStyle}||${normSize}`
     let candidates = buckets.get(key) || []
-
-    // ── Style-prefix fallback — only when NO exact bucket match ─────────────
-    // Sales CSVs use a shorter style code that is a prefix of the full template
-    // style name. Size disambiguates which variant to route to:
-    //   "M022" + S/M/L/XL → "M022 Missy"   (bstyle m022missy startsWith m022)
-    //   "M022" + 1X/2X/3X → "M022 PLUS"    (bstyle m022plus  startsWith m022)
-    //   "M022" + PS/PM/PL  → "M022 Petite"  (bstyle m022petite startsWith m022)
-    //   "M017" + S/M/L/XL → "M017-MISSY"   (bstyle m017missy startsWith m017)
-    //   "80423" + any      → "80423W"       (bstyle 80423w    startsWith 80423)
-    //
-    // Guard: sales style must be ≥ 4 chars to avoid single/two-char false matches.
-    if (!candidates.length) {
-      const prefixCandidates = []
-      for (const [bkey, bucket] of buckets.entries()) {
-        const sep    = bkey.lastIndexOf('||')
-        const bstyle = bkey.slice(0, sep)
-        const bsize  = bkey.slice(sep + 2)
-        if (bsize !== normSize || bstyle === normStyle) continue
-        if (normStyle.length < 4) continue
-        if (bstyle.startsWith(normStyle)) {
-          prefixCandidates.push(...bucket)
-        }
-      }
-      if (prefixCandidates.length) candidates = prefixCandidates
+    const baseAliasKey = aliasKey(style, color)
+    const savedReviewAlias = parseIssue && sourceSignature
+      ? aliases[reviewAliasKey(style, color, normSize, sourceSignature, parseIssue)]
+      : null
+    const confirmedSourceReview = savedReviewAlias?._confirmed === true
+      && savedReviewAlias._sourceSignature === sourceSignature
+      && normalizedIssues(savedReviewAlias._confirmedIssues) === normalizedIssues(parseIssue)
+    const savedSizeAlias = aliases[aliasKey(style, color, normSize)]
+    const savedGeneralAlias = aliases[baseAliasKey]
+    const inferredDimensionReview = parseIssue
+      ? inferConfirmedDimensionReviewAlias(aliases, aliasKey(style, color, normSize))
+      : null
+    let aliasTarget = (confirmedSourceReview && (asConfirmedAlias(savedReviewAlias, true) || savedReviewAlias))
+      || asConfirmedAlias(savedSizeAlias, true)
+      || savedSizeAlias
+      || inferredDimensionReview
+      || asConfirmedAlias(savedGeneralAlias)
+      || savedGeneralAlias
+      || inferConfirmedStyleColorAlias(aliases, baseAliasKey)
+    if (normalizeStyleIdentity(style) === 'm022' && routedStyle && aliasTarget?._confirmed && !Array.isArray(aliasTarget.components)) {
+      aliasTarget = { ...aliasTarget, STYLE: routedStyle }
     }
 
-    // ── Learned alias — a previous human "Link" or "Combo" wins outright ────────
-    // If the user has taught us what this (style, color) means, fill that template
-    // color directly and skip fuzzy scoring. Combo aliases split one source row into
-    // multiple template rows, each receiving the source quantity.
-    const aliasTarget = aliases[aliasKey(style, color, normSize)] || aliases[aliasKey(style, color)]
+    const confirmedStyleColorRule = aliasTarget?._confirmed === true
+    const confirmedDimensionReview = parseIssue && aliasTarget?._confirmedDimensions === true
+    const confirmedComboRule = confirmedStyleColorRule && Array.isArray(aliasTarget?.components)
+    const effectivePackCount = confirmedComboRule
+      ? aliasTarget.components.reduce((sum, component) =>
+          sum + Math.max(1, parseInt(component.multiplier, 10) || 1), 0)
+      : packCount
+    srcTotal += qty * effectivePackCount
+
+    // Unconfirmed legacy combos require review. A cross-style mapping can only
+    // auto-apply when it came from a human-confirmed style+color rule.
+    const aliasNeedsReview = (Array.isArray(aliasTarget?.components) && !confirmedComboRule)
+      || (
+        aliasTarget?.STYLE
+        && normalizeStyleIdentity(aliasTarget.STYLE) !== normalizeStyleIdentity(style)
+        && !confirmedStyleColorRule
+    )
+    if (aliasNeedsReview) {
+      unmatchedRows.push({
+        style, color, size: normSize, qty, packCount: effectivePackCount, businessDay, sourceSignature,
+        ...(sourceIssue ? { sourceIssue } : {}),
+        parseIssue: parseIssue || 'confirmed_mapping_requires_review',
+      })
+      return
+    }
+
+    // ── Learned alias ──────────────────────────────────────────────────────────
+    // A confirmed style+color rule reuses the current source size. Target style,
+    // color, and size still have to exist exactly in the current inventory.
     const target = typeof aliasTarget === 'string' ? { COLOR: aliasTarget } : aliasTarget
     const applyAliasTarget = (pool = []) => {
       const matchTarget = (wanted, items) => {
-        const wantStyle = normalizeStyle(wanted.STYLE || '')
-        const wantColor = normalizeColor(wanted.COLOR || '')
+        const wantStyle = String(wanted.STYLE || '').trim()
+        const wantColor = String(wanted.COLOR || '').trim()
         const wantSize = normalizeSize(wanted.SIZE || normSize)
-        return items.find(c => {
-          const styleOk = !wantStyle || normalizeStyle(c.style) === wantStyle
-          const colorOk = !wantColor || normalizeColor(c.color) === wantColor
+        const matches = items.filter(c => {
+          const styleOk = !wantStyle || normalizeStyleIdentity(c.style) === normalizeStyleIdentity(wantStyle)
+          const colorOk = !wantColor || normalizeColor(c.color) === normalizeColor(wantColor)
           const sizeOk = !wantSize || normalizeSize(c.size) === wantSize
           return styleOk && colorOk && sizeOk
         })
+        return matches.length === 1 ? matches[0] : null
       }
 
-      if (Array.isArray(target?.components) && target.components.length) {
-        const matches = target.components.map(component => matchTarget(component, entries))
-        if (matches.some(match => !match)) return false
-        for (const matched of matches) matched.qty += qty
+      if (confirmedComboRule) {
+        const matches = target.components.map((component) =>
+          matchTarget({
+            STYLE: component.STYLE,
+            COLOR: component.COLOR,
+            SIZE: component.SIZE || normSize,
+          }, entries)
+        )
+        if (matches.some((match) => !match)) return false
+
+        for (const [index, matched] of matches.entries()) {
+          const multiplier = Math.max(1, parseInt(target.components[index].multiplier, 10) || 1)
+          const componentQty = qty * multiplier
+          matched.qty += componentQty
+          filledTotal += componentQty
+          matchLog.push({
+            style,
+            salesColor: color,
+            size: normSize,
+            qty: componentQty,
+            targetStyle: matched.style,
+            targetColor: matched.color,
+            targetSize: matched.size,
+            businessDay,
+            via: 'confirmed combo',
+          })
+        }
+        return true
+      }
+
+      let matched = matchTarget({
+        STYLE: target.STYLE,
+        COLOR: target.COLOR,
+        SIZE: target.SIZE || normSize,
+      }, pool)
+      if (!matched && confirmedStyleColorRule && target.STYLE) {
+        matched = matchTarget({
+          STYLE: target.STYLE,
+          COLOR: target.COLOR,
+          SIZE: target.SIZE || normSize,
+        }, entries)
+      }
+      if (matched) {
+        matched.qty += qty
         filledTotal += qty
         matchLog.push({
           style,
           salesColor: color,
           size: normSize,
           qty,
-          matchedTo: target.components.map(c => `${c.STYLE}/${c.COLOR}/${c.SIZE}`).join(' + '),
-          via: 'alias combo',
+          targetStyle: matched.style,
+          targetColor: matched.color,
+          targetSize: matched.size,
+          businessDay,
+          via: 'confirmed',
         })
-        return true
-      }
-
-      const wantStyle = normalizeStyle(target.STYLE || '')
-      const wantColor = normalizeColor(target.COLOR || '')
-      const wantSize = normalizeSize(target.SIZE || normSize)
-      const matchIn = (items) => matchTarget({ STYLE: wantStyle, COLOR: wantColor, SIZE: wantSize }, items)
-      const matched = matchIn(pool) || (wantStyle ? matchIn(entries) : null)
-      if (matched) {
-        matched.qty += qty
-        filledTotal += qty
-        matchLog.push({ style, salesColor: color, size: normSize, qty, matchedTo: matched.color, via: 'alias' })
-        return true
-      }
-      if (target._isNew && target.STYLE && target.COLOR) {
-        entries.push({ style: target.STYLE, color: target.COLOR, size: target.SIZE || normSize, qty })
-        filledTotal += qty
-        matchLog.push({ style, salesColor: color, size: normSize, qty, matchedTo: target.COLOR, via: 'alias new' })
         return true
       }
       return false
     }
 
+    // A confirmed combo resolves only the known set/combo uncertainty. Other
+    // parsing warnings still require a fresh human decision.
+    const comboResolvedIssue = confirmedSourceReview || confirmedDimensionReview || (
+      confirmedComboRule
+      && parseIssue
+        .split(';')
+        .filter(Boolean)
+        .every((issue) => ['set_components_unknown', 'cross_style_combo', 'ambiguous_color_separator'].includes(issue))
+    )
+    if (parseIssue && !comboResolvedIssue) {
+      unmatchedRows.push({ style, color, size: normSize, qty, packCount: effectivePackCount, businessDay, sourceSignature, sourceIssue, parseIssue })
+      return
+    }
+
+    const hadLooseStyleCandidates = candidates.length > 0
+    candidates = candidates.filter((candidate) =>
+      normalizeStyleIdentity(candidate.style) === normalizeStyleIdentity(matchStyle)
+    )
+
     if (!candidates?.length && target) {
       if (applyAliasTarget([])) return
+      unmatchedRows.push({
+        style,
+        color,
+        size: normSize,
+        qty,
+        packCount: effectivePackCount,
+        businessDay,
+        sourceSignature,
+        ...(sourceIssue ? { sourceIssue } : {}),
+        parseIssue: target._isNew ? 'confirmed_new_target_missing' : 'confirmed_mapping_size_missing',
+      })
+      return
     }
 
     if (!candidates?.length) {
-      unmatchedRows.push({ style, color, size: normSize, qty })
+      unmatchedRows.push({
+        style,
+        color,
+        size: normSize,
+        qty,
+        packCount: effectivePackCount,
+        businessDay,
+        sourceSignature,
+        ...(sourceIssue ? { sourceIssue } : {}),
+        parseIssue: hadLooseStyleCandidates ? 'style_identity_mismatch' : parseIssue,
+      })
+      return
+    }
+
+    if (!aliasTarget && new Set(candidates.map((candidate) => candidate.style)).size > 1) {
+      unmatchedRows.push({
+        style, color, size: normSize, qty, packCount: effectivePackCount, businessDay, sourceSignature,
+        ...(sourceIssue ? { sourceIssue } : {}),
+        parseIssue: 'ambiguous_inventory_style',
+      })
       return
     }
 
     if (aliasTarget) {
       if (applyAliasTarget(candidates)) return
+      unmatchedRows.push({
+        style,
+        color,
+        size: normSize,
+        qty,
+        packCount: effectivePackCount,
+        businessDay,
+        sourceSignature,
+        ...(sourceIssue ? { sourceIssue } : {}),
+        parseIssue: target?._isNew ? 'confirmed_new_target_missing' : 'confirmed_mapping_size_missing',
+      })
+      return
+    }
+
+    // Fail closed if destructive cleanup would make two differently named
+    // inventory colors share one exact identity.
+    const exactIdentity = normalizeColor(color)
+    const exactTargets = new Map(
+      candidates
+        .filter((candidate) => normalizeColor(candidate.color) === exactIdentity)
+        .map((candidate) => [
+          `${candidate.style}\u0000${candidate.color}\u0000${candidate.size}`,
+          candidate,
+        ]),
+    )
+    if (exactTargets.size > 1) {
+      unmatchedRows.push({
+        style, color, size: normSize, qty, packCount, businessDay, sourceSignature,
+        ...(sourceIssue ? { sourceIssue } : {}),
+        parseIssue: 'ambiguous_inventory_color',
+      })
+      return
     }
 
     // Score every candidate, keeping the best score per DISTINCT color (a color's
@@ -365,9 +697,8 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
       if (!cur || s > cur.score) bySig.set(sig, { score: s, idx: i })
     })
 
-    const passing = [...bySig.values()]
-      .filter(x => x.score >= MATCH_THRESHOLD)
-      .sort((a, b) => b.score - a.score)
+    const ranked = [...bySig.values()].sort((a, b) => b.score - a.score)
+    const passing = ranked.filter(x => x.score >= MATCH_THRESHOLD)
 
     // Decide:
     //   • nothing clears the bar                       → review (unmatched)
@@ -375,22 +706,30 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
     //   • several qualify, but a UNIQUE exact (1.0)     → that exact match wins
     //   • several distinct colors tie below exact      → AMBIGUOUS → review, never guess
     let chosen = -1
-    if (passing.length === 1) {
-      chosen = passing[0].idx
-    } else if (passing.length > 1) {
-      const topExact = passing[0].score >= 0.999 && passing[1].score < 0.999
-      if (topExact) chosen = passing[0].idx
-    }
+    if (passing.length === 1) chosen = passing[0].idx
 
     if (chosen >= 0) {
-      candidates[chosen].qty += qty
+      const matched = candidates[chosen]
+      matched.qty += qty
       filledTotal += qty
       const chosenScore = passing.find(p => p.idx === chosen)?.score ?? 0
-      if (chosenScore < 0.999) {
-        matchLog.push({ style, salesColor: color, size: normSize, qty, matchedTo: candidates[chosen].color, via: `fuzzy ${chosenScore.toFixed(2)}` })
-      }
+      matchLog.push({
+        style,
+        salesColor: color,
+        size: normSize,
+        qty,
+        targetStyle: matched.style,
+        targetColor: matched.color,
+        targetSize: matched.size,
+        businessDay,
+        via: chosenScore >= 0.999 ? 'exact' : `fuzzy ${chosenScore.toFixed(2)}`,
+      })
     } else {
-      unmatchedRows.push({ style, color, size: normSize, qty })
+      unmatchedRows.push({
+        style, color, size: normSize, qty, packCount, businessDay, sourceSignature,
+        ...(sourceIssue ? { sourceIssue } : {}),
+        parseIssue,
+      })
     }
   })
 
@@ -398,7 +737,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
   // would regroup by style+size and scramble the order.
   const filledRows = entries.map(e => ({ STYLE: e.style, COLOR: e.color, SIZE: e.size, QTY: e.qty }))
 
-  const appendTotal = unmatchedRows.reduce((s, r) => s + r.qty, 0)
+  const appendTotal = unmatchedRows.reduce((s, r) => s + r.qty * (r.packCount || 1), 0)
 
   return {
     filledRows,
@@ -409,6 +748,10 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
       filled_total:     filledTotal,
       append_total:     appendTotal,
       reconciled_total: filledTotal + appendTotal,
+      has_unknown_unit_counts: unmatchedRows.some(r =>
+        (/set_components_unknown/.test(r.parseIssue || '') && (r.packCount || 1) === 1) ||
+        /cross_style_combo/.test(r.parseIssue || '')
+      ),
     },
   }
 }

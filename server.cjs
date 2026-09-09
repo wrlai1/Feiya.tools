@@ -9,12 +9,52 @@ const cors    = require('cors');
 const { neon }  = require('@neondatabase/serverless');
 const bcrypt    = require('bcryptjs');
 const jwt       = require('jsonwebtoken');
+const { resolveInventoryTargets } = require('./lib/inventoryTargetResolution.cjs');
+const {
+  normalizeInventoryQuantity,
+  normalizeOrderClaims,
+  orderClaimsToSqlRecords,
+} = require('./lib/inventoryTransactionSafety.cjs');
 
 const app  = express();
 const PORT = 3001;
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '5mb' }));
+
+// Local development uses the same handlers as production. The legacy route
+// implementations below remain temporarily for migration reference, but these
+// first-mounted routes are the executable source of truth.
+const apiHandlerPromises = new Map();
+function mountProductionHandler(route, modulePath) {
+  app.all(route, async (req, res, next) => {
+    try {
+      if (!apiHandlerPromises.has(modulePath)) {
+        apiHandlerPromises.set(modulePath, import(modulePath).then((module) => module.default));
+      }
+      return await (await apiHandlerPromises.get(modulePath))(req, res);
+    } catch (error) {
+      if (res.headersSent) return next(error);
+      console.error(`[${route}]`, error.message);
+      return res.status(500).json({ error: error.message });
+    }
+  });
+}
+
+[
+  ['/api/auth', './api/auth.js'],
+  ['/api/users', './api/users.js'],
+  ['/api/app-data', './api/app-data.js'],
+  ['/api/custom-metrics', './api/custom-metrics.js'],
+  ['/api/analytics-store', './api/analytics-store.js'],
+  ['/api/new-product-tracker', './api/new-product-tracker.js'],
+  ['/api/chat-messages', './api/chat-messages.js'],
+  ['/api/auto-deduct', './api/auto-deduct.js'],
+  ['/api/inventory-balance', './api/inventory-balance.js'],
+  ['/api/timeclock', './api/timeclock.js'],
+  ['/api/attendance', './api/attendance.js'],
+  ['/api/returns', './api/returns.js'],
+].forEach(([route, modulePath]) => mountProductionHandler(route, modulePath));
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -56,13 +96,18 @@ async function ensureUsersTable(sql) {
 async function seedAdminIfNeeded(sql) {
   const rows = await sql`SELECT COUNT(*)::int AS count FROM users`;
   if (rows[0].count === 0) {
-    const hash = await bcrypt.hash('feiya2026', 10);
+    const password = String(process.env.INITIAL_ADMIN_PASSWORD || '');
+    if (password.length < 12) {
+      throw new Error('No users exist. Set INITIAL_ADMIN_PASSWORD to a private password of at least 12 characters.');
+    }
+    const username = String(process.env.INITIAL_ADMIN_USERNAME || 'admin').trim().toLowerCase();
+    const hash = await bcrypt.hash(password, 10);
     await sql`
       INSERT INTO users (username, password_hash, role, created_by)
-      VALUES ('admin', ${hash}, 'admin', 'system')
+      VALUES (${username}, ${hash}, 'admin', 'system')
       ON CONFLICT (username) DO NOTHING
     `;
-    console.log('  ✓ Seeded default admin user (admin / feiya2026)');
+    console.log('  ✓ Seeded the initial admin user from environment settings');
   }
 }
 
@@ -365,6 +410,23 @@ async function ensureAnalyticsStoreTables(sql) {
       created_at TIMESTAMPTZ DEFAULT NOW()
     )
   `;
+  await sql`
+    CREATE TABLE IF NOT EXISTS analytics_daily_logs (
+      username   TEXT NOT NULL,
+      store      TEXT NOT NULL,
+      day        DATE NOT NULL,
+      note       TEXT NOT NULL,
+      tags       JSONB NOT NULL DEFAULT '[]'::jsonb,
+      follow_up  TEXT,
+      follow_up_done BOOLEAN NOT NULL DEFAULT FALSE,
+      updated_by TEXT,
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (username, store, day)
+    )
+  `;
+  await sql`ALTER TABLE analytics_daily_logs ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '[]'::jsonb`;
+  await sql`ALTER TABLE analytics_daily_logs ADD COLUMN IF NOT EXISTS follow_up TEXT`;
+  await sql`ALTER TABLE analytics_daily_logs ADD COLUMN IF NOT EXISTS follow_up_done BOOLEAN NOT NULL DEFAULT FALSE`;
 }
 
 async function recordAnalyticsEvent(sql, username, actor, store, action, summary, details = {}, snapshot = null) {
@@ -653,6 +715,52 @@ app.all('/api/analytics-store', async (req, res) => {
       return res.json({ days: summary, rows });
     }
 
+    if (req.method === 'GET' && action === 'daily-logs') {
+      const store = String(req.query.store || '').trim();
+      const { from, to } = req.query;
+      if (!store || !from || !to) return res.status(400).json({ error: 'store, from and to are required' });
+      const rows = await sql`
+        SELECT day, note, tags, follow_up, follow_up_done, updated_by, updated_at
+        FROM analytics_daily_logs
+        WHERE username = ${username} AND store = ${store} AND day >= ${from} AND day <= ${to}
+        ORDER BY day
+      `;
+      return res.json({
+        logs: rows.map((row) => ({
+          day: analyticsDayString(row.day),
+          note: row.note,
+          tags: Array.isArray(row.tags) ? row.tags : [],
+          followUp: row.follow_up || '',
+          followUpDone: Boolean(row.follow_up_done),
+          updatedBy: row.updated_by,
+          updatedAt: row.updated_at,
+        })),
+      });
+    }
+
+    if (req.method === 'POST' && action === 'save-daily-log') {
+      const store = String(req.body?.store || '').trim();
+      const day = String(req.body?.day || '').slice(0, 10);
+      const note = String(req.body?.note || '').trim();
+      const tags = Array.isArray(req.body?.tags) ? req.body.tags.map((tag) => String(tag).trim()).filter(Boolean).slice(0, 10) : [];
+      const followUp = String(req.body?.followUp || '').trim();
+      const followUpDone = Boolean(req.body?.followUpDone);
+      if (!store || !/^\d{4}-\d{2}-\d{2}$/.test(day)) return res.status(400).json({ error: 'store and a valid day are required' });
+      await sql`INSERT INTO analytics_stores (username, name) VALUES (${username}, ${store}) ON CONFLICT DO NOTHING`;
+      if (!note && !followUp) {
+        await sql`DELETE FROM analytics_daily_logs WHERE username = ${username} AND store = ${store} AND day = ${day}`;
+        return res.json({ ok: true, deleted: true });
+      }
+      await sql`
+        INSERT INTO analytics_daily_logs (username, store, day, note, tags, follow_up, follow_up_done, updated_by, updated_at)
+        VALUES (${username}, ${store}, ${day}, ${note}, ${JSON.stringify(tags)}::jsonb, ${followUp || null}, ${followUpDone}, ${actor}, NOW())
+        ON CONFLICT (username, store, day)
+        DO UPDATE SET note = EXCLUDED.note, tags = EXCLUDED.tags, follow_up = EXCLUDED.follow_up,
+          follow_up_done = EXCLUDED.follow_up_done, updated_by = EXCLUDED.updated_by, updated_at = NOW()
+      `;
+      return res.json({ ok: true, log: { day, note, tags, followUp, followUpDone, updatedBy: actor } });
+    }
+
     if (req.method === 'DELETE' && action === 'delete-day') {
       const store = String(req.query.store || '').trim();
       const day   = req.query.day;
@@ -737,6 +845,178 @@ app.all('/api/analytics-store', async (req, res) => {
         restored: result.restored,
       }, null);
       return res.json({ ok: true, ...result });
+    }
+
+    return res.status(400).json({ error: 'Unknown action' });
+  } catch (err) { return res.status(500).json({ error: err.message }); }
+});
+
+// ─── /api/new-product-tracker ─────────────────────────────────────────────────
+
+async function ensureNewProductTrackerTables(sql) {
+  await sql`
+    CREATE TABLE IF NOT EXISTS new_product_trackers (
+      id           BIGSERIAL PRIMARY KEY,
+      username     TEXT NOT NULL,
+      store        TEXT NOT NULL,
+      spu          TEXT NOT NULL,
+      product_name TEXT,
+      launch_date  DATE NOT NULL,
+      created_at   TIMESTAMPTZ DEFAULT NOW(),
+      updated_at   TIMESTAMPTZ DEFAULT NOW()
+    )
+  `;
+  await sql`
+    CREATE TABLE IF NOT EXISTS new_product_roas_events (
+      id             BIGSERIAL PRIMARY KEY,
+      tracker_id     BIGINT NOT NULL REFERENCES new_product_trackers(id) ON DELETE CASCADE,
+      username       TEXT NOT NULL,
+      effective_date DATE NOT NULL,
+      roas           NUMERIC NOT NULL,
+      note           TEXT,
+      created_at     TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE (tracker_id, effective_date)
+    )
+  `;
+  await sql`
+    CREATE INDEX IF NOT EXISTS new_product_trackers_user_idx
+    ON new_product_trackers (username, created_at DESC)
+  `;
+}
+
+function newProductTrackerJson(row, events = []) {
+  return {
+    id: String(row.id),
+    store: row.store,
+    spu: row.spu,
+    productName: row.product_name || '',
+    launchDate: analyticsDayString(row.launch_date),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    roasEvents: events.map((event) => ({
+      id: String(event.id),
+      effectiveDate: analyticsDayString(event.effective_date),
+      roas: Number(event.roas),
+      note: event.note || '',
+      createdAt: event.created_at,
+    })),
+  };
+}
+
+app.all('/api/new-product-tracker', async (req, res) => {
+  try {
+    const sql = getDB();
+    const payload = verifyToken(req.headers.authorization, getSecret());
+    if (!payload) return res.status(401).json({ error: 'Not authenticated' });
+    const username = payload.role === 'admin' ? 'admin' : payload.username;
+    const action = String(req.query.action || '');
+    await ensureNewProductTrackerTables(sql);
+
+    if (req.method === 'GET' && action === 'list') {
+      const trackers = await sql`
+        SELECT id, store, spu, product_name, launch_date, created_at, updated_at
+        FROM new_product_trackers
+        WHERE username = ${username}
+        ORDER BY launch_date DESC, created_at DESC
+      `;
+      const events = await sql`
+        SELECT e.id, e.tracker_id, e.effective_date, e.roas, e.note, e.created_at
+        FROM new_product_roas_events e
+        JOIN new_product_trackers t ON t.id = e.tracker_id
+        WHERE t.username = ${username}
+        ORDER BY e.effective_date, e.created_at
+      `;
+      const byTracker = new Map();
+      for (const event of events) {
+        const key = String(event.tracker_id);
+        if (!byTracker.has(key)) byTracker.set(key, []);
+        byTracker.get(key).push(event);
+      }
+      return res.json({
+        trackers: trackers.map((row) => newProductTrackerJson(row, byTracker.get(String(row.id)) || [])),
+      });
+    }
+
+    if (req.method === 'POST' && action === 'create') {
+      const store = String(req.body?.store || '').trim();
+      const spu = String(req.body?.spu || '').trim();
+      const productName = String(req.body?.productName || '').trim();
+      const launchDate = analyticsDayString(req.body?.launchDate);
+      const initialRoas = Number(req.body?.initialRoas);
+      if (!store || !spu || !launchDate) {
+        return res.status(400).json({ error: '店铺、SPU 和上架日期为必填项' });
+      }
+      if (!Number.isFinite(initialRoas) || initialRoas <= 0) {
+        return res.status(400).json({ error: '请填写大于 0 的目标 ROAS' });
+      }
+      const duplicate = await sql`
+        SELECT id FROM new_product_trackers
+        WHERE username = ${username} AND LOWER(store) = LOWER(${store}) AND LOWER(spu) = LOWER(${spu})
+        LIMIT 1
+      `;
+      if (duplicate.length) {
+        return res.status(409).json({ error: '这个店铺的 SPU 已在追踪中；如需重新上架，请先删除旧追踪' });
+      }
+      const rows = await sql`
+        INSERT INTO new_product_trackers (username, store, spu, product_name, launch_date)
+        VALUES (${username}, ${store}, ${spu}, ${productName || null}, ${launchDate})
+        RETURNING id, store, spu, product_name, launch_date, created_at, updated_at
+      `;
+      const tracker = rows[0];
+      const eventRows = await sql`
+        INSERT INTO new_product_roas_events (tracker_id, username, effective_date, roas, note)
+        VALUES (${tracker.id}, ${username}, ${launchDate}, ${initialRoas}, ${'初始目标'})
+        RETURNING id, tracker_id, effective_date, roas, note, created_at
+      `;
+      return res.status(201).json({ tracker: newProductTrackerJson(tracker, eventRows) });
+    }
+
+    if (req.method === 'POST' && action === 'save-roas') {
+      const trackerId = Number(req.body?.trackerId);
+      const effectiveDate = analyticsDayString(req.body?.effectiveDate);
+      const roas = Number(req.body?.roas);
+      const note = String(req.body?.note || '').trim();
+      if (!trackerId || !effectiveDate || !Number.isFinite(roas) || roas <= 0) {
+        return res.status(400).json({ error: '追踪款、修改日期和目标 ROAS 均为必填项' });
+      }
+      const owned = await sql`
+        SELECT id, launch_date FROM new_product_trackers
+        WHERE id = ${trackerId} AND username = ${username}
+        LIMIT 1
+      `;
+      if (!owned.length) return res.status(404).json({ error: '未找到这个新品追踪' });
+      if (effectiveDate < analyticsDayString(owned[0].launch_date)) {
+        return res.status(400).json({ error: 'ROAS 修改日期不能早于新品上架日期' });
+      }
+      const events = await sql`
+        INSERT INTO new_product_roas_events (tracker_id, username, effective_date, roas, note)
+        VALUES (${trackerId}, ${username}, ${effectiveDate}, ${roas}, ${note || null})
+        ON CONFLICT (tracker_id, effective_date)
+        DO UPDATE SET roas = EXCLUDED.roas, note = EXCLUDED.note
+        RETURNING id, tracker_id, effective_date, roas, note, created_at
+      `;
+      await sql`UPDATE new_product_trackers SET updated_at = NOW() WHERE id = ${trackerId}`;
+      return res.json({
+        event: {
+          id: String(events[0].id),
+          effectiveDate: analyticsDayString(events[0].effective_date),
+          roas: Number(events[0].roas),
+          note: events[0].note || '',
+          createdAt: events[0].created_at,
+        },
+      });
+    }
+
+    if (req.method === 'DELETE') {
+      const id = Number(req.query.id);
+      if (!id) return res.status(400).json({ error: 'id is required' });
+      const rows = await sql`
+        DELETE FROM new_product_trackers
+        WHERE id = ${id} AND username = ${username}
+        RETURNING id
+      `;
+      if (!rows.length) return res.status(404).json({ error: '未找到这个新品追踪' });
+      return res.json({ ok: true });
     }
 
     return res.status(400).json({ error: 'Unknown action' });
@@ -859,6 +1139,7 @@ app.all('/api/auto-deduct', async (req, res) => {
     }
 
     if (req.method === 'POST' && action === 'save-aliases') {
+      if (!isAdmin) return res.status(403).json({ error: 'Admin access required' });
       const { aliases } = req.body || {};
       if (!aliases || typeof aliases !== 'object' || Array.isArray(aliases)) return res.status(400).json({ error: 'aliases object required' });
       const value = JSON.stringify({ aliases, updatedAt: new Date().toISOString(), updatedBy: payload.username });
@@ -1043,7 +1324,7 @@ app.all('/api/timeclock', async (req, res) => {
 
 // ─── /api/inventory-balance ───────────────────────────────────────────────────
 
-const MAX_SNAPSHOTS_INV = 5;
+const MAX_SNAPSHOTS_INV = 20;
 
 async function ensureInventoryTables(sql) {
   await sql`
@@ -1068,6 +1349,19 @@ async function ensureInventoryTables(sql) {
     )
   `;
   await sql`
+    CREATE TABLE IF NOT EXISTS inventory_txn_rows (
+      id          BIGSERIAL PRIMARY KEY,
+      txn_type    TEXT NOT NULL,
+      style       TEXT NOT NULL,
+      color       TEXT NOT NULL,
+      size        TEXT NOT NULL,
+      qty         INTEGER NOT NULL,
+      source_file TEXT,
+      applied_by  TEXT,
+      applied_at  TIMESTAMPTZ DEFAULT NOW()
+    )
+  `;
+  await sql`
     CREATE TABLE IF NOT EXISTS inventory_snapshots (
       id          SERIAL PRIMARY KEY,
       label       TEXT,
@@ -1078,10 +1372,140 @@ async function ensureInventoryTables(sql) {
       created_at  TIMESTAMPTZ DEFAULT NOW()
     )
   `;
+  await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS source_file TEXT`;
+  await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS applied_units INTEGER DEFAULT 0`;
+  await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS applied_by TEXT`;
+  await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS applied_at TIMESTAMPTZ DEFAULT NOW()`;
+  await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS source_hash TEXT`;
+  await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS row_count INTEGER`;
+  await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS rollback_snapshot_id INTEGER`;
+  await sql`ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS rolled_back_at TIMESTAMPTZ`;
+  await sql`ALTER TABLE inventory_txn_rows ADD COLUMN IF NOT EXISTS transaction_id INTEGER`;
+  await sql`
+    UPDATE inventory_txn_rows rows
+    SET transaction_id = (
+      SELECT transactions.id
+      FROM inventory_transactions transactions
+      WHERE transactions.transaction_type = rows.txn_type
+        AND transactions.source_file IS NOT DISTINCT FROM rows.source_file
+        AND transactions.applied_by IS NOT DISTINCT FROM rows.applied_by
+        AND ABS(EXTRACT(EPOCH FROM (transactions.applied_at - rows.applied_at))) <= 30
+      ORDER BY
+        ABS(EXTRACT(EPOCH FROM (transactions.applied_at - rows.applied_at))),
+        transactions.id DESC
+      LIMIT 1
+    )
+    WHERE rows.transaction_id IS NULL
+  `;
+  await sql`
+    CREATE INDEX IF NOT EXISTS inventory_txn_rows_transaction_id_idx
+    ON inventory_txn_rows (transaction_id)
+  `;
+  await sql`
+    WITH restored_snapshots AS (
+      SELECT
+        substring(source_name FROM 'point ([0-9]+)$')::integer AS snapshot_id,
+        created_at AS restored_at
+      FROM inventory_snapshots
+      WHERE label = 'pre_restore' AND source_name ~ 'point [0-9]+$'
+    ),
+    restored_transactions AS (
+      SELECT
+        restored.restored_at,
+        (
+          SELECT candidate.id
+          FROM inventory_transactions candidate
+          JOIN inventory_snapshots original ON original.id = restored.snapshot_id
+          WHERE candidate.rollback_snapshot_id = original.id
+             OR (
+               candidate.rollback_snapshot_id IS NULL
+               AND candidate.transaction_type = original.label
+               AND candidate.source_file IS NOT DISTINCT FROM original.source_name
+               AND candidate.applied_at >= original.created_at
+             )
+          ORDER BY
+            CASE WHEN candidate.rollback_snapshot_id = original.id THEN 0 ELSE 1 END,
+            candidate.applied_at,
+            candidate.id
+          LIMIT 1
+        ) AS transaction_id
+      FROM restored_snapshots restored
+    )
+    UPDATE inventory_transactions target
+    SET rolled_back_at = restored.restored_at
+    FROM restored_transactions restored
+    WHERE target.id = restored.transaction_id
+      AND target.rolled_back_at IS NULL
+  `;
+  await sql`DROP INDEX IF EXISTS inventory_transactions_source_hash_uq`;
+  await sql`
+    CREATE UNIQUE INDEX IF NOT EXISTS inventory_transactions_active_source_hash_uq
+    ON inventory_transactions (transaction_type, source_hash)
+    WHERE source_hash IS NOT NULL AND source_hash <> '' AND rolled_back_at IS NULL
+  `;
+  await sql`
+    CREATE TABLE IF NOT EXISTS inventory_order_claims (
+      id BIGSERIAL PRIMARY KEY,
+      transaction_id INTEGER NOT NULL,
+      order_key TEXT NOT NULL,
+      item_key TEXT NOT NULL,
+      source_hash TEXT NOT NULL,
+      claimed_at TIMESTAMPTZ DEFAULT NOW(),
+      rolled_back_at TIMESTAMPTZ
+    )
+  `;
+  await sql`
+    CREATE UNIQUE INDEX IF NOT EXISTS inventory_order_claims_active_item_uq
+    ON inventory_order_claims (order_key, item_key)
+    WHERE rolled_back_at IS NULL
+  `;
+  await sql`
+    UPDATE inventory_order_claims claims
+    SET rolled_back_at = transactions.rolled_back_at
+    FROM inventory_transactions transactions
+    WHERE claims.transaction_id = transactions.id
+      AND claims.rolled_back_at IS NULL
+      AND transactions.rolled_back_at IS NOT NULL
+  `;
+  await sql`
+    DO $$
+    BEGIN
+      IF to_regclass('public.return_orders') IS NOT NULL
+         AND to_regclass('public.return_order_items') IS NOT NULL THEN
+        INSERT INTO inventory_order_claims (
+          transaction_id, order_key, item_key, source_hash
+        )
+        SELECT
+          transactions.id,
+          orders.order_key,
+          CASE
+            WHEN NULLIF(BTRIM(items.sku_id), '') IS NOT NULL
+              THEN 'sku:' || LOWER(BTRIM(items.sku_id))
+            WHEN NULLIF(BTRIM(items.skc_id), '') IS NOT NULL
+              THEN 'skc:' || LOWER(BTRIM(items.skc_id))
+            ELSE 'item:' || LOWER(REGEXP_REPLACE(items.item_key, '[[:space:]]+', '', 'g'))
+          END,
+          transactions.source_hash
+        FROM inventory_transactions transactions
+        JOIN return_orders orders
+          ON orders.source_hash = transactions.source_hash
+        JOIN return_order_items items
+          ON items.order_id = orders.id
+        WHERE transactions.transaction_type = 'sales'
+          AND transactions.rolled_back_at IS NULL
+          AND transactions.source_hash IS NOT NULL
+          AND transactions.source_hash <> ''
+        ON CONFLICT DO NOTHING;
+      END IF;
+    END
+    $$;
+  `;
+  await sql`ALTER TABLE inventory_balance ADD COLUMN IF NOT EXISTS sort_order INTEGER`;
+  await sql`UPDATE inventory_balance SET sort_order = id WHERE sort_order IS NULL`;
 }
 
 async function saveInventorySnapshot(sql, label, sourceName = '') {
-  const rows = await sql`SELECT style, color, size, quantity FROM inventory_balance ORDER BY style, color, size`;
+  const rows = await sql`SELECT style, color, size, quantity, sort_order FROM inventory_balance ORDER BY sort_order NULLS LAST, id`;
   const totalUnits = rows.reduce((s, r) => s + (r.quantity || 0), 0);
   await sql`
     INSERT INTO inventory_snapshots (label, source_name, data, total_rows, total_units)
@@ -1165,14 +1589,76 @@ app.all('/api/inventory-balance', async (req, res) => {
       if (!isAdmin) return res.status(403).json({ error: 'Admin access required' });
       const id = parseInt(req.query.id, 10);
       if (!id) return res.status(400).json({ error: 'id required' });
-      const { quantity } = req.body || {};
-      if (quantity === undefined || quantity === null) return res.status(400).json({ error: 'quantity required' });
+      const { quantity: rawQuantity, reason: rawReason = '' } = req.body || {};
+      if (rawQuantity === undefined || rawQuantity === null) return res.status(400).json({ error: 'quantity required' });
+      let quantity;
+      try {
+        quantity = normalizeInventoryQuantity(rawQuantity);
+      } catch (error) {
+        return res.status(400).json({ error: error.message });
+      }
 
-      const [old] = await sql`SELECT quantity FROM inventory_balance WHERE id = ${id}`;
+      const [old] = await sql`SELECT style, color, size, quantity FROM inventory_balance WHERE id = ${id}`;
       if (!old) return res.status(404).json({ error: 'Row not found' });
+      if (Number(old.quantity) === quantity) {
+        return res.json({ ok: true, old_quantity: old.quantity, new_quantity: quantity, no_change: true });
+      }
 
-      await sql`UPDATE inventory_balance SET quantity = ${quantity}, updated_at = NOW() WHERE id = ${id}`;
-      return res.json({ ok: true, old_quantity: old.quantity, new_quantity: quantity });
+      const reason = String(rawReason || '').trim().slice(0, 300);
+      const sourceName = `Manual adjustment: ${old.style} / ${old.color} / ${old.size}${reason ? ` — ${reason}` : ''}`;
+      const [result] = await sql`
+        WITH target AS MATERIALIZED (
+          SELECT id, style, color, size, quantity
+          FROM inventory_balance
+          WHERE id = ${id}
+          FOR UPDATE
+        ),
+        saved_snapshot AS (
+          INSERT INTO inventory_snapshots (label, source_name, data, total_rows, total_units)
+          SELECT
+            'adjustment',
+            ${sourceName},
+            COALESCE(jsonb_agg(jsonb_build_object(
+              'style', inventory.style, 'color', inventory.color, 'size', inventory.size,
+              'quantity', inventory.quantity, 'sort_order', inventory.sort_order
+            ) ORDER BY inventory.sort_order NULLS LAST, inventory.id), '[]'::jsonb),
+            COUNT(*)::int,
+            COALESCE(SUM(inventory.quantity), 0)::int
+          FROM inventory_balance inventory
+          RETURNING id
+        ),
+        logged_transaction AS (
+          INSERT INTO inventory_transactions (
+            transaction_type, source_file, applied_units, row_count,
+            applied_by, rollback_snapshot_id
+          )
+          SELECT
+            'adjustment', ${sourceName}, ABS(${quantity} - target.quantity),
+            1, ${payload.username}, saved_snapshot.id
+          FROM target, saved_snapshot
+          RETURNING id
+        ),
+        updated AS (
+          UPDATE inventory_balance inventory
+          SET quantity = ${quantity}, updated_at = NOW()
+          FROM target
+          WHERE inventory.id = target.id
+          RETURNING inventory.quantity
+        ),
+        logged_movement AS (
+          INSERT INTO inventory_txn_rows (
+            transaction_id, txn_type, style, color, size, qty, source_file, applied_by
+          )
+          SELECT
+            logged_transaction.id, 'adjustment', target.style, target.color, target.size,
+            ${quantity} - target.quantity, ${sourceName}, ${payload.username}
+          FROM target, logged_transaction
+        )
+        SELECT target.quantity AS old_quantity, updated.quantity AS new_quantity
+        FROM target, updated
+      `;
+      if (!result) return res.status(409).json({ error: 'Inventory row changed before the adjustment could be saved. Refresh and try again.' });
+      return res.json({ ok: true, old_quantity: result.old_quantity, new_quantity: result.new_quantity });
     }
 
     // POST add-rows
@@ -1221,44 +1707,269 @@ app.all('/api/inventory-balance', async (req, res) => {
     // POST apply
     if (req.method === 'POST' && action === 'apply') {
       if (!isAdmin) return res.status(403).json({ error: 'Admin access required' });
-      const { filledRows = [], txnType = 'sales', sourceName = '' } = req.body || {};
-
-      await saveInventorySnapshot(sql, txnType, sourceName);
-
-      let appliedUnits = 0;
-      for (const r of filledRows) {
-        const qty = parseInt(r.QTY, 10) || 0;
-        if (!qty) continue;
-
-        if (txnType === 'sales') {
-          await sql`
-            UPDATE inventory_balance
-            SET quantity   = GREATEST(0, quantity - ${qty}),
-                updated_at = NOW()
-            WHERE style = ${String(r.STYLE)} AND color = ${String(r.COLOR)} AND size = ${String(r.SIZE)}
-          `;
-        } else {
-          await sql`
-            UPDATE inventory_balance
-            SET quantity   = quantity + ${qty},
-                updated_at = NOW()
-            WHERE style = ${String(r.STYLE)} AND color = ${String(r.COLOR)} AND size = ${String(r.SIZE)}
-          `;
-        }
-        appliedUnits += qty;
+      const {
+        filledRows = [],
+        txnType = 'sales',
+        sourceName = '',
+        sourceHash: rawSourceHash = '',
+        orderClaims: rawOrderClaims = [],
+        sourceUnits: rawSourceUnits,
+      } = req.body || {};
+      if (!['sales', 'return'].includes(txnType)) return res.status(400).json({ error: 'Invalid transaction type' });
+      const sourceHash = String(rawSourceHash || '').trim();
+      if (!sourceHash) return res.status(400).json({ error: 'A source file fingerprint is required before inventory can be changed.' });
+      let sourceUnits;
+      try {
+        sourceUnits = normalizeInventoryQuantity(rawSourceUnits);
+      } catch {
+        return res.status(400).json({ error: 'A valid source physical-unit total is required before inventory can be changed.' });
+      }
+      let orderClaims;
+      try {
+        orderClaims = normalizeOrderClaims(rawOrderClaims);
+      } catch (error) {
+        return res.status(400).json({ error: error.message });
+      }
+      const orderClaimRecords = orderClaimsToSqlRecords(orderClaims);
+      if (txnType !== 'sales' && orderClaims.length) {
+        return res.status(400).json({ error: 'Order deduction claims are only valid for sales.' });
+      }
+      if (txnType === 'sales' && !orderClaims.length) {
+        return res.status(400).json({
+          error: 'Sales deductions require a raw order workbook with order numbers. Consolidated CSV files can be reviewed or downloaded, but cannot change inventory.',
+        });
       }
 
-      await sql`
-        INSERT INTO inventory_transactions (transaction_type, source_file, applied_units, applied_by)
-        VALUES (${txnType}, ${sourceName}, ${appliedUnits}, ${payload.username})
+      const duplicate = await sql`
+        SELECT id FROM inventory_transactions
+        WHERE transaction_type = ${txnType}
+          AND source_hash = ${sourceHash}
+          AND rolled_back_at IS NULL
+        LIMIT 1
       `;
+      if (duplicate.length) return res.status(409).json({ error: 'This exact file has already been applied. Inventory was not changed.' });
+      if (orderClaims.length) {
+        const existingClaims = await sql`
+          WITH incoming AS (
+            SELECT *
+            FROM jsonb_to_recordset(${JSON.stringify(orderClaimRecords)}::jsonb)
+              AS claim(order_key TEXT, item_key TEXT)
+          )
+          SELECT claims.order_key, claims.item_key
+          FROM inventory_order_claims claims
+          JOIN incoming
+            ON incoming.order_key = claims.order_key
+           AND incoming.item_key = claims.item_key
+          WHERE claims.rolled_back_at IS NULL
+          LIMIT 20
+        `;
+        if (existingClaims.length) {
+          return res.status(409).json({
+            error: `${existingClaims.length} order item(s) were already deducted in an earlier file. Inventory was not changed.`,
+            duplicate_order_items: existingClaims,
+          });
+        }
+      }
+
+      let applyRows = filledRows.flatMap((r) => {
+        const style = String(r.STYLE || '').trim();
+        const color = String(r.COLOR || '').trim();
+        const size = String(r.SIZE || '').trim();
+        const rawQty = r.QTY;
+        const qty = Number(rawQty);
+        if (rawQty === '' || rawQty == null || qty === 0) return [];
+        return [{ style, color, size, qty, allowCreate: r.allowCreate === true }];
+      });
+      const invalidRow = applyRows.find((row) =>
+        !row.style || !row.color || !row.size || !Number.isSafeInteger(row.qty) || row.qty < 0
+      );
+      if (invalidRow) return res.status(400).json({ error: 'Invalid style, color, size, or quantity in deduction preview' });
+      if (!applyRows.length) return res.status(400).json({ error: 'No inventory quantities to apply' });
+
+      const targetResolutions = await sql`
+        WITH targets AS (
+          SELECT
+            (target.ordinality - 1)::int AS target_index,
+            target.value->>'style' AS style,
+            target.value->>'color' AS color,
+            target.value->>'size' AS size
+          FROM jsonb_array_elements(${JSON.stringify(applyRows)}::jsonb)
+            WITH ORDINALITY AS target(value, ordinality)
+        )
+        SELECT
+          target.target_index,
+          COUNT(inventory.id)::int AS match_count,
+          MIN(inventory.style) AS matched_style,
+          MIN(inventory.color) AS matched_color,
+          MIN(inventory.size) AS matched_size
+        FROM targets target
+        LEFT JOIN inventory_balance inventory
+          ON LOWER(BTRIM(inventory.style)) = LOWER(BTRIM(target.style))
+         AND LOWER(BTRIM(inventory.color)) = LOWER(BTRIM(target.color))
+         AND LOWER(BTRIM(inventory.size)) = LOWER(BTRIM(target.size))
+        GROUP BY target.target_index
+        ORDER BY target.target_index
+      `;
+      const resolvedTargets = resolveInventoryTargets(applyRows, targetResolutions);
+      if (resolvedTargets.ambiguous.length) {
+        const target = resolvedTargets.ambiguous[0];
+        return res.status(409).json({
+          error: `More than one inventory target matches capitalization-insensitively: ${target.style} / ${target.color} / ${target.size}. Merge the duplicate inventory rows before applying.`,
+        });
+      }
+      if (resolvedTargets.missing.length) {
+        const target = resolvedTargets.missing[0];
+        return res.status(409).json({ error: `Inventory target no longer exists: ${target.style} / ${target.color} / ${target.size}. Run Auto-Fill again.` });
+      }
+      applyRows = resolvedTargets.rows;
+      const existingTargets = applyRows.filter((row) => !row.allowCreate);
+
+      const appliedUnits = applyRows.reduce((sum, row) => sum + row.qty, 0);
+      if (appliedUnits !== sourceUnits) {
+        return res.status(409).json({
+          error: `Source physical-unit total (${sourceUnits}) does not match the inventory update total (${appliedUnits}). Inventory was not changed.`,
+        });
+      }
+      await sql.transaction((txn) => [
+        ...(existingTargets.length ? [txn`
+          WITH targets AS (
+            SELECT * FROM jsonb_to_recordset(${JSON.stringify(existingTargets)}::jsonb)
+              AS target(style TEXT, color TEXT, size TEXT)
+          ),
+          locked AS MATERIALIZED (
+            SELECT inventory.id
+            FROM targets target
+            JOIN inventory_balance inventory
+              ON inventory.style = target.style
+             AND inventory.color = target.color
+             AND inventory.size = target.size
+            FOR UPDATE OF inventory
+          ),
+          target_counts AS (
+            SELECT
+              (SELECT COUNT(*) FROM targets) AS expected,
+              (SELECT COUNT(*) FROM locked) AS found
+          )
+          SELECT 1 / CASE WHEN expected = found THEN 1 ELSE 0 END AS targets_valid
+          FROM target_counts
+        `] : []),
+        txn`
+          WITH saved_snapshot AS (
+            INSERT INTO inventory_snapshots (label, source_name, data, total_rows, total_units)
+            SELECT
+              ${txnType},
+              ${sourceName},
+              COALESCE(jsonb_agg(jsonb_build_object(
+                'style', style, 'color', color, 'size', size, 'quantity', quantity,
+                'sort_order', sort_order
+              ) ORDER BY sort_order NULLS LAST, id), '[]'::jsonb),
+              COUNT(*)::int,
+              COALESCE(SUM(quantity), 0)::int
+            FROM inventory_balance
+            RETURNING id
+          )
+          INSERT INTO inventory_transactions (
+            transaction_type, source_file, source_hash, applied_units, row_count,
+            applied_by, rollback_snapshot_id
+          )
+          SELECT
+            ${txnType}, ${sourceName}, ${sourceHash}, ${appliedUnits},
+            ${applyRows.length}, ${payload.username}, saved_snapshot.id
+          FROM saved_snapshot
+        `,
+        ...(orderClaims.length ? [txn`
+          WITH incoming AS (
+            SELECT *
+            FROM jsonb_to_recordset(${JSON.stringify(orderClaimRecords)}::jsonb)
+              AS claim(order_key TEXT, item_key TEXT)
+          ),
+          applied_transaction AS (
+            SELECT id
+            FROM inventory_transactions
+            WHERE transaction_type = ${txnType}
+              AND source_hash = ${sourceHash}
+              AND rolled_back_at IS NULL
+          )
+          INSERT INTO inventory_order_claims (
+            transaction_id, order_key, item_key, source_hash
+          )
+          SELECT
+            applied_transaction.id, incoming.order_key, incoming.item_key, ${sourceHash}
+          FROM incoming
+          CROSS JOIN applied_transaction
+        `] : []),
+        ...applyRows.flatMap((row) => {
+          const delta = txnType === 'sales' ? -row.qty : row.qty;
+          const update = row.allowCreate
+            ? txn`
+                INSERT INTO inventory_balance (style, color, size, quantity)
+                VALUES (${row.style}, ${row.color}, ${row.size}, ${delta})
+                ON CONFLICT (style, color, size)
+                DO UPDATE SET quantity = inventory_balance.quantity + ${delta}, updated_at = NOW()
+              `
+            : txn`
+                UPDATE inventory_balance
+                SET quantity = quantity + ${delta}, updated_at = NOW()
+                WHERE style = ${row.style} AND color = ${row.color} AND size = ${row.size}
+              `;
+          return [
+            update,
+            txn`
+              INSERT INTO inventory_txn_rows (
+                transaction_id, txn_type, style, color, size, qty, source_file, applied_by
+              )
+              SELECT
+                transactions.id, ${txnType}, ${row.style}, ${row.color}, ${row.size},
+                ${row.qty}, ${sourceName}, ${payload.username}
+              FROM inventory_transactions transactions
+              WHERE transactions.transaction_type = ${txnType}
+                AND transactions.source_hash = ${sourceHash}
+                AND transactions.rolled_back_at IS NULL
+            `,
+          ];
+        }),
+        txn`
+          DELETE FROM inventory_snapshots
+          WHERE id NOT IN (
+            SELECT id FROM inventory_snapshots ORDER BY created_at DESC LIMIT ${MAX_SNAPSHOTS_INV}
+          )
+        `,
+      ]);
       return res.json({ ok: true, applied_units: appliedUnits });
+    }
+
+    // GET movements — 动销流水（per-SKU dated flow）
+    if (req.method === 'GET' && action === 'movements') {
+      const days = Math.min(Math.max(parseInt(req.query.days, 10) || 30, 1), 365);
+      const from = new Date(Date.now() - days * 86400000).toISOString();
+      const rows = await sql`
+        SELECT rows.txn_type, rows.style, rows.color, rows.size, rows.qty, rows.applied_at::date AS day
+        FROM inventory_txn_rows rows
+        WHERE rows.applied_at >= ${from}
+          AND NOT EXISTS (
+            SELECT 1
+            FROM inventory_transactions transactions
+            WHERE transactions.rolled_back_at IS NOT NULL
+              AND (
+                transactions.id = rows.transaction_id
+                OR (
+                  rows.transaction_id IS NULL
+                  AND transactions.transaction_type = rows.txn_type
+                  AND transactions.source_file IS NOT DISTINCT FROM rows.source_file
+                  AND transactions.applied_by IS NOT DISTINCT FROM rows.applied_by
+                  AND ABS(EXTRACT(EPOCH FROM (transactions.applied_at - rows.applied_at))) <= 30
+                )
+              )
+          )
+        ORDER BY rows.applied_at
+      `;
+      return res.json({ days, rows });
     }
 
     // GET transactions
     if (req.method === 'GET' && action === 'transactions') {
       const rows = await sql`
-        SELECT id, transaction_type, source_file, applied_units, applied_by, applied_at
+        SELECT id, transaction_type, source_file, applied_units, row_count, applied_by, applied_at, rolled_back_at
         FROM inventory_transactions
         ORDER BY applied_at DESC LIMIT 50
       `;
@@ -1270,8 +1981,33 @@ app.all('/api/inventory-balance', async (req, res) => {
     // GET history
     if (req.method === 'GET' && action === 'history') {
       const rows = await sql`
-        SELECT id, label, source_name, total_rows, total_units, created_at
-        FROM inventory_snapshots ORDER BY created_at DESC LIMIT ${MAX_SNAPSHOTS_INV}
+        SELECT
+          snapshots.id,
+          snapshots.label,
+          snapshots.source_name,
+          snapshots.total_rows,
+          snapshots.total_units,
+          snapshots.created_at,
+          CASE
+            WHEN snapshots.label IN ('sales', 'return', 'adjustment') THEN EXISTS (
+              SELECT 1
+              FROM inventory_transactions transactions
+              WHERE transactions.rolled_back_at IS NULL
+                AND (
+                  transactions.rollback_snapshot_id = snapshots.id
+                  OR (
+                    transactions.rollback_snapshot_id IS NULL
+                    AND transactions.transaction_type = snapshots.label
+                    AND transactions.source_file IS NOT DISTINCT FROM snapshots.source_name
+                    AND transactions.applied_at >= snapshots.created_at
+                  )
+                )
+            )
+            ELSE snapshots.label <> 'pre_restore'
+          END AS restorable
+        FROM inventory_snapshots snapshots
+        ORDER BY snapshots.created_at DESC
+        LIMIT ${MAX_SNAPSHOTS_INV}
       `;
       return res.json({
         snapshots: rows.map(r => ({
@@ -1280,7 +2016,9 @@ app.all('/api/inventory-balance', async (req, res) => {
           source_name: r.source_name,
           total_rows:  r.total_rows,
           total_units: r.total_units,
+          created_at:  r.created_at,
           timestamp:   new Date(r.created_at).toLocaleString(),
+          restorable:  Boolean(r.restorable),
         })),
       });
     }
@@ -1290,29 +2028,222 @@ app.all('/api/inventory-balance', async (req, res) => {
       if (!isAdmin) return res.status(403).json({ error: 'Admin access required' });
       const snapId = parseInt(req.query.id, 10);
       if (!snapId) return res.status(400).json({ error: 'id required' });
+      const quantityOnly = req.query.mode === 'quantities';
 
-      const [snap] = await sql`SELECT data FROM inventory_snapshots WHERE id = ${snapId}`;
+      const [snap] = await sql`
+        SELECT data, label, source_name, created_at
+        FROM inventory_snapshots
+        WHERE id = ${snapId}
+      `;
       if (!snap) return res.status(404).json({ error: 'Snapshot not found' });
-
-      await saveInventorySnapshot(sql, 'pre_restore');
-      await sql`DELETE FROM inventory_balance`;
-
-      for (const r of snap.data) {
-        await sql`
-          INSERT INTO inventory_balance (style, color, size, quantity)
-          VALUES (${r.style}, ${r.color}, ${r.size}, ${r.quantity})
-          ON CONFLICT (style, color, size)
-          DO UPDATE SET quantity = EXCLUDED.quantity, updated_at = NOW()
-        `;
+      if (snap.label === 'pre_restore') {
+        return res.status(409).json({
+          error: 'Rollback backup points are audit-only and cannot be restored safely. Choose the original deduction, return, or inventory version instead.',
+        });
       }
+      const isTransactionSnapshot = ['sales', 'return', 'adjustment'].includes(snap.label);
+      const [rollbackTransaction] = isTransactionSnapshot
+        ? await sql`
+            SELECT candidate.id, candidate.source_hash, candidate.applied_at
+            FROM inventory_transactions candidate
+            WHERE candidate.rolled_back_at IS NULL
+              AND (
+                candidate.rollback_snapshot_id = ${snapId}
+                OR (
+                  candidate.rollback_snapshot_id IS NULL
+                  AND candidate.transaction_type = ${snap.label}
+                  AND candidate.source_file IS NOT DISTINCT FROM ${snap.source_name}
+                  AND candidate.applied_at >= ${snap.created_at}
+                )
+              )
+            ORDER BY
+              CASE WHEN candidate.rollback_snapshot_id = ${snapId} THEN 0 ELSE 1 END,
+              candidate.applied_at,
+              candidate.id
+            LIMIT 1
+          `
+        : [];
+      if (isTransactionSnapshot && !rollbackTransaction) {
+        return res.status(409).json({
+          error: 'This inventory update was already rolled back, so this rollback point cannot be used again.',
+        });
+      }
+      const rollbackTransactions = rollbackTransaction
+        ? await sql`
+            SELECT id, source_hash
+            FROM inventory_transactions
+            WHERE rolled_back_at IS NULL
+              AND (
+                applied_at > ${rollbackTransaction.applied_at}
+                OR (
+                  applied_at = ${rollbackTransaction.applied_at}
+                  AND id >= ${rollbackTransaction.id}
+                )
+              )
+            ORDER BY applied_at, id
+          `
+        : [];
+      const rollbackTransactionIds = rollbackTransactions.map((transaction) => Number(transaction.id));
+      const returnTrackingKeys = [...new Set(rollbackTransactions
+        .map((transaction) => String(transaction.source_hash || ''))
+        .filter((sourceHash) => sourceHash.startsWith('return-package:'))
+        .map((sourceHash) => sourceHash.slice('return-package:'.length))
+        .filter(Boolean))];
 
-      const [stat] = await sql`SELECT COALESCE(SUM(quantity),0)::int AS u FROM inventory_balance`;
-      return res.json({ ok: true, total_units: stat.u });
+      const restoreRows = (Array.isArray(snap.data) ? snap.data : []).map((row, index) => ({
+        style: String(row.style || '').trim(),
+        color: String(row.color || '').trim(),
+        size: String(row.size || '').trim(),
+        quantity: Number(row.quantity),
+        sort_order: Number.isSafeInteger(Number(row.sort_order)) ? Number(row.sort_order) : index,
+      }));
+      const invalidRow = restoreRows.find((row) =>
+        !row.style || !row.color || !row.size || !Number.isSafeInteger(row.quantity)
+      );
+      if (invalidRow) return res.status(409).json({ error: 'This rollback point contains invalid inventory data and cannot be restored safely.' });
+
+      const totalUnits = restoreRows.reduce((sum, row) => sum + row.quantity, 0);
+      const transactionResults = await sql.transaction((txn) => [
+        txn`
+          INSERT INTO inventory_snapshots (label, source_name, data, total_rows, total_units)
+          SELECT
+            'pre_restore',
+            ${`${quantityOnly ? 'Quantity rollback' : 'Rollback'} point ${snapId}`},
+            COALESCE(jsonb_agg(jsonb_build_object(
+              'style', style, 'color', color, 'size', size, 'quantity', quantity,
+              'sort_order', sort_order
+            ) ORDER BY sort_order NULLS LAST, id), '[]'::jsonb),
+            COUNT(*)::int,
+            COALESCE(SUM(quantity), 0)::int
+          FROM inventory_balance
+        `,
+        ...(rollbackTransactionIds.length
+          ? [
+              txn`
+                UPDATE inventory_transactions
+                SET rolled_back_at = NOW()
+                WHERE id = ANY(${rollbackTransactionIds}::int[])
+                  AND rolled_back_at IS NULL
+              `,
+              txn`
+                UPDATE inventory_order_claims
+                SET rolled_back_at = NOW()
+                WHERE transaction_id = ANY(${rollbackTransactionIds}::int[])
+                  AND rolled_back_at IS NULL
+              `,
+            ]
+          : []),
+        ...(returnTrackingKeys.length
+          ? [
+              txn`
+                UPDATE return_package_items items
+                SET actual_qty = NULL,
+                    restock_qty = NULL,
+                    not_ours_qty = NULL
+                FROM return_packages packages
+                WHERE items.package_id = packages.id
+                  AND packages.tracking_key = ANY(${returnTrackingKeys}::text[])
+              `,
+              txn`
+                UPDATE return_packages
+                SET status = 'pending',
+                    actual_units = 0,
+                    restock_units = 0,
+                    flagged_not_ours = false,
+                    remark = NULL,
+                    confirmed_by = NULL,
+                    confirmed_at = NULL
+                WHERE tracking_key = ANY(${returnTrackingKeys}::text[])
+              `,
+            ]
+          : []),
+        ...(quantityOnly
+          ? [txn`
+              INSERT INTO inventory_balance (style, color, size, quantity, sort_order)
+              SELECT restored.style, restored.color, restored.size, restored.quantity, restored.sort_order
+              FROM jsonb_to_recordset(${JSON.stringify(restoreRows)}::jsonb)
+                AS restored(style TEXT, color TEXT, size TEXT, quantity INTEGER, sort_order INTEGER)
+              ON CONFLICT (style, color, size)
+              DO UPDATE SET quantity = EXCLUDED.quantity, updated_at = NOW()
+            `]
+          : [
+              txn`DELETE FROM inventory_balance`,
+              txn`
+                INSERT INTO inventory_balance (style, color, size, quantity, sort_order)
+                SELECT restored.style, restored.color, restored.size, restored.quantity, restored.sort_order
+                FROM jsonb_to_recordset(${JSON.stringify(restoreRows)}::jsonb)
+                  AS restored(style TEXT, color TEXT, size TEXT, quantity INTEGER, sort_order INTEGER)
+              `,
+            ]),
+        ...(quantityOnly && rollbackTransactionIds.length
+          ? [txn`
+              WITH restored_keys AS (
+                SELECT restored.style, restored.color, restored.size
+                FROM jsonb_to_recordset(${JSON.stringify(restoreRows)}::jsonb)
+                  AS restored(style TEXT, color TEXT, size TEXT, quantity INTEGER, sort_order INTEGER)
+              ),
+              rolled_delta AS (
+                SELECT
+                  rows.style,
+                  rows.color,
+                  rows.size,
+                  SUM(
+                    CASE
+                      WHEN rows.txn_type = 'sales' THEN -rows.qty
+                      WHEN rows.txn_type = 'return' THEN rows.qty
+                      ELSE rows.qty
+                    END
+                  )::int AS quantity_delta
+                FROM inventory_txn_rows rows
+                WHERE rows.transaction_id = ANY(${rollbackTransactionIds}::int[])
+                GROUP BY rows.style, rows.color, rows.size
+              )
+              UPDATE inventory_balance inventory
+              SET quantity = GREATEST(0, inventory.quantity - rolled_delta.quantity_delta),
+                  updated_at = NOW()
+              FROM rolled_delta
+              WHERE inventory.style = rolled_delta.style
+                AND inventory.color = rolled_delta.color
+                AND inventory.size = rolled_delta.size
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM restored_keys
+                  WHERE restored_keys.style = inventory.style
+                    AND restored_keys.color = inventory.color
+                    AND restored_keys.size = inventory.size
+                )
+            `]
+          : []),
+        txn`
+          DELETE FROM inventory_snapshots
+          WHERE id NOT IN (
+            SELECT id FROM inventory_snapshots ORDER BY created_at DESC LIMIT ${MAX_SNAPSHOTS_INV}
+          )
+        `,
+        txn`
+          SELECT COUNT(*)::int AS total_rows, COALESCE(SUM(quantity), 0)::int AS total_units
+          FROM inventory_balance
+        `,
+      ], { isolationLevel: 'Serializable' });
+
+      const [restoredStats] = transactionResults[transactionResults.length - 1];
+      return res.json({
+        ok: true,
+        total_units: restoredStats?.total_units ?? totalUnits,
+        total_rows: restoredStats?.total_rows ?? restoreRows.length,
+        rolled_back_transactions: rollbackTransactionIds.length,
+      });
     }
 
     return res.status(400).json({ error: `Unknown action: ${action}` });
   } catch (err) {
     console.error('[/api/inventory-balance]', err.message);
+    if (/inventory_order_claims_active_item_uq/.test(err.message)) {
+      return res.status(409).json({ error: 'One or more order items were already deducted. Inventory was not changed.' });
+    }
+    if (/inventory_transactions_active_source_hash_uq/.test(err.message)) {
+      return res.status(409).json({ error: 'This exact file has already been applied. Inventory was not changed.' });
+    }
     return res.status(500).json({ error: err.message });
   }
 });

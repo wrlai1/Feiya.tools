@@ -1,0 +1,8 @@
+outputs/
+.claude/
+.codex-tmp/
+.git/
+.env
+node_modules/
+dist/
+__pycache__/
