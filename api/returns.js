@@ -2931,6 +2931,10 @@ export default async function handler(req, res) {
             ranked.*,
             COALESCE(
               NULLIF(BTRIM(ranked.sku_id), ''),
+              CASE
+                WHEN LOWER(BTRIM(ranked.item_key)) LIKE 'sku:%'
+                  THEN NULLIF(BTRIM(SUBSTRING(ranked.item_key FROM 5)), '')
+              END,
               CASE WHEN ranked.has_combined_order THEN ranked.unique_sku_id END
             ) AS resolved_sku_id,
             CASE
