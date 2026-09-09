@@ -115,6 +115,18 @@ function sameSize(left, right) {
   return normalize(left) === normalize(right)
 }
 
+function formatSkuComponents(components) {
+  if (!Array.isArray(components) || components.length === 0) return ['Component mapping unavailable']
+  return components.map((component) => {
+    const quantity = Number(component?.qty || 0)
+    const label = [component?.style, component?.color, component?.size]
+      .map((value) => String(value || '').trim())
+      .filter(Boolean)
+      .join(' / ')
+    return `${label || 'Unmapped component'}${quantity > 1 ? ` ×${quantity}` : ''}`
+  })
+}
+
 function CountControl({ value, onChange, disabled, max = 9999, label = 'Actual quantity' }) {
   const [error, setError] = useState('')
 
@@ -2825,6 +2837,90 @@ export default function ReturnsReceiving() {
                           <td className="px-4 py-3 text-right">{store.sold_product_units}</td>
                           <td className="px-4 py-3 text-right">{store.returned_product_units}</td>
                           <td className="px-4 py-3 text-right">{store.product_return_rate == null ? '—' : `${Number(store.product_return_rate).toFixed(2)}%`}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              <div className="card overflow-hidden">
+                <div className="border-b border-slate-200 px-4 py-3 sm:px-5">
+                  <h3 className="text-sm font-semibold text-slate-800">SKU product return rate</h3>
+                  <p className="mt-1 text-xs text-slate-400">
+                    Complete returned sets ÷ products sold. Every color in a multi-color SKU is shown below.
+                  </p>
+                </div>
+                <div className="space-y-3 p-3 sm:hidden">
+                  {(analytics.skuRows || []).map((row, index) => (
+                    <div
+                      key={`${row.store_key}-${row.sku_id}-mobile-${index}`}
+                      className="rounded-xl border border-slate-200 p-3"
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="font-semibold text-slate-800">{row.sku_code || row.sku_id}</p>
+                          <p className="mt-0.5 break-all text-xs text-slate-400">{row.store_name} · {row.sku_id}</p>
+                        </div>
+                        <p className="shrink-0 font-bold text-slate-800">
+                          {row.return_rate == null ? '—' : `${Number(row.return_rate).toFixed(2)}%`}
+                        </p>
+                      </div>
+                      <div className="mt-3 flex flex-wrap gap-1.5">
+                        {formatSkuComponents(row.components).map((component, componentIndex) => (
+                          <span
+                            key={`${component}-${componentIndex}`}
+                            className="rounded-full bg-slate-100 px-2 py-1 text-[11px] text-slate-600"
+                          >
+                            {component}
+                          </span>
+                        ))}
+                      </div>
+                      <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
+                        <div><p className="text-slate-400">Products sold</p><p className="font-semibold">{row.sold_product_units}</p></div>
+                        <div><p className="text-slate-400">Complete returns</p><p className="font-semibold text-blue-700">{row.returned_product_units}</p></div>
+                      </div>
+                      {!row.return_coverage_complete && (
+                        <p className="mt-2 text-xs font-medium text-amber-700">Older return quantity is incomplete; rate is hidden.</p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+                <div className="hidden overflow-x-auto sm:block">
+                  <table className="w-full min-w-[1000px] text-sm">
+                    <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
+                      <tr>
+                        <th className="px-4 py-3">Store</th>
+                        <th className="px-4 py-3">SKU</th>
+                        <th className="px-4 py-3">SKU ID</th>
+                        <th className="px-4 py-3">Components</th>
+                        <th className="px-4 py-3 text-right">Products Sold</th>
+                        <th className="px-4 py-3 text-right">Complete Returns</th>
+                        <th className="px-4 py-3 text-right">Return Rate</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {(analytics.skuRows || []).map((row, index) => (
+                        <tr key={`${row.store_key}-${row.sku_id}-${index}`}>
+                          <td className="px-4 py-3 font-medium text-slate-800">{row.store_name}</td>
+                          <td className="px-4 py-3 text-slate-700">{row.sku_code || '—'}</td>
+                          <td className="max-w-[220px] break-all px-4 py-3 text-xs text-slate-500">{row.sku_id}</td>
+                          <td className="px-4 py-3">
+                            <div className="flex max-w-md flex-wrap gap-1.5">
+                              {formatSkuComponents(row.components).map((component, componentIndex) => (
+                                <span
+                                  key={`${component}-${componentIndex}`}
+                                  className="rounded-full bg-slate-100 px-2 py-1 text-[11px] text-slate-600"
+                                >
+                                  {component}
+                                </span>
+                              ))}
+                            </div>
+                          </td>
+                          <td className="px-4 py-3 text-right tabular-nums">{row.sold_product_units}</td>
+                          <td className="px-4 py-3 text-right tabular-nums font-semibold text-blue-700">{row.returned_product_units}</td>
+                          <td className="px-4 py-3 text-right tabular-nums font-semibold">
+                            {row.return_rate == null ? '—' : `${Number(row.return_rate).toFixed(2)}%`}
+                          </td>
                         </tr>
                       ))}
                     </tbody>
