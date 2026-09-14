@@ -15,8 +15,11 @@ test('rejects invalid email and send hour', () => {
 })
 
 test('builds totals and escapes inventory content', () => {
-  const report = buildInventoryEmail({ reportDate: '2026-09-07', inventory: [{ style: '<50199>', color: 'White', size: 'M', quantity: 12 }], movements: [{ style: '<50199>', color: 'White', size: 'M', sales: 3, returns: 1 }] })
-  assert.deepEqual(report.totals, { quantity: 12, sales: 3, returns: 1, net: -2 })
+  const report = buildInventoryEmail({ reportDate: '2026-09-07', inventory: [{ style: '<50199>', color: 'White', size: 'M', quantity: 12 }], movements: [{ style: '<50199>', color: 'White', size: 'M', sales: 3, returns: 1, sales30: 90 }] })
+  assert.deepEqual(report.totals, { quantity: 12, sales: 3, returns: 1, net: -2, sales30: 90, targetStock: 63, replenishment: 51 })
+  assert.equal(report.rows[0].dailyAverage, 3)
+  assert.equal(report.rows[0].targetStock, 63)
+  assert.equal(report.rows[0].replenishment, 51)
   assert.match(report.html, /&lt;50199&gt;/)
   assert.doesNotMatch(report.html, /<50199>/)
 })
@@ -36,11 +39,16 @@ test('builds one formatted worksheet per style with stock alerts', async () => {
   const report = buildInventoryEmail({
     reportDate: '2026-09-07',
     inventory: [
+      { style: '50199', color: 'White', size: 'S', quantity: 120 },
       { style: '50199', color: 'White', size: 'M', quantity: 12 },
-      { style: '50199', color: 'Wine', size: 'M', quantity: 35 },
-      { style: '50200', color: 'Black', size: 'L', quantity: 80 },
+      { style: '50199', color: 'Wine', size: 'M', quantity: 75 },
+      { style: '50200', color: 'Black', size: 'L', quantity: 100 },
     ],
-    movements: [{ style: '50199', color: 'White', size: 'M', sales: 3, returns: 1 }],
+    movements: [
+      { style: '50199', color: 'White', size: 'S', sales: 2, returns: 0, sales30: 60 },
+      { style: '50199', color: 'White', size: 'M', sales: 3, returns: 1, sales30: 90 },
+      { style: '50199', color: 'Wine', size: 'M', sales: 1, returns: 0, sales30: 30 },
+    ],
   })
   const bytes = await buildInventoryWorkbook({ ...report, reportDate: '2026-09-07', movementDay: '2026-09-06' })
   const workbook = new ExcelJS.Workbook()
@@ -48,9 +56,16 @@ test('builds one formatted worksheet per style with stock alerts', async () => {
 
   assert.deepEqual(workbook.worksheets.map((sheet) => sheet.name), ['50199', '50200'])
   const sheet = workbook.getWorksheet('50199')
-  assert.deepEqual(sheet.getRow(5).values.slice(1), ['White', 'M', 12, 3, 1, -2])
-  assert.equal(sheet.getCell('C5').fill.fgColor.argb, 'FFF4CCCC')
-  assert.equal(sheet.getCell('C6').fill.fgColor.argb, 'FFFFF2CC')
-  assert.equal(workbook.getWorksheet('50200').getCell('C5').fill.type, 'pattern')
-  assert.notEqual(workbook.getWorksheet('50200').getCell('C5').fill.fgColor?.argb, 'FFF4CCCC')
+  assert.deepEqual(['A4', 'B4', 'D4', 'F4', 'H4', 'J4', 'L4', 'N4'].map((cell) => sheet.getCell(cell).value), ['Color', 'Current Inventory', 'Yesterday Sales', 'Yesterday Returns', '30-Day Avg / Day', '21-Day Target', 'Replenishment', 'Total Replenishment'])
+  assert.deepEqual(sheet.getRow(5).values.slice(2, 6), ['S', 'M', 'S', 'M'])
+  assert.deepEqual(sheet.getRow(6).values.slice(1, 6), ['White', 120, 12, 2, 3])
+  assert.deepEqual(sheet.getCell('K6').value, { formula: 'ROUNDUP(I6*21,0)', result: 63 })
+  assert.deepEqual(sheet.getCell('M6').value, { formula: 'MAX(0,K6-C6)', result: 51 })
+  assert.equal(sheet.getCell('C6').fill.fgColor.argb, 'FFF4CCCC')
+  assert.equal(sheet.getCell('C7').fill.fgColor.argb, 'FFFFF2CC')
+  assert.equal(sheet.getCell('B7').value, null)
+  assert.equal(sheet.getCell('B7').fill.type, 'pattern')
+  assert.equal(sheet.getCell('B7').fill.pattern, 'none')
+  assert.notEqual(workbook.getWorksheet('50200').getCell('B6').fill.fgColor?.argb, 'FFF4CCCC')
+  assert.notEqual(workbook.getWorksheet('50200').getCell('B6').fill.fgColor?.argb, 'FFFFF2CC')
 })
