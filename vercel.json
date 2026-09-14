@@ -1,6 +1,32 @@
 {
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
+  "crons": [
+    { "path": "/api/inventory-balance?action=email-cron&slot=00", "schedule": "5 0 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=01", "schedule": "5 1 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=02", "schedule": "5 2 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=03", "schedule": "5 3 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=04", "schedule": "5 4 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=05", "schedule": "5 5 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=06", "schedule": "5 6 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=07", "schedule": "5 7 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=08", "schedule": "5 8 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=09", "schedule": "5 9 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=10", "schedule": "5 10 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=11", "schedule": "5 11 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=12", "schedule": "5 12 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=13", "schedule": "5 13 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=14", "schedule": "5 14 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=15", "schedule": "5 15 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=16", "schedule": "5 16 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=17", "schedule": "5 17 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=18", "schedule": "5 18 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=19", "schedule": "5 19 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=20", "schedule": "5 20 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=21", "schedule": "5 21 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=22", "schedule": "5 22 * * *" },
+    { "path": "/api/inventory-balance?action=email-cron&slot=23", "schedule": "5 23 * * *" }
+  ],
   "rewrites": [
     { "source": "/((?!api/).*)", "destination": "/index.html" }
   ]

@@ -7,7 +7,9 @@
 //   DELETE ?id=<id>       — delete one of this user's metrics by id
 
 import { neon } from '@neondatabase/serverless'
-import jwt from 'jsonwebtoken'
+import authentication from '../lib/authentication.cjs'
+
+const { authenticateUser } = authentication
 
 function getDB() {
   const url = process.env.DATABASE_URL
@@ -19,11 +21,6 @@ function getSecret() {
   if (!s) throw new Error('JWT_SECRET not set')
   return s
 }
-function verifyToken(header, secret) {
-  if (!header?.startsWith('Bearer ')) return null
-  try { return jwt.verify(header.slice(7), secret) } catch { return null }
-}
-
 async function ensureTable(sql) {
   await sql`
     CREATE TABLE IF NOT EXISTS custom_metrics (
@@ -50,8 +47,9 @@ export default async function handler(req, res) {
   try {
     const sql     = getDB()
     const secret  = getSecret()
-    const payload = verifyToken(req.headers.authorization, secret)
+    const payload = await authenticateUser(sql, req.headers.authorization, secret)
     if (!payload) return res.status(401).json({ error: 'Not authenticated' })
+    if (payload.role !== 'admin') return res.status(403).json({ error: 'Admin access required' })
     const username = payload.username
 
     await ensureTable(sql)
