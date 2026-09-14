@@ -43,6 +43,10 @@ test('builds one formatted worksheet per style with stock alerts', async () => {
       { style: '50199', color: 'White', size: 'M', quantity: 12 },
       { style: '50199', color: 'Wine', size: 'M', quantity: 75 },
       { style: '50200', color: 'Black', size: 'L', quantity: 100 },
+      { style: '50200', color: 'Black', size: '6', quantity: 100 },
+      { style: '50200', color: 'Black', size: 'PM', quantity: 100 },
+      { style: '50200', color: 'Black', size: '2X', quantity: 100 },
+      { style: '50200', color: 'Black', size: '14W', quantity: 100 },
     ],
     movements: [
       { style: '50199', color: 'White', size: 'S', sales: 2, returns: 0, sales30: 60 },
@@ -58,6 +62,8 @@ test('builds one formatted worksheet per style with stock alerts', async () => {
   const sheet = workbook.getWorksheet('50199')
   assert.deepEqual(['A4', 'B4', 'D4', 'F4', 'H4', 'J4', 'L4', 'N4'].map((cell) => sheet.getCell(cell).value), ['Color', 'Current Inventory', 'Yesterday Sales', 'Yesterday Returns', '30-Day Avg / Day', '21-Day Target', 'Replenishment', 'Total Replenishment'])
   assert.deepEqual(sheet.getRow(5).values.slice(2, 6), ['S', 'M', 'S', 'M'])
+  assert.equal(sheet.getCell('B5').fill.fgColor.argb, 'FF16A34A')
+  assert.equal(sheet.getCell('C5').fill.fgColor.argb, 'FF16A34A')
   assert.deepEqual(sheet.getRow(6).values.slice(1, 6), ['White', 120, 12, 2, 3])
   assert.deepEqual(sheet.getCell('K6').value, { formula: 'ROUNDUP(I6*21,0)', result: 63 })
   assert.deepEqual(sheet.getCell('M6').value, { formula: 'MAX(0,K6-C6)', result: 51 })
@@ -66,6 +72,15 @@ test('builds one formatted worksheet per style with stock alerts', async () => {
   assert.equal(sheet.getCell('B7').value, null)
   assert.equal(sheet.getCell('B7').fill.type, 'pattern')
   assert.equal(sheet.getCell('B7').fill.pattern, 'none')
-  assert.notEqual(workbook.getWorksheet('50200').getCell('B6').fill.fgColor?.argb, 'FFF4CCCC')
-  assert.notEqual(workbook.getWorksheet('50200').getCell('B6').fill.fgColor?.argb, 'FFFFF2CC')
+  const otherSizes = workbook.getWorksheet('50200')
+  assert.notEqual(otherSizes.getCell('B6').fill.fgColor?.argb, 'FFF4CCCC')
+  assert.notEqual(otherSizes.getCell('B6').fill.fgColor?.argb, 'FFFFF2CC')
+  const sizeFills = {}
+  const expectedSizes = new Set(['L', 'PM', '2X', '6', '14W'])
+  otherSizes.getRow(5).eachCell((cell) => {
+    if (expectedSizes.has(String(cell.value))) sizeFills[cell.value] = cell.fill.fgColor?.argb
+  })
+  assert.deepEqual(sizeFills, {
+    L: 'FF16A34A', PM: 'FF0F766E', '2X': 'FF7C3AED', 6: 'FF2563EB', '14W': 'FFBE185D',
+  })
 })
