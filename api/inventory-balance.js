@@ -8,6 +8,7 @@
 //   GET  ?action=list          — all rows + stats
 //   POST ?action=init          — replace all rows (admin)
 //   PATCH ?action=edit&id=N    — update one row's quantity (admin)
+//   PATCH ?action=bulk-edit    — update multiple quantities atomically (admin)
 //   POST ?action=add-rows      — append new rows, skip existing (admin)
 //   DELETE ?action=remove-rows — delete rows by id (admin)
 //   POST ?action=reset         — set all quantities to 0 (admin)
@@ -56,6 +57,22 @@ export function normalizeInventoryRowIds(rawIds) {
     throw new Error('ids must contain positive whole-number inventory row IDs')
   }
   return [...new Set(ids)]
+}
+
+export function normalizeInventoryBulkUpdates(rawUpdates) {
+  if (!Array.isArray(rawUpdates) || rawUpdates.length === 0) throw new Error('updates required')
+  if (rawUpdates.length > 2000) throw new Error('A maximum of 2,000 inventory rows can be updated at once')
+  const updates = rawUpdates.map((update) => ({
+    id: Number(update?.id),
+    quantity: normalizeInventoryQuantity(update?.quantity),
+  }))
+  if (updates.some(({ id }) => !Number.isSafeInteger(id) || id <= 0)) {
+    throw new Error('Every update requires a positive whole-number inventory row ID')
+  }
+  if (new Set(updates.map(({ id }) => id)).size !== updates.length) {
+    throw new Error('Each inventory row can only be updated once')
+  }
+  return updates
 }
 
 export function trimInventorySnapshots(sql) {
@@ -507,6 +524,99 @@ export default async function handler(req, res) {
       `
       if (!result) return res.status(409).json({ error: 'Inventory row changed before the adjustment could be saved. Refresh and try again.' })
       return res.json({ ok: true, old_quantity: result.old_quantity, new_quantity: result.new_quantity })
+    }
+
+    // ── PATCH bulk-edit — atomically update selected quantities ─────────────
+    if (req.method === 'PATCH' && action === 'bulk-edit') {
+      if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
+      let updates
+      try {
+        updates = normalizeInventoryBulkUpdates(req.body?.updates)
+      } catch (error) {
+        return res.status(400).json({ error: error.message })
+      }
+      const reason = String(req.body?.reason || '').trim().slice(0, 300)
+      const sourceName = `Bulk inventory adjustment: ${updates.length} SKUs${reason ? ` — ${reason}` : ''}`
+      const updateJson = JSON.stringify(updates)
+
+      const results = await sql.transaction((txn) => [
+        txn`SELECT pg_advisory_xact_lock(hashtext('inventory-balance-write'))`,
+        txn`
+          WITH requested AS (
+            SELECT * FROM jsonb_to_recordset(${updateJson}::jsonb)
+              AS incoming(id INTEGER, quantity INTEGER)
+          ),
+          matched AS MATERIALIZED (
+            SELECT inventory.id, inventory.style, inventory.color, inventory.size,
+                   inventory.quantity AS old_quantity, requested.quantity AS new_quantity
+            FROM inventory_balance inventory
+            JOIN requested ON requested.id = inventory.id
+            FOR UPDATE OF inventory
+          ),
+          changes AS MATERIALIZED (
+            SELECT * FROM matched WHERE old_quantity IS DISTINCT FROM new_quantity
+          ),
+          validation AS (
+            SELECT
+              (SELECT COUNT(*) FROM requested)::int AS requested_count,
+              (SELECT COUNT(*) FROM matched)::int AS matched_count
+          ),
+          saved_snapshot AS (
+            INSERT INTO inventory_snapshots (label, source_name, data, total_rows, total_units)
+            SELECT
+              'adjustment', ${sourceName},
+              COALESCE(jsonb_agg(jsonb_build_object(
+                'style', inventory.style, 'color', inventory.color, 'size', inventory.size,
+                'quantity', inventory.quantity, 'sort_order', inventory.sort_order
+              ) ORDER BY inventory.sort_order NULLS LAST, inventory.id), '[]'::jsonb),
+              COUNT(*)::int, COALESCE(SUM(inventory.quantity), 0)::int
+            FROM inventory_balance inventory
+            CROSS JOIN validation
+            WHERE validation.requested_count = validation.matched_count
+              AND EXISTS (SELECT 1 FROM changes)
+            GROUP BY validation.requested_count, validation.matched_count
+            RETURNING id
+          ),
+          logged_transaction AS (
+            INSERT INTO inventory_transactions (
+              transaction_type, source_file, applied_units, row_count,
+              applied_by, rollback_snapshot_id
+            )
+            SELECT 'adjustment', ${sourceName},
+                   COALESCE(SUM(ABS(changes.new_quantity - changes.old_quantity)), 0)::int,
+                   COUNT(*)::int, ${payload.username}, saved_snapshot.id
+            FROM changes CROSS JOIN saved_snapshot
+            GROUP BY saved_snapshot.id
+            RETURNING id
+          ),
+          updated AS (
+            UPDATE inventory_balance inventory
+            SET quantity = changes.new_quantity, updated_at = NOW()
+            FROM changes, logged_transaction
+            WHERE inventory.id = changes.id
+            RETURNING inventory.id, inventory.quantity
+          ),
+          logged_movements AS (
+            INSERT INTO inventory_txn_rows (
+              transaction_id, txn_type, style, color, size, qty, source_file, applied_by
+            )
+            SELECT logged_transaction.id, 'adjustment', changes.style, changes.color, changes.size,
+                   changes.new_quantity - changes.old_quantity, ${sourceName}, ${payload.username}
+            FROM changes CROSS JOIN logged_transaction
+          )
+          SELECT validation.requested_count, validation.matched_count,
+                 (SELECT COUNT(*)::int FROM updated) AS updated,
+                 COALESCE((SELECT jsonb_agg(jsonb_build_object('id', id, 'quantity', quantity)) FROM updated), '[]'::jsonb) AS rows
+          FROM validation
+        `,
+        trimInventorySnapshots(txn),
+      ], { isolationLevel: 'Serializable' })
+
+      const result = results[1]?.[0]
+      if (!result || Number(result.matched_count) !== Number(result.requested_count)) {
+        return res.status(409).json({ error: 'One or more inventory rows no longer exist. Refresh and try again.' })
+      }
+      return res.json({ ok: true, updated: Number(result.updated || 0), rows: result.rows || [] })
     }
 
     // ── POST add-rows — append new rows, skip existing ────────────────────────

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 
 import {
+  normalizeInventoryBulkUpdates,
   normalizeInventoryRowIds,
   queryInventorySnapshotHistory,
   trimInventorySnapshots,
@@ -20,6 +21,23 @@ test('inventory row deletion IDs are validated and deduplicated before mutation'
   assert.throws(() => normalizeInventoryRowIds([1.5]), /positive whole-number/)
 })
 
+test('bulk inventory updates require unique valid IDs and quantities', () => {
+  assert.deepEqual(normalizeInventoryBulkUpdates([
+    { id: '12', quantity: '0' },
+    { id: 7, quantity: 25 },
+  ]), [
+    { id: 12, quantity: 0 },
+    { id: 7, quantity: 25 },
+  ])
+  assert.throws(() => normalizeInventoryBulkUpdates([]), /updates required/)
+  assert.throws(() => normalizeInventoryBulkUpdates([{ id: 0, quantity: 1 }]), /positive whole-number/)
+  assert.throws(() => normalizeInventoryBulkUpdates([{ id: 1, quantity: -1 }]), /whole number of 0 or more/)
+  assert.throws(() => normalizeInventoryBulkUpdates([
+    { id: 1, quantity: 2 },
+    { id: 1, quantity: 3 },
+  ]), /only be updated once/)
+})
+
 test('snapshot retention protects every active transaction rollback point', () => {
   const query = trimInventorySnapshots(captureSql)
 
@@ -30,7 +48,7 @@ test('snapshot retention protects every active transaction rollback point', () =
 
   const apiSource = readFileSync(new URL('../api/inventory-balance.js', import.meta.url), 'utf8')
   assert.equal((apiSource.match(/DELETE FROM inventory_snapshots/g) || []).length, 1)
-  assert.equal((apiSource.match(/trimInventorySnapshots\(txn\)/g) || []).length, 5)
+  assert.equal((apiSource.match(/trimInventorySnapshots\(txn\)/g) || []).length, 6)
 })
 
 test('snapshot history caps only ordinary snapshots and always includes active rollback points', () => {

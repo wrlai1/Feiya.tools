@@ -172,6 +172,174 @@ function EditQtyModal({ row, onClose, onDone, getToken }) {
   )
 }
 
+// ── Bulk Edit Quantity Modal ───────────────────────────────────────
+function BulkEditQtyModal({ rows, onClose, onDone, getToken }) {
+  const [quantities, setQuantities] = useState(() =>
+    Object.fromEntries(rows.map((row) => [row.id, String(row.Quantity ?? 0)]))
+  )
+  const [setAllValue, setSetAllValue] = useState('')
+  const [reason, setReason] = useState('')
+  const [loading, setLoading] = useState(false)
+  const toast = useToast()
+
+  const changedRows = rows.filter((row) => String(row.Quantity ?? 0) !== quantities[row.id])
+
+  const applyToAll = () => {
+    const value = Number(setAllValue)
+    if (setAllValue.trim() === '' || !Number.isSafeInteger(value) || value < 0) {
+      toast.error('Quantity must be a whole number of 0 or more')
+      return
+    }
+    setQuantities(Object.fromEntries(rows.map((row) => [row.id, String(value)])))
+  }
+
+  const handlePaste = (event, startIndex) => {
+    const values = event.clipboardData.getData('text')
+      .split(/[\t\r\n]+/)
+      .map((value) => value.trim())
+      .filter(Boolean)
+    if (values.length <= 1) return
+    if (values.some((value) => !Number.isSafeInteger(Number(value)) || Number(value) < 0)) {
+      event.preventDefault()
+      toast.error('The pasted quantity column contains an invalid value')
+      return
+    }
+    event.preventDefault()
+    setQuantities((current) => {
+      const next = { ...current }
+      values.forEach((value, offset) => {
+        const row = rows[startIndex + offset]
+        if (row) next[row.id] = value
+      })
+      return next
+    })
+  }
+
+  const handleSave = async () => {
+    const updates = changedRows.map((row) => ({ id: row.id, quantity: Number(quantities[row.id]) }))
+    if (changedRows.some((row) => quantities[row.id].trim() === '') ||
+        updates.some(({ quantity }) => !Number.isSafeInteger(quantity) || quantity < 0)) {
+      toast.error('Every quantity must be a whole number of 0 or more')
+      return
+    }
+    if (!updates.length) return
+    setLoading(true)
+    try {
+      const data = await apiFetch(`${BASE}/inventory-balance?action=bulk-edit`, {
+        method: 'PATCH',
+        headers: authHeaders(getToken(), true),
+        body: JSON.stringify({ updates, reason }),
+      })
+      toast.success(`Updated ${data.updated} SKUs`, 'Bulk Update Saved')
+      onDone(data.rows || updates)
+      onClose()
+    } catch (err) {
+      toast.error(err.message, 'Bulk Update Failed')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-2xl shadow-xl w-full max-w-3xl p-6 space-y-4 max-h-[90vh] flex flex-col">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h3 className="font-semibold text-slate-800">Bulk Edit Inventory</h3>
+            <p className="text-xs text-slate-400 mt-1">
+              Edit like a spreadsheet. Copy one quantity column from Excel and paste it into the first quantity cell.
+            </p>
+          </div>
+          <button onClick={onClose} className="p-1.5 text-slate-400 hover:text-slate-600 rounded-lg">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        <div className="flex flex-col sm:flex-row gap-2 rounded-xl bg-blue-50 border border-blue-100 p-3">
+          <input
+            type="number"
+            min="0"
+            step="1"
+            value={setAllValue}
+            onChange={(event) => setSetAllValue(event.target.value)}
+            onKeyDown={(event) => event.key === 'Enter' && applyToAll()}
+            placeholder="Set one quantity for all selected"
+            className="input-base flex-1 bg-white"
+          />
+          <button onClick={applyToAll} className="btn-secondary justify-center whitespace-nowrap">Apply to all</button>
+        </div>
+
+        <div className="overflow-auto rounded-xl border border-slate-200 flex-1 min-h-0">
+          <table className="w-full text-sm">
+            <thead className="sticky top-0 bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
+              <tr>
+                <th className="px-3 py-2.5 text-left">Style</th>
+                <th className="px-3 py-2.5 text-left">Color</th>
+                <th className="px-3 py-2.5 text-left">Size</th>
+                <th className="px-3 py-2.5 text-right">Current</th>
+                <th className="px-3 py-2.5 text-left w-36">New Quantity</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {rows.map((row, index) => {
+                const changed = String(row.Quantity ?? 0) !== quantities[row.id]
+                return (
+                  <tr key={row.id} className={changed ? 'bg-blue-50/60' : ''}>
+                    <td className="px-3 py-2 font-medium text-slate-700">{row.Style}</td>
+                    <td className="px-3 py-2 text-slate-600">{row.Color}</td>
+                    <td className="px-3 py-2 text-slate-600">{row.Size}</td>
+                    <td className="px-3 py-2 text-right text-slate-400">{row.Quantity}</td>
+                    <td className="px-3 py-1.5">
+                      <input
+                        type="number"
+                        min="0"
+                        step="1"
+                        value={quantities[row.id]}
+                        onChange={(event) => setQuantities((current) => ({ ...current, [row.id]: event.target.value }))}
+                        onPaste={(event) => handlePaste(event, index)}
+                        className={`w-full rounded-md border px-2 py-1.5 font-semibold outline-none focus:ring-2 focus:ring-blue-100 ${
+                          changed ? 'border-blue-400 text-blue-700' : 'border-slate-200 text-slate-700'
+                        }`}
+                      />
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+
+        <div>
+          <label className="block text-xs font-medium text-slate-500 mb-1.5">Reason / Remark (optional)</label>
+          <input
+            type="text"
+            value={reason}
+            maxLength={300}
+            onChange={(event) => setReason(event.target.value)}
+            placeholder="Example: Physical count correction"
+            className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+          />
+        </div>
+
+        <div className="flex items-center justify-between gap-3">
+          <p className="text-xs text-slate-500">{changedRows.length} of {rows.length} selected SKUs changed</p>
+          <div className="flex gap-2">
+            <button onClick={onClose} className="btn-secondary justify-center py-2.5">Cancel</button>
+            <button
+              onClick={handleSave}
+              disabled={loading || changedRows.length === 0}
+              className="btn-primary justify-center py-2.5 disabled:opacity-50"
+            >
+              {loading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
+              Save {changedRows.length} Change{changedRows.length === 1 ? '' : 's'}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── Add Rows Modal ─────────────────────────────────────────────────────────────
 function AddRowsModal({ onClose, onDone, currentRows, getToken }) {
   const [file,    setFile]    = useState(null)
@@ -902,6 +1070,7 @@ export default function StockManagement() {
   const [inputValue,     setInputValue]     = useState('')
   const [searchQuery,    setSearchQuery]    = useState('')
   const [filter,         setFilter]         = useState('all')  // all | low | zero
+  const [styleFilter,    setStyleFilter]    = useState('all')
   const [isPending,      startTransition]   = useTransition()
   const [serverError,    setServerError]    = useState(null)
   const [resetting,      setResetting]      = useState(false)
@@ -909,6 +1078,8 @@ export default function StockManagement() {
   const [showAddRows,    setShowAddRows]    = useState(false)
   const [showRemoveRows, setShowRemoveRows] = useState(false)
   const [editTarget,     setEditTarget]     = useState(null)
+  const [selectedIds,    setSelectedIds]    = useState(() => new Set())
+  const [showBulkEdit,   setShowBulkEdit]   = useState(false)
   const [activeView,     setActiveView]     = useState('balance')
   const toast = useToast()
 
@@ -997,6 +1168,11 @@ export default function StockManagement() {
 
   const allRows = balanceData?.rows || []
 
+  const styles = useMemo(() => (
+    [...new Set(allRows.map((row) => row.Style).filter(Boolean))]
+      .sort((a, b) => String(a).localeCompare(String(b), undefined, { numeric: true }))
+  ), [allRows])
+
   const displayRows = useMemo(() => {
     let rows = allRows
     if (searchQuery.trim()) {
@@ -1009,8 +1185,76 @@ export default function StockManagement() {
     }
     if (filter === 'low')  rows = rows.filter(r => Number(r.Quantity) > 0 && Number(r.Quantity) < 5)
     if (filter === 'zero') rows = rows.filter(r => Number(r.Quantity) <= 0)
+    if (styleFilter !== 'all') rows = rows.filter(r => r.Style === styleFilter)
     return rows
-  }, [allRows, searchQuery, filter])
+  }, [allRows, searchQuery, filter, styleFilter])
+
+  const selectedRows = useMemo(
+    () => allRows.filter((row) => selectedIds.has(row.id)),
+    [allRows, selectedIds]
+  )
+  const allDisplayedSelected = displayRows.length > 0 && displayRows.every((row) => selectedIds.has(row.id))
+
+  const toggleRow = useCallback((id) => {
+    setSelectedIds((current) => {
+      const next = new Set(current)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }, [])
+
+  const toggleAllDisplayed = useCallback(() => {
+    setSelectedIds((current) => {
+      const next = new Set(current)
+      const shouldSelect = displayRows.some((row) => !next.has(row.id))
+      displayRows.forEach((row) => shouldSelect ? next.add(row.id) : next.delete(row.id))
+      return next
+    })
+  }, [displayRows])
+
+  const selectionColumn = useMemo(() => ({
+    key: '__selected',
+    label: (
+      <input
+        type="checkbox"
+        checked={allDisplayedSelected}
+        onChange={toggleAllDisplayed}
+        onClick={(event) => event.stopPropagation()}
+        aria-label="Select all filtered inventory rows"
+        className="h-4 w-4 rounded border-slate-300 text-blue-600"
+      />
+    ),
+    sortable: false,
+    className: 'w-12',
+    cellClassName: 'w-12',
+    render: (_, row) => (
+      <input
+        type="checkbox"
+        checked={selectedIds.has(row.id)}
+        onChange={() => toggleRow(row.id)}
+        onClick={(event) => event.stopPropagation()}
+        aria-label={`Select ${row.Style} ${row.Color} ${row.Size}`}
+        className="h-4 w-4 rounded border-slate-300 text-blue-600"
+      />
+    ),
+  }), [allDisplayedSelected, selectedIds, toggleAllDisplayed, toggleRow])
+
+  const handleBulkUpdated = useCallback((updates) => {
+    const byId = new Map(updates.map((row) => [Number(row.id), Number(row.quantity)]))
+    setBalanceData((current) => {
+      if (!current?.rows) return current
+      const rows = current.rows.map((row) => byId.has(row.id) ? { ...row, Quantity: byId.get(row.id) } : row)
+      return {
+        ...current,
+        rows,
+        total_units: rows.reduce((sum, row) => sum + (Number(row.Quantity) || 0), 0),
+        skus_in_stock: rows.filter((row) => Number(row.Quantity) > 0).length,
+        skus_zero: rows.filter((row) => Number(row.Quantity) <= 0).length,
+      }
+    })
+    setSelectedIds(new Set())
+  }, [])
 
   const handleExport = useCallback(() => {
     if (!displayRows.length) return
@@ -1073,6 +1317,14 @@ export default function StockManagement() {
           row={editTarget}
           onClose={() => setEditTarget(null)}
           onDone={handleQuantityUpdated}
+          getToken={getToken}
+        />
+      )}
+      {showBulkEdit && selectedRows.length > 0 && (
+        <BulkEditQtyModal
+          rows={selectedRows}
+          onClose={() => setShowBulkEdit(false)}
+          onDone={handleBulkUpdated}
           getToken={getToken}
         />
       )}
@@ -1196,6 +1448,16 @@ export default function StockManagement() {
                     />
                   </div>
 
+                  <select
+                    value={styleFilter}
+                    onChange={(event) => setStyleFilter(event.target.value)}
+                    className="input-base sm:w-48 bg-white"
+                    aria-label="Filter by style"
+                  >
+                    <option value="all">All styles</option>
+                    {styles.map((style) => <option key={style} value={style}>{style}</option>)}
+                  </select>
+
                   <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-xl flex-shrink-0">
                     {[
                       { id: 'all',  label: 'All' },
@@ -1213,17 +1475,33 @@ export default function StockManagement() {
                   </div>
                 </div>
 
-                {(inputValue || filter !== 'all') && (
+                {(inputValue || filter !== 'all' || styleFilter !== 'all') && (
                   <div className="flex items-center gap-2 text-xs text-slate-500">
                     <span className="bg-blue-100 text-blue-700 px-2.5 py-1 rounded-full font-medium">
                       {isPending ? '…' : `${displayRows.length.toLocaleString()} results`}
                     </span>
                     <button
-                      onClick={() => { setInputValue(''); startTransition(() => setSearchQuery('')); setFilter('all') }}
+                      onClick={() => { setInputValue(''); startTransition(() => setSearchQuery('')); setFilter('all'); setStyleFilter('all') }}
                       className="text-slate-400 hover:text-slate-600"
                     >
                       Clear filters
                     </button>
+                  </div>
+                )}
+
+                {selectedRows.length > 0 && (
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3">
+                    <div>
+                      <p className="text-sm font-semibold text-blue-800">{selectedRows.length} SKU{selectedRows.length === 1 ? '' : 's'} selected</p>
+                      <p className="text-xs text-blue-600 mt-0.5">Choose a style, then use the top checkbox to select all of its colors and sizes.</p>
+                    </div>
+                    <div className="flex gap-2">
+                      <button onClick={() => setSelectedIds(new Set())} className="btn-secondary text-sm">Clear</button>
+                      <button onClick={() => setShowBulkEdit(true)} className="btn-primary text-sm">
+                        <Pencil className="w-4 h-4" />
+                        Bulk Edit
+                      </button>
+                    </div>
                   </div>
                 )}
 
@@ -1236,12 +1514,12 @@ export default function StockManagement() {
 
                 <DataTable
                   data={displayRows}
-                  columns={COLUMNS}
+                  columns={[selectionColumn, ...COLUMNS]}
                   pageSize={50}
-                  resetPageKey={`${searchQuery}\u0000${filter}`}
+                  resetPageKey={`${searchQuery}\u0000${filter}\u0000${styleFilter}`}
                   rowClassName={rowColor}
                   emptyMessage={
-                    searchQuery || filter !== 'all'
+                    searchQuery || filter !== 'all' || styleFilter !== 'all'
                       ? 'No rows match the current filters'
                       : 'No balance data'
                   }
