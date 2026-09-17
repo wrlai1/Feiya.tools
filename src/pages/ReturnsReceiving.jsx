@@ -127,6 +127,33 @@ function formatSkuComponents(components) {
   })
 }
 
+function analyticsRowSearchText(row) {
+  return [
+    row.store_name,
+    row.sku_code,
+    row.sku_id,
+    row.product_name,
+    row.style,
+    row.color,
+    row.size,
+    ...formatSkuComponents(row.components),
+  ].join(' ').toLowerCase()
+}
+
+function sortAnalyticsRows(rows, sort) {
+  const [field, direction] = sort.split(':')
+  const multiplier = direction === 'asc' ? 1 : -1
+  return [...rows].sort((left, right) => {
+    const leftValue = Number(left[field])
+    const rightValue = Number(right[field])
+    const leftNumber = Number.isFinite(leftValue) ? leftValue : -1
+    const rightNumber = Number.isFinite(rightValue) ? rightValue : -1
+    const difference = (leftNumber - rightNumber) * multiplier
+    if (difference) return difference
+    return analyticsRowSearchText(left).localeCompare(analyticsRowSearchText(right))
+  })
+}
+
 function CountControl({ value, onChange, disabled, max = 9999, label = 'Actual quantity' }) {
   const [error, setError] = useState('')
 
@@ -368,8 +395,19 @@ export default function ReturnsReceiving() {
   const [catalogParsed, setCatalogParsed] = useState(null)
   const [catalogUploading, setCatalogUploading] = useState(false)
   const [analytics, setAnalytics] = useState(null)
+  const [lifetimeAnalytics, setLifetimeAnalytics] = useState(null)
   const [integrity, setIntegrity] = useState(null)
   const [analyticsDays, setAnalyticsDays] = useState(30)
+  const [analyticsLoading, setAnalyticsLoading] = useState(false)
+  const [lifetimeLoading, setLifetimeLoading] = useState(false)
+  const [integrityLoading, setIntegrityLoading] = useState(false)
+  const [analyticsUpdatedAt, setAnalyticsUpdatedAt] = useState(null)
+  const [analyticsStore, setAnalyticsStore] = useState('all')
+  const [analyticsSearch, setAnalyticsSearch] = useState('')
+  const [analyticsSort, setAnalyticsSort] = useState('return_rate:desc')
+  const [analyticsVisibleRows, setAnalyticsVisibleRows] = useState(100)
+  const analyticsRequestRef = useRef(0)
+  const lifetimeLoadedRef = useRef(false)
   const [orderOnly, setOrderOnly] = useState(null)
   const [orderChoices, setOrderChoices] = useState([])
   const [orderFile, setOrderFile] = useState(null)
@@ -1178,38 +1216,156 @@ export default function ReturnsReceiving() {
     }
   }
 
-  const loadAnalytics = useCallback(async () => {
+  const loadAnalytics = useCallback(async (options = {}) => {
     if (!isAdmin) return
-    setLoading(true)
+    const requestId = analyticsRequestRef.current + 1
+    analyticsRequestRef.current = requestId
+    setAnalyticsLoading(true)
     try {
-      const [analyticsRes, integrityRes] = await Promise.all([
-        fetch(`${BASE}/returns?action=analytics&days=${analyticsDays}`, {
-          headers: headers(getToken),
-        }),
-        fetch(`${BASE}/returns?action=integrity`, {
-          headers: headers(getToken),
-        }),
-      ])
-      const [analyticsData, integrityData] = await Promise.all([
-        analyticsRes.json().catch(() => ({})),
-        integrityRes.json().catch(() => ({})),
-      ])
+      const analyticsRes = await fetch(`${BASE}/returns?action=analytics&days=${analyticsDays}`, {
+        headers: headers(getToken),
+      })
+      const analyticsData = await analyticsRes.json().catch(() => ({}))
       if (!analyticsRes.ok) throw new Error(analyticsData.error || 'Could not load return analytics')
-      if (!integrityRes.ok) throw new Error(integrityData.error || 'Could not run data checks')
+      if (requestId !== analyticsRequestRef.current) return
       setAnalytics(analyticsData)
-      setIntegrity(integrityData)
+      setAnalyticsUpdatedAt(new Date())
     } catch (error) {
       toast.error(error.message, 'Analytics Failed')
+      return
     } finally {
-      setLoading(false)
+      if (requestId === analyticsRequestRef.current) setAnalyticsLoading(false)
+    }
+
+    if (requestId !== analyticsRequestRef.current) return
+    if (lifetimeLoadedRef.current && options.refreshLifetime !== true) return
+    setLifetimeLoading(true)
+    try {
+      const lifetimeRes = await fetch(`${BASE}/returns?action=analytics&days=36500`, {
+        headers: headers(getToken),
+      })
+      const lifetimeData = await lifetimeRes.json().catch(() => ({}))
+      if (!lifetimeRes.ok) throw new Error(lifetimeData.error || 'Could not load all-time analytics')
+      if (requestId === analyticsRequestRef.current) {
+        setLifetimeAnalytics(lifetimeData)
+        lifetimeLoadedRef.current = true
+      }
+    } catch (error) {
+      toast.error(error.message, 'All-Time Analytics Failed')
+    } finally {
+      if (requestId === analyticsRequestRef.current) setLifetimeLoading(false)
     }
   }, [analyticsDays, getToken, isAdmin, toast])
+
+  const loadIntegrity = useCallback(async () => {
+    if (!isAdmin || integrityLoading) return
+    setIntegrityLoading(true)
+    try {
+      const response = await fetch(`${BASE}/returns?action=integrity`, {
+        headers: headers(getToken),
+      })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(data.error || 'Could not run data checks')
+      setIntegrity(data)
+    } catch (error) {
+      toast.error(error.message, 'Data Check Failed')
+    } finally {
+      setIntegrityLoading(false)
+    }
+  }, [getToken, integrityLoading, isAdmin, toast])
 
   useEffect(() => {
     if (tab === 'analytics') loadAnalytics()
     if (tab === 'orders') loadOrderStats()
     if (tab === 'review') loadReviewPackages()
   }, [loadAnalytics, loadOrderStats, loadReviewPackages, tab])
+
+  const analyticsStores = useMemo(() => {
+    const byKey = new Map()
+    ;[...(analytics?.stores || []), ...(lifetimeAnalytics?.stores || [])].forEach((store) => {
+      byKey.set(store.store_key, store.store_name)
+    })
+    return [...byKey.entries()]
+      .map(([store_key, store_name]) => ({ store_key, store_name }))
+      .sort((left, right) => left.store_name.localeCompare(right.store_name))
+  }, [analytics, lifetimeAnalytics])
+
+  const mergedStoreRows = useMemo(() => {
+    const periodByKey = new Map((analytics?.stores || []).map((row) => [row.store_key, row]))
+    const lifetimeByKey = new Map((lifetimeAnalytics?.stores || []).map((row) => [row.store_key, row]))
+    return analyticsStores.map((store) => ({
+      ...store,
+      ...(periodByKey.get(store.store_key) || {}),
+      lifetime_sold_product_units: Number(lifetimeByKey.get(store.store_key)?.sold_product_units || 0),
+      lifetime_returned_product_units: Number(lifetimeByKey.get(store.store_key)?.returned_product_units || 0),
+      lifetime_product_return_rate: lifetimeByKey.get(store.store_key)?.product_return_rate ?? null,
+      lifetime_physical_return_rate: lifetimeByKey.get(store.store_key)?.physical_return_rate ?? null,
+    }))
+  }, [analytics, analyticsStores, lifetimeAnalytics])
+
+  const mergedSkuRows = useMemo(() => {
+    const keyOf = (row) => `${row.store_key}\u241f${row.sku_id}`
+    const periodByKey = new Map((analytics?.skuRows || []).map((row) => [keyOf(row), row]))
+    const lifetimeByKey = new Map((lifetimeAnalytics?.skuRows || []).map((row) => [keyOf(row), row]))
+    return [...new Set([...periodByKey.keys(), ...lifetimeByKey.keys()])].map((key) => {
+      const period = periodByKey.get(key)
+      const lifetime = lifetimeByKey.get(key)
+      return {
+        ...(lifetime || {}),
+        ...(period || {}),
+        sold_product_units: Number(period?.sold_product_units || 0),
+        returned_product_units: Number(period?.returned_product_units || 0),
+        return_rate: period?.return_rate ?? null,
+        lifetime_sold_product_units: Number(lifetime?.sold_product_units || 0),
+        lifetime_returned_product_units: Number(lifetime?.returned_product_units || 0),
+        lifetime_return_rate: lifetime?.return_rate ?? null,
+      }
+    })
+  }, [analytics, lifetimeAnalytics])
+
+  const mergedPhysicalRows = useMemo(() => {
+    const keyOf = (row) => [row.store_key, row.style, row.color, row.size]
+      .map((value) => String(value || '').trim().toLowerCase()).join('\u241f')
+    const periodByKey = new Map((analytics?.rows || []).map((row) => [keyOf(row), row]))
+    const lifetimeByKey = new Map((lifetimeAnalytics?.rows || []).map((row) => [keyOf(row), row]))
+    return [...new Set([...periodByKey.keys(), ...lifetimeByKey.keys()])].map((key) => {
+      const period = periodByKey.get(key)
+      const lifetime = lifetimeByKey.get(key)
+      return {
+        ...(lifetime || {}),
+        ...(period || {}),
+        sold_qty: Number(period?.sold_qty || 0),
+        returned_qty: Number(period?.returned_qty || 0),
+        return_rate: period?.return_rate ?? null,
+        lifetime_sold_qty: Number(lifetime?.sold_qty || 0),
+        lifetime_returned_qty: Number(lifetime?.returned_qty || 0),
+        lifetime_return_rate: lifetime?.return_rate ?? null,
+      }
+    })
+  }, [analytics, lifetimeAnalytics])
+
+  const analyticsQuery = analyticsSearch.trim().toLowerCase()
+  const matchesAnalyticsFilters = useCallback((row) => (
+    (analyticsStore === 'all' || row.store_key === analyticsStore)
+    && (!analyticsQuery || analyticsRowSearchText(row).includes(analyticsQuery))
+  ), [analyticsQuery, analyticsStore])
+
+  const filteredStoreRows = useMemo(() => mergedStoreRows.filter((row) => (
+    analyticsStore === 'all' || row.store_key === analyticsStore
+  )), [analyticsStore, mergedStoreRows])
+  const filteredSkuRows = useMemo(() => sortAnalyticsRows(
+    mergedSkuRows.filter(matchesAnalyticsFilters),
+    analyticsSort,
+  ), [analyticsSort, matchesAnalyticsFilters, mergedSkuRows])
+  const filteredPhysicalRows = useMemo(() => sortAnalyticsRows(
+    mergedPhysicalRows.filter(matchesAnalyticsFilters),
+    analyticsSort.replace('sold_product_units', 'sold_qty')
+      .replace('returned_product_units', 'returned_qty'),
+  ), [analyticsSort, matchesAnalyticsFilters, mergedPhysicalRows])
+
+  useEffect(() => {
+    setAnalyticsVisibleRows(100)
+  }, [analyticsSearch, analyticsSort, analyticsStore])
 
   const tabs = [
     { id: 'receive', label: 'Scan & Receive', shortLabel: 'Scan', icon: ScanLine },
@@ -2656,19 +2812,75 @@ export default function ReturnsReceiving() {
 
       {tab === 'analytics' && isAdmin && (
         <div className="space-y-4">
-          <div className="flex items-center justify-between gap-3">
-            <select
-              value={analyticsDays}
-              onChange={(event) => setAnalyticsDays(Number(event.target.value))}
-              className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
-            >
-              <option value={30}>Last 30 days</option>
-              <option value={90}>Last 90 days</option>
-              <option value={365}>Last 365 days</option>
-            </select>
-            <button type="button" onClick={loadAnalytics} className="btn-secondary text-sm">
-              <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} /> Refresh
-            </button>
+          <div className="card p-4">
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              <label className="text-xs font-semibold text-slate-600">
+                Comparison period
+                <select
+                  value={analyticsDays}
+                  onChange={(event) => setAnalyticsDays(Number(event.target.value))}
+                  className="mt-1 h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm"
+                >
+                  <option value={30}>Last 30 days</option>
+                  <option value={90}>Last 90 days</option>
+                  <option value={365}>Last 365 days</option>
+                </select>
+              </label>
+              <label className="text-xs font-semibold text-slate-600">
+                Store
+                <select
+                  value={analyticsStore}
+                  onChange={(event) => setAnalyticsStore(event.target.value)}
+                  className="mt-1 h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm"
+                >
+                  <option value="all">All stores</option>
+                  {analyticsStores.map((store) => (
+                    <option key={store.store_key} value={store.store_key}>{store.store_name}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="text-xs font-semibold text-slate-600">
+                Search product
+                <input
+                  value={analyticsSearch}
+                  onChange={(event) => setAnalyticsSearch(event.target.value)}
+                  placeholder="SKU, style, color, size"
+                  className="mt-1 h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm"
+                />
+              </label>
+              <label className="text-xs font-semibold text-slate-600">
+                Sort by
+                <select
+                  value={analyticsSort}
+                  onChange={(event) => setAnalyticsSort(event.target.value)}
+                  className="mt-1 h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm"
+                >
+                  <option value="return_rate:desc">{analyticsDays}-day return rate: high to low</option>
+                  <option value="lifetime_return_rate:desc">All-time return rate: high to low</option>
+                  <option value="sold_product_units:desc">{analyticsDays}-day products sold: high to low</option>
+                  <option value="lifetime_sold_product_units:desc">All-time products sold: high to low</option>
+                  <option value="returned_product_units:desc">{analyticsDays}-day returns: high to low</option>
+                </select>
+              </label>
+            </div>
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+              <p className="text-xs text-slate-500">
+                {analyticsUpdatedAt
+                  ? `Updated ${analyticsUpdatedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+                  : 'Not loaded yet'}
+                {lifetimeLoading ? ' · Loading all-time totals…' : ''}
+              </p>
+              <div className="flex gap-2">
+                <button type="button" onClick={loadIntegrity} className="btn-secondary text-sm">
+                  <CheckCircle2 className={`h-4 w-4 ${integrityLoading ? 'animate-pulse' : ''}`} />
+                  {integrityLoading ? 'Checking…' : 'Run Data Check'}
+                </button>
+                <button type="button" onClick={() => loadAnalytics({ refreshLifetime: true })} className="btn-secondary text-sm">
+                  <RefreshCw className={`h-4 w-4 ${analyticsLoading ? 'animate-spin' : ''}`} />
+                  {analyticsLoading ? 'Refreshing…' : 'Refresh'}
+                </button>
+              </div>
+            </div>
           </div>
 
           {analytics && (
@@ -2733,14 +2945,18 @@ export default function ReturnsReceiving() {
                   ['Actual Returned Units', analytics.summary.returned_units],
                   ['Restocked Units', analytics.summary.restocked_units],
                   ['Physical Units Sold', analytics.summary.sold_units],
-                  ['Physical Unit Return Rate', analytics.summary.total_return_rate == null
+                  [`${analyticsDays}-Day Physical Return Rate`, analytics.summary.total_return_rate == null
                     ? '—'
                     : `${Number(analytics.summary.total_return_rate).toFixed(2)}%`],
                   ['Product Units Sold', analytics.summary.sold_product_units],
                   ['Complete Product Returns', analytics.summary.returned_product_units],
-                  ['Product Unit Return Rate', analytics.summary.product_return_rate == null
+                  [`${analyticsDays}-Day Product Return Rate`, analytics.summary.product_return_rate == null
                     ? '—'
                     : `${Number(analytics.summary.product_return_rate).toFixed(2)}%`],
+                  ['All-Time Products Sold', lifetimeAnalytics?.summary?.sold_product_units ?? 'Loading…'],
+                  ['All-Time Product Return Rate', lifetimeAnalytics?.summary?.product_return_rate == null
+                    ? (lifetimeLoading ? 'Loading…' : '—')
+                    : `${Number(lifetimeAnalytics.summary.product_return_rate).toFixed(2)}%`],
                 ].map(([label, value]) => (
                   <div key={label} className="card p-4">
                     <p className="text-2xl font-bold text-slate-900">
@@ -2794,20 +3010,22 @@ export default function ReturnsReceiving() {
                   </p>
                 </div>
                 <div className="space-y-3 p-3 sm:hidden">
-                  {(analytics.stores || []).map((store) => (
-                    <div key={store.store_name} className="rounded-xl border border-slate-200 p-3">
+                  {filteredStoreRows.map((store) => (
+                    <div key={store.store_key} className="rounded-xl border border-slate-200 p-3">
                       <p className="font-semibold text-slate-800">{store.store_name}</p>
                       <div className="mt-3 grid grid-cols-2 gap-3 text-xs">
                         <div><p className="text-slate-400">Physical sold</p><p className="font-semibold">{store.sold_units}</p></div>
                         <div><p className="text-slate-400">Physical returned</p><p className="font-semibold text-blue-700">{store.returned_units}</p></div>
                         <div><p className="text-slate-400">Physical rate</p><p className="font-semibold">{store.physical_return_rate == null ? '—' : `${Number(store.physical_return_rate).toFixed(2)}%`}</p></div>
-                        <div><p className="text-slate-400">Product rate</p><p className="font-semibold">{store.product_return_rate == null ? '—' : `${Number(store.product_return_rate).toFixed(2)}%`}</p></div>
+                        <div><p className="text-slate-400">{analyticsDays}d product rate</p><p className="font-semibold">{store.product_return_rate == null ? '—' : `${Number(store.product_return_rate).toFixed(2)}%`}</p></div>
+                        <div><p className="text-slate-400">All-time sold</p><p className="font-semibold">{store.lifetime_sold_product_units}</p></div>
+                        <div><p className="text-slate-400">All-time rate</p><p className="font-semibold">{store.lifetime_product_return_rate == null ? '—' : `${Number(store.lifetime_product_return_rate).toFixed(2)}%`}</p></div>
                       </div>
                     </div>
                   ))}
                 </div>
                 <div className="hidden overflow-x-auto sm:block">
-                  <table className="w-full min-w-[1050px] text-sm">
+                  <table className="w-full min-w-[1250px] text-sm">
                     <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
                       <tr>
                         <th className="px-4 py-3">Store</th>
@@ -2818,14 +3036,17 @@ export default function ReturnsReceiving() {
                         <th className="px-4 py-3 text-right">Restocked</th>
                         <th className="px-4 py-3 text-right">Physical Sold</th>
                         <th className="px-4 py-3 text-right">Physical Rate</th>
-                        <th className="px-4 py-3 text-right">Products Sold</th>
-                        <th className="px-4 py-3 text-right">Product Returns</th>
-                        <th className="px-4 py-3 text-right">Product Rate</th>
+                        <th className="px-4 py-3 text-right">{analyticsDays}d Products Sold</th>
+                        <th className="px-4 py-3 text-right">{analyticsDays}d Product Returns</th>
+                        <th className="px-4 py-3 text-right">{analyticsDays}d Product Rate</th>
+                        <th className="px-4 py-3 text-right">All-Time Sold</th>
+                        <th className="px-4 py-3 text-right">All-Time Returns</th>
+                        <th className="px-4 py-3 text-right">All-Time Rate</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
-                      {(analytics.stores || []).map((store) => (
-                        <tr key={store.store_name}>
+                      {filteredStoreRows.map((store) => (
+                        <tr key={store.store_key}>
                           <td className="px-4 py-3 font-medium text-slate-800">{store.store_name}</td>
                           <td className="px-4 py-3 text-right">{store.received_packages}</td>
                           <td className="px-4 py-3 text-right">{store.discrepancy_packages}</td>
@@ -2837,6 +3058,9 @@ export default function ReturnsReceiving() {
                           <td className="px-4 py-3 text-right">{store.sold_product_units}</td>
                           <td className="px-4 py-3 text-right">{store.returned_product_units}</td>
                           <td className="px-4 py-3 text-right">{store.product_return_rate == null ? '—' : `${Number(store.product_return_rate).toFixed(2)}%`}</td>
+                          <td className="px-4 py-3 text-right">{store.lifetime_sold_product_units}</td>
+                          <td className="px-4 py-3 text-right">{store.lifetime_returned_product_units}</td>
+                          <td className="px-4 py-3 text-right font-semibold">{store.lifetime_product_return_rate == null ? '—' : `${Number(store.lifetime_product_return_rate).toFixed(2)}%`}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -2849,9 +3073,12 @@ export default function ReturnsReceiving() {
                   <p className="mt-1 text-xs text-slate-400">
                     Complete returned sets ÷ products sold. Every color in a multi-color SKU is shown below.
                   </p>
+                  <p className="mt-1 text-xs font-medium text-slate-500">
+                    {filteredSkuRows.length.toLocaleString()} matching SKU(s)
+                  </p>
                 </div>
                 <div className="space-y-3 p-3 sm:hidden">
-                  {(analytics.skuRows || []).map((row, index) => (
+                  {filteredSkuRows.slice(0, analyticsVisibleRows).map((row, index) => (
                     <div
                       key={`${row.store_key}-${row.sku_id}-mobile-${index}`}
                       className="rounded-xl border border-slate-200 p-3"
@@ -2861,9 +3088,10 @@ export default function ReturnsReceiving() {
                           <p className="font-semibold text-slate-800">{row.sku_code || row.sku_id}</p>
                           <p className="mt-0.5 break-all text-xs text-slate-400">{row.store_name} · {row.sku_id}</p>
                         </div>
-                        <p className="shrink-0 font-bold text-slate-800">
-                          {row.return_rate == null ? '—' : `${Number(row.return_rate).toFixed(2)}%`}
-                        </p>
+                        <div className="shrink-0 text-right">
+                          <p className="font-bold text-slate-800">{row.return_rate == null ? '—' : `${Number(row.return_rate).toFixed(2)}%`}</p>
+                          <p className="text-[10px] text-slate-400">{analyticsDays} days</p>
+                        </div>
                       </div>
                       <div className="mt-3 flex flex-wrap gap-1.5">
                         {formatSkuComponents(row.components).map((component, componentIndex) => (
@@ -2878,6 +3106,8 @@ export default function ReturnsReceiving() {
                       <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
                         <div><p className="text-slate-400">Products sold</p><p className="font-semibold">{row.sold_product_units}</p></div>
                         <div><p className="text-slate-400">Complete returns</p><p className="font-semibold text-blue-700">{row.returned_product_units}</p></div>
+                        <div><p className="text-slate-400">All-time sold</p><p className="font-semibold">{row.lifetime_sold_product_units}</p></div>
+                        <div><p className="text-slate-400">All-time rate</p><p className="font-semibold">{row.lifetime_return_rate == null ? '—' : `${Number(row.lifetime_return_rate).toFixed(2)}%`}</p></div>
                       </div>
                       {!row.return_coverage_complete && (
                         <p className="mt-2 text-xs font-medium text-amber-700">Older return quantity is incomplete; rate is hidden.</p>
@@ -2886,20 +3116,23 @@ export default function ReturnsReceiving() {
                   ))}
                 </div>
                 <div className="hidden overflow-x-auto sm:block">
-                  <table className="w-full min-w-[1000px] text-sm">
+                  <table className="w-full min-w-[1200px] text-sm">
                     <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
                       <tr>
                         <th className="px-4 py-3">Store</th>
                         <th className="px-4 py-3">SKU</th>
                         <th className="px-4 py-3">SKU ID</th>
                         <th className="px-4 py-3">Components</th>
-                        <th className="px-4 py-3 text-right">Products Sold</th>
-                        <th className="px-4 py-3 text-right">Complete Returns</th>
-                        <th className="px-4 py-3 text-right">Return Rate</th>
+                        <th className="px-4 py-3 text-right">{analyticsDays}d Sold</th>
+                        <th className="px-4 py-3 text-right">{analyticsDays}d Returns</th>
+                        <th className="px-4 py-3 text-right">{analyticsDays}d Rate</th>
+                        <th className="px-4 py-3 text-right">All-Time Sold</th>
+                        <th className="px-4 py-3 text-right">All-Time Returns</th>
+                        <th className="px-4 py-3 text-right">All-Time Rate</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
-                      {(analytics.skuRows || []).map((row, index) => (
+                      {filteredSkuRows.slice(0, analyticsVisibleRows).map((row, index) => (
                         <tr key={`${row.store_key}-${row.sku_id}-${index}`}>
                           <td className="px-4 py-3 font-medium text-slate-800">{row.store_name}</td>
                           <td className="px-4 py-3 text-slate-700">{row.sku_code || '—'}</td>
@@ -2921,49 +3154,71 @@ export default function ReturnsReceiving() {
                           <td className="px-4 py-3 text-right tabular-nums font-semibold">
                             {row.return_rate == null ? '—' : `${Number(row.return_rate).toFixed(2)}%`}
                           </td>
+                          <td className="px-4 py-3 text-right tabular-nums">{row.lifetime_sold_product_units}</td>
+                          <td className="px-4 py-3 text-right tabular-nums font-semibold text-blue-700">{row.lifetime_returned_product_units}</td>
+                          <td className="px-4 py-3 text-right tabular-nums font-semibold">
+                            {row.lifetime_return_rate == null ? '—' : `${Number(row.lifetime_return_rate).toFixed(2)}%`}
+                          </td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
                 </div>
+                {filteredSkuRows.length > analyticsVisibleRows && (
+                  <div className="border-t border-slate-100 p-3 text-center">
+                    <button type="button" className="btn-secondary text-sm" onClick={() => setAnalyticsVisibleRows((value) => value + 100)}>
+                      Show 100 more SKUs
+                    </button>
+                  </div>
+                )}
               </div>
               <div className="card overflow-hidden">
                 <div className="border-b border-slate-200 px-4 py-3 sm:px-5">
                   <h3 className="text-sm font-semibold text-slate-800">Physical inventory return rate</h3>
-                  <p className="mt-1 text-xs text-slate-400">Actual received units ÷ sold units in the selected period</p>
+                  <p className="mt-1 text-xs text-slate-400">Actual received units ÷ sold units, separated by store, style, color, and size.</p>
+                  <p className="mt-1 text-xs font-medium text-slate-500">
+                    {filteredPhysicalRows.length.toLocaleString()} matching combination(s)
+                  </p>
                 </div>
                 <div className="space-y-3 p-3 sm:hidden">
-                  {(analytics.rows || []).map((row, index) => (
+                  {filteredPhysicalRows.slice(0, analyticsVisibleRows).map((row, index) => (
                     <div
-                      key={`${row.style}-${row.color}-${row.size}-mobile-${index}`}
+                      key={`${row.store_key}-${row.style}-${row.color}-${row.size}-mobile-${index}`}
                       className="rounded-xl border border-slate-200 p-3"
                     >
                       <p className="font-semibold text-slate-800">
                         {row.style} / {row.color} / {row.size}
                       </p>
-                      <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
-                        <div><p className="text-slate-400">Sold</p><p className="font-semibold">{row.sold_qty}</p></div>
-                        <div><p className="text-slate-400">Returned</p><p className="font-semibold text-blue-700">{row.returned_qty}</p></div>
-                        <div><p className="text-slate-400">Rate</p><p className="font-semibold">{row.return_rate == null ? '—' : `${Number(row.return_rate).toFixed(2)}%`}</p></div>
+                      <p className="mt-0.5 text-xs text-slate-400">{row.store_name}</p>
+                      <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
+                        <div><p className="text-slate-400">{analyticsDays}d sold</p><p className="font-semibold">{row.sold_qty}</p></div>
+                        <div><p className="text-slate-400">{analyticsDays}d rate</p><p className="font-semibold">{row.return_rate == null ? '—' : `${Number(row.return_rate).toFixed(2)}%`}</p></div>
+                        <div><p className="text-slate-400">All-time sold</p><p className="font-semibold">{row.lifetime_sold_qty}</p></div>
+                        <div><p className="text-slate-400">All-time rate</p><p className="font-semibold">{row.lifetime_return_rate == null ? '—' : `${Number(row.lifetime_return_rate).toFixed(2)}%`}</p></div>
                       </div>
                     </div>
                   ))}
                 </div>
                 <div className="hidden overflow-x-auto sm:block">
-                  <table className="w-full min-w-[700px] text-sm">
+                  <table className="w-full min-w-[1050px] text-sm">
                     <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
                       <tr>
+                        <th className="px-4 py-3">Store</th>
                         <th className="px-4 py-3">Style</th>
                         <th className="px-4 py-3">Color</th>
                         <th className="px-4 py-3">Size</th>
-                        <th className="px-4 py-3 text-right">Sold</th>
-                        <th className="px-4 py-3 text-right">Returned</th>
-                        <th className="px-4 py-3 text-right">Return Rate</th>
+                        <th className="px-4 py-3 text-right">{analyticsDays}d Sold</th>
+                        <th className="px-4 py-3 text-right">{analyticsDays}d Returned</th>
+                        <th className="px-4 py-3 text-right">{analyticsDays}d Rate</th>
+                        <th className="px-4 py-3 text-right">All-Time Sold</th>
+                        <th className="px-4 py-3 text-right">All-Time Returned</th>
+                        <th className="px-4 py-3 text-right">All-Time Rate</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
-                      {(analytics.rows || []).map((row, index) => (
-                        <tr key={`${row.style}-${row.color}-${row.size}-${index}`}>
+                      {filteredPhysicalRows.slice(0, analyticsVisibleRows).map((row, index) => (
+                        <tr key={`${row.store_key}-${row.style}-${row.color}-${row.size}-${index}`}>
+                          <td className="px-4 py-3 font-medium text-slate-800">{row.store_name}</td>
                           <td className="px-4 py-3 font-medium text-slate-800">{row.style}</td>
                           <td className="px-4 py-3 text-slate-600">{row.color}</td>
                           <td className="px-4 py-3 text-slate-600">{row.size}</td>
@@ -2972,11 +3227,23 @@ export default function ReturnsReceiving() {
                           <td className="px-4 py-3 text-right tabular-nums font-semibold">
                             {row.return_rate == null ? '—' : `${Number(row.return_rate).toFixed(2)}%`}
                           </td>
+                          <td className="px-4 py-3 text-right tabular-nums">{row.lifetime_sold_qty}</td>
+                          <td className="px-4 py-3 text-right tabular-nums font-semibold text-blue-700">{row.lifetime_returned_qty}</td>
+                          <td className="px-4 py-3 text-right tabular-nums font-semibold">
+                            {row.lifetime_return_rate == null ? '—' : `${Number(row.lifetime_return_rate).toFixed(2)}%`}
+                          </td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
                 </div>
+                {filteredPhysicalRows.length > analyticsVisibleRows && (
+                  <div className="border-t border-slate-100 p-3 text-center">
+                    <button type="button" className="btn-secondary text-sm" onClick={() => setAnalyticsVisibleRows((value) => value + 100)}>
+                      Show 100 more combinations
+                    </button>
+                  </div>
+                )}
               </div>
             </>
           )}

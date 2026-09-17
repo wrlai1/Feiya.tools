@@ -596,6 +596,18 @@ async function ensureTables(sql) {
   await sql`CREATE INDEX IF NOT EXISTS return_order_items_sku_id_idx ON return_order_items (sku_id)`
 }
 
+let tablesReadyPromise
+
+function ensureTablesOnce(sql) {
+  if (!tablesReadyPromise) {
+    tablesReadyPromise = ensureTables(sql).catch((error) => {
+      tablesReadyPromise = null
+      throw error
+    })
+  }
+  return tablesReadyPromise
+}
+
 async function loadPackage(sql, trackingKey) {
   const [pkg] = await sql`
     SELECT id, tracking_number, tracking_key, source_file, status, store_name, store_key,
@@ -861,7 +873,7 @@ export default async function handler(req, res) {
     )
     if (!payload) return res.status(401).json({ error: 'Not authenticated' })
     const action = String(req.query.action || '')
-    await ensureTables(sql)
+    await ensureTablesOnce(sql)
 
     if (req.method === 'POST' && action === 'catalog-import') {
       if (payload.role !== 'admin') return res.status(403).json({ error: 'Admin access required' })
@@ -2766,7 +2778,7 @@ export default async function handler(req, res) {
 
     if (req.method === 'GET' && action === 'analytics') {
       if (payload.role !== 'admin') return res.status(403).json({ error: 'Admin access required' })
-      const days = Math.min(Math.max(Number(req.query.days) || 30, 1), 3650)
+      const days = Math.min(Math.max(Number(req.query.days) || 30, 1), 36500)
       const from = new Date(Date.now() - days * 86400000).toISOString()
       const [summary] = await sql`
         SELECT
@@ -2988,6 +3000,7 @@ export default async function handler(req, res) {
         ),
         sales_items AS (
           SELECT
+            items.order_key,
             COALESCE(identity.sku_id, items.resolved_sku_id) AS sku_id,
             COALESCE(
               NULLIF(BTRIM(catalog.sku_code), ''),
@@ -3035,6 +3048,8 @@ export default async function handler(req, res) {
         ),
         physical_sku_sales AS (
           SELECT
+            items.store_key,
+            MIN(items.store_name) AS store_name,
             LOWER(BTRIM(component.style)) AS style_key,
             LOWER(BTRIM(component.color)) AS color_key,
             CASE UPPER(BTRIM(component.size))
@@ -3049,7 +3064,7 @@ export default async function handler(req, res) {
           CROSS JOIN LATERAL jsonb_to_recordset(
             CASE WHEN items.physical_mapping_ready THEN items.components ELSE '[]'::jsonb END
           ) AS component(style TEXT, color TEXT, size TEXT, qty INTEGER)
-          GROUP BY 1, 2, 3
+          GROUP BY 1, 3, 4, 5
         ),
         product_sales AS (
           SELECT
@@ -3067,20 +3082,37 @@ export default async function handler(req, res) {
         ),
         sku_product_sales AS (
           SELECT
+            store_key,
+            MIN(store_name) AS store_name,
             sku_id,
             MIN(sku_code) AS sku_code,
             MIN(product_name) AS product_name,
             COALESCE(SUM(quantity), 0)::int AS sold_product_units
           FROM sales_items
           WHERE NULLIF(BTRIM(sku_id), '') IS NOT NULL
-          GROUP BY sku_id
+          GROUP BY store_key, sku_id
         ),
-        sku_product_returns AS (
+        order_sku_sales AS (
+          SELECT
+            order_key,
+            sku_id,
+            COALESCE(SUM(quantity), 0)::int AS sold_product_units
+          FROM sales_items
+          WHERE NULLIF(BTRIM(sku_id), '') IS NOT NULL
+          GROUP BY order_key, sku_id
+        ),
+        raw_sku_product_returns AS (
           SELECT
             COALESCE(NULLIF(packages.store_key, ''), 'unassigned') AS store_key,
             MIN(COALESCE(NULLIF(packages.store_name, ''), 'Unassigned')) AS store_name,
             items.package_id,
             items.sku_id,
+            CASE
+              WHEN jsonb_typeof(packages.order_numbers) = 'array'
+               AND jsonb_array_length(packages.order_numbers) = 1
+                THEN NULLIF(BTRIM(packages.order_numbers->>0), '')
+              ELSE NULL
+            END AS order_key,
             MIN(NULLIF(BTRIM(items.sku_code), '')) AS sku_code,
             BOOL_AND(items.source_qty IS NOT NULL AND items.source_qty > 0) AS has_source_qty,
             LEAST(
@@ -3099,7 +3131,39 @@ export default async function handler(req, res) {
           GROUP BY
             COALESCE(NULLIF(packages.store_key, ''), 'unassigned'),
             items.package_id,
-            items.sku_id
+            items.sku_id,
+            CASE
+              WHEN jsonb_typeof(packages.order_numbers) = 'array'
+               AND jsonb_array_length(packages.order_numbers) = 1
+                THEN NULLIF(BTRIM(packages.order_numbers->>0), '')
+              ELSE NULL
+            END
+        ),
+        sku_product_returns AS (
+          SELECT
+            returns.store_key,
+            MIN(returns.store_name) AS store_name,
+            returns.sku_id,
+            MIN(returns.sku_code) AS sku_code,
+            BOOL_AND(returns.has_source_qty) AS has_source_qty,
+            CASE
+              WHEN returns.order_key IS NOT NULL
+               AND MAX(sales.sold_product_units) > 0
+                THEN LEAST(
+                  COALESCE(SUM(returns.returned_product_units), 0),
+                  MAX(sales.sold_product_units)
+                )::int
+              ELSE COALESCE(SUM(returns.returned_product_units), 0)::int
+            END AS returned_product_units
+          FROM raw_sku_product_returns returns
+          LEFT JOIN order_sku_sales sales
+            ON sales.order_key = returns.order_key
+           AND sales.sku_id = returns.sku_id
+          GROUP BY
+            returns.store_key,
+            returns.sku_id,
+            COALESCE(returns.order_key, 'package:' || returns.package_id::text),
+            returns.order_key
         ),
         product_returns AS (
           SELECT
@@ -3112,14 +3176,15 @@ export default async function handler(req, res) {
         ),
         sku_product_return_totals AS (
           SELECT
+            store_key,
+            MIN(store_name) AS store_name,
             sku_id,
-            STRING_AGG(DISTINCT store_name, ', ' ORDER BY store_name) AS store_names,
             MIN(sku_code) AS sku_code,
             COALESCE(SUM(returned_product_units) FILTER (WHERE has_source_qty), 0)::int
               AS returned_product_units,
             BOOL_AND(has_source_qty) AS return_coverage_complete
           FROM sku_product_returns
-          GROUP BY sku_id
+          GROUP BY store_key, sku_id
         ),
         store_keys AS (
           SELECT store_key FROM package_returns
@@ -3146,20 +3211,27 @@ export default async function handler(req, res) {
               AS uncovered_sales_product_units,
             COALESCE(sold_products.unreconciled_product_units, 0)::int
               AS unreconciled_sales_product_units,
-            COALESCE(returned_products.returned_product_units, 0)::int
+            LEAST(
+              COALESCE(returned_products.returned_product_units, 0),
+              COALESCE(sold_products.sold_product_units, 0)
+            )::int
               AS returned_product_units,
             CASE
               WHEN COALESCE(sold_products.uncovered_product_units, 0) > 0 THEN NULL
               WHEN COALESCE(physical.sold_units, 0) > 0
               THEN ROUND(
-                COALESCE(packages.returned_units, 0)::numeric * 100 / physical.sold_units,
+                LEAST(COALESCE(packages.returned_units, 0), physical.sold_units)::numeric
+                * 100 / physical.sold_units,
                 2
               )
               ELSE NULL
             END AS physical_return_rate,
             CASE WHEN COALESCE(sold_products.sold_product_units, 0) > 0
               THEN ROUND(
-                COALESCE(returned_products.returned_product_units, 0)::numeric
+                LEAST(
+                  COALESCE(returned_products.returned_product_units, 0),
+                  sold_products.sold_product_units
+                )::numeric
                 * 100 / sold_products.sold_product_units,
                 2
               )
@@ -3172,12 +3244,13 @@ export default async function handler(req, res) {
           LEFT JOIN product_returns returned_products USING (store_key)
         ),
         sku_product_keys AS (
-          SELECT sku_id FROM sku_product_sales
+          SELECT store_key, sku_id FROM sku_product_sales
           UNION
-          SELECT sku_id FROM sku_product_return_totals
+          SELECT store_key, sku_id FROM sku_product_return_totals
         ),
         sku_catalog_display AS (
           SELECT
+            store_key,
             sku_id,
             MIN(sku_code) AS sku_code,
             CASE
@@ -3186,12 +3259,12 @@ export default async function handler(req, res) {
               ELSE '[]'::jsonb
             END AS components
           FROM return_product_catalog
-          GROUP BY sku_id
+          GROUP BY store_key, sku_id
         ),
         sku_product_output AS (
           SELECT
-            'all-stores'::text AS store_key,
-            COALESCE(returned.store_names, 'All Stores') AS store_name,
+            keys.store_key,
+            COALESCE(sales.store_name, returned.store_name, 'Unassigned') AS store_name,
             keys.sku_id,
             COALESCE(sales.sku_code, returned.sku_code, catalog.sku_code) AS sku_code,
             sales.product_name,
@@ -3200,28 +3273,36 @@ export default async function handler(req, res) {
               ELSE '[]'::jsonb
             END AS components,
             COALESCE(sales.sold_product_units, 0)::int AS sold_product_units,
-            COALESCE(returned.returned_product_units, 0)::int AS returned_product_units,
+            LEAST(
+              COALESCE(returned.returned_product_units, 0),
+              COALESCE(sales.sold_product_units, 0)
+            )::int AS returned_product_units,
             COALESCE(returned.return_coverage_complete, true) AS return_coverage_complete,
             CASE
               WHEN COALESCE(returned.return_coverage_complete, true) = false THEN NULL
               WHEN COALESCE(sales.sold_product_units, 0) > 0
               THEN ROUND(
-                COALESCE(returned.returned_product_units, 0)::numeric
+                LEAST(
+                  COALESCE(returned.returned_product_units, 0),
+                  sales.sold_product_units
+                )::numeric
                 * 100 / sales.sold_product_units,
                 2
               )
               ELSE NULL
             END AS return_rate
           FROM sku_product_keys keys
-          LEFT JOIN sku_product_sales sales USING (sku_id)
-          LEFT JOIN sku_product_return_totals returned USING (sku_id)
-          LEFT JOIN sku_catalog_display catalog USING (sku_id)
+          LEFT JOIN sku_product_sales sales USING (store_key, sku_id)
+          LEFT JOIN sku_product_return_totals returned USING (store_key, sku_id)
+          LEFT JOIN sku_catalog_display catalog USING (store_key, sku_id)
           WHERE COALESCE(sales.sold_product_units, 0) > 0
              OR COALESCE(returned.returned_product_units, 0) > 0
              OR COALESCE(returned.return_coverage_complete, true) = false
         ),
         physical_sku_returns AS (
           SELECT
+            COALESCE(NULLIF(packages.store_key, ''), 'unassigned') AS store_key,
+            MIN(COALESCE(NULLIF(packages.store_name, ''), 'Unassigned')) AS store_name,
             LOWER(BTRIM(items.style)) AS style_key,
             LOWER(BTRIM(items.color)) AS color_key,
             CASE UPPER(BTRIM(items.size))
@@ -3237,20 +3318,25 @@ export default async function handler(req, res) {
           JOIN return_packages packages ON packages.id = items.package_id
           WHERE packages.status IN ('received', 'discrepancy')
             AND packages.confirmed_at >= ${from}
-          GROUP BY 1, 2, 3
+          GROUP BY 1, 3, 4, 5
         ),
         physical_sku_keys AS (
-          SELECT style_key, color_key, size_key FROM physical_sku_sales
+          SELECT store_key, style_key, color_key, size_key FROM physical_sku_sales
           UNION
-          SELECT style_key, color_key, size_key FROM physical_sku_returns
+          SELECT store_key, style_key, color_key, size_key FROM physical_sku_returns
         ),
         physical_sku_output AS (
           SELECT
+            keys.store_key,
+            COALESCE(sales.store_name, returned.store_name, 'Unassigned') AS store_name,
             COALESCE(sales.style, returned.style) AS style,
             COALESCE(sales.color, returned.color) AS color,
             COALESCE(sales.size, returned.size) AS size,
             COALESCE(sales.sold_qty, 0)::int AS sold_qty,
-            COALESCE(returned.returned_qty, 0)::int AS returned_qty,
+            LEAST(
+              COALESCE(returned.returned_qty, 0),
+              COALESCE(sales.sold_qty, 0)
+            )::int AS returned_qty,
             COALESCE(returned.restocked_qty, 0)::int AS restocked_qty,
             NOT EXISTS (
               SELECT 1 FROM product_sales WHERE uncovered_product_units > 0
@@ -3265,15 +3351,17 @@ export default async function handler(req, res) {
               ) THEN NULL
               WHEN COALESCE(sales.sold_qty, 0) > 0
               THEN ROUND(
-                COALESCE(returned.returned_qty, 0)::numeric * 100 / sales.sold_qty,
+                LEAST(COALESCE(returned.returned_qty, 0), sales.sold_qty)::numeric
+                * 100 / sales.sold_qty,
                 2
               )
               ELSE NULL
             END AS return_rate
           FROM physical_sku_keys keys
-          LEFT JOIN physical_sku_sales sales USING (style_key, color_key, size_key)
-          LEFT JOIN physical_sku_returns returned USING (style_key, color_key, size_key)
-          WHERE COALESCE(returned.returned_qty, 0) > 0
+          LEFT JOIN physical_sku_sales sales USING (store_key, style_key, color_key, size_key)
+          LEFT JOIN physical_sku_returns returned USING (store_key, style_key, color_key, size_key)
+          WHERE COALESCE(sales.sold_qty, 0) > 0
+             OR COALESCE(returned.returned_qty, 0) > 0
         )
         SELECT
           COALESCE((
@@ -3289,7 +3377,6 @@ export default async function handler(req, res) {
               SELECT * FROM sku_product_output
               ORDER BY return_rate DESC NULLS LAST, returned_product_units DESC,
                 store_name, sku_id
-              LIMIT 500
             ) sku_product_output
           ), '[]'::jsonb) AS sku_rows,
           COALESCE((
@@ -3298,7 +3385,6 @@ export default async function handler(req, res) {
             FROM (
               SELECT * FROM physical_sku_output
               ORDER BY returned_qty DESC, style, color, size
-              LIMIT 500
             ) physical_sku_output
           ), '[]'::jsonb) AS rows
       `
@@ -3349,12 +3435,17 @@ export default async function handler(req, res) {
       summary.sold_units = salesCoverage.mapped_physical_units
       summary.total_return_rate = summary.sales_catalog_coverage.complete
         && summary.sold_units > 0
-        ? Number(summary.returned_units || 0) * 100 / summary.sold_units
+        ? Math.min(Number(summary.returned_units || 0), summary.sold_units)
+          * 100 / summary.sold_units
         : null
       summary.physical_sales_source = 'canonical_orders_catalog'
       summary.inventory_reconciliation_delta = summary.sold_units
         - summary.inventory_physical_units
       summary.sold_product_units = salesCoverage.product_units
+      summary.returned_product_units = Math.min(
+        Number(summary.returned_product_units || 0),
+        summary.sold_product_units,
+      )
       summary.product_return_rate = summary.sold_product_units > 0
         ? summary.returned_product_units * 100 / summary.sold_product_units
         : null
