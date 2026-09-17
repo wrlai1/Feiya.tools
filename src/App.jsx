@@ -1,23 +1,23 @@
-import React from 'react'
+import React, { lazy, Suspense } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import { ToastProvider } from './components/Toast.jsx'
 import { AuthProvider, useAuth } from './context/AuthContext.jsx'
 import Layout from './components/Layout.jsx'
 import LoginPage from './pages/LoginPage.jsx'
-import Dashboard from './pages/Dashboard.jsx'
-import InventoryCheck from './pages/InventoryCheck.jsx'
-import NotesPage from './pages/NotesPage.jsx'
-import StockManagement from './pages/StockManagement.jsx'
-import AutoDeduct from './pages/AutoDeduct.jsx'
-import AutoDeductHistory from './pages/AutoDeductHistory.jsx'
-import MetricsAnalytics from './pages/MetricsAnalytics.jsx'
-import NewProductTracker from './pages/NewProductTracker.jsx'
-import AutoGenerate from './pages/AutoGenerate.jsx'
-import AdminUsers from './pages/AdminUsers.jsx'
-import TimeClockPage from './pages/TimeClockPage.jsx'
-import AdminTimeReport from './pages/AdminTimeReport.jsx'
-import ReturnsReceiving from './pages/ReturnsReceiving.jsx'
-import FactoryAttendance from './pages/FactoryAttendance.jsx'
+const Dashboard = lazy(() => import('./pages/Dashboard.jsx'))
+const InventoryCheck = lazy(() => import('./pages/InventoryCheck.jsx'))
+const NotesPage = lazy(() => import('./pages/NotesPage.jsx'))
+const StockManagement = lazy(() => import('./pages/StockManagement.jsx'))
+const AutoDeduct = lazy(() => import('./pages/AutoDeduct.jsx'))
+const AutoDeductHistory = lazy(() => import('./pages/AutoDeductHistory.jsx'))
+const MetricsAnalytics = lazy(() => import('./pages/MetricsAnalytics.jsx'))
+const NewProductTracker = lazy(() => import('./pages/NewProductTracker.jsx'))
+const AutoGenerate = lazy(() => import('./pages/AutoGenerate.jsx'))
+const AdminUsers = lazy(() => import('./pages/AdminUsers.jsx'))
+const TimeClockPage = lazy(() => import('./pages/TimeClockPage.jsx'))
+const AdminTimeReport = lazy(() => import('./pages/AdminTimeReport.jsx'))
+const ReturnsReceiving = lazy(() => import('./pages/ReturnsReceiving.jsx'))
+const FactoryAttendance = lazy(() => import('./pages/FactoryAttendance.jsx'))
 import userPermissions from './utils/userPermissions.js'
 
 const { INVENTORY_CHECK_VIEW, userHasPermission } = userPermissions
@@ -130,7 +130,7 @@ export default function App() {
     <ToastProvider>
       <AuthProvider>
         <BrowserRouter>
-          <AppRoutes />
+          <Suspense fallback={<SplashLoader />}><AppRoutes /></Suspense>
         </BrowserRouter>
       </AuthProvider>
     </ToastProvider>

@@ -144,6 +144,8 @@ function sortAnalyticsRows(rows, sort) {
   const [field, direction] = sort.split(':')
   const multiplier = direction === 'asc' ? 1 : -1
   return [...rows].sort((left, right) => {
+    if (left[field] == null && right[field] != null) return 1
+    if (right[field] == null && left[field] != null) return -1
     const leftValue = Number(left[field])
     const rightValue = Number(right[field])
     const leftNumber = Number.isFinite(leftValue) ? leftValue : -1
@@ -152,6 +154,10 @@ function sortAnalyticsRows(rows, sort) {
     if (difference) return difference
     return analyticsRowSearchText(left).localeCompare(analyticsRowSearchText(right))
   })
+}
+
+function formatAnalyticsCount(value) {
+  return value == null ? '—' : Number(value).toLocaleString()
 }
 
 function CountControl({ value, onChange, disabled, max = 9999, label = 'Actual quantity' }) {
@@ -407,7 +413,8 @@ export default function ReturnsReceiving() {
   const [analyticsSort, setAnalyticsSort] = useState('return_rate:desc')
   const [analyticsVisibleRows, setAnalyticsVisibleRows] = useState(100)
   const analyticsRequestRef = useRef(0)
-  const lifetimeLoadedRef = useRef(false)
+  const lifetimeLoadedRef = useRef(0)
+  const analyticsAbortRef = useRef(null)
   const [orderOnly, setOrderOnly] = useState(null)
   const [orderChoices, setOrderChoices] = useState([])
   const [orderFile, setOrderFile] = useState(null)
@@ -1218,45 +1225,47 @@ export default function ReturnsReceiving() {
 
   const loadAnalytics = useCallback(async (options = {}) => {
     if (!isAdmin) return
-    const requestId = analyticsRequestRef.current + 1
-    analyticsRequestRef.current = requestId
+    analyticsAbortRef.current?.abort()
+    const controller = new AbortController()
+    analyticsAbortRef.current = controller
+    const requestId = ++analyticsRequestRef.current
+    const refresh = options.refreshLifetime === true
+    const loadLifetime = refresh || Date.now() - lifetimeLoadedRef.current >= 60000
     setAnalyticsLoading(true)
-    try {
-      const analyticsRes = await fetch(`${BASE}/returns?action=analytics&days=${analyticsDays}`, {
-        headers: headers(getToken),
-      })
-      const analyticsData = await analyticsRes.json().catch(() => ({}))
-      if (!analyticsRes.ok) throw new Error(analyticsData.error || 'Could not load return analytics')
-      if (requestId !== analyticsRequestRef.current) return
-      setAnalytics(analyticsData)
-      setAnalyticsUpdatedAt(new Date())
-    } catch (error) {
-      toast.error(error.message, 'Analytics Failed')
-      return
-    } finally {
-      if (requestId === analyticsRequestRef.current) setAnalyticsLoading(false)
-    }
-
-    if (requestId !== analyticsRequestRef.current) return
-    if (lifetimeLoadedRef.current && options.refreshLifetime !== true) return
-    setLifetimeLoading(true)
-    try {
-      const lifetimeRes = await fetch(`${BASE}/returns?action=analytics&days=36500`, {
-        headers: headers(getToken),
-      })
-      const lifetimeData = await lifetimeRes.json().catch(() => ({}))
-      if (!lifetimeRes.ok) throw new Error(lifetimeData.error || 'Could not load all-time analytics')
-      if (requestId === analyticsRequestRef.current) {
-        setLifetimeAnalytics(lifetimeData)
-        lifetimeLoadedRef.current = true
+    setLifetimeLoading(loadLifetime)
+    const loadPeriod = async (days, lifetime) => {
+      try {
+        const response = await fetch(`${BASE}/returns?action=analytics&days=${days}${refresh ? '&refresh=1' : ''}`, {
+          headers: headers(getToken),
+          signal: controller.signal,
+        })
+        const data = await response.json().catch(() => ({}))
+        if (!response.ok) throw new Error(data.error || 'Could not load return analytics')
+        if (requestId !== analyticsRequestRef.current) return
+        if (lifetime) {
+          setLifetimeAnalytics(data)
+          lifetimeLoadedRef.current = new Date(data.generatedAt || Date.now()).getTime()
+        } else {
+          setAnalytics(data)
+          setAnalyticsUpdatedAt(new Date(data.generatedAt || Date.now()))
+        }
+      } catch (error) {
+        if (controller.signal.aborted || requestId !== analyticsRequestRef.current) return
+        toast.error(error.message, lifetime ? 'All-Time Analytics Failed' : 'Analytics Failed')
+      } finally {
+        if (requestId === analyticsRequestRef.current) {
+          if (lifetime) setLifetimeLoading(false)
+          else setAnalyticsLoading(false)
+        }
       }
-    } catch (error) {
-      toast.error(error.message, 'All-Time Analytics Failed')
-    } finally {
-      if (requestId === analyticsRequestRef.current) setLifetimeLoading(false)
     }
+    await Promise.all([
+      loadPeriod(analyticsDays, false),
+      ...(loadLifetime ? [loadPeriod('all', true)] : []),
+    ])
   }, [analyticsDays, getToken, isAdmin, toast])
 
+  useEffect(() => () => analyticsAbortRef.current?.abort(), [])
   const loadIntegrity = useCallback(async () => {
     if (!isAdmin || integrityLoading) return
     setIntegrityLoading(true)
@@ -1296,8 +1305,8 @@ export default function ReturnsReceiving() {
     return analyticsStores.map((store) => ({
       ...store,
       ...(periodByKey.get(store.store_key) || {}),
-      lifetime_sold_product_units: Number(lifetimeByKey.get(store.store_key)?.sold_product_units || 0),
-      lifetime_returned_product_units: Number(lifetimeByKey.get(store.store_key)?.returned_product_units || 0),
+      lifetime_sold_product_units: lifetimeAnalytics ? Number(lifetimeByKey.get(store.store_key)?.sold_product_units || 0) : null,
+      lifetime_returned_product_units: lifetimeAnalytics ? Number(lifetimeByKey.get(store.store_key)?.returned_product_units || 0) : null,
       lifetime_product_return_rate: lifetimeByKey.get(store.store_key)?.product_return_rate ?? null,
       lifetime_physical_return_rate: lifetimeByKey.get(store.store_key)?.physical_return_rate ?? null,
     }))
@@ -1316,8 +1325,8 @@ export default function ReturnsReceiving() {
         sold_product_units: Number(period?.sold_product_units || 0),
         returned_product_units: Number(period?.returned_product_units || 0),
         return_rate: period?.return_rate ?? null,
-        lifetime_sold_product_units: Number(lifetime?.sold_product_units || 0),
-        lifetime_returned_product_units: Number(lifetime?.returned_product_units || 0),
+        lifetime_sold_product_units: lifetimeAnalytics ? Number(lifetime?.sold_product_units || 0) : null,
+        lifetime_returned_product_units: lifetimeAnalytics ? Number(lifetime?.returned_product_units || 0) : null,
         lifetime_return_rate: lifetime?.return_rate ?? null,
       }
     })
@@ -1337,8 +1346,8 @@ export default function ReturnsReceiving() {
         sold_qty: Number(period?.sold_qty || 0),
         returned_qty: Number(period?.returned_qty || 0),
         return_rate: period?.return_rate ?? null,
-        lifetime_sold_qty: Number(lifetime?.sold_qty || 0),
-        lifetime_returned_qty: Number(lifetime?.returned_qty || 0),
+        lifetime_sold_qty: lifetimeAnalytics ? Number(lifetime?.sold_qty || 0) : null,
+        lifetime_returned_qty: lifetimeAnalytics ? Number(lifetime?.returned_qty || 0) : null,
         lifetime_return_rate: lifetime?.return_rate ?? null,
       }
     })
@@ -2875,14 +2884,15 @@ export default function ReturnsReceiving() {
                   <CheckCircle2 className={`h-4 w-4 ${integrityLoading ? 'animate-pulse' : ''}`} />
                   {integrityLoading ? 'Checking…' : 'Run Data Check'}
                 </button>
-                <button type="button" onClick={() => loadAnalytics({ refreshLifetime: true })} className="btn-secondary text-sm">
+                <button type="button" disabled={analyticsLoading || lifetimeLoading} onClick={() => loadAnalytics({ refreshLifetime: true })} className="btn-secondary text-sm disabled:opacity-50">
                   <RefreshCw className={`h-4 w-4 ${analyticsLoading ? 'animate-spin' : ''}`} />
-                  {analyticsLoading ? 'Refreshing…' : 'Refresh'}
+                  {analyticsLoading || lifetimeLoading ? 'Refreshing…' : 'Refresh'}
                 </button>
               </div>
             </div>
           </div>
 
+          <p className="text-xs text-slate-500">Reports may be up to 60 seconds old. Refresh recalculates both periods.</p>
           {analytics && (
             <>
               {integrity && (
@@ -2953,7 +2963,7 @@ export default function ReturnsReceiving() {
                   [`${analyticsDays}-Day Product Return Rate`, analytics.summary.product_return_rate == null
                     ? '—'
                     : `${Number(analytics.summary.product_return_rate).toFixed(2)}%`],
-                  ['All-Time Products Sold', lifetimeAnalytics?.summary?.sold_product_units ?? 'Loading…'],
+                  ['All-Time Products Sold', lifetimeAnalytics?.summary?.sold_product_units ?? (lifetimeLoading ? 'Loading…' : '—')],
                   ['All-Time Product Return Rate', lifetimeAnalytics?.summary?.product_return_rate == null
                     ? (lifetimeLoading ? 'Loading…' : '—')
                     : `${Number(lifetimeAnalytics.summary.product_return_rate).toFixed(2)}%`],
@@ -3018,7 +3028,7 @@ export default function ReturnsReceiving() {
                         <div><p className="text-slate-400">Physical returned</p><p className="font-semibold text-blue-700">{store.returned_units}</p></div>
                         <div><p className="text-slate-400">Physical rate</p><p className="font-semibold">{store.physical_return_rate == null ? '—' : `${Number(store.physical_return_rate).toFixed(2)}%`}</p></div>
                         <div><p className="text-slate-400">{analyticsDays}d product rate</p><p className="font-semibold">{store.product_return_rate == null ? '—' : `${Number(store.product_return_rate).toFixed(2)}%`}</p></div>
-                        <div><p className="text-slate-400">All-time sold</p><p className="font-semibold">{store.lifetime_sold_product_units}</p></div>
+                        <div><p className="text-slate-400">All-time sold</p><p className="font-semibold">{formatAnalyticsCount(store.lifetime_sold_product_units)}</p></div>
                         <div><p className="text-slate-400">All-time rate</p><p className="font-semibold">{store.lifetime_product_return_rate == null ? '—' : `${Number(store.lifetime_product_return_rate).toFixed(2)}%`}</p></div>
                       </div>
                     </div>
@@ -3058,8 +3068,8 @@ export default function ReturnsReceiving() {
                           <td className="px-4 py-3 text-right">{store.sold_product_units}</td>
                           <td className="px-4 py-3 text-right">{store.returned_product_units}</td>
                           <td className="px-4 py-3 text-right">{store.product_return_rate == null ? '—' : `${Number(store.product_return_rate).toFixed(2)}%`}</td>
-                          <td className="px-4 py-3 text-right">{store.lifetime_sold_product_units}</td>
-                          <td className="px-4 py-3 text-right">{store.lifetime_returned_product_units}</td>
+                          <td className="px-4 py-3 text-right">{formatAnalyticsCount(store.lifetime_sold_product_units)}</td>
+                          <td className="px-4 py-3 text-right">{formatAnalyticsCount(store.lifetime_returned_product_units)}</td>
                           <td className="px-4 py-3 text-right font-semibold">{store.lifetime_product_return_rate == null ? '—' : `${Number(store.lifetime_product_return_rate).toFixed(2)}%`}</td>
                         </tr>
                       ))}
@@ -3106,7 +3116,7 @@ export default function ReturnsReceiving() {
                       <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
                         <div><p className="text-slate-400">Products sold</p><p className="font-semibold">{row.sold_product_units}</p></div>
                         <div><p className="text-slate-400">Complete returns</p><p className="font-semibold text-blue-700">{row.returned_product_units}</p></div>
-                        <div><p className="text-slate-400">All-time sold</p><p className="font-semibold">{row.lifetime_sold_product_units}</p></div>
+                        <div><p className="text-slate-400">All-time sold</p><p className="font-semibold">{formatAnalyticsCount(row.lifetime_sold_product_units)}</p></div>
                         <div><p className="text-slate-400">All-time rate</p><p className="font-semibold">{row.lifetime_return_rate == null ? '—' : `${Number(row.lifetime_return_rate).toFixed(2)}%`}</p></div>
                       </div>
                       {!row.return_coverage_complete && (
@@ -3154,8 +3164,8 @@ export default function ReturnsReceiving() {
                           <td className="px-4 py-3 text-right tabular-nums font-semibold">
                             {row.return_rate == null ? '—' : `${Number(row.return_rate).toFixed(2)}%`}
                           </td>
-                          <td className="px-4 py-3 text-right tabular-nums">{row.lifetime_sold_product_units}</td>
-                          <td className="px-4 py-3 text-right tabular-nums font-semibold text-blue-700">{row.lifetime_returned_product_units}</td>
+                          <td className="px-4 py-3 text-right tabular-nums">{formatAnalyticsCount(row.lifetime_sold_product_units)}</td>
+                          <td className="px-4 py-3 text-right tabular-nums font-semibold text-blue-700">{formatAnalyticsCount(row.lifetime_returned_product_units)}</td>
                           <td className="px-4 py-3 text-right tabular-nums font-semibold">
                             {row.lifetime_return_rate == null ? '—' : `${Number(row.lifetime_return_rate).toFixed(2)}%`}
                           </td>
@@ -3193,7 +3203,7 @@ export default function ReturnsReceiving() {
                       <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
                         <div><p className="text-slate-400">{analyticsDays}d sold</p><p className="font-semibold">{row.sold_qty}</p></div>
                         <div><p className="text-slate-400">{analyticsDays}d rate</p><p className="font-semibold">{row.return_rate == null ? '—' : `${Number(row.return_rate).toFixed(2)}%`}</p></div>
-                        <div><p className="text-slate-400">All-time sold</p><p className="font-semibold">{row.lifetime_sold_qty}</p></div>
+                        <div><p className="text-slate-400">All-time sold</p><p className="font-semibold">{formatAnalyticsCount(row.lifetime_sold_qty)}</p></div>
                         <div><p className="text-slate-400">All-time rate</p><p className="font-semibold">{row.lifetime_return_rate == null ? '—' : `${Number(row.lifetime_return_rate).toFixed(2)}%`}</p></div>
                       </div>
                     </div>
@@ -3227,8 +3237,8 @@ export default function ReturnsReceiving() {
                           <td className="px-4 py-3 text-right tabular-nums font-semibold">
                             {row.return_rate == null ? '—' : `${Number(row.return_rate).toFixed(2)}%`}
                           </td>
-                          <td className="px-4 py-3 text-right tabular-nums">{row.lifetime_sold_qty}</td>
-                          <td className="px-4 py-3 text-right tabular-nums font-semibold text-blue-700">{row.lifetime_returned_qty}</td>
+                          <td className="px-4 py-3 text-right tabular-nums">{formatAnalyticsCount(row.lifetime_sold_qty)}</td>
+                          <td className="px-4 py-3 text-right tabular-nums font-semibold text-blue-700">{formatAnalyticsCount(row.lifetime_returned_qty)}</td>
                           <td className="px-4 py-3 text-right tabular-nums font-semibold">
                             {row.lifetime_return_rate == null ? '—' : `${Number(row.lifetime_return_rate).toFixed(2)}%`}
                           </td>

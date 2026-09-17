@@ -6,6 +6,7 @@
     "dev": "vite",
     "dev:full": "concurrently -n API,VITE -c cyan,green \"node server.cjs\" \"vite\"",
     "build": "vite build",
+    "migrate:returns": "node scripts/migrate-returns.mjs",
     "test:auto-deduct": "node --test tests/autoDeductEngine.test.js",
     "test:orders": "node --test tests/orderImportEngine.test.js",
     "test:replenishment": "node --test tests/replenishmentPlan.test.js",
@@ -27,6 +28,7 @@
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
     "@vitejs/plugin-react": "^4.2.1",
     "autoprefixer": "^10.4.18",
     "concurrently": "^9.2.1",

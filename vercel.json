@@ -1,5 +1,5 @@
 {
-  "buildCommand": "npm run build",
+  "buildCommand": "npm run migrate:returns && npm run build",
   "outputDirectory": "dist",
   "crons": [
     { "path": "/api/inventory-balance?action=email-cron&slot=00", "schedule": "5 0 * * *" },
