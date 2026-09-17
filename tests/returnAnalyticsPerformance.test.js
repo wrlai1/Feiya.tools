@@ -18,29 +18,39 @@ before(async () => {
     INSERT INTO return_product_catalog (store_key, store_name, sku_id, sku_code, components, status)
     VALUES ('house', 'House', '100', 'STYLE-BLACK-M',
       '[{"style":"STYLE","color":"BLACK","size":"M","qty":1}]', 'ready'),
+      ('house', 'House', '101', 'STYLE-BLACK-L',
+      '[{"style":"STYLE","color":"BLACK","size":"L","qty":1}]', 'ready'),
       ('garden', 'Garden', '200', 'STYLE-WHITE-M',
-      '[{"style":"STYLE","color":"WHITE","size":"M","qty":1}]', 'ready');
+      '[{"style":"STYLE","color":"WHITE","size":"M","qty":1}]', 'ready'),
+      ('garden', 'Garden', '201', 'UNMAPPED', '[]', 'needs_review');
     INSERT INTO return_orders (id, store_key, store_name, order_key, order_number, order_created_at)
     VALUES (1, 'house', 'House', 'PO-1', 'PO-1', NOW() - INTERVAL '3 days'),
-      (2, 'garden', 'Garden', 'PO-2', 'PO-2', NOW() - INTERVAL '60 days');
+      (2, 'garden', 'Garden', 'PO-2', 'PO-2', NOW() - INTERVAL '60 days'),
+      (3, 'house', 'House', 'PO-3', 'PO-3', NOW() - INTERVAL '2 days'),
+      (4, 'garden', 'Garden', 'PO-4', 'PO-4', NOW() - INTERVAL '2 days');
     INSERT INTO return_order_items (order_id, item_key, sku_id, sku_code, attributes, quantity)
     VALUES (1, 'sku:100', '100', 'STYLE-BLACK-M', 'BLACK M', 2),
-      (2, 'sku:200', '200', 'STYLE-WHITE-M', 'WHITE M', 5);
+      (2, 'sku:200', '200', 'STYLE-WHITE-M', 'WHITE M', 5),
+      (3, 'sku:101', '101', 'STYLE-BLACK-L', 'BLACK L', 4),
+      (4, 'sku:201', '201', 'UNMAPPED', 'UNKNOWN', 3);
     INSERT INTO return_packages (id, tracking_number, tracking_key, status, store_key, store_name,
       order_numbers, confirmed_at, expected_units, actual_units, restock_units)
     VALUES (1, 'TRACK1', 'TRACK1', 'received', 'house', 'House', '["PO-1"]', NOW(), 2, 2, 2),
       (2, 'TRACK2', 'TRACK2', 'received', 'house', 'House', '["PO-1"]', NOW(), 2, 2, 2),
-      (3, 'TRACK3', 'TRACK3', 'received', 'garden', 'Garden', '["PO-2"]', NOW() - INTERVAL '40 days', 1, 1, 1);
+      (3, 'TRACK3', 'TRACK3', 'received', 'garden', 'Garden', '["PO-2"]', NOW() - INTERVAL '40 days', 1, 1, 1),
+      (4, 'TRACK4', 'TRACK4', 'received', 'house', 'House', '["PO-3"]', NOW(), 1, 1, 1);
     INSERT INTO return_package_items (package_id, sku_id, sku_code, style, color, size, expected_qty, actual_qty, source_qty, restock_qty)
     VALUES (1, '100', 'STYLE-BLACK-M', 'STYLE', 'BLACK', 'M', 2, 2, 2, 2),
       (2, '100', 'STYLE-BLACK-M', 'STYLE', 'BLACK', 'M', 2, 2, 2, 2),
-      (3, '200', 'STYLE-WHITE-M', 'STYLE', 'WHITE', 'M', 1, 1, 1, 1);
+      (3, '200', 'STYLE-WHITE-M', 'STYLE', 'WHITE', 'M', 1, 1, 1, 1),
+      (4, '101', 'STYLE-BLACK-L', 'STYLE', 'BLACK', 'L', 1, 1, 4, 1);
     INSERT INTO inventory_transactions (id, transaction_type, source_file, applied_by, applied_at, rolled_back_at)
     VALUES (1, 'sales', 'active', 'admin', NOW(), NULL),
       (2, 'sales', 'reversed', 'admin', NOW(), NOW()),
       (3, 'sales', 'legacy-reversed', 'admin', NOW(), NOW());
     INSERT INTO inventory_txn_rows (txn_type, style, color, size, qty, transaction_id, business_day, source_file, applied_by, applied_at)
     VALUES ('sales', 'STYLE', 'BLACK', 'M', 2, 1, CURRENT_DATE, 'active', 'admin', NOW()),
+      ('sales', 'STYLE', 'BLACK', 'L', 4, 1, CURRENT_DATE, 'active', 'admin', NOW()),
       ('sales', 'STYLE', 'BLACK', 'M', 99, 2, CURRENT_DATE, 'reversed', 'admin', NOW()),
       ('sales', 'STYLE', 'BLACK', 'M', 50, NULL, NULL, 'legacy-reversed', 'admin', NOW());
   `)
@@ -49,15 +59,20 @@ after(async () => { await db?.close() })
 
 test('analytics SQL preserves periods, store separation, return caps and rollback exclusion', async () => {
   const recent = await computeReturnAnalytics(sql, 30)
-  assert.equal(recent.summary.inventory_physical_units, 2)
-  assert.equal(recent.summary.sold_product_units, 2)
-  assert.equal(recent.skuRows.length, 1)
-  assert.equal(recent.skuRows[0].store_key, 'house')
-  assert.equal(recent.skuRows[0].returned_product_units, 2)
-  assert.equal(Number(recent.skuRows[0].return_rate), 100)
+  assert.equal(recent.summary.inventory_physical_units, 6)
+  assert.equal(recent.summary.sold_product_units, 9)
+  assert.equal(recent.skuRows.length, 3)
+  const houseMedium = recent.skuRows.find(row => row.store_key === 'house' && row.sku_id === '100')
+  assert.equal(houseMedium.returned_product_units, 2)
+  assert.equal(Number(houseMedium.return_rate), 100)
+  const houseSizes = recent.rows.filter(row => row.store_key === 'house')
+  assert.deepEqual(houseSizes.map(row => row.size).sort(), ['L', 'M'])
+  assert.equal(Number(houseSizes.find(row => row.size === 'M').return_rate), 100)
+  assert.equal(Number(houseSizes.find(row => row.size === 'L').return_rate), 25)
+  assert.equal(houseSizes.every(row => row.coverage_complete), true)
   const lifetime = await computeReturnAnalytics(sql, 'all')
-  assert.equal(lifetime.summary.sold_product_units, 7)
-  assert.equal(lifetime.skuRows.length, 2)
+  assert.equal(lifetime.summary.sold_product_units, 14)
+  assert.equal(lifetime.skuRows.length, 4)
   assert.equal(Number(lifetime.skuRows.find(row => row.store_key === 'garden').return_rate), 20)
 })
 

@@ -1372,6 +1372,14 @@ export default function ReturnsReceiving() {
       .replace('returned_product_units', 'returned_qty'),
   ), [analyticsSort, matchesAnalyticsFilters, mergedPhysicalRows])
 
+  const selectedStoreSummary = useMemo(() => (
+    analyticsStore === 'all'
+      ? null
+      : mergedStoreRows.find((row) => row.store_key === analyticsStore) || null
+  ), [analyticsStore, mergedStoreRows])
+  const displayedAnalyticsSummary = selectedStoreSummary || analytics?.summary
+  const displayedStoreName = selectedStoreSummary?.store_name || 'All stores'
+
   useEffect(() => {
     setAnalyticsVisibleRows(100)
   }, [analyticsSearch, analyticsSort, analyticsStore])
@@ -2949,24 +2957,34 @@ export default function ReturnsReceiving() {
               )}
               <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
                 {[
-                  ['Received Packages', analytics.summary.received_packages],
-                  ['Discrepancy Packages', analytics.summary.discrepancy_packages],
-                  ['Not Ours / Flagged', analytics.summary.flagged_packages],
-                  ['Actual Returned Units', analytics.summary.returned_units],
-                  ['Restocked Units', analytics.summary.restocked_units],
-                  ['Physical Units Sold', analytics.summary.sold_units],
-                  [`${analyticsDays}-Day Physical Return Rate`, analytics.summary.total_return_rate == null
+                  ['Received Packages', displayedAnalyticsSummary?.received_packages || 0],
+                  ['Discrepancy Packages', displayedAnalyticsSummary?.discrepancy_packages || 0],
+                  ['Not Ours / Flagged', displayedAnalyticsSummary?.flagged_packages || 0],
+                  ['Actual Returned Units', displayedAnalyticsSummary?.returned_units || 0],
+                  ['Restocked Units', displayedAnalyticsSummary?.restocked_units || 0],
+                  ['Physical Units Sold', displayedAnalyticsSummary?.sold_units || 0],
+                  [`${analyticsDays}-Day Physical Return Rate`, (selectedStoreSummary
+                    ? displayedAnalyticsSummary?.physical_return_rate
+                    : displayedAnalyticsSummary?.total_return_rate) == null
                     ? '—'
-                    : `${Number(analytics.summary.total_return_rate).toFixed(2)}%`],
-                  ['Product Units Sold', analytics.summary.sold_product_units],
-                  ['Complete Product Returns', analytics.summary.returned_product_units],
-                  [`${analyticsDays}-Day Product Return Rate`, analytics.summary.product_return_rate == null
+                    : `${Number(selectedStoreSummary
+                      ? displayedAnalyticsSummary.physical_return_rate
+                      : displayedAnalyticsSummary.total_return_rate).toFixed(2)}%`],
+                  ['Product Units Sold', displayedAnalyticsSummary?.sold_product_units || 0],
+                  ['Complete Product Returns', displayedAnalyticsSummary?.returned_product_units || 0],
+                  [`${analyticsDays}-Day Product Return Rate`, displayedAnalyticsSummary?.product_return_rate == null
                     ? '—'
-                    : `${Number(analytics.summary.product_return_rate).toFixed(2)}%`],
-                  ['All-Time Products Sold', lifetimeAnalytics?.summary?.sold_product_units ?? (lifetimeLoading ? 'Loading…' : '—')],
-                  ['All-Time Product Return Rate', lifetimeAnalytics?.summary?.product_return_rate == null
+                    : `${Number(displayedAnalyticsSummary.product_return_rate).toFixed(2)}%`],
+                  ['All-Time Products Sold', selectedStoreSummary
+                    ? formatAnalyticsCount(selectedStoreSummary.lifetime_sold_product_units)
+                    : lifetimeAnalytics?.summary?.sold_product_units ?? (lifetimeLoading ? 'Loading…' : '—')],
+                  ['All-Time Product Return Rate', (selectedStoreSummary
+                    ? selectedStoreSummary.lifetime_product_return_rate
+                    : lifetimeAnalytics?.summary?.product_return_rate) == null
                     ? (lifetimeLoading ? 'Loading…' : '—')
-                    : `${Number(lifetimeAnalytics.summary.product_return_rate).toFixed(2)}%`],
+                    : `${Number(selectedStoreSummary
+                      ? selectedStoreSummary.lifetime_product_return_rate
+                      : lifetimeAnalytics.summary.product_return_rate).toFixed(2)}%`],
                 ].map(([label, value]) => (
                   <div key={label} className="card p-4">
                     <p className="text-2xl font-bold text-slate-900">
@@ -2976,6 +2994,9 @@ export default function ReturnsReceiving() {
                   </div>
                 ))}
               </div>
+              <p className="text-xs font-medium text-slate-500">
+                Summary scope: {displayedStoreName}. The SKU/size table below uses the same store filter.
+              </p>
               {analytics.summary.sales_catalog_coverage
                 && !analytics.summary.sales_catalog_coverage.complete && (
                 <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
@@ -3184,8 +3205,12 @@ export default function ReturnsReceiving() {
               </div>
               <div className="card overflow-hidden">
                 <div className="border-b border-slate-200 px-4 py-3 sm:px-5">
-                  <h3 className="text-sm font-semibold text-slate-800">Physical inventory return rate</h3>
-                  <p className="mt-1 text-xs text-slate-400">Actual received units ÷ sold units, separated by store, style, color, and size.</p>
+                  <h3 className="text-sm font-semibold text-slate-800">
+                    SKU / Size return rate{analyticsStore === 'all' ? '' : ` · ${displayedStoreName}`}
+                  </h3>
+                  <p className="mt-1 text-xs text-slate-400">
+                    Actual returned units ÷ sold units for the exact store, style, color, and size. Duplicate returns are capped at units sold.
+                  </p>
                   <p className="mt-1 text-xs font-medium text-slate-500">
                     {filteredPhysicalRows.length.toLocaleString()} matching combination(s)
                   </p>
@@ -3209,6 +3234,11 @@ export default function ReturnsReceiving() {
                     </div>
                   ))}
                 </div>
+                {filteredPhysicalRows.length === 0 && (
+                  <div className="border-t border-slate-100 px-4 py-8 text-center text-sm text-slate-500">
+                    No SKU/size sales and return data matches this store and search.
+                  </div>
+                )}
                 <div className="hidden overflow-x-auto sm:block">
                   <table className="w-full min-w-[1050px] text-sm">
                     <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
