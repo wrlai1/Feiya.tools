@@ -2957,27 +2957,17 @@ export default function ReturnsReceiving() {
               )}
               <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
                 {[
-                  ['Received Packages', displayedAnalyticsSummary?.received_packages || 0],
-                  ['Discrepancy Packages', displayedAnalyticsSummary?.discrepancy_packages || 0],
-                  ['Not Ours / Flagged', displayedAnalyticsSummary?.flagged_packages || 0],
-                  ['Actual Returned Units', displayedAnalyticsSummary?.returned_units || 0],
-                  ['Restocked Units', displayedAnalyticsSummary?.restocked_units || 0],
-                  ['Physical Units Sold', displayedAnalyticsSummary?.sold_units || 0],
-                  [`${analyticsDays}-Day Physical Return Rate`, (selectedStoreSummary
-                    ? displayedAnalyticsSummary?.physical_return_rate
-                    : displayedAnalyticsSummary?.total_return_rate) == null
-                    ? '—'
-                    : `${Number(selectedStoreSummary
-                      ? displayedAnalyticsSummary.physical_return_rate
-                      : displayedAnalyticsSummary.total_return_rate).toFixed(2)}%`],
-                  ['Product Units Sold', displayedAnalyticsSummary?.sold_product_units || 0],
-                  ['Complete Product Returns', displayedAnalyticsSummary?.returned_product_units || 0],
+                  [`${analyticsDays}-Day Products Sold`, displayedAnalyticsSummary?.sold_product_units || 0],
+                  [`${analyticsDays}-Day Returns`, displayedAnalyticsSummary?.returned_product_units || 0],
                   [`${analyticsDays}-Day Product Return Rate`, displayedAnalyticsSummary?.product_return_rate == null
                     ? '—'
                     : `${Number(displayedAnalyticsSummary.product_return_rate).toFixed(2)}%`],
                   ['All-Time Products Sold', selectedStoreSummary
                     ? formatAnalyticsCount(selectedStoreSummary.lifetime_sold_product_units)
                     : lifetimeAnalytics?.summary?.sold_product_units ?? (lifetimeLoading ? 'Loading…' : '—')],
+                  ['All-Time Returns', selectedStoreSummary
+                    ? formatAnalyticsCount(selectedStoreSummary.lifetime_returned_product_units)
+                    : lifetimeAnalytics?.summary?.returned_product_units ?? (lifetimeLoading ? 'Loading…' : '—')],
                   ['All-Time Product Return Rate', (selectedStoreSummary
                     ? selectedStoreSummary.lifetime_product_return_rate
                     : lifetimeAnalytics?.summary?.product_return_rate) == null
@@ -3037,7 +3027,7 @@ export default function ReturnsReceiving() {
                 <div className="border-b border-slate-200 px-4 py-3 sm:px-5">
                   <h3 className="text-sm font-semibold text-slate-800">Returns by store</h3>
                   <p className="mt-1 text-xs text-slate-400">
-                    Physical pieces and complete product/SKU units are kept separate.
+                    Products sold, complete returns, and return rate for the selected period and all time.
                   </p>
                 </div>
                 <div className="space-y-3 p-3 sm:hidden">
@@ -3045,28 +3035,21 @@ export default function ReturnsReceiving() {
                     <div key={store.store_key} className="rounded-xl border border-slate-200 p-3">
                       <p className="font-semibold text-slate-800">{store.store_name}</p>
                       <div className="mt-3 grid grid-cols-2 gap-3 text-xs">
-                        <div><p className="text-slate-400">Physical sold</p><p className="font-semibold">{store.sold_units}</p></div>
-                        <div><p className="text-slate-400">Physical returned</p><p className="font-semibold text-blue-700">{store.returned_units}</p></div>
-                        <div><p className="text-slate-400">Physical rate</p><p className="font-semibold">{store.physical_return_rate == null ? '—' : `${Number(store.physical_return_rate).toFixed(2)}%`}</p></div>
+                        <div><p className="text-slate-400">{analyticsDays}d sold</p><p className="font-semibold">{store.sold_product_units}</p></div>
+                        <div><p className="text-slate-400">{analyticsDays}d returns</p><p className="font-semibold text-blue-700">{store.returned_product_units}</p></div>
                         <div><p className="text-slate-400">{analyticsDays}d product rate</p><p className="font-semibold">{store.product_return_rate == null ? '—' : `${Number(store.product_return_rate).toFixed(2)}%`}</p></div>
                         <div><p className="text-slate-400">All-time sold</p><p className="font-semibold">{formatAnalyticsCount(store.lifetime_sold_product_units)}</p></div>
+                        <div><p className="text-slate-400">All-time returns</p><p className="font-semibold text-blue-700">{formatAnalyticsCount(store.lifetime_returned_product_units)}</p></div>
                         <div><p className="text-slate-400">All-time rate</p><p className="font-semibold">{store.lifetime_product_return_rate == null ? '—' : `${Number(store.lifetime_product_return_rate).toFixed(2)}%`}</p></div>
                       </div>
                     </div>
                   ))}
                 </div>
                 <div className="hidden overflow-x-auto sm:block">
-                  <table className="w-full min-w-[1250px] text-sm">
+                  <table className="w-full min-w-[760px] text-sm">
                     <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
                       <tr>
                         <th className="px-4 py-3">Store</th>
-                        <th className="px-4 py-3 text-right">Packages</th>
-                        <th className="px-4 py-3 text-right">Discrepancies</th>
-                        <th className="px-4 py-3 text-right">Not Ours</th>
-                        <th className="px-4 py-3 text-right">Returned</th>
-                        <th className="px-4 py-3 text-right">Restocked</th>
-                        <th className="px-4 py-3 text-right">Physical Sold</th>
-                        <th className="px-4 py-3 text-right">Physical Rate</th>
                         <th className="px-4 py-3 text-right">{analyticsDays}d Products Sold</th>
                         <th className="px-4 py-3 text-right">{analyticsDays}d Product Returns</th>
                         <th className="px-4 py-3 text-right">{analyticsDays}d Product Rate</th>
@@ -3079,13 +3062,6 @@ export default function ReturnsReceiving() {
                       {filteredStoreRows.map((store) => (
                         <tr key={store.store_key}>
                           <td className="px-4 py-3 font-medium text-slate-800">{store.store_name}</td>
-                          <td className="px-4 py-3 text-right">{store.received_packages}</td>
-                          <td className="px-4 py-3 text-right">{store.discrepancy_packages}</td>
-                          <td className="px-4 py-3 text-right font-semibold text-red-700">{store.flagged_packages}</td>
-                          <td className="px-4 py-3 text-right font-semibold text-blue-700">{store.returned_units}</td>
-                          <td className="px-4 py-3 text-right font-semibold text-emerald-700">{store.restocked_units}</td>
-                          <td className="px-4 py-3 text-right">{store.sold_units}</td>
-                          <td className="px-4 py-3 text-right">{store.physical_return_rate == null ? '—' : `${Number(store.physical_return_rate).toFixed(2)}%`}</td>
                           <td className="px-4 py-3 text-right">{store.sold_product_units}</td>
                           <td className="px-4 py-3 text-right">{store.returned_product_units}</td>
                           <td className="px-4 py-3 text-right">{store.product_return_rate == null ? '—' : `${Number(store.product_return_rate).toFixed(2)}%`}</td>
@@ -3098,16 +3074,16 @@ export default function ReturnsReceiving() {
                   </table>
                 </div>
               </div>
-              <div className="card overflow-hidden">
-                <div className="border-b border-slate-200 px-4 py-3 sm:px-5">
-                  <h3 className="text-sm font-semibold text-slate-800">SKU product return rate</h3>
+              <details className="card overflow-hidden">
+                <summary className="cursor-pointer border-b border-slate-200 px-4 py-3 sm:px-5">
+                  <h3 className="inline text-sm font-semibold text-slate-800">Product-set audit details</h3>
                   <p className="mt-1 text-xs text-slate-400">
-                    Complete returned sets ÷ products sold. Every color in a multi-color SKU is shown below.
+                    Optional SKU-level detail for complete returned sets. Open only when an order needs review.
                   </p>
                   <p className="mt-1 text-xs font-medium text-slate-500">
                     {filteredSkuRows.length.toLocaleString()} matching SKU(s)
                   </p>
-                </div>
+                </summary>
                 <div className="space-y-3 p-3 sm:hidden">
                   {filteredSkuRows.slice(0, analyticsVisibleRows).map((row, index) => (
                     <div
@@ -3202,7 +3178,7 @@ export default function ReturnsReceiving() {
                     </button>
                   </div>
                 )}
-              </div>
+              </details>
               <div className="card overflow-hidden">
                 <div className="border-b border-slate-200 px-4 py-3 sm:px-5">
                   <h3 className="text-sm font-semibold text-slate-800">

@@ -20,8 +20,15 @@ export default function AutoDeductHistory() {
   const [error, setError] = useState('')
   const [restoring, setRestoring] = useState(null)
   const [historyType, setHistoryType] = useState('sales')
+  const [searchInput, setSearchInput] = useState('')
+  const [search, setSearch] = useState('')
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo] = useState('')
+  const [page, setPage] = useState(1)
+  const [total, setTotal] = useState(0)
+  const pageSize = 50
   const visibleSnapshots = snapshots.filter((snapshot) => snapshot.label === historyType)
-  const visibleTransactions = transactions.filter((item) => item.transaction_type === historyType)
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
 
   const loadHistory = useCallback(async () => {
     setLoading(true)
@@ -29,7 +36,14 @@ export default function AutoDeductHistory() {
     try {
       const headers = { Authorization: `Bearer ${getToken()}` }
       const [transactionsRes, snapshotsRes] = await Promise.all([
-        fetch(`/api/inventory-balance?action=transactions&txnType=${historyType}`, { headers }),
+        fetch(`/api/inventory-balance?action=transactions&${new URLSearchParams({
+          txnType: historyType,
+          page: String(page),
+          pageSize: String(pageSize),
+          search,
+          dateFrom,
+          dateTo,
+        })}`, { headers }),
         fetch('/api/inventory-balance?action=history', { headers }),
       ])
       const [transactionsData, snapshotsData] = await Promise.all([
@@ -39,6 +53,7 @@ export default function AutoDeductHistory() {
       if (!transactionsRes.ok) throw new Error(transactionsData.error || 'Could not load transaction history')
       if (!snapshotsRes.ok) throw new Error(snapshotsData.error || 'Could not load rollback points')
       setTransactions(transactionsData.transactions || [])
+      setTotal(Number(transactionsData.total || 0))
       setSnapshots((snapshotsData.snapshots || []).filter((snapshot) =>
         ['sales', 'return'].includes(snapshot.label) && snapshot.restorable !== false
       ))
@@ -47,7 +62,7 @@ export default function AutoDeductHistory() {
     } finally {
       setLoading(false)
     }
-  }, [getToken, historyType])
+  }, [dateFrom, dateTo, getToken, historyType, page, search])
 
   useEffect(() => { loadHistory() }, [loadHistory])
 
@@ -110,12 +125,43 @@ export default function AutoDeductHistory() {
         {[['sales', 'Daily Auto Deduct / 每日扣库存'], ['return', 'Returns / 退货']].map(([value, label]) => (
           <button key={value} type="button" aria-pressed={historyType === value}
             disabled={loading || restoring !== null}
-            onClick={() => setHistoryType(value)}
+            onClick={() => { setHistoryType(value); setPage(1) }}
             className={`${historyType === value ? 'btn-primary' : 'btn-secondary'} text-sm disabled:opacity-50`}>
             {label}
           </button>
         ))}
       </div>
+
+      <form
+        className="card grid gap-3 p-4 sm:grid-cols-2 lg:grid-cols-[minmax(220px,1fr)_180px_180px_auto]"
+        onSubmit={(event) => { event.preventDefault(); setPage(1); setSearch(searchInput.trim()) }}
+      >
+        <label className="text-xs font-semibold text-slate-600">
+          File or user
+          <input value={searchInput} onChange={(event) => setSearchInput(event.target.value)}
+            placeholder="Search file name or applied by"
+            className="mt-1 h-10 w-full rounded-xl border border-slate-200 px-3 text-sm" />
+        </label>
+        <label className="text-xs font-semibold text-slate-600">
+          From
+          <input type="date" value={dateFrom}
+            onChange={(event) => { setDateFrom(event.target.value); setPage(1) }}
+            className="mt-1 h-10 w-full rounded-xl border border-slate-200 px-3 text-sm" />
+        </label>
+        <label className="text-xs font-semibold text-slate-600">
+          To
+          <input type="date" value={dateTo}
+            onChange={(event) => { setDateTo(event.target.value); setPage(1) }}
+            className="mt-1 h-10 w-full rounded-xl border border-slate-200 px-3 text-sm" />
+        </label>
+        <div className="flex items-end gap-2">
+          <button type="submit" className="btn-primary h-10 text-sm">Search</button>
+          <button type="button" className="btn-secondary h-10 text-sm"
+            onClick={() => { setSearchInput(''); setSearch(''); setDateFrom(''); setDateTo(''); setPage(1) }}>
+            Clear
+          </button>
+        </div>
+      </form>
 
       {error && (
         <div className="px-4 py-3 rounded-xl border border-red-200 bg-red-50 text-sm text-red-700">
@@ -190,7 +236,7 @@ export default function AutoDeductHistory() {
           <div className="py-16 flex items-center justify-center gap-2 text-sm text-slate-500">
             <RefreshCw className="w-4 h-4 animate-spin" /> Loading history…
           </div>
-        ) : visibleTransactions.length === 0 ? (
+        ) : transactions.length === 0 ? (
           <div className="py-16 text-center">
             <History className="w-9 h-9 text-slate-300 mx-auto mb-3" />
             <p className="text-sm font-medium text-slate-600">No {historyType === 'sales' ? 'deduction' : 'return'} records yet</p>
@@ -211,7 +257,7 @@ export default function AutoDeductHistory() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {visibleTransactions.map((item) => {
+                {transactions.map((item) => {
                   const isSale = item.transaction_type === 'sales'
                   const isRolledBack = Boolean(item.rolled_back_at)
                   const ActionIcon = isSale ? Minus : TrendingUp
@@ -249,6 +295,15 @@ export default function AutoDeductHistory() {
                 })}
               </tbody>
             </table>
+          </div>
+        )}
+        {!loading && total > 0 && (
+          <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 px-4 py-3 text-sm text-slate-500">
+            <span>{total.toLocaleString()} record(s) · Page {page} of {totalPages}</span>
+            <div className="flex gap-2">
+              <button type="button" disabled={page <= 1} onClick={() => setPage((value) => value - 1)} className="btn-secondary text-sm disabled:opacity-40">Previous</button>
+              <button type="button" disabled={page >= totalPages} onClick={() => setPage((value) => value + 1)} className="btn-secondary text-sm disabled:opacity-40">Next</button>
+            </div>
           </div>
         )}
       </div>

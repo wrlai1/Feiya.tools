@@ -1080,17 +1080,46 @@ export default async function handler(req, res) {
       if (txnType && !['sales', 'return'].includes(txnType)) {
         return res.status(400).json({ error: 'Invalid transaction type' })
       }
-      const rows = await sql`
+      const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1)
+      const pageSize = [25, 50, 100].includes(Number(req.query.pageSize))
+        ? Number(req.query.pageSize)
+        : 50
+      const offset = (page - 1) * pageSize
+      const search = String(req.query.search || '').trim().slice(0, 200)
+      const searchPattern = `%${search}%`
+      const dateFrom = /^\d{4}-\d{2}-\d{2}$/.test(req.query.dateFrom || '')
+        ? req.query.dateFrom
+        : null
+      const dateTo = /^\d{4}-\d{2}-\d{2}$/.test(req.query.dateTo || '')
+        ? req.query.dateTo
+        : null
+      const [rows, countRows] = await Promise.all([sql`
         SELECT id, transaction_type, source_file, applied_units, row_count, applied_by, applied_at, rolled_back_at
         FROM inventory_transactions
         WHERE (${txnType}::text IS NULL OR transaction_type = ${txnType})
-        ORDER BY applied_at DESC LIMIT 200
-      `
+          AND (${search}::text = '' OR source_file ILIKE ${searchPattern}
+            OR applied_by ILIKE ${searchPattern})
+          AND (${dateFrom}::date IS NULL OR applied_at >= ${dateFrom}::date)
+          AND (${dateTo}::date IS NULL OR applied_at < ${dateTo}::date + INTERVAL '1 day')
+        ORDER BY applied_at DESC
+        LIMIT ${pageSize} OFFSET ${offset}
+      `, sql`
+        SELECT COUNT(*)::int AS total
+        FROM inventory_transactions
+        WHERE (${txnType}::text IS NULL OR transaction_type = ${txnType})
+          AND (${search}::text = '' OR source_file ILIKE ${searchPattern}
+            OR applied_by ILIKE ${searchPattern})
+          AND (${dateFrom}::date IS NULL OR applied_at >= ${dateFrom}::date)
+          AND (${dateTo}::date IS NULL OR applied_at < ${dateTo}::date + INTERVAL '1 day')
+      `])
       return res.json({
         transactions: rows.map(r => ({
           ...r,
           timestamp: new Date(r.applied_at).toLocaleString(),
         })),
+        total: Number(countRows[0]?.total || 0),
+        page,
+        pageSize,
       })
     }
 
