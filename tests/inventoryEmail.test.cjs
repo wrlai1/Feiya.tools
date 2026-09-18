@@ -14,14 +14,14 @@ test('rejects invalid email and send hour', () => {
   assert.throws(() => normalizeSettings({ sendHour: 24 }), /0 to 23/)
 })
 
-test('builds totals and escapes inventory content', () => {
+test('builds totals without creating an email body', () => {
   const report = buildInventoryEmail({ reportDate: '2026-09-07', inventory: [{ style: '<50199>', color: 'White', size: 'M', quantity: 12 }], movements: [{ style: '<50199>', color: 'White', size: 'M', sales: 3, returns: 1, sales30: 90 }] })
   assert.deepEqual(report.totals, { quantity: 12, sales: 3, returns: 1, net: -2, sales30: 90, targetStock: 63, replenishment: 51 })
   assert.equal(report.rows[0].dailyAverage, 3)
   assert.equal(report.rows[0].targetStock, 63)
   assert.equal(report.rows[0].replenishment, 51)
-  assert.match(report.html, /&lt;50199&gt;/)
-  assert.doesNotMatch(report.html, /<50199>/)
+  assert.equal('html' in report, false)
+  assert.equal('text' in report, false)
 })
 
 test('uses New York local date and previous calendar date', () => {
