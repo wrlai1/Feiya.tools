@@ -221,7 +221,31 @@ export default function AutoDeduct() {
   const [resolutionAliasKeys, setResolutionAliasKeys] = useState([])
   const [previewConfirmed, setPreviewConfirmed] = useState(false)
   const [orderArchive, setOrderArchive] = useState(null)
+  const [uploadedThrough, setUploadedThrough] = useState(null)
+  const [uploadDateLoading, setUploadDateLoading] = useState(true)
+  const [uploadDateError, setUploadDateError] = useState(false)
   const toast = useToast()
+
+  const loadUploadDate = useCallback(async () => {
+    setUploadDateLoading(true)
+    setUploadDateError(false)
+    try {
+      if (isMock) { setUploadedThrough(null); return }
+      const response = await fetch(`${BASE}/returns?action=order-stats`, {
+        headers: authHeaders(getToken()),
+      })
+      if (!response.ok) throw new Error('Could not load uploaded order dates')
+      const data = await response.json()
+      const store = (data.stores || []).find((row) => row.store_key === COMBINED_STORE.toLowerCase())
+      setUploadedThrough(store?.latest_order ? String(store.latest_order).slice(0, 10) : null)
+    } catch {
+      setUploadDateError(true)
+    } finally {
+      setUploadDateLoading(false)
+    }
+  }, [getToken, isMock])
+
+  useEffect(() => { loadUploadDate() }, [loadUploadDate])
 
   // Merge resolver output into filledRows:
   //   linked items  → find the matching row and add QTY
@@ -667,8 +691,9 @@ export default function AutoDeduct() {
       toast.error(err.message, 'Apply Failed')
     } finally {
       setApplying(false)
+      loadUploadDate()
     }
-  }, [archiveDailyOrders, mergedFilledRows, businessMovementRows, txnType, srcFile, sourceHash, orderArchive, orderClaims, orderImportIssueCount, expectedSourceUnits, inventoryApplyUnits, reconciliationMismatch, skippedUnits, applying, getToken, previewConfirmed, toast])
+  }, [archiveDailyOrders, mergedFilledRows, businessMovementRows, txnType, srcFile, sourceHash, orderArchive, orderClaims, orderImportIssueCount, expectedSourceUnits, inventoryApplyUnits, reconciliationMismatch, skippedUnits, applying, getToken, previewConfirmed, toast, loadUploadDate])
 
   const stats            = result?.stats
   const hasUnresolved    = result?.unmatchedRows?.length > 0 && resolvedExtras === null
@@ -718,6 +743,17 @@ export default function AutoDeduct() {
             Settings
           </button>
         </div>
+      </div>
+
+      <div className="rounded-xl border border-blue-100 bg-blue-50 px-4 py-3 text-sm text-blue-900">
+        <p className="font-semibold">
+          Latest uploaded order date / 已上传最新订单日期：{' '}
+          {uploadDateLoading ? 'Loading…' : uploadDateError ? 'Unable to load' : uploadedThrough || 'No dated orders uploaded'}
+        </p>
+        <p className="mt-1 text-xs text-blue-700">
+          Based on order dates in saved Auto Deduct files. Earlier dates may still have gaps; saved orders may be pending deduction.
+        </p>
+        {uploadDateError && <button type="button" onClick={loadUploadDate} className="mt-2 underline">Retry</button>}
       </div>
 
       {/* Error banner */}

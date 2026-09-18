@@ -68,7 +68,7 @@ export default function DailyStyleReport({ inventoryRows = [] }) {
     }
     setSelectedStyles((current) => {
       const valid = current.filter((selected) => styles.some((style) => normalizedPart(style) === normalizedPart(selected)))
-      return valid.length ? valid : [styles[0]]
+      return valid
     })
   }, [styles])
 
@@ -106,7 +106,7 @@ export default function DailyStyleReport({ inventoryRows = [] }) {
   const toggleStyle = (style) => {
     setSelectedStyles((current) => {
       const selected = current.some((item) => normalizedPart(item) === normalizedPart(style))
-      if (selected) return current.length === 1 ? current : current.filter((item) => normalizedPart(item) !== normalizedPart(style))
+      if (selected) return current.filter((item) => normalizedPart(item) !== normalizedPart(style))
       return [...current, style]
     })
   }
@@ -169,7 +169,7 @@ export default function DailyStyleReport({ inventoryRows = [] }) {
             <p className="text-xs font-semibold text-slate-500">Styles / 款式（已选 {selectedStyles.length}）</p>
             <div className="flex gap-3 text-xs font-semibold">
               <button type="button" onClick={() => setSelectedStyles(styles)} className="text-blue-600 hover:text-blue-800">Select all</button>
-              <button type="button" onClick={() => setSelectedStyles([activeStyle || styles[0]])} className="text-slate-500 hover:text-slate-800">Keep one</button>
+              <button type="button" disabled={!activeStyle} onClick={() => setSelectedStyles([activeStyle])} className="text-slate-500 hover:text-slate-800 disabled:opacity-40">Keep one</button>
             </div>
           </div>
           <input value={styleSearch} onChange={(event) => setStyleSearch(event.target.value)}

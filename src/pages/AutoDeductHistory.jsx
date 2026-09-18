@@ -19,6 +19,9 @@ export default function AutoDeductHistory() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [restoring, setRestoring] = useState(null)
+  const [historyType, setHistoryType] = useState('sales')
+  const visibleSnapshots = snapshots.filter((snapshot) => snapshot.label === historyType)
+  const visibleTransactions = transactions.filter((item) => item.transaction_type === historyType)
 
   const loadHistory = useCallback(async () => {
     setLoading(true)
@@ -26,7 +29,7 @@ export default function AutoDeductHistory() {
     try {
       const headers = { Authorization: `Bearer ${getToken()}` }
       const [transactionsRes, snapshotsRes] = await Promise.all([
-        fetch('/api/inventory-balance?action=transactions', { headers }),
+        fetch(`/api/inventory-balance?action=transactions&txnType=${historyType}`, { headers }),
         fetch('/api/inventory-balance?action=history', { headers }),
       ])
       const [transactionsData, snapshotsData] = await Promise.all([
@@ -44,7 +47,7 @@ export default function AutoDeductHistory() {
     } finally {
       setLoading(false)
     }
-  }, [getToken])
+  }, [getToken, historyType])
 
   useEffect(() => { loadHistory() }, [loadHistory])
 
@@ -103,6 +106,17 @@ export default function AutoDeductHistory() {
         </div>
       </div>
 
+      <div className="flex gap-2" role="group" aria-label="History type">
+        {[['sales', 'Daily Auto Deduct / 每日扣库存'], ['return', 'Returns / 退货']].map(([value, label]) => (
+          <button key={value} type="button" aria-pressed={historyType === value}
+            disabled={loading || restoring !== null}
+            onClick={() => setHistoryType(value)}
+            className={`${historyType === value ? 'btn-primary' : 'btn-secondary'} text-sm disabled:opacity-50`}>
+            {label}
+          </button>
+        ))}
+      </div>
+
       {error && (
         <div className="px-4 py-3 rounded-xl border border-red-200 bg-red-50 text-sm text-red-700">
           {error}
@@ -113,7 +127,7 @@ export default function AutoDeductHistory() {
         <div className="border-b border-slate-100 px-5 py-4">
           <div className="flex items-center gap-2">
             <RotateCcw className="h-4 w-4 text-blue-600" />
-            <h3 className="font-semibold text-slate-800">Rollback Auto Deduct</h3>
+            <h3 className="font-semibold text-slate-800">{historyType === 'sales' ? 'Rollback Auto Deduct' : 'Rollback Returns'}</h3>
           </div>
           <div className="mt-3 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
@@ -127,13 +141,13 @@ export default function AutoDeductHistory() {
           <div className="flex items-center justify-center gap-2 py-10 text-sm text-slate-500">
             <RefreshCw className="h-4 w-4 animate-spin" /> Loading rollback points…
           </div>
-        ) : snapshots.length === 0 ? (
+        ) : visibleSnapshots.length === 0 ? (
           <div className="px-5 py-10 text-center text-sm text-slate-500">
-            No Auto Deduct rollback points are available yet.
+            No {historyType === 'sales' ? 'deduction' : 'return'} rollback points are available yet.
           </div>
         ) : (
           <div className="divide-y divide-slate-100">
-            {snapshots.map((snapshot) => {
+            {visibleSnapshots.map((snapshot) => {
               const isSale = snapshot.label === 'sales'
               return (
                 <div key={snapshot.id} className="flex flex-col gap-3 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
@@ -176,10 +190,10 @@ export default function AutoDeductHistory() {
           <div className="py-16 flex items-center justify-center gap-2 text-sm text-slate-500">
             <RefreshCw className="w-4 h-4 animate-spin" /> Loading history…
           </div>
-        ) : transactions.length === 0 ? (
+        ) : visibleTransactions.length === 0 ? (
           <div className="py-16 text-center">
             <History className="w-9 h-9 text-slate-300 mx-auto mb-3" />
-            <p className="text-sm font-medium text-slate-600">No successful updates yet</p>
+            <p className="text-sm font-medium text-slate-600">No {historyType === 'sales' ? 'deduction' : 'return'} records yet</p>
             <p className="text-xs text-slate-400 mt-1">Apply a sale or return in Auto Deduct to create the first record.</p>
           </div>
         ) : (
@@ -197,7 +211,7 @@ export default function AutoDeductHistory() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {transactions.map((item) => {
+                {visibleTransactions.map((item) => {
                   const isSale = item.transaction_type === 'sales'
                   const isRolledBack = Boolean(item.rolled_back_at)
                   const ActionIcon = isSale ? Minus : TrendingUp

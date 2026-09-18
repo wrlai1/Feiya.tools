@@ -1076,9 +1076,14 @@ export default async function handler(req, res) {
 
     // ── GET transactions ──────────────────────────────────────────────────────
     if (req.method === 'GET' && action === 'transactions') {
+      const txnType = req.query.txnType || null
+      if (txnType && !['sales', 'return'].includes(txnType)) {
+        return res.status(400).json({ error: 'Invalid transaction type' })
+      }
       const rows = await sql`
         SELECT id, transaction_type, source_file, applied_units, row_count, applied_by, applied_at, rolled_back_at
         FROM inventory_transactions
+        WHERE (${txnType}::text IS NULL OR transaction_type = ${txnType})
         ORDER BY applied_at DESC LIMIT 200
       `
       return res.json({
