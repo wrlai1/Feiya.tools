@@ -12,8 +12,8 @@
       Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
-    background-color: #f1f5f9;
-    color: #1e293b;
+    background-color: #f5f5f7;
+    color: #1d1d1f;
   }
 
   ::-webkit-scrollbar {
@@ -22,7 +22,7 @@
   }
 
   ::-webkit-scrollbar-track {
-    background: #f1f5f9;
+    background: transparent;
   }
 
   ::-webkit-scrollbar-thumb {
@@ -37,34 +37,35 @@
 
 @layer components {
   .card {
-    @apply bg-white rounded-xl shadow-sm border border-slate-200;
+    @apply rounded-2xl border border-slate-200/70 bg-white;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.025), 0 8px 24px rgba(15, 23, 42, 0.035);
   }
 
   .btn-primary {
-    @apply bg-blue-600 hover:bg-blue-700 text-white font-medium px-4 py-2 rounded-lg transition-colors duration-150 inline-flex items-center gap-2;
+    @apply inline-flex items-center gap-2 rounded-xl bg-[#0071e3] px-4 py-2 font-medium text-white transition-colors duration-150 hover:bg-[#0077ed];
   }
 
   .btn-secondary {
-    @apply bg-white hover:bg-slate-50 text-slate-700 font-medium px-4 py-2 rounded-lg border border-slate-200 transition-colors duration-150 inline-flex items-center gap-2;
+    @apply inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2 font-medium text-slate-700 transition-colors duration-150 hover:bg-slate-50;
   }
 
   .btn-ghost {
-    @apply hover:bg-slate-100 text-slate-600 font-medium px-3 py-2 rounded-lg transition-colors duration-150 inline-flex items-center gap-2;
+    @apply inline-flex items-center gap-2 rounded-xl px-3 py-2 font-medium text-slate-600 transition-colors duration-150 hover:bg-slate-100;
   }
 
   .input-base {
-    @apply w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition;
+    @apply w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 placeholder-slate-400 transition focus:border-transparent focus:outline-none focus:ring-2 focus:ring-[#0071e3]/30;
   }
 
   /* Compact, auto-width control for the Analytics picker/builder rows. */
   .metric-input {
-    @apply px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition;
+    @apply rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 placeholder-slate-400 transition focus:border-transparent focus:outline-none focus:ring-2 focus:ring-[#0071e3]/30;
   }
 }
 
 /* Sidebar transition */
 .sidebar-transition {
-  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: width 0.22s cubic-bezier(0.4, 0, 0.2, 1), transform 0.22s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 /* Smooth table row transitions */

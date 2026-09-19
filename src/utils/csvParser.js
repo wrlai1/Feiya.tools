@@ -58,6 +58,48 @@ export function parseCSV(text) {
   return rows
 }
 
+export function normalizeTrackingRows(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return []
+  const findKey = (row, candidates) => {
+    const entries = Object.keys(row).map((key) => ({
+      key,
+      normalized: key.trim().toLowerCase().replace(/[^a-z0-9]/g, ''),
+    }))
+    const wanted = candidates.map((candidate) => candidate.toLowerCase().replace(/[^a-z0-9]/g, ''))
+    return entries.find((entry) => wanted.includes(entry.normalized))?.key
+      || entries.find((entry) => wanted.some((candidate) => entry.normalized.includes(candidate)))?.key
+      || ''
+  }
+
+  const trackingKey = findKey(rows[0], ['Tracking', 'Tracking#', 'TrackingNo'])
+  const skuKey = findKey(rows[0], ['SKU', 'Item', 'Product'])
+  const qtyKey = findKey(rows[0], ['Quantity', 'Qty', 'Count'])
+  const sizeKey = findKey(rows[0], ['Actual Size On TEMU', 'Actual Size', 'Size'])
+  if (!trackingKey || !skuKey || !qtyKey) {
+    throw new Error('Tracking file requires Tracking, SKU, and Quantity columns')
+  }
+
+  return rows.map((row, index) => {
+    const tracking = String(row[trackingKey] || '').trim()
+    const sku = String(row[skuKey] || '').trim()
+    const rawQuantity = row[qtyKey]
+    const quantity = Number(rawQuantity)
+    if (!tracking || !sku) {
+      throw new Error(`CSV row ${index + 2} requires both Tracking and SKU`)
+    }
+    if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+      throw new Error(`CSV row ${index + 2} Quantity must be a positive whole number`)
+    }
+    return {
+      tracking,
+      sku,
+      quantity,
+      actualSize: String(row[sizeKey] || '').trim(),
+      _raw: row,
+    }
+  })
+}
+
 /**
  * Parse tracking CSV file
  * Expected columns: Tracking, SKU, Quantity, Actual Size On TEMU
@@ -76,28 +118,7 @@ export async function parseTrackingCSV(file) {
           return
         }
 
-        // Normalize column names
-        const sampleKeys = Object.keys(rows[0])
-
-        const findKey = (row, candidates) =>
-          Object.keys(row).find((k) =>
-            candidates.some((c) => k.toLowerCase().includes(c.toLowerCase()))
-          ) || ''
-
-        const trackingKey = findKey(rows[0], ['Tracking', 'Track', 'Tracking#', 'TrackingNo'])
-        const skuKey = findKey(rows[0], ['SKU', 'Sku', 'Item', 'Product'])
-        const qtyKey = findKey(rows[0], ['Quantity', 'Qty', 'QTY', 'Count'])
-        const sizeKey = findKey(rows[0], ['Actual Size', 'Size', 'TEMU', 'Actual'])
-
-        const normalized = rows.map((row) => ({
-          tracking: row[trackingKey] || '',
-          sku: row[skuKey] || '',
-          quantity: parseInt(row[qtyKey], 10) || 0,
-          actualSize: row[sizeKey] || '',
-          _raw: row,
-        }))
-
-        resolve(normalized.filter((r) => r.tracking || r.sku))
+        resolve(normalizeTrackingRows(rows))
       } catch (err) {
         reject(new Error(`Failed to parse CSV file: ${err.message}`))
       }
