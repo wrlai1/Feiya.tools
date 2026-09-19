@@ -15,13 +15,28 @@ test('rejects invalid email and send hour', () => {
 })
 
 test('builds totals without creating an email body', () => {
-  const report = buildInventoryEmail({ reportDate: '2026-09-07', inventory: [{ style: '<50199>', color: 'White', size: 'M', quantity: 12 }], movements: [{ style: '<50199>', color: 'White', size: 'M', sales: 3, returns: 1, sales30: 90 }] })
-  assert.deepEqual(report.totals, { quantity: 12, sales: 3, returns: 1, net: -2, sales30: 90, targetStock: 63, replenishment: 51 })
+  const report = buildInventoryEmail({ reportDate: '2026-09-07', inventory: [{ style: '<50199>', color: 'White', size: 'M', quantity: 12 }], movements: [{ style: '<50199>', color: 'White', size: 'M', sales: 3, returns: 1, sales7: 21, sales14: 45, sales30: 90, returns30: 12 }] })
+  assert.deepEqual(report.totals, {
+    quantity: 12, sales: 3, returns: 1, net: -2,
+    sales7: 21, sales14: 45, sales30: 90, returns30: 12,
+    targetStock: 63, replenishment: 51, returnRate30: 12 / 90,
+  })
   assert.equal(report.rows[0].dailyAverage, 3)
   assert.equal(report.rows[0].targetStock, 63)
   assert.equal(report.rows[0].replenishment, 51)
+  assert.equal(report.rows[0].returnRate30, 12 / 90)
   assert.equal('html' in report, false)
   assert.equal('text' in report, false)
+})
+
+test('caps the 30-day return rate at 100 percent', () => {
+  const report = buildInventoryEmail({
+    reportDate: '2026-09-07',
+    inventory: [{ style: '50199', color: 'White', size: 'M', quantity: 12 }],
+    movements: [{ style: '50199', color: 'White', size: 'M', sales30: 2, returns30: 5 }],
+  })
+  assert.equal(report.rows[0].returnRate30, 1)
+  assert.equal(report.totals.returnRate30, 1)
 })
 
 test('uses New York local date and previous calendar date', () => {
@@ -49,18 +64,29 @@ test('builds one formatted worksheet per style with stock alerts', async () => {
       { style: '50200', color: 'Black', size: '14W', quantity: 100 },
     ],
     movements: [
-      { style: '50199', color: 'White', size: 'S', sales: 2, returns: 0, sales30: 60 },
-      { style: '50199', color: 'White', size: 'M', sales: 3, returns: 1, sales30: 90 },
-      { style: '50199', color: 'Wine', size: 'M', sales: 1, returns: 0, sales30: 30 },
+      { style: '50199', color: 'White', size: 'S', sales: 2, returns: 0, sales7: 12, sales14: 28, sales30: 60, returns30: 3 },
+      { style: '50199', color: 'White', size: 'M', sales: 3, returns: 1, sales7: 21, sales14: 45, sales30: 90, returns30: 12 },
+      { style: '50199', color: 'Wine', size: 'M', sales: 1, returns: 0, sales7: 7, sales14: 14, sales30: 30, returns30: 35 },
     ],
   })
   const bytes = await buildInventoryWorkbook({ ...report, reportDate: '2026-09-07', movementDay: '2026-09-06' })
   const workbook = new ExcelJS.Workbook()
   await workbook.xlsx.load(bytes)
 
-  assert.deepEqual(workbook.worksheets.map((sheet) => sheet.name), ['50199', '50200'])
+  assert.deepEqual(workbook.worksheets.map((sheet) => sheet.name), ['Sales Summary', '50199', '50200'])
+  const summary = workbook.getWorksheet('Sales Summary')
+  assert.deepEqual(summary.getRow(4).values.slice(1), [
+    'Style', 'Color', 'Size', 'Sales (2026-09-06)', '7-Day Sales', '14-Day Sales',
+    '30-Day Sales', '30-Day Returns', '30-Day Return Rate', 'Current Inventory',
+  ])
+  assert.deepEqual(summary.getRow(5).values.slice(1, 11), [
+    '50199', 'White', 'S', 2, 12, 28, 60, 3, 0.05, 120,
+  ])
+  assert.equal(summary.getCell('I7').value, 1)
+  assert.equal(summary.getCell('I7').numFmt, '0.0%')
+  assert.equal(summary.getCell('J6').fill.fgColor.argb, 'FFF4CCCC')
   const sheet = workbook.getWorksheet('50199')
-  assert.deepEqual(['A4', 'B4', 'D4', 'F4', 'H4', 'J4', 'L4', 'N4'].map((cell) => sheet.getCell(cell).value), ['Color', 'Current Inventory', 'Yesterday Sales', 'Yesterday Returns', '30-Day Avg / Day', '21-Day Target', 'Replenishment', 'Total Replenishment'])
+  assert.deepEqual(['A4', 'B4', 'D4', 'F4', 'H4', 'J4', 'L4', 'N4'].map((cell) => sheet.getCell(cell).value), ['Color', 'Current Inventory', 'Latest Day Sales', 'Latest Day Returns', '30-Day Avg / Day', '21-Day Target', 'Replenishment', 'Total Replenishment'])
   assert.deepEqual(sheet.getRow(5).values.slice(2, 6), ['S', 'M', 'S', 'M'])
   assert.equal(sheet.getCell('B5').fill.fgColor.argb, 'FF16A34A')
   assert.equal(sheet.getCell('C5').fill.fgColor.argb, 'FF16A34A')

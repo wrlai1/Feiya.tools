@@ -320,7 +320,7 @@ function DailyInventoryEmailPanel() {
       })
       const data = await response.json()
       if (!response.ok) throw new Error(data.error || 'Could not save email settings')
-      toast.success(action === 'send-test' ? 'Test inventory email sent.' : 'Daily inventory email settings saved.', action === 'send-test' ? 'Email Sent' : 'Settings Saved')
+      toast.success(action === 'send-test' ? 'Test sales and inventory email sent.' : 'Daily sales and inventory email settings saved.', action === 'send-test' ? 'Email Sent' : 'Settings Saved')
       await load()
     } catch (error) {
       toast.error(error.message, action === 'send-test' ? 'Could Not Send' : 'Could Not Save')
@@ -343,7 +343,7 @@ function DailyInventoryEmailPanel() {
       <button type="button" onClick={() => setOpen((value) => !value)} className="flex w-full items-center justify-between gap-4 p-5 text-left hover:bg-indigo-50/40">
         <div className="flex min-w-0 items-center gap-3">
           <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-indigo-100 text-indigo-700"><Mail className="h-5 w-5" /></span>
-          <div><h2 className="font-bold text-slate-900">Daily Inventory Email</h2><p className="mt-0.5 text-sm text-slate-500">Choose styles, recipients and the daily send time.</p></div>
+          <div><h2 className="font-bold text-slate-900">Daily Sales & Inventory Email</h2><p className="mt-0.5 text-sm text-slate-500">Email an Excel summary with latest-day, 7/14/30-day sales, return rate and current inventory.</p></div>
         </div>
         <ChevronRight className={`h-5 w-5 shrink-0 text-slate-400 transition ${open ? 'rotate-90' : ''}`} />
       </button>
@@ -354,7 +354,7 @@ function DailyInventoryEmailPanel() {
             <span className={`rounded-full px-3 py-1 ${system.cronConfigured ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-800'}`}>Daily scheduler: {system.cronConfigured ? 'Ready' : 'Needs setup'}</span>
             <span className="rounded-full bg-slate-100 px-3 py-1 text-slate-600">Eastern Time</span>
           </div>
-          <label className="flex items-center justify-between gap-4 rounded-2xl border border-slate-200 p-4"><span><span className="block text-sm font-bold text-slate-800">Enable daily email</span><span className="mt-0.5 block text-xs text-slate-500">The report sends once during the selected hour.</span></span><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} className="h-5 w-5 accent-indigo-600" /></label>
+          <label className="flex items-center justify-between gap-4 rounded-2xl border border-slate-200 p-4"><span><span className="block text-sm font-bold text-slate-800">Enable daily email</span><span className="mt-0.5 block text-xs text-slate-500">The Excel report sends once during the selected hour.</span></span><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} className="h-5 w-5 accent-indigo-600" /></label>
           <div className="grid gap-4 lg:grid-cols-[2fr_1fr]">
             <label className="text-sm font-bold text-slate-700">Recipients
               <textarea value={recipients} onChange={(event) => setRecipients(event.target.value)} rows={3} placeholder="name@company.com, manager@company.com" className="mt-2 w-full rounded-2xl border border-slate-200 px-4 py-3 text-sm font-normal outline-none focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100" />
