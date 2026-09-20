@@ -459,6 +459,7 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
     const skuId = String(row[skuIdKey] ?? '').trim()
     const orderNumber = poKey ? String(row[poKey] ?? '').trim() : ''
     const rawQty = quantityKey ? row[quantityKey] : 1
+    const quantityProvided = Boolean(quantityKey) && rawQty !== '' && rawQty != null
     const quantity = rawQty === '' || rawQty == null ? 1 : Number(rawQty)
     if (!tracking) {
       waitingForTracking.push({
@@ -624,6 +625,19 @@ export function parseSkuReturnManifestRows(rows, catalogRows, historicalOrders =
       const orderQuantity = historicalOrderSkuQuantity(
         orders, orderNumber, group, skuId, product?.sku_code || product?.skuCode,
       )
+      if (!quantityProvided && orderQuantity > 1) {
+        if (product) addGroupStore(group, product)
+        group.review.push({
+          tracking: trackingNumber,
+          excelRow,
+          orderNumber,
+          skuId,
+          orderedQuantity: orderQuantity,
+          parse_issue: 'return_quantity_missing',
+        })
+        groups.set(tracking, group)
+        return
+      }
       const usageKey = `${orderKey}\u241f${skuId}`
       const usedQuantity = group.explicitOrderSkuQuantities.get(usageKey) || 0
       const effectiveQuantity = orderQuantity == null

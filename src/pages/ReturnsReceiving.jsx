@@ -2557,6 +2557,16 @@ export default function ReturnsReceiving() {
                 </div>
               )}
 
+              {parsed.needsReview.some((row) => row.parse_issue === 'return_quantity_missing') && (
+                <div className="rounded-xl border border-amber-200 bg-amber-50 p-3">
+                  <p className="text-sm font-semibold text-amber-800">Return quantity confirmation required</p>
+                  <p className="mt-1 text-xs text-amber-700">
+                    The manifest has no quantity, while the original order contains multiple units of the same SKU.
+                    These packages will go to Admin Review so the returned quantity can be selected instead of defaulting to 1.
+                  </p>
+                </div>
+              )}
+
               {(parsed.waitingForTracking || []).length > 0 && (
                 <div className="rounded-xl border border-blue-200 bg-blue-50 p-3">
                   <p className="text-sm font-semibold text-blue-800">Waiting for Tracking</p>
@@ -2574,7 +2584,7 @@ export default function ReturnsReceiving() {
                 </div>
               )}
 
-              {parsed.needsReview.some((row) => row.parse_issue !== 'order_has_multiple_skus') && (
+              {parsed.needsReview.some((row) => !['order_has_multiple_skus', 'return_quantity_missing'].includes(row.parse_issue)) && (
                 <div className="rounded-xl border border-amber-200 bg-amber-50 p-3">
                   <p className="text-sm font-semibold text-amber-800">Review required for these packages</p>
                   <p className="mt-1 text-xs text-amber-700">
@@ -2582,7 +2592,7 @@ export default function ReturnsReceiving() {
                   </p>
                   <ul className="mt-2 space-y-1 text-xs text-amber-800">
                     {parsed.needsReview
-                      .filter((row) => row.parse_issue !== 'order_has_multiple_skus')
+                      .filter((row) => !['order_has_multiple_skus', 'return_quantity_missing'].includes(row.parse_issue))
                       .slice(0, 10)
                       .map((row, index) => (
                       <li key={`${row.tracking}-${index}`}>

@@ -1262,6 +1262,43 @@ test('SKU return manifests cap duplicate and oversized rows to the original orde
   ])
 })
 
+test('return manifests require quantity review when the file omits quantity for a multi-unit SKU', () => {
+  const catalog = [{
+    store_name: 'House',
+    store_key: 'house',
+    sku_id: '24047521376',
+    sku_code: '0066Black2XL',
+    status: 'ready',
+    components: [{ style: '7020066', color: 'BLACK', size: '2X', qty: 1 }],
+  }]
+  const orders = [{
+    order_number: 'PO-211-02058095166072165',
+    store_name: 'All Stores',
+    store_key: 'all stores',
+    items: [{ sku_id: '24047521376', sku_code: '0066Black2XL', quantity: 2 }],
+  }]
+  const row = {
+    '订单号 PO': 'PO-211-02058095166072165-D01',
+    'SKU ID': '24047521376',
+    '运单号 Tracking Number': '1Z0JA1729082656662',
+  }
+
+  const missingQuantity = parseSkuReturnManifestRows([row], catalog, orders)
+  assert.equal(missingQuantity.packages.length, 0)
+  assert.equal(missingQuantity.reviewPackages.length, 1)
+  assert.equal(missingQuantity.reviewPackages[0].expectedUnits, 0)
+  assert.equal(missingQuantity.reviewPackages[0].requiresItemResolution, true)
+  assert.equal(missingQuantity.needsReview[0].parse_issue, 'return_quantity_missing')
+  assert.equal(missingQuantity.needsReview[0].orderedQuantity, 2)
+
+  const explicitPartialReturn = parseSkuReturnManifestRows([
+    { ...row, Quantity: 1 },
+  ], catalog, orders)
+  assert.equal(explicitPartialReturn.needsReview.length, 0)
+  assert.equal(explicitPartialReturn.packages[0].expectedUnits, 1)
+  assert.equal(explicitPartialReturn.packages[0].items[0].sourceQty, 1)
+})
+
 test('one combined return manifest assigns each tracking to its SKU catalog store', () => {
   const rows = [
     { 'SKU ID': 'GARDEN-SKU', '运单号 Tracking Number': 'TRACK-GARDEN' },
