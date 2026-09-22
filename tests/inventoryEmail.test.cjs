@@ -1,7 +1,11 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const ExcelJS = require('exceljs')
-const { buildInventoryEmail, buildInventoryWorkbook, localDateParts, normalizeSettings, previousDate, shouldSendDailyReport } = require('../lib/inventoryEmail.cjs')
+const { ATTACHMENT_ONLY_HTML, buildInventoryEmail, buildInventoryWorkbook, localDateParts, normalizeSettings, previousDate, shouldSendDailyReport } = require('../lib/inventoryEmail.cjs')
+
+test('supplies a visually blank HTML body for attachment-only delivery', () => {
+  assert.equal(ATTACHMENT_ONLY_HTML.replace(/<[^>]*>|&nbsp;/g, ''), '')
+})
 
 test('normalizes comma separated recipients and styles', () => {
   assert.deepEqual(normalizeSettings({ enabled: true, recipients: 'A@EXAMPLE.COM, b@example.com', styles: '50199, 50200', sendHour: 8 }), {
