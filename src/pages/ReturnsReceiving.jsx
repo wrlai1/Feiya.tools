@@ -9,6 +9,7 @@ import {
   FileSpreadsheet,
   Minus,
   PackageOpen,
+  Pencil,
   Plus,
   RefreshCw,
   ScanLine,
@@ -431,6 +432,9 @@ export default function ReturnsReceiving() {
   const [reviewMappingModes, setReviewMappingModes] = useState({})
   const [reviewMappingLoading, setReviewMappingLoading] = useState(false)
   const [reviewSavingSku, setReviewSavingSku] = useState('')
+  const [editingSetSku, setEditingSetSku] = useState('')
+  const [editingSetTargets, setEditingSetTargets] = useState([])
+  const [editSetLoading, setEditSetLoading] = useState(false)
 
   const loadRecent = useCallback(async () => {
     if (demoMode) {
@@ -504,6 +508,11 @@ export default function ReturnsReceiving() {
     const frame = requestAnimationFrame(() => scannerRef.current?.focus())
     return () => cancelAnimationFrame(frame)
   }, [demoMode, loadRecent, loadReviewPackages, loadStores])
+
+  useEffect(() => {
+    setEditingSetSku('')
+    setEditingSetTargets([])
+  }, [pkg?.id])
 
   const lookup = useCallback(async (value = tracking, orderStore = '') => {
     const query = String(value || '').trim()
@@ -845,6 +854,72 @@ export default function ReturnsReceiving() {
       toast.error(error.message, 'Could Not Resolve Package')
     } finally {
       setLoading(false)
+    }
+  }
+
+  const startEditingSet = async (product) => {
+    const components = inventoryMappingFromPackageItems({
+      sku_id: product.skuId,
+      sku_code: product.skuCode,
+    }, pkg?.items || [])
+    setEditingSetSku(product.skuId)
+    setEditingSetTargets(components)
+    if (reviewInventoryRows.length || demoMode) return
+    setEditSetLoading(true)
+    try {
+      const res = await fetch(`${BASE}/inventory-balance?action=list`, {
+        headers: headers(getToken),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not load inventory products')
+      setReviewInventoryRows((data.rows || []).map((row) => ({
+        STYLE: row.Style,
+        COLOR: row.Color,
+        SIZE: row.Size,
+      })))
+    } catch (error) {
+      toast.error(error.message, 'Could Not Edit Set')
+      setEditingSetSku('')
+      setEditingSetTargets([])
+    } finally {
+      setEditSetLoading(false)
+    }
+  }
+
+  const saveEditedSet = async () => {
+    if (!pkg || !editingSetSku || editSetLoading) return
+    if (!hasCompleteInventoryMapping(editingSetTargets)) {
+      toast.error('Choose a complete style, color, size, and quantity for every item.', 'Incomplete Set')
+      return
+    }
+    setEditSetLoading(true)
+    try {
+      const res = await fetch(`${BASE}/returns?action=edit-set-mapping`, {
+        method: 'POST',
+        headers: headers(getToken, true),
+        body: JSON.stringify({
+          tracking: pkg.tracking_number,
+          skuId: editingSetSku,
+          components: editingSetTargets,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not update this set')
+      const next = data.package
+      setPkg(next)
+      setCounts(Object.fromEntries((next.items || []).map((item) => [
+        item.id,
+        { good: 0, damaged: 0, notOurs: 0 },
+      ])))
+      setCounted(false)
+      setEditingSetSku('')
+      setEditingSetTargets([])
+      toast.success('This return and the saved set mapping were updated.', 'Set Updated')
+      await loadReviewPackages()
+    } catch (error) {
+      toast.error(error.message, 'Could Not Update Set')
+    } finally {
+      setEditSetLoading(false)
     }
   }
 
@@ -2175,6 +2250,162 @@ export default function ReturnsReceiving() {
                   )}
                 </div>
               ) : (
+              <>
+              {['pending', 'needs_review'].includes(pkg.status)
+                && !pkg.requires_item_resolution
+                && productGroups.some((product) => (
+                  product.skuId
+                  && (product.inventoryLines > 1 || product.inventoryPieces > product.productQty)
+                )) && (
+                <div className="border-b border-blue-100 bg-blue-50/60 px-4 py-4 sm:px-5">
+                  <p className="font-semibold text-slate-900">Set details / 套装明细</p>
+                  <p className="mt-1 text-xs text-slate-600">
+                    If a set was entered incorrectly, edit it before confirming inventory.
+                  </p>
+                  <div className="mt-3 space-y-3">
+                    {productGroups.filter((product) => (
+                      product.skuId
+                      && (product.inventoryLines > 1 || product.inventoryPieces > product.productQty)
+                    )).map((product) => (
+                      <div key={`set-${product.key}`} className="rounded-xl border border-blue-200 bg-white p-3">
+                        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                          <div>
+                            <p className="font-semibold text-slate-900">{product.skuCode || product.skuId}</p>
+                            <p className="mt-1 text-xs text-slate-500">
+                              {product.productQty} set{product.productQty === 1 ? '' : 's'} · {product.inventoryPieces} inventory pieces
+                            </p>
+                          </div>
+                          {editingSetSku !== product.skuId && (
+                            <button
+                              type="button"
+                              onClick={() => startEditingSet(product)}
+                              disabled={editSetLoading}
+                              className="btn-secondary min-h-10 justify-center disabled:opacity-50"
+                            >
+                              <Pencil className="h-4 w-4" />
+                              Edit set / 修改套装
+                            </button>
+                          )}
+                        </div>
+
+                        {editingSetSku === product.skuId && (
+                          <div className="mt-3 space-y-3 border-t border-blue-100 pt-3">
+                            {editSetLoading && !reviewInventoryRows.length ? (
+                              <div className="flex items-center gap-2 text-sm text-slate-500">
+                                <RefreshCw className="h-4 w-4 animate-spin" /> Loading inventory products…
+                              </div>
+                            ) : editingSetTargets.map((target, index) => {
+                              const styleOptions = [...new Set(reviewInventoryRows.map((row) => row.STYLE))].sort()
+                              const colorOptions = [...new Set(reviewInventoryRows
+                                .filter((row) => row.STYLE === target.style)
+                                .map((row) => row.COLOR))].sort()
+                              const sizeOptions = [...new Set(reviewInventoryRows
+                                .filter((row) => row.STYLE === target.style && row.COLOR === target.color)
+                                .map((row) => row.SIZE))].sort()
+                              const updateTarget = (changes) => setEditingSetTargets((current) => (
+                                current.map((row, rowIndex) => (
+                                  rowIndex === index ? { ...row, ...changes } : row
+                                ))
+                              ))
+                              return (
+                                <div key={`${product.skuId}-edit-${index}`} className="grid gap-2 sm:grid-cols-4">
+                                  <select
+                                    aria-label="Set inventory style"
+                                    value={target.style}
+                                    onChange={(event) => updateTarget({ style: event.target.value, color: '', size: '' })}
+                                    className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm"
+                                  >
+                                    <option value="">Style / 款号</option>
+                                    {styleOptions.map((style) => <option key={style} value={style}>{style}</option>)}
+                                  </select>
+                                  <select
+                                    aria-label="Set inventory color"
+                                    value={target.color}
+                                    disabled={!target.style}
+                                    onChange={(event) => updateTarget({ color: event.target.value, size: '' })}
+                                    className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm disabled:bg-slate-100"
+                                  >
+                                    <option value="">Color / 颜色</option>
+                                    {colorOptions.map((color) => <option key={color} value={color}>{color}</option>)}
+                                  </select>
+                                  <select
+                                    aria-label="Set inventory size"
+                                    value={target.size}
+                                    disabled={!target.color}
+                                    onChange={(event) => updateTarget({ size: event.target.value })}
+                                    className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm disabled:bg-slate-100"
+                                  >
+                                    <option value="">Size / 尺码</option>
+                                    {sizeOptions.map((size) => <option key={size} value={size}>{size}</option>)}
+                                  </select>
+                                  <div className="flex gap-2">
+                                    <input
+                                      type="number"
+                                      min="1"
+                                      max="9999"
+                                      step="1"
+                                      aria-label="Pieces per set"
+                                      value={target.qty}
+                                      onChange={(event) => updateTarget({ qty: Number(event.target.value) })}
+                                      className="h-11 min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-2 text-sm"
+                                    />
+                                    {editingSetTargets.length > 1 && (
+                                      <button
+                                        type="button"
+                                        aria-label="Remove set item"
+                                        onClick={() => setEditingSetTargets((current) => current.filter((_, rowIndex) => rowIndex !== index))}
+                                        className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-red-200 text-red-600"
+                                      >
+                                        <XCircle className="h-4 w-4" />
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+                              )
+                            })}
+                            {!editSetLoading && !reviewInventoryRows.length && (
+                              <p className="text-xs font-medium text-red-700">No inventory products are available.</p>
+                            )}
+                            <div className="flex flex-col gap-2 sm:flex-row">
+                              <button
+                                type="button"
+                                onClick={() => setEditingSetTargets((current) => [
+                                  ...current,
+                                  { style: '', color: '', size: '', qty: 1 },
+                                ])}
+                                disabled={editSetLoading || !reviewInventoryRows.length}
+                                className="btn-secondary min-h-10 justify-center disabled:opacity-50"
+                              >
+                                <Plus className="h-4 w-4" /> Add item / 添加一件
+                              </button>
+                              <button
+                                type="button"
+                                onClick={saveEditedSet}
+                                disabled={editSetLoading || !reviewInventoryRows.length}
+                                className="btn-primary min-h-10 justify-center disabled:opacity-50"
+                              >
+                                {editSetLoading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                                Save set / 保存套装
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setEditingSetSku('')
+                                  setEditingSetTargets([])
+                                }}
+                                disabled={editSetLoading}
+                                className="min-h-10 rounded-xl px-4 text-sm font-semibold text-slate-600 hover:bg-slate-100 disabled:opacity-50"
+                              >
+                                Cancel / 取消
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
               <div className="divide-y divide-slate-100">
                 {pkg.items.map((item) => {
                   const expected = Number(item.expected_qty)
@@ -2286,6 +2517,7 @@ export default function ReturnsReceiving() {
                   )
                 })}
               </div>
+              </>
               )}
 
               {isAdmin && ['pending', 'needs_review'].includes(pkg.status)

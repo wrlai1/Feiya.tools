@@ -1628,6 +1628,158 @@ export default async function handler(req, res) {
       })
     }
 
+    if (req.method === 'POST' && action === 'edit-set-mapping') {
+      if (payload.role !== 'admin') return res.status(403).json({ error: 'Admin access required' })
+      const trackingKey = normalizeTracking(req.body?.tracking)
+      const skuId = cleanText(req.body?.skuId, 100)
+      if (!trackingKey || !skuId) {
+        return res.status(400).json({ error: 'tracking and skuId are required' })
+      }
+      const pkg = await loadPackage(sql, trackingKey)
+      if (!pkg) return res.status(404).json({ error: 'Tracking is not in the uploaded return manifest' })
+      if (!['pending', 'needs_review'].includes(pkg.status) || pkg.requires_item_resolution) {
+        return res.status(409).json({ error: 'Only an unresolved inventory check can be edited' })
+      }
+      if (!pkg.store_key || pkg.store_key === 'unresolved') {
+        return res.status(409).json({ error: 'Resolve the package store before editing this set' })
+      }
+
+      const matchingItems = pkg.items.filter((item) => String(item.sku_id || '').trim() === skuId)
+      if (!matchingItems.length) {
+        return res.status(404).json({ error: 'This SKU is not in the selected return package' })
+      }
+      const skuCode = cleanText(matchingItems[0].sku_code, 300)
+      const sourceQuantities = [...new Set(matchingItems
+        .map((item) => Number(item.source_qty))
+        .filter((quantity) => Number.isSafeInteger(quantity) && quantity > 0))]
+      if (sourceQuantities.length > 1) {
+        return res.status(409).json({ error: 'This set has inconsistent product quantities and needs review' })
+      }
+      const productQuantity = sourceQuantities[0] || 1
+      const [catalogRow] = normalizeCatalogRows([{
+        skuId,
+        skuCode,
+        status: 'ready',
+        components: req.body?.components,
+      }])
+      const resolution = await resolveInventoryRows(sql, catalogRow.components.map((component) => ({
+        ...component,
+        allowCreate: false,
+      })))
+      if (resolution.missing.length || resolution.ambiguous.length) {
+        return res.status(409).json({
+          error: 'One or more selected style, color, and size targets are not unique in inventory',
+        })
+      }
+      const components = mergeInventoryComponents(resolution.rows.map((component) => ({
+        style: component.style,
+        color: component.color,
+        size: component.size,
+        qty: component.qty,
+      })))
+      const replacementItems = components.map((component) => ({
+        sku_id: skuId,
+        sku_code: skuCode,
+        style: component.style,
+        color: component.color,
+        size: component.size,
+        expected_qty: component.qty * productQuantity,
+        source_qty: productQuantity,
+      }))
+      if (replacementItems.some((item) => item.expected_qty > 9999)) {
+        return res.status(400).json({ error: 'Resolved return quantity is too large' })
+      }
+
+      const conflicts = await sql`
+        SELECT store_name
+        FROM return_product_catalog
+        WHERE sku_id = ${skuId} AND store_key <> ${pkg.store_key}
+        LIMIT 1
+      `
+      if (conflicts.length) {
+        return res.status(409).json({
+          error: `SKU ID ${skuId} already belongs to ${conflicts[0].store_name}`,
+        })
+      }
+
+      const items = replaceSelectedReturnPackageItems(
+        pkg.items,
+        replacementItems,
+        [{ sku_id: skuId, sku_code: skuCode }],
+      )
+      const expectedUnits = items.reduce((sum, item) => sum + item.expected_qty, 0)
+      const componentData = JSON.stringify(components)
+      const newMapping = JSON.stringify({ sku_code: skuCode, components, status: 'ready' })
+
+      await sql.transaction((txn) => [
+        txn`
+          INSERT INTO return_product_catalog_history (
+            store_name, store_key, sku_id, old_mapping, new_mapping,
+            change_source, tracking_number, changed_by
+          )
+          SELECT
+            ${pkg.store_name}, ${pkg.store_key}, ${skuId},
+            CASE WHEN catalog.id IS NULL THEN NULL ELSE jsonb_build_object(
+              'sku_code', catalog.sku_code,
+              'components', catalog.components,
+              'status', catalog.status,
+              'issue', catalog.issue,
+              'mapping_source', catalog.mapping_source,
+              'mapping_version', catalog.mapping_version
+            ) END,
+            ${newMapping}::jsonb,
+            'returns_set_edit',
+            ${pkg.tracking_number},
+            ${payload.username}
+          FROM (SELECT 1) seed
+          LEFT JOIN return_product_catalog catalog
+            ON catalog.store_key = ${pkg.store_key}
+           AND catalog.sku_id = ${skuId}
+        `,
+        txn`
+          INSERT INTO return_product_catalog (
+            store_name, store_key, sku_id, sku_code, components, status, issue,
+            source_file, updated_by, updated_at, mapping_source, mapping_version,
+            mapping_confirmed_by, mapping_confirmed_at
+          ) VALUES (
+            ${pkg.store_name}, ${pkg.store_key}, ${skuId}, ${skuCode},
+            ${componentData}::jsonb, 'ready', NULL, 'Returns Set Edit',
+            ${payload.username}, NOW(), 'admin', 1, ${payload.username}, NOW()
+          )
+          ON CONFLICT (store_key, sku_id) DO UPDATE SET
+            store_name = EXCLUDED.store_name,
+            sku_code = EXCLUDED.sku_code,
+            components = EXCLUDED.components,
+            status = 'ready',
+            issue = NULL,
+            source_file = EXCLUDED.source_file,
+            updated_by = EXCLUDED.updated_by,
+            updated_at = NOW(),
+            mapping_source = 'admin',
+            mapping_version = return_product_catalog.mapping_version + 1,
+            mapping_confirmed_by = EXCLUDED.mapping_confirmed_by,
+            mapping_confirmed_at = NOW()
+        `,
+        txn`DELETE FROM return_package_items WHERE package_id = ${pkg.id}`,
+        ...items.map((item) => txn`
+          INSERT INTO return_package_items (
+            package_id, sku_id, sku_code, style, color, size,
+            expected_qty, source_qty, actual_qty, restock_qty, not_ours_qty
+          ) VALUES (
+            ${pkg.id}, ${item.sku_id}, ${item.sku_code}, ${item.style}, ${item.color},
+            ${item.size}, ${item.expected_qty}, ${item.source_qty}, NULL, NULL, NULL
+          )
+        `),
+        txn`
+          UPDATE return_packages
+          SET expected_units = ${expectedUnits}
+          WHERE id = ${pkg.id} AND status = ${pkg.status}
+        `,
+      ], { isolationLevel: 'Serializable' })
+
+      return res.json({ ok: true, package: await loadPackage(sql, trackingKey) })
+    }
+
     if (req.method === 'POST' && action === 'resolve-items') {
       if (payload.role !== 'admin') return res.status(403).json({ error: 'Admin access required' })
       const trackingKey = normalizeTracking(req.body?.tracking)
