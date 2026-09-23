@@ -33,16 +33,16 @@ export function fetchInventory() {
   return request(`${BASE}/app-data?type=inventory`)
 }
 
-export function saveInventory(data, fileName = null) {
+export function saveInventory(data, fileName = null, expectedRevision = 0) {
   return request(`${BASE}/app-data`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: 'inventory', data, fileName, updatedAt: new Date().toISOString() }),
+    body: JSON.stringify({ type: 'inventory', data, fileName, expectedRevision }),
   })
 }
 
-export function clearInventory() {
-  return request(`${BASE}/app-data?type=inventory`, { method: 'DELETE' })
+export function clearInventory(expectedRevision = 0) {
+  return request(`${BASE}/app-data?type=inventory&expectedRevision=${expectedRevision}`, { method: 'DELETE' })
 }
 
 // ─── Tracking ─────────────────────────────────────────────────────────────────
@@ -51,16 +51,16 @@ export function fetchTracking() {
   return request(`${BASE}/app-data?type=tracking`)
 }
 
-export function saveTracking(data, fileName = null) {
+export function saveTracking(data, fileName = null, expectedRevision = 0) {
   return request(`${BASE}/app-data`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: 'tracking', data, fileName, updatedAt: new Date().toISOString() }),
+    body: JSON.stringify({ type: 'tracking', data, fileName, expectedRevision }),
   })
 }
 
-export function clearTracking() {
-  return request(`${BASE}/app-data?type=tracking`, { method: 'DELETE' })
+export function clearTracking(expectedRevision = 0) {
+  return request(`${BASE}/app-data?type=tracking&expectedRevision=${expectedRevision}`, { method: 'DELETE' })
 }
 
 // ─── Chat Messages ────────────────────────────────────────────────────────────
@@ -69,11 +69,11 @@ export function fetchMessages() {
   return request(`${BASE}/chat-messages`)
 }
 
-export function sendMessage(name, text) {
+export function sendMessage(text) {
   return request(`${BASE}/chat-messages`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, text }),
+    body: JSON.stringify({ text }),
   })
 }
 
@@ -135,8 +135,26 @@ export function saveStoreDay(store, day, fileName, rows) {
   })
 }
 
+export function saveStoreDays(store, days, replaceOverlaps = false) {
+  return request(`${BASE}/analytics-store?action=save-days`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ store, days, replaceOverlaps }),
+  })
+}
+
 export function fetchStoreRange(store, from, to) {
   return request(`${BASE}/analytics-store?action=range&store=${encodeURIComponent(store)}&from=${from}&to=${to}`)
+}
+
+export function fetchDailyLogs(store, from, to) {
+  return request(`${BASE}/analytics-store?action=daily-logs&store=${encodeURIComponent(store)}&from=${from}&to=${to}`)
+}
+
+export function saveDailyLog(store, day, note, details = {}) {
+  return request(`${BASE}/analytics-store?action=save-daily-log`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ store, day, note, ...details }),
+  })
 }
 
 export function deleteStoreDay(store, day) {
@@ -181,4 +199,40 @@ export function saveAnalyticsSettings(store, settings) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ store, settings }),
   })
+}
+
+// ─── 新品 14 天追踪 ────────────────────────────────────────────────────────────
+
+export function fetchNewProductTrackers() {
+  return request(`${BASE}/new-product-tracker?action=list`)
+}
+
+export function createNewProductTracker(data) {
+  return request(`${BASE}/new-product-tracker?action=create`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+}
+
+export function saveNewProductRoas(trackerId, effectiveDate, roas, note = '') {
+  return request(`${BASE}/new-product-tracker?action=save-roas`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ trackerId, effectiveDate, roas, note }),
+  })
+}
+
+export function deleteNewProductTracker(id) {
+  return request(`${BASE}/new-product-tracker?id=${encodeURIComponent(id)}`, { method: 'DELETE' })
+}
+
+// ─── 动销（inventory movements）─────────────────────────────────────────────────
+
+export function fetchMovements(days = 30) {
+  return request(`${BASE}/inventory-balance?action=movements&days=${days}`)
+}
+
+export function fetchInventoryBalance() {
+  return request(`${BASE}/inventory-balance?action=list`)
 }

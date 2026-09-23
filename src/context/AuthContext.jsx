@@ -62,6 +62,7 @@ export function AuthProvider({ children }) {
     })
     const data = await res.json()
     if (!res.ok) throw new Error(data.error || 'Failed to change password')
+    if (data.token) localStorage.setItem(TOKEN_KEY, data.token)
   }, [])
 
   return (

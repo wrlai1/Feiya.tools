@@ -5,8 +5,9 @@ import {
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import {
-  calcHours, formatHours, filterToday, filterThisWeek,
-  groupByUser, isMissedPunch, getStatus, STATUS_LABEL, PUNCH_LABEL,
+  calcCompletedHoursInRange, formatHours,
+  groupByUser, isMissedPunch, getStatus, toLocalDateTimeInput,
+  STATUS_LABEL, PUNCH_LABEL,
 } from '../utils/timeCalc.js'
 
 const BASE = '/api'
@@ -42,7 +43,7 @@ function StatusBadge({ status }) {
 /* ── Inline edit for a single punch ──────────────────────────────────── */
 function PunchRow({ punch, token, onUpdated, onDeleted }) {
   const [editing, setEditing] = useState(false)
-  const [val, setVal]         = useState(punch.punched_at?.slice(0, 16) ?? '')
+  const [val, setVal]         = useState(toLocalDateTimeInput(punch.punched_at))
   const [note, setNote]       = useState(punch.note ?? '')
   const [saving, setSaving]   = useState(false)
   const [err, setErr]         = useState(null)
@@ -133,9 +134,15 @@ function UserCard({ username, punches: initial, token, onPunchesChange }) {
 
   const status  = getStatus(punches)
   const missed  = isMissedPunch(punches)
-  const total   = formatHours(calcHours(punches))
-  const today   = formatHours(calcHours(filterToday(punches)))
-  const week    = formatHours(calcHours(filterThisWeek(punches)))
+  const nowMs = Date.now()
+  const todayStart = new Date(nowMs)
+  todayStart.setHours(0, 0, 0, 0)
+  const weekStart = new Date(nowMs)
+  weekStart.setDate(weekStart.getDate() - weekStart.getDay())
+  weekStart.setHours(0, 0, 0, 0)
+  const total = formatHours(calcCompletedHoursInRange(punches, -Infinity, nowMs))
+  const today = formatHours(calcCompletedHoursInRange(punches, todayStart.getTime(), nowMs))
+  const week = formatHours(calcCompletedHoursInRange(punches, weekStart.getTime(), nowMs))
 
   const handleUpdated = (updated) => {
     const next = punches.map(p => p.id === updated.id ? updated : p)
@@ -258,7 +265,7 @@ function ResetModal({ token, onDone, onClose }) {
 }
 
 /* ── Export helpers ──────────────────────────────────────────────────── */
-function exportCSV(punches, from, to) {
+function exportCSV(punches, contextPunches, from, to) {
   const headers = ['Username', 'Type', 'Punched At', 'Note', 'Edited By', 'Original Time']
   const rows = punches.map(p => [
     p.username,
@@ -270,10 +277,13 @@ function exportCSV(punches, from, to) {
   ])
 
   // Build summary rows per user
-  const byUser = groupByUser(punches)
+  const calculationPunches = [...(contextPunches || []), ...punches]
+  const byUser = groupByUser(calculationPunches)
+  const rangeStartMs = new Date(from).getTime()
+  const rangeEndMs = new Date(to).getTime()
   const summaryRows = Object.entries(byUser).map(([u, ps]) => ({
     username: u,
-    hours: calcHours(ps),
+    hours: calcCompletedHoursInRange(ps, rangeStartMs, rangeEndMs),
   }))
 
   let csv = 'PUNCH LOG EXPORT\n'
@@ -332,15 +342,15 @@ export default function AdminTimeReport() {
   const handleExport = async () => {
     setExporting(true)
     try {
-      const from = exportFrom ? new Date(exportFrom).toISOString() : periodStart
-      const to   = exportTo   ? new Date(exportTo + 'T23:59:59').toISOString() : new Date().toISOString()
+      const from = exportFrom ? new Date(`${exportFrom}T00:00:00`).toISOString() : periodStart
+      const to   = exportTo ? new Date(`${exportTo}T23:59:59.999`).toISOString() : new Date().toISOString()
       const params = new URLSearchParams({ action: 'export', from, to })
       const res  = await fetch(`${BASE}/timeclock?${params}`, {
         headers: authHeaders(getToken()),
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error)
-      exportCSV(data.punches, data.from, data.to)
+      exportCSV(data.punches || [], data.contextPunches || [], data.from, data.to)
     } catch (e) {
       setError(e.message)
     } finally {
@@ -349,7 +359,10 @@ export default function AdminTimeReport() {
   }
 
   const allPunches = Object.values(userMap).flat()
-  const totalHours = Object.values(userMap).reduce((sum, ps) => sum + calcHours(ps), 0)
+  const totalHours = Object.values(userMap).reduce(
+    (sum, ps) => sum + calcCompletedHoursInRange(ps, -Infinity, Date.now()),
+    0,
+  )
   const userCount  = Object.keys(userMap).length
 
   return (
@@ -398,6 +411,7 @@ export default function AdminTimeReport() {
         <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-4 text-center">
           <p className="text-xs text-slate-400 uppercase tracking-wide mb-1">Total Hours</p>
           <p className="text-2xl font-bold text-slate-800">{formatHours(totalHours)}</p>
+          <p className="mt-1 text-[11px] text-slate-400">Completed shifts only</p>
         </div>
         <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-4 text-center">
           <p className="text-xs text-slate-400 uppercase tracking-wide mb-1">Total Punches</p>
