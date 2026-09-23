@@ -7,6 +7,7 @@ import {
   limitReturnPackageQuantities,
   remainingOrderItemQuantities,
 } from '../src/utils/returnOrderQuantity.js'
+import { identifyTrackingNumber, normalizeTracking } from '../src/utils/trackingIdentifier.js'
 import { respondWithReturnAnalytics } from '../lib/returnAnalyticsCache.js'
 
 const { resolveInventoryTargets } = inventoryTargetResolution
@@ -31,10 +32,6 @@ function getDB() {
   const url = process.env.DATABASE_URL
   if (!url) throw new Error('DATABASE_URL not set')
   return neon(url)
-}
-
-function normalizeTracking(value) {
-  return String(value || '').trim().replace(/\s+/g, '').toUpperCase()
 }
 
 function normalizeStore(value) {
@@ -222,7 +219,8 @@ function normalizePackages(rawPackages, fallbackStore = null, {
   let itemCount = 0
   const packages = new Map()
   for (const rawPackage of rawPackages) {
-    const trackingKey = normalizeTracking(rawPackage.tracking || rawPackage.trackingNumber)
+    const trackingIdentity = identifyTrackingNumber(rawPackage.trackingNumber || rawPackage.tracking)
+    const trackingKey = trackingIdentity.key
     const trackingNumber = String(rawPackage.trackingNumber || rawPackage.tracking || '').trim()
     const rawStoreName = cleanText(rawPackage.storeName || rawPackage.store_name, 100)
     const store = rawStoreName ? normalizeStore(rawStoreName) : fallbackStore
@@ -240,7 +238,7 @@ function normalizePackages(rawPackages, fallbackStore = null, {
       order_numbers: new Set(),
       return_reasons: new Set(),
       buyer_remarks: new Set(),
-      carrier: String(rawPackage.carrier || '').trim(),
+      carrier: String(rawPackage.carrier || trackingIdentity.carrier).trim(),
       status,
       review_reason: cleanText(rawPackage.reviewReason || rawPackage.review_reason, 500),
       requires_item_resolution: Boolean(

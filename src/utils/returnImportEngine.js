@@ -1,6 +1,9 @@
 import { consolidateRows } from './consolidateEngine.js'
 import { fillTemplate } from './autoDeductEngine.js'
 import { orderSkuQuantity } from './returnOrderQuantity.js'
+import { normalizeTracking } from './trackingIdentifier.js'
+
+export { normalizeTracking } from './trackingIdentifier.js'
 
 const TRACKING_ALIASES = [
   'Tracking', 'Tracking Number', 'Tracking No', 'Return Tracking',
@@ -36,10 +39,6 @@ const CONFIRMED_SHORTHAND_COMBOS = [
 function findKey(row, names) {
   const wanted = new Set(names.map((name) => name.toLowerCase()))
   return Object.keys(row).find((key) => wanted.has(key.trim().toLowerCase()))
-}
-
-export function normalizeTracking(value) {
-  return String(value || '').trim().replace(/\s+/g, '').toUpperCase()
 }
 
 function normalizeStoreKey(value) {

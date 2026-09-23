@@ -33,6 +33,7 @@ import {
 } from '../src/utils/returnImportEngine.js'
 import inventoryTargetResolution from '../lib/inventoryTargetResolution.cjs'
 import returnPackageSafety from '../lib/returnPackageSafety.cjs'
+import { identifyTrackingNumber } from '../src/utils/trackingIdentifier.js'
 
 const { resolveInventoryTargets } = inventoryTargetResolution
 const { mergeInventoryComponents, mergeReturnPackageItems } = returnPackageSafety
@@ -999,6 +1000,35 @@ test('return manifests group tracking numbers and expand ampersand sets', () => 
     { style: 'M022 Missy', color: 'KHAKI', size: 'M', expectedQty: 1 },
     { style: 'M022 Missy', color: 'WHITE', size: 'M', expectedQty: 2 },
   ])
+})
+
+test('FedEx Ground barcode and its final 12 digits share one tracking identifier', () => {
+  assert.deepEqual(identifyTrackingNumber('9631091350202528670700383329035945'), {
+    carrier: 'FedEx Ground',
+    key: '383329035945',
+  })
+  assert.equal(
+    identifyTrackingNumber('9531091350202528670700383329035945').key,
+    '9531091350202528670700383329035945',
+  )
+
+  const result = parseReturnManifestRows([
+    {
+      Tracking: '9631091350202528670700383329035945',
+      SKU: 'M022WhiteM',
+      Quantity: 1,
+    },
+    {
+      Tracking: '383329035945',
+      SKU: 'M022WhiteM',
+      Quantity: 1,
+    },
+  ])
+
+  assert.equal(result.packages.length, 1)
+  assert.equal(result.packages[0].tracking, '383329035945')
+  assert.equal(result.packages[0].trackingNumber, '9631091350202528670700383329035945')
+  assert.equal(result.packages[0].expectedUnits, 2)
 })
 
 test('return manifests stop unknown non-ampersand sets for review', () => {
