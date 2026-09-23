@@ -213,6 +213,83 @@ function CountControl({ value, onChange, disabled, max = 9999, label = 'Actual q
   )
 }
 
+function InventoryMappingFields({ targets, inventoryRows, onChange, disabled }) {
+  return (
+    <div className="space-y-2">
+      {targets.map((target, index) => {
+        const styleOptions = [...new Set(inventoryRows.map((row) => row.STYLE))].sort()
+        const colorOptions = [...new Set(inventoryRows
+          .filter((row) => row.STYLE === target.style)
+          .map((row) => row.COLOR))].sort()
+        const sizeOptions = [...new Set(inventoryRows
+          .filter((row) => row.STYLE === target.style && row.COLOR === target.color)
+          .map((row) => row.SIZE))].sort()
+        const updateTarget = (changes) => onChange(targets.map((row, rowIndex) => (
+          rowIndex === index ? { ...row, ...changes } : row
+        )))
+        return (
+          <div key={`inventory-mapping-${index}`} className="grid gap-2 sm:grid-cols-4">
+            <select
+              aria-label="Inventory style"
+              value={target.style}
+              disabled={disabled}
+              onChange={(event) => updateTarget({ style: event.target.value, color: '', size: '' })}
+              className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm disabled:bg-slate-100"
+            >
+              <option value="">Style / 款号</option>
+              {styleOptions.map((style) => <option key={style} value={style}>{style}</option>)}
+            </select>
+            <select
+              aria-label="Inventory color"
+              value={target.color}
+              disabled={disabled || !target.style}
+              onChange={(event) => updateTarget({ color: event.target.value, size: '' })}
+              className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm disabled:bg-slate-100"
+            >
+              <option value="">Color / 颜色</option>
+              {colorOptions.map((color) => <option key={color} value={color}>{color}</option>)}
+            </select>
+            <select
+              aria-label="Inventory size"
+              value={target.size}
+              disabled={disabled || !target.color}
+              onChange={(event) => updateTarget({ size: event.target.value })}
+              className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm disabled:bg-slate-100"
+            >
+              <option value="">Size / 尺码</option>
+              {sizeOptions.map((size) => <option key={size} value={size}>{size}</option>)}
+            </select>
+            <div className="flex gap-2">
+              <input
+                type="number"
+                min="1"
+                max="9999"
+                step="1"
+                aria-label="Pieces per set"
+                value={target.qty}
+                disabled={disabled}
+                onChange={(event) => updateTarget({ qty: Number(event.target.value) })}
+                className="h-11 min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-2 text-sm disabled:bg-slate-100"
+              />
+              {targets.length > 1 && (
+                <button
+                  type="button"
+                  aria-label="Remove set item"
+                  disabled={disabled}
+                  onClick={() => onChange(targets.filter((_, rowIndex) => rowIndex !== index))}
+                  className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-red-200 text-red-600 disabled:opacity-40"
+                >
+                  <XCircle className="h-4 w-4" />
+                </button>
+              )}
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 function PhoneCameraScanner({ open, onClose, onDetected }) {
   const videoRef = useRef(null)
   const controlsRef = useRef(null)
@@ -401,6 +478,13 @@ export default function ReturnsReceiving() {
   const [catalogFile, setCatalogFile] = useState(null)
   const [catalogParsed, setCatalogParsed] = useState(null)
   const [catalogUploading, setCatalogUploading] = useState(false)
+  const [savedSets, setSavedSets] = useState([])
+  const [savedSetSearch, setSavedSetSearch] = useState('')
+  const [savedSetsLoading, setSavedSetsLoading] = useState(false)
+  const [savedSetEditingSku, setSavedSetEditingSku] = useState('')
+  const [savedSetTargets, setSavedSetTargets] = useState([])
+  const [savedSetInventoryRows, setSavedSetInventoryRows] = useState([])
+  const [savedSetSaving, setSavedSetSaving] = useState(false)
   const [analytics, setAnalytics] = useState(null)
   const [lifetimeAnalytics, setLifetimeAnalytics] = useState(null)
   const [integrity, setIntegrity] = useState(null)
@@ -484,6 +568,31 @@ export default function ReturnsReceiving() {
     }
   }, [demoMode, getToken, isAdmin])
 
+  const loadSavedSets = useCallback(async (selectedStore, query = '') => {
+    if (!isAdmin || demoMode || !selectedStore) {
+      setSavedSets([])
+      return
+    }
+    setSavedSetsLoading(true)
+    try {
+      const params = new URLSearchParams({
+        action: 'catalog',
+        store: selectedStore,
+        setsOnly: '1',
+      })
+      if (query.trim()) params.set('q', query.trim())
+      const res = await fetch(`${BASE}/returns?${params}`, { headers: headers(getToken) })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not load saved sets')
+      setSavedSets(data.rows || [])
+    } catch (error) {
+      setSavedSets([])
+      toast.error(error.message, 'Could Not Load Sets')
+    } finally {
+      setSavedSetsLoading(false)
+    }
+  }, [demoMode, getToken, isAdmin, toast])
+
   const loadReviewPackages = useCallback(async () => {
     if (!isAdmin || demoMode) return
     const res = await fetch(`${BASE}/returns?action=list&status=needs_review`, {
@@ -508,6 +617,14 @@ export default function ReturnsReceiving() {
     const frame = requestAnimationFrame(() => scannerRef.current?.focus())
     return () => cancelAnimationFrame(frame)
   }, [demoMode, loadRecent, loadReviewPackages, loadStores])
+
+  useEffect(() => {
+    if (tab !== 'catalog') return
+    setSavedSetEditingSku('')
+    setSavedSetTargets([])
+    setSavedSetSearch('')
+    loadSavedSets(storeName)
+  }, [loadSavedSets, storeName, tab])
 
   useEffect(() => {
     setEditingSetSku('')
@@ -1190,11 +1307,73 @@ export default function ReturnsReceiving() {
       )
       setCatalogFile(null)
       setCatalogParsed(null)
-      await loadStores()
+      await Promise.all([loadStores(), loadSavedSets(storeName)])
     } catch (error) {
       toast.error(error.message, 'Product Upload Failed')
     } finally {
       setCatalogUploading(false)
+    }
+  }
+
+  const startEditingSavedSet = async (row) => {
+    setSavedSetEditingSku(row.sku_id)
+    setSavedSetTargets((row.components || []).map((component) => ({
+      style: component.style,
+      color: component.color,
+      size: component.size,
+      qty: Number(component.qty || 1),
+    })))
+    if (savedSetInventoryRows.length) return
+    setSavedSetSaving(true)
+    try {
+      const res = await fetch(`${BASE}/inventory-balance?action=list`, {
+        headers: headers(getToken),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not load inventory products')
+      setSavedSetInventoryRows((data.rows || []).map((item) => ({
+        STYLE: item.Style,
+        COLOR: item.Color,
+        SIZE: item.Size,
+      })))
+    } catch (error) {
+      toast.error(error.message, 'Could Not Edit Set')
+      setSavedSetEditingSku('')
+      setSavedSetTargets([])
+    } finally {
+      setSavedSetSaving(false)
+    }
+  }
+
+  const saveSavedSet = async () => {
+    if (!storeName || !savedSetEditingSku || savedSetSaving) return
+    if (!hasCompleteInventoryMapping(savedSetTargets)) {
+      toast.error('Choose a complete style, color, size, and quantity for every item.', 'Incomplete Set')
+      return
+    }
+    setSavedSetSaving(true)
+    try {
+      const res = await fetch(`${BASE}/returns?action=catalog-update`, {
+        method: 'POST',
+        headers: headers(getToken, true),
+        body: JSON.stringify({
+          storeName,
+          skuId: savedSetEditingSku,
+          components: savedSetTargets,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not update this saved set')
+      setSavedSets((current) => current.map((row) => (
+        row.sku_id === data.row.sku_id ? data.row : row
+      )))
+      setSavedSetEditingSku('')
+      setSavedSetTargets([])
+      toast.success('Future returns will use the corrected set.', 'Saved Set Updated')
+    } catch (error) {
+      toast.error(error.message, 'Could Not Update Set')
+    } finally {
+      setSavedSetSaving(false)
     }
   }
 
@@ -2930,6 +3109,148 @@ export default function ReturnsReceiving() {
                   {catalogUploading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
                   Upload Product Catalog
                 </button>
+              </div>
+            )}
+          </div>
+
+          <div className="card overflow-hidden">
+            <div className="border-b border-slate-200 px-4 py-4 sm:px-5">
+              <div className="flex items-start gap-3">
+                <div className="rounded-xl bg-blue-50 p-2 text-blue-600">
+                  <Search className="h-5 w-5" />
+                </div>
+                <div>
+                  <h3 className="font-semibold text-slate-900">Saved sets / 已保存套装</h3>
+                  <p className="mt-1 text-sm text-slate-500">
+                    Search by SKU ID, SKU code, style, color, or size, then edit the saved combination.
+                  </p>
+                </div>
+              </div>
+              <form
+                className="mt-4 flex flex-col gap-2 sm:flex-row"
+                onSubmit={(event) => {
+                  event.preventDefault()
+                  loadSavedSets(storeName, savedSetSearch)
+                }}
+              >
+                <div className="relative flex-1">
+                  <Search className="pointer-events-none absolute left-3 top-3.5 h-4 w-4 text-slate-400" />
+                  <input
+                    type="search"
+                    value={savedSetSearch}
+                    onChange={(event) => setSavedSetSearch(event.target.value)}
+                    placeholder="Search SKU, style, color, size / 搜索"
+                    disabled={!storeName}
+                    className="h-11 w-full rounded-xl border border-slate-300 bg-white pl-9 pr-3 text-sm outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 disabled:bg-slate-100"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={!storeName || savedSetsLoading}
+                  className="btn-primary min-h-11 justify-center disabled:opacity-50"
+                >
+                  {savedSetsLoading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
+                  Search / 搜索
+                </button>
+              </form>
+            </div>
+
+            {!storeName ? (
+              <p className="px-5 py-10 text-center text-sm text-slate-400">
+                Choose a store to view saved sets / 请先选择店铺
+              </p>
+            ) : savedSetsLoading ? (
+              <div className="flex items-center justify-center gap-2 px-5 py-10 text-sm text-slate-500">
+                <RefreshCw className="h-4 w-4 animate-spin" /> Loading saved sets…
+              </div>
+            ) : !savedSets.length ? (
+              <p className="px-5 py-10 text-center text-sm text-slate-400">
+                No matching saved sets / 没有找到相应套装
+              </p>
+            ) : (
+              <div className="divide-y divide-slate-100">
+                {savedSets.map((row) => (
+                  <div key={row.sku_id} className="px-4 py-4 sm:px-5">
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                      <div className="min-w-0">
+                        <p className="break-words font-semibold text-slate-900">{row.sku_code}</p>
+                        <p className="mt-1 text-xs text-slate-500">
+                          SKU ID {row.sku_id} · Version {Number(row.mapping_version || 1)}
+                        </p>
+                        <div className="mt-2 flex flex-wrap gap-1.5">
+                          {formatSkuComponents(row.components).map((component, index) => (
+                            <span
+                              key={`${row.sku_id}-component-${index}`}
+                              className="rounded-md bg-slate-100 px-2 py-1 text-xs text-slate-700"
+                            >
+                              {component}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                      {savedSetEditingSku !== row.sku_id && (
+                        <button
+                          type="button"
+                          onClick={() => startEditingSavedSet(row)}
+                          disabled={savedSetSaving}
+                          className="btn-secondary min-h-10 shrink-0 justify-center disabled:opacity-50"
+                        >
+                          <Pencil className="h-4 w-4" /> Edit / 修改
+                        </button>
+                      )}
+                    </div>
+
+                    {savedSetEditingSku === row.sku_id && (
+                      <div className="mt-4 space-y-3 rounded-xl border border-blue-200 bg-blue-50/50 p-3">
+                        {savedSetSaving && !savedSetInventoryRows.length ? (
+                          <div className="flex items-center gap-2 text-sm text-slate-500">
+                            <RefreshCw className="h-4 w-4 animate-spin" /> Loading inventory products…
+                          </div>
+                        ) : (
+                          <InventoryMappingFields
+                            targets={savedSetTargets}
+                            inventoryRows={savedSetInventoryRows}
+                            onChange={setSavedSetTargets}
+                            disabled={savedSetSaving}
+                          />
+                        )}
+                        <div className="flex flex-col gap-2 sm:flex-row">
+                          <button
+                            type="button"
+                            onClick={() => setSavedSetTargets((current) => [
+                              ...current,
+                              { style: '', color: '', size: '', qty: 1 },
+                            ])}
+                            disabled={savedSetSaving || !savedSetInventoryRows.length}
+                            className="btn-secondary min-h-10 justify-center disabled:opacity-50"
+                          >
+                            <Plus className="h-4 w-4" /> Add item / 添加一件
+                          </button>
+                          <button
+                            type="button"
+                            onClick={saveSavedSet}
+                            disabled={savedSetSaving || !savedSetInventoryRows.length}
+                            className="btn-primary min-h-10 justify-center disabled:opacity-50"
+                          >
+                            {savedSetSaving ? <RefreshCw className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                            Save / 保存
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSavedSetEditingSku('')
+                              setSavedSetTargets([])
+                            }}
+                            disabled={savedSetSaving}
+                            className="min-h-10 rounded-xl px-4 text-sm font-semibold text-slate-600 hover:bg-white disabled:opacity-50"
+                          >
+                            Cancel / 取消
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
               </div>
             )}
           </div>

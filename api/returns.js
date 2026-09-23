@@ -749,15 +749,119 @@ export default async function handler(req, res) {
       return res.json({ rows })
     }
 
+    if (req.method === 'POST' && action === 'catalog-update') {
+      if (payload.role !== 'admin') return res.status(403).json({ error: 'Admin access required' })
+      const store = normalizeStore(req.body?.storeName)
+      const skuId = cleanText(req.body?.skuId, 100)
+      if (!skuId) return res.status(400).json({ error: 'skuId is required' })
+      const [existing] = await sql`
+        SELECT sku_id, sku_code, components, status, issue, mapping_source, mapping_version
+        FROM return_product_catalog
+        WHERE store_key = ${store.key} AND sku_id = ${skuId}
+      `
+      if (!existing) return res.status(404).json({ error: 'Saved SKU mapping not found' })
+
+      const [catalogRow] = normalizeCatalogRows([{
+        skuId,
+        skuCode: existing.sku_code,
+        status: 'ready',
+        components: req.body?.components,
+      }])
+      const resolution = await resolveInventoryRows(sql, catalogRow.components.map((component) => ({
+        ...component,
+        allowCreate: false,
+      })))
+      if (resolution.missing.length || resolution.ambiguous.length) {
+        return res.status(409).json({
+          error: 'One or more selected style, color, and size targets are not unique in inventory',
+        })
+      }
+      const components = mergeInventoryComponents(resolution.rows.map((component) => ({
+        style: component.style,
+        color: component.color,
+        size: component.size,
+        qty: component.qty,
+      })))
+      const componentData = JSON.stringify(components)
+      const oldMapping = JSON.stringify({
+        sku_code: existing.sku_code,
+        components: existing.components,
+        status: existing.status,
+        issue: existing.issue,
+        mapping_source: existing.mapping_source,
+        mapping_version: existing.mapping_version,
+      })
+      const newMapping = JSON.stringify({
+        sku_code: existing.sku_code,
+        components,
+        status: 'ready',
+      })
+
+      await sql.transaction((txn) => [
+        txn`
+          INSERT INTO return_product_catalog_history (
+            store_name, store_key, sku_id, old_mapping, new_mapping,
+            change_source, tracking_number, changed_by
+          ) VALUES (
+            ${store.name}, ${store.key}, ${skuId}, ${oldMapping}::jsonb,
+            ${newMapping}::jsonb, 'catalog_set_edit', NULL, ${payload.username}
+          )
+        `,
+        txn`
+          UPDATE return_product_catalog
+          SET components = ${componentData}::jsonb,
+              status = 'ready',
+              issue = NULL,
+              source_file = 'Saved Set Edit',
+              updated_by = ${payload.username},
+              updated_at = NOW(),
+              mapping_source = 'admin',
+              mapping_version = mapping_version + 1,
+              mapping_confirmed_by = ${payload.username},
+              mapping_confirmed_at = NOW()
+          WHERE store_key = ${store.key} AND sku_id = ${skuId}
+        `,
+      ], { isolationLevel: 'Serializable' })
+
+      const [row] = await sql`
+        SELECT sku_id, sku_code, components, status, issue, source_file, updated_at,
+               mapping_source, mapping_version, mapping_confirmed_by, mapping_confirmed_at
+        FROM return_product_catalog
+        WHERE store_key = ${store.key} AND sku_id = ${skuId}
+      `
+      return res.json({ ok: true, row })
+    }
+
     if (req.method === 'GET' && action === 'catalog') {
       if (payload.role !== 'admin') return res.status(403).json({ error: 'Admin access required' })
       const store = normalizeStore(req.query.store)
+      const query = cleanText(req.query.q, 200)
+      const setsOnly = String(req.query.setsOnly || '') === '1'
       const rows = await sql`
         SELECT sku_id, sku_code, components, status, issue, source_file, updated_at,
                mapping_source, mapping_version, mapping_confirmed_by, mapping_confirmed_at
         FROM return_product_catalog
         WHERE store_key = ${store.key}
+          AND (
+            ${query} = ''
+            OR sku_id ILIKE ${`%${query}%`}
+            OR sku_code ILIKE ${`%${query}%`}
+            OR components::text ILIKE ${`%${query}%`}
+          )
+          AND (
+            ${setsOnly} = false
+            OR CASE
+              WHEN jsonb_typeof(components) = 'array' THEN jsonb_array_length(components) > 1
+                OR COALESCE((
+                  SELECT SUM((component->>'qty')::int)
+                  FROM jsonb_array_elements(components) component
+                  WHERE component->>'qty' ~ '^[0-9]+$'
+                ), 0) > 1
+              ELSE false
+            END
+          )
         ORDER BY sku_id
+        LIMIT 100
       `
       return res.json({ store_name: store.name, rows })
     }
