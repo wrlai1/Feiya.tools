@@ -43,6 +43,27 @@ test('caps the 30-day return rate at 100 percent', () => {
   assert.equal(report.totals.returnRate30, 1)
 })
 
+test('separates 95445 letter and number size tables', async () => {
+  const report = buildInventoryEmail({
+    reportDate: '2026-09-23',
+    inventory: [
+      { style: '95445', color: 'Black', size: 'M', quantity: 20 },
+      { style: '95445', color: 'Black', size: '8', quantity: 30 },
+    ],
+  })
+  const bytes = await buildInventoryWorkbook({ ...report, reportDate: '2026-09-23', movementDay: '2026-09-22' })
+  const workbook = new ExcelJS.Workbook()
+  await workbook.xlsx.load(bytes)
+
+  assert.ok(workbook.getWorksheet('95445(Letter)'))
+  assert.ok(workbook.getWorksheet('95445(Number)'))
+  assert.equal(workbook.getWorksheet('95445(Letter)').getCell('B5').value, 'M')
+  assert.equal(workbook.getWorksheet('95445(Number)').getCell('B5').value, '8')
+  assert.deepEqual(workbook.getWorksheet('Sales Summary').getColumn(1).values.slice(5), [
+    '95445(Letter)', '95445(Number)', 'TOTAL',
+  ])
+})
+
 test('uses New York local date and previous calendar date', () => {
   assert.deepEqual(localDateParts(new Date('2026-01-01T04:30:00Z')), { date: '2025-12-31', hour: 23 })
   assert.equal(previousDate('2026-03-01'), '2026-02-28')
