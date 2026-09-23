@@ -19,6 +19,46 @@ export function orderSkuQuantity(order, skuId, skuCode) {
   return matches.reduce((sum, item) => sum + Number(item.quantity), 0)
 }
 
+export function remainingOrderItemQuantities(orderItems = [], returnedProducts = []) {
+  const itemKeysByCode = new Map()
+  const itemKey = (item) => {
+    const id = text(item.sku_id || item.skuId)
+    const code = text(item.sku_code || item.skuCode).toLowerCase()
+    const key = id ? `id:${id}` : `code:${code}`
+    if (code) {
+      if (!itemKeysByCode.has(code)) itemKeysByCode.set(code, new Set())
+      itemKeysByCode.get(code).add(key)
+    }
+    return key
+  }
+  const normalizedItems = orderItems.map((item) => ({ item, key: itemKey(item) }))
+  const returnedByKey = new Map()
+  for (const product of returnedProducts) {
+    const id = text(product.sku_id || product.skuId)
+    const code = text(product.sku_code || product.skuCode).toLowerCase()
+    const quantity = Number(product.returned_quantity ?? product.returnedQuantity)
+    if (!Number.isSafeInteger(quantity) || quantity < 0) {
+      throw new Error('Invalid previously returned quantity')
+    }
+    let key = id ? `id:${id}` : ''
+    if (!key && code && itemKeysByCode.get(code)?.size === 1) {
+      key = [...itemKeysByCode.get(code)][0]
+    }
+    if (key) returnedByKey.set(key, (returnedByKey.get(key) || 0) + quantity)
+  }
+
+  const remainingReturned = new Map(returnedByKey)
+  return Object.fromEntries(normalizedItems.map(({ item, key }) => {
+    const quantity = Number(item.quantity)
+    if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+      throw new Error('Invalid order item quantity')
+    }
+    const alreadyReturned = Math.min(quantity, remainingReturned.get(key) || 0)
+    remainingReturned.set(key, Math.max((remainingReturned.get(key) || 0) - quantity, 0))
+    return [String(item.id), quantity - alreadyReturned]
+  }))
+}
+
 // Cap sold-product quantities, preserving all physical components of a set.
 // Incomplete or ambiguous evidence must never turn a real multi-item return into one.
 export function limitReturnPackageQuantities(packages, orders) {

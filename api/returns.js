@@ -3,7 +3,10 @@ import authentication from '../lib/authentication.cjs'
 import inventoryTargetResolution from '../lib/inventoryTargetResolution.cjs'
 import returnPackageSafety from '../lib/returnPackageSafety.cjs'
 import { summarizeReturnInspection } from '../src/utils/returnInspection.js'
-import { limitReturnPackageQuantities } from '../src/utils/returnOrderQuantity.js'
+import {
+  limitReturnPackageQuantities,
+  remainingOrderItemQuantities,
+} from '../src/utils/returnOrderQuantity.js'
 import { respondWithReturnAnalytics } from '../lib/returnAnalyticsCache.js'
 
 const { resolveInventoryTargets } = inventoryTargetResolution
@@ -364,6 +367,60 @@ async function loadPackage(sql, trackingKey) {
     Array.isArray(pkg.order_numbers) ? pkg.order_numbers : [],
   )
   return { ...pkg, items, related_orders: relatedOrders }
+}
+
+async function loadReturnedProductsForOrder(sql, order, excludePackageId = 0) {
+  return sql`
+    WITH package_products AS (
+      SELECT
+        packages.id AS package_id,
+        items.sku_id,
+        items.sku_code,
+        MAX(CASE
+          WHEN packages.status IN ('pending', 'needs_review') THEN
+            CASE
+              WHEN items.source_qty IS NOT NULL AND items.source_qty > 0 THEN items.source_qty
+              ELSE items.expected_qty
+            END
+          WHEN COALESCE(items.actual_qty, 0) <= 0 THEN 0
+          WHEN items.source_qty IS NOT NULL AND items.source_qty > 0 AND items.expected_qty > 0
+            THEN CEIL(items.actual_qty::numeric * items.source_qty / items.expected_qty)::int
+          ELSE items.actual_qty
+        END)::int AS returned_quantity
+      FROM return_packages packages
+      JOIN return_package_items items ON items.package_id = packages.id
+      WHERE packages.id <> ${excludePackageId}
+        AND packages.status <> 'rejected'
+        AND EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements_text(packages.order_numbers) entry(value)
+          WHERE REGEXP_REPLACE(
+            UPPER(REPLACE(entry.value, ' ', '')), '-D[0-9]+$', ''
+          ) = ${normalizeOrderNumber(order.order_number)}
+        )
+        AND (
+          ${order.store_key === COMBINED_ORDER_STORE_KEY}
+          OR packages.store_key = ${order.store_key}
+        )
+      GROUP BY packages.id, items.sku_id, items.sku_code
+    )
+    SELECT sku_id, sku_code, SUM(returned_quantity)::int AS returned_quantity
+    FROM package_products
+    GROUP BY sku_id, sku_code
+  `
+}
+
+function attachReturnableQuantities(pkg, quantities) {
+  return {
+    ...pkg,
+    related_orders: (pkg.related_orders || []).map((order) => ({
+      ...order,
+      items: (order.items || []).map((item) => ({
+        ...item,
+        returnable_quantity: Number(quantities[String(item.id)] || 0),
+      })),
+    })),
+  }
 }
 
 async function loadOrdersByKeys(sql, storeKey, orderNumbers) {
@@ -1167,10 +1224,12 @@ export default async function handler(req, res) {
           packages.uploaded_at, packages.confirmed_at,
           COALESCE((
             SELECT jsonb_agg(jsonb_build_object(
+              'sku_id', items.sku_id,
               'sku_code', items.sku_code,
               'style', items.style,
               'color', items.color,
               'size', items.size,
+              'source_qty', items.source_qty,
               'expected_qty', items.expected_qty,
               'actual_qty', items.actual_qty
             ) ORDER BY items.id)
@@ -1214,6 +1273,46 @@ export default async function handler(req, res) {
       }
       const order = orders[0]
       if (!order.items?.length) return res.status(409).json({ error: 'This order has no products' })
+      const [openPackage] = await sql`
+        SELECT id, tracking_key
+        FROM return_packages packages
+        WHERE packages.status IN ('pending', 'needs_review')
+          AND EXISTS (
+            SELECT 1
+            FROM jsonb_array_elements_text(packages.order_numbers) entry(value)
+            WHERE REGEXP_REPLACE(
+              UPPER(REPLACE(entry.value, ' ', '')), '-D[0-9]+$', ''
+            ) = ${orderKey}
+          )
+          AND (
+            ${order.store_key === COMBINED_ORDER_STORE_KEY}
+            OR packages.store_key = ${order.store_key}
+          )
+        ORDER BY packages.uploaded_at DESC, packages.id DESC
+        LIMIT 1
+      `
+      if (openPackage) {
+        const returnedProducts = await loadReturnedProductsForOrder(sql, order, openPackage.id)
+        const suggestions = remainingOrderItemQuantities(order.items, returnedProducts)
+        const existingPackage = attachReturnableQuantities(
+          await loadPackage(sql, openPackage.tracking_key),
+          suggestions,
+        )
+        return res.json({
+          ok: true,
+          package: existingPackage,
+          suggested_selections: suggestions,
+          reused_existing: true,
+        })
+      }
+
+      const returnedProducts = await loadReturnedProductsForOrder(sql, order)
+      const suggestions = remainingOrderItemQuantities(order.items, returnedProducts)
+      if (!Object.values(suggestions).some((quantity) => quantity > 0)) {
+        return res.status(409).json({
+          error: 'Every product in this order already has a return record. Open the existing return instead.',
+        })
+      }
       const suffix = crypto.randomUUID().replace(/-/g, '').slice(0, 10).toUpperCase()
       const trackingNumber = `MANUAL-${orderKey}-${suffix}`
       const reviewData = JSON.stringify({
@@ -1237,7 +1336,16 @@ export default async function handler(req, res) {
           0, ${payload.username}, true, 'manual_po_return', ${reviewData}::jsonb
         )
       `
-      return res.json({ ok: true, package: await loadPackage(sql, normalizeTracking(trackingNumber)) })
+      const manualPackage = attachReturnableQuantities(
+        await loadPackage(sql, normalizeTracking(trackingNumber)),
+        suggestions,
+      )
+      return res.json({
+        ok: true,
+        package: manualPackage,
+        suggested_selections: suggestions,
+        reused_existing: false,
+      })
     }
 
     if (req.method === 'POST' && action === 'orders-lookup') {
@@ -1899,6 +2007,12 @@ export default async function handler(req, res) {
         (pkg.related_orders || []).flatMap((order) => order.items || [])
           .map((item) => [Number(item.id), item]),
       )
+      let returnableQuantities = null
+      if ((pkg.related_orders || []).length === 1) {
+        const [order] = pkg.related_orders
+        const returnedProducts = await loadReturnedProductsForOrder(sql, order, pkg.id)
+        returnableQuantities = remainingOrderItemQuantities(order.items, returnedProducts)
+      }
       const selectedIds = new Set()
       const selectedItems = []
       for (const selection of selections) {
@@ -1912,8 +2026,12 @@ export default async function handler(req, res) {
           || quantity <= 0
           || !orderItem
           || quantity > Number(orderItem.quantity)
+          || (returnableQuantities
+            && quantity > Number(returnableQuantities[String(orderItemId)] || 0))
         ) {
-          return res.status(400).json({ error: 'Choose valid returned quantities from the original order' })
+          return res.status(400).json({
+            error: 'Choose quantities that have not already been matched to another return for this order',
+          })
         }
         const catalogReady = orderItem.catalog_status === 'ready'
           && Array.isArray(orderItem.catalog_components)
@@ -1979,8 +2097,99 @@ export default async function handler(req, res) {
         selectedItems.map(({ orderItem }) => orderItem),
       )
       const expectedUnits = items.reduce((sum, item) => sum + item.expected_qty, 0)
+      let returnClaims = null
+      let returnOrder = null
+      if ((pkg.related_orders || []).length === 1) {
+        ;[returnOrder] = pkg.related_orders
+        const claims = new Map()
+        for (const { orderItem, quantity } of selectedItems) {
+          const skuId = cleanText(orderItem.sku_id, 100)
+          const skuCode = cleanText(orderItem.sku_code, 300)
+          const key = skuId ? `id:${skuId}` : `code:${skuCode.toLowerCase()}`
+          const existing = claims.get(key) || {
+            sku_id: skuId,
+            sku_code: skuCode,
+            selected_quantity: 0,
+            order_quantity: 0,
+          }
+          existing.selected_quantity += quantity
+          claims.set(key, existing)
+        }
+        for (const orderItem of returnOrder.items || []) {
+          const skuId = cleanText(orderItem.sku_id, 100)
+          const skuCode = cleanText(orderItem.sku_code, 300)
+          const key = skuId ? `id:${skuId}` : `code:${skuCode.toLowerCase()}`
+          if (claims.has(key)) claims.get(key).order_quantity += Number(orderItem.quantity || 0)
+        }
+        returnClaims = JSON.stringify([...claims.values()])
+      }
 
       await sql.transaction((txn) => [
+        ...(returnClaims ? [
+          txn`SELECT pg_advisory_xact_lock(hashtext(${`return-order:${normalizeOrderNumber(returnOrder.order_number)}`}))`,
+          txn`
+            WITH claims AS (
+              SELECT *
+              FROM jsonb_to_recordset(${returnClaims}::jsonb)
+                AS claim(
+                  sku_id TEXT, sku_code TEXT,
+                  selected_quantity INTEGER, order_quantity INTEGER
+                )
+            ),
+            package_products AS (
+              SELECT
+                packages.id AS package_id,
+                items.sku_id,
+                items.sku_code,
+                MAX(CASE
+                  WHEN packages.status IN ('pending', 'needs_review') THEN
+                    CASE
+                      WHEN items.source_qty IS NOT NULL AND items.source_qty > 0 THEN items.source_qty
+                      ELSE items.expected_qty
+                    END
+                  WHEN COALESCE(items.actual_qty, 0) <= 0 THEN 0
+                  WHEN items.source_qty IS NOT NULL AND items.source_qty > 0 AND items.expected_qty > 0
+                    THEN CEIL(items.actual_qty::numeric * items.source_qty / items.expected_qty)::int
+                  ELSE items.actual_qty
+                END)::int AS returned_quantity
+              FROM return_packages packages
+              JOIN return_package_items items ON items.package_id = packages.id
+              WHERE packages.id <> ${pkg.id}
+                AND packages.status <> 'rejected'
+                AND EXISTS (
+                  SELECT 1
+                  FROM jsonb_array_elements_text(packages.order_numbers) entry(value)
+                  WHERE REGEXP_REPLACE(
+                    UPPER(REPLACE(entry.value, ' ', '')), '-D[0-9]+$', ''
+                  ) = ${normalizeOrderNumber(returnOrder.order_number)}
+                )
+                AND (
+                  ${returnOrder.store_key === COMBINED_ORDER_STORE_KEY}
+                  OR packages.store_key = ${returnOrder.store_key}
+                )
+              GROUP BY packages.id, items.sku_id, items.sku_code
+            ),
+            violations AS (
+              SELECT claims.sku_id, claims.sku_code
+              FROM claims
+              WHERE claims.selected_quantity + COALESCE((
+                SELECT SUM(products.returned_quantity)
+                FROM package_products products
+                WHERE (
+                  claims.sku_id <> '' AND products.sku_id = claims.sku_id
+                ) OR (
+                  (claims.sku_id = '' OR products.sku_id = '')
+                  AND LOWER(products.sku_code) = LOWER(claims.sku_code)
+                )
+              ), 0) > claims.order_quantity
+            )
+            SELECT CASE
+              WHEN COUNT(*) = 0 THEN 1
+              ELSE ('return_order_quantity_changed_' || COUNT(*)::text)::int
+            END AS valid
+            FROM violations
+          `,
+        ] : []),
         txn`DELETE FROM return_package_items WHERE package_id = ${pkg.id}`,
         ...items.map((item) => txn`
           INSERT INTO return_package_items (
@@ -2779,6 +2988,11 @@ export default async function handler(req, res) {
     if (/return_package_changed/.test(error.message)) {
       return res.status(409).json({
         error: 'This return package changed while it was being saved. Refresh the package and confirm it again.',
+      })
+    }
+    if (/return_order_quantity_changed/.test(error.message)) {
+      return res.status(409).json({
+        error: 'Another return already matched these products. Reopen the PO to see the remaining quantities.',
       })
     }
     if (/could not serialize access|serialization failure/i.test(error.message)) {

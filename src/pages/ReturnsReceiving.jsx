@@ -727,11 +727,22 @@ export default function ReturnsReceiving() {
       setPkg(next)
       setOrderOnly(null)
       setTracking(next.tracking_number)
-      setCounts({})
-      setAdminSelections({})
+      const workerVerified = next.review_data?.workerInspection?.status === 'all_good'
+      setCounts(Object.fromEntries((next.items || []).map((item) => [
+        item.id,
+        workerVerified
+          ? { good: Number(item.expected_qty), damaged: 0, notOurs: 0 }
+          : { good: 0, damaged: 0, notOurs: 0 },
+      ])))
+      setAdminSelections(data.suggested_selections || {})
       setCounted(false)
       setRemark('')
-      toast.success('Choose the products and quantities that were returned.', 'Manual Return Started')
+      toast.success(
+        data.reused_existing
+          ? 'Opened the existing return for this PO. No duplicate was created.'
+          : 'Products were matched automatically. Confirm or change the quantities below.',
+        data.reused_existing ? 'Existing Return Opened' : 'PO Matched',
+      )
       await loadRecent()
     } catch (error) {
       toast.error(error.message, 'Could Not Start Manual Return')
@@ -1781,10 +1792,8 @@ export default function ReturnsReceiving() {
                         </p>
                         {item.items?.length > 0 && (
                           <p className="mt-1 text-xs text-slate-500">
-                            {item.items.map((line) => (
-                              `${line.sku_code || line.style} / ${line.color} / ${line.size} ×${
-                                Number(line.actual_qty ?? line.expected_qty ?? 0)
-                              }`
+                            {groupReturnProducts(item.items).map((product) => (
+                              `${product.skuCode || product.skuId || 'Product'} ×${product.productQty}`
                             )).join(' · ')}
                           </p>
                         )}
@@ -1802,7 +1811,7 @@ export default function ReturnsReceiving() {
                   <p className="text-sm text-blue-900">
                     {orderOnly.return_history?.length
                       ? 'This order already has a return record. Start another only for a separate or partial return.'
-                      : 'No tracking number? Start a manual return and choose the products actually returned.'}
+                      : 'No tracking number? Match the order automatically, then confirm or change the returned quantities.'}
                   </p>
                   <button
                     type="button"
@@ -1810,7 +1819,7 @@ export default function ReturnsReceiving() {
                     disabled={loading}
                     className="btn-primary mt-3 min-h-11 w-full sm:w-auto"
                   >
-                    Start Manual Return / 手动退货
+                    Auto Match Return / 自动匹配退货
                   </button>
                 </div>
               ) : (
@@ -2253,7 +2262,7 @@ export default function ReturnsReceiving() {
                           <CountControl
                             label={`Returned quantity for ${item.sku_code || item.sku_id}`}
                             value={Number(adminSelections[item.id] || 0)}
-                            max={Number(item.quantity || 0)}
+                            max={Number(item.returnable_quantity ?? item.quantity ?? 0)}
                             disabled={!mappingReady}
                             onChange={(value) => setAdminSelections((current) => ({
                               ...current,

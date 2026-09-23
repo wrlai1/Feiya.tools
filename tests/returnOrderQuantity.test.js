@@ -1,6 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { orderSkuQuantity, limitReturnPackageQuantities } from '../src/utils/returnOrderQuantity.js'
+import {
+  orderSkuQuantity,
+  limitReturnPackageQuantities,
+  remainingOrderItemQuantities,
+} from '../src/utils/returnOrderQuantity.js'
 import { parseSkuReturnManifestRows } from '../src/utils/returnImportEngine.js'
 
 const order = (quantity = 1) => ({
@@ -77,4 +81,31 @@ test('manifest preview caps duplicate rows using a legacy order with no SKU ID',
   assert.equal(result.packages[0].expectedUnits, 1)
   assert.equal(result.packages[0].items[0].sourceQty, 1)
   assert.equal(result.needsReview.length, 0)
+})
+
+test('PO return suggestions subtract an existing tracking return exactly once', () => {
+  const items = [{ id: 10, sku_id: 'SET', sku_code: 'SET-M', quantity: 2 }]
+  assert.deepEqual(remainingOrderItemQuantities(items, [{
+    sku_id: 'SET', sku_code: 'SET-M', returned_quantity: 1,
+  }]), { 10: 1 })
+})
+
+test('PO return suggestions allocate duplicate order rows without double matching', () => {
+  const items = [
+    { id: 10, sku_id: 'SET', sku_code: 'SET-M', quantity: 1 },
+    { id: 11, sku_id: 'SET', sku_code: 'SET-M', quantity: 1 },
+  ]
+  assert.deepEqual(remainingOrderItemQuantities(items, [{
+    sku_id: 'SET', sku_code: 'SET-M', returned_quantity: 1,
+  }]), { 10: 0, 11: 1 })
+})
+
+test('legacy returned SKU codes only match one unambiguous order product', () => {
+  const items = [
+    { id: 10, sku_id: 'A', sku_code: 'SAME', quantity: 1 },
+    { id: 11, sku_id: 'B', sku_code: 'SAME', quantity: 1 },
+  ]
+  assert.deepEqual(remainingOrderItemQuantities(items, [{
+    sku_id: '', sku_code: 'SAME', returned_quantity: 1,
+  }]), { 10: 1, 11: 1 })
 })
