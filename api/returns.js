@@ -2060,7 +2060,7 @@ export default async function handler(req, res) {
           }
           components = mergeInventoryComponents(resolution.rows)
         }
-        selectedItems.push({ orderItem, quantity, components })
+        selectedItems.push({ orderItem, quantity, components, catalogReady })
       }
       const resolvedItems = []
       for (const { orderItem, quantity, components } of selectedItems) {
@@ -2089,6 +2089,51 @@ export default async function handler(req, res) {
       }
       if (!resolvedItems.length) {
         return res.status(400).json({ error: 'Select at least one returned product' })
+      }
+
+      const manualMappingsBySku = new Map()
+      for (const { orderItem, components, catalogReady } of selectedItems) {
+        if (catalogReady) continue
+        const skuId = cleanText(orderItem.sku_id, 100)
+        if (!skuId) continue
+        const skuCode = cleanText(orderItem.sku_code, 300)
+        const normalizedComponents = mergeInventoryComponents(components)
+        const signature = JSON.stringify([...normalizedComponents].sort((left, right) => (
+          `${left.style}\u0000${left.color}\u0000${left.size}`
+            .localeCompare(`${right.style}\u0000${right.color}\u0000${right.size}`)
+        )))
+        const existing = manualMappingsBySku.get(skuId)
+        if (existing && existing.signature !== signature) {
+          return res.status(409).json({
+            error: `SKU ${skuCode || skuId} was manually matched to two different inventory combinations`,
+          })
+        }
+        manualMappingsBySku.set(skuId, {
+          skuId,
+          skuCode,
+          components: normalizedComponents,
+          signature,
+        })
+      }
+      const manualMappings = [...manualMappingsBySku.values()]
+      if (manualMappings.length) {
+        const conflicts = await sql`
+          WITH wanted AS (
+            SELECT value #>> '{}' AS sku_id
+            FROM jsonb_array_elements(${JSON.stringify(manualMappings.map((item) => item.skuId))}::jsonb)
+          )
+          SELECT catalog.sku_id, MIN(catalog.store_name) AS store_name
+          FROM return_product_catalog catalog
+          JOIN wanted USING (sku_id)
+          WHERE catalog.store_key <> ${pkg.store_key}
+          GROUP BY catalog.sku_id
+          LIMIT 1
+        `
+        if (conflicts.length) {
+          return res.status(409).json({
+            error: `SKU ID ${conflicts[0].sku_id} already belongs to ${conflicts[0].store_name}`,
+          })
+        }
       }
 
       const items = replaceSelectedReturnPackageItems(
@@ -2190,6 +2235,64 @@ export default async function handler(req, res) {
             FROM violations
           `,
         ] : []),
+        ...manualMappings.flatMap((mapping) => {
+          const componentData = JSON.stringify(mapping.components)
+          const newMapping = JSON.stringify({
+            sku_code: mapping.skuCode,
+            components: mapping.components,
+            status: 'ready',
+          })
+          return [
+            txn`
+              INSERT INTO return_product_catalog_history (
+                store_name, store_key, sku_id, old_mapping, new_mapping,
+                change_source, tracking_number, changed_by
+              )
+              SELECT
+                ${pkg.store_name}, ${pkg.store_key}, ${mapping.skuId},
+                CASE WHEN catalog.id IS NULL THEN NULL ELSE jsonb_build_object(
+                  'sku_code', catalog.sku_code,
+                  'components', catalog.components,
+                  'status', catalog.status,
+                  'issue', catalog.issue,
+                  'mapping_source', catalog.mapping_source,
+                  'mapping_version', catalog.mapping_version
+                ) END,
+                ${newMapping}::jsonb,
+                'po_manual_match',
+                ${pkg.tracking_number},
+                ${payload.username}
+              FROM (SELECT 1) seed
+              LEFT JOIN return_product_catalog catalog
+                ON catalog.store_key = ${pkg.store_key}
+               AND catalog.sku_id = ${mapping.skuId}
+            `,
+            txn`
+              INSERT INTO return_product_catalog (
+                store_name, store_key, sku_id, sku_code, components, status, issue,
+                source_file, updated_by, updated_at, mapping_source, mapping_version,
+                mapping_confirmed_by, mapping_confirmed_at
+              ) VALUES (
+                ${pkg.store_name}, ${pkg.store_key}, ${mapping.skuId}, ${mapping.skuCode},
+                ${componentData}::jsonb, 'ready', NULL, 'PO Manual Match',
+                ${payload.username}, NOW(), 'admin', 1, ${payload.username}, NOW()
+              )
+              ON CONFLICT (store_key, sku_id) DO UPDATE SET
+                store_name = EXCLUDED.store_name,
+                sku_code = EXCLUDED.sku_code,
+                components = EXCLUDED.components,
+                status = 'ready',
+                issue = NULL,
+                source_file = EXCLUDED.source_file,
+                updated_by = EXCLUDED.updated_by,
+                updated_at = NOW(),
+                mapping_source = 'admin',
+                mapping_version = return_product_catalog.mapping_version + 1,
+                mapping_confirmed_by = EXCLUDED.mapping_confirmed_by,
+                mapping_confirmed_at = NOW()
+            `,
+          ]
+        }),
         txn`DELETE FROM return_package_items WHERE package_id = ${pkg.id}`,
         ...items.map((item) => txn`
           INSERT INTO return_package_items (
@@ -2215,7 +2318,11 @@ export default async function handler(req, res) {
         `,
       ], { isolationLevel: 'Serializable' })
 
-      return res.json({ ok: true, package: await loadPackage(sql, trackingKey) })
+      return res.json({
+        ok: true,
+        package: await loadPackage(sql, trackingKey),
+        remembered_mappings: manualMappings.length,
+      })
     }
 
     if (req.method === 'POST' && action === 'confirm') {

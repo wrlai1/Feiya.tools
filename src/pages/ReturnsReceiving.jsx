@@ -578,7 +578,6 @@ export default function ReturnsReceiving() {
       const params = new URLSearchParams({
         action: 'catalog',
         store: selectedStore,
-        setsOnly: '1',
       })
       if (query.trim()) params.set('q', query.trim())
       const res = await fetch(`${BASE}/returns?${params}`, { headers: headers(getToken) })
@@ -976,7 +975,13 @@ export default function ReturnsReceiving() {
       ])))
       setAdminSelections({})
       setCounted(false)
-      toast.success('Returned products selected. Complete the inspection below.', 'Products Saved')
+      const rememberedText = Number(data.remembered_mappings || 0) > 0
+        ? ` ${data.remembered_mappings} manual mapping(s) were remembered for future returns.`
+        : ''
+      toast.success(
+        `Returned products selected.${rememberedText} Complete the inspection below.`,
+        'Products Saved',
+      )
       await loadReviewPackages()
     } catch (error) {
       toast.error(error.message, 'Could Not Resolve Package')
@@ -3129,9 +3134,9 @@ export default function ReturnsReceiving() {
                   <Search className="h-5 w-5" />
                 </div>
                 <div>
-                  <h3 className="font-semibold text-slate-900">Saved sets / 已保存套装</h3>
+                  <h3 className="font-semibold text-slate-900">Saved mappings / 已保存匹配</h3>
                   <p className="mt-1 text-sm text-slate-500">
-                    Search by SKU ID, SKU code, style, color, or size, then edit the saved combination.
+                    Search and edit saved products or sets. Manual PO matches appear here too.
                   </p>
                 </div>
               </div>
@@ -3166,15 +3171,15 @@ export default function ReturnsReceiving() {
 
             {!storeName ? (
               <p className="px-5 py-10 text-center text-sm text-slate-400">
-                Choose a store to view saved sets / 请先选择店铺
+                Choose a store to view saved mappings / 请先选择店铺
               </p>
             ) : savedSetsLoading ? (
               <div className="flex items-center justify-center gap-2 px-5 py-10 text-sm text-slate-500">
-                <RefreshCw className="h-4 w-4 animate-spin" /> Loading saved sets…
+                <RefreshCw className="h-4 w-4 animate-spin" /> Loading saved mappings…
               </div>
             ) : !savedSets.length ? (
               <p className="px-5 py-10 text-center text-sm text-slate-400">
-                No matching saved sets / 没有找到相应套装
+                No matching saved mappings / 没有找到相应匹配
               </p>
             ) : (
               <div className="divide-y divide-slate-100">
