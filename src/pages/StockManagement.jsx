@@ -7,6 +7,7 @@ import {
 import DailyStyleReport from '../components/DailyStyleReport.jsx'
 import FileUploadZone from '../components/FileUploadZone.jsx'
 import ReplenishmentPlan from '../components/ReplenishmentPlan.jsx'
+import OversoldManagement from '../components/OversoldManagement.jsx'
 import { useToast } from '../hooks/useToast.js'
 import { useAuth } from '../context/AuthContext.jsx'
 import { parseCSV } from '../utils/autoDeductEngine.js'
@@ -1483,8 +1484,8 @@ export default function StockManagement() {
     },
   ], [])
 
-  const loadBalance = useCallback(async () => {
-    setLoading(true)
+  const loadBalance = useCallback(async (showSpinner = true) => {
+    if (showSpinner) setLoading(true)
     setServerError(null)
     try {
       const data = await apiFetch(`${BASE}/inventory-balance?action=list`, {
@@ -1494,7 +1495,7 @@ export default function StockManagement() {
     } catch (err) {
       setServerError(err.message)
     } finally {
-      setLoading(false)
+      if (showSpinner) setLoading(false)
     }
   }, [getToken])
 
@@ -1583,14 +1584,18 @@ export default function StockManagement() {
           updates: pendingChanges.map((row) => ({
             id: row.id,
             quantity: row.newQuantity,
-            expectedQuantity: Number(row.Quantity),
+            expectedQuantity: Number(row.RawQuantity ?? row.Quantity),
           })),
         }),
       })
       const savedById = new Map((data.rows || []).map((row) => [Number(row.id), Number(row.quantity)]))
       setBalanceData((current) => {
         if (!current?.rows) return current
-        const rows = current.rows.map((row) => savedById.has(row.id) ? { ...row, Quantity: savedById.get(row.id) } : row)
+        const rows = current.rows.map((row) => savedById.has(row.id) ? {
+          ...row,
+          Quantity: Math.max(0, savedById.get(row.id)),
+          RawQuantity: savedById.get(row.id),
+        } : row)
         return {
           ...current,
           rows,
@@ -1800,7 +1805,9 @@ export default function StockManagement() {
           <h2 className="text-xl font-bold text-slate-800">Stock Management</h2>
           <p className="text-sm text-slate-500 mt-0.5">
             {activeView === 'balance'
-              ? 'Real-time inventory balance — updated every time you run Auto Deduct'
+              ? 'Real-time inventory balance — negative stock is displayed and exported as zero'
+              : activeView === 'oversold'
+                ? 'Resolve negative inventory with the color that was actually shipped'
               : activeView === 'daily-report'
                 ? 'One-style daily inventory, sales comparison, and days-of-stock report'
                 : 'Factory replenishment suggestions based on real inventory movement'}
@@ -1852,6 +1859,7 @@ export default function StockManagement() {
           <div className="flex w-full rounded-xl bg-slate-100 p-1 sm:w-fit">
             {[
               ['balance', 'Inventory Balance'],
+              ['oversold', 'Oversold'],
               ['daily-report', 'Daily Style Report'],
               ['replenishment', 'Replenishment Plan'],
             ].map(([value, label]) => (
@@ -1876,6 +1884,8 @@ export default function StockManagement() {
             />
           ) : activeView === 'daily-report' ? (
             <DailyStyleReport inventoryRows={allRows} />
+          ) : activeView === 'oversold' ? (
+            <OversoldManagement getToken={getToken} onInventoryChanged={() => loadBalance(false)} />
           ) : (
             <>
               {/* Stats */}

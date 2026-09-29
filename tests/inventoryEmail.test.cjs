@@ -43,6 +43,15 @@ test('caps the 30-day return rate at 100 percent', () => {
   assert.equal(report.totals.returnRate30, 1)
 })
 
+test('daily inventory output displays negative stock as zero', () => {
+  const report = buildInventoryEmail({
+    reportDate: '2026-09-07',
+    inventory: [{ style: '50199', color: 'White', size: 'M', quantity: -12 }],
+  })
+  assert.equal(report.rows[0].quantity, 0)
+  assert.equal(report.totals.quantity, 0)
+})
+
 test('separates 95445 letter and number size tables', async () => {
   const report = buildInventoryEmail({
     reportDate: '2026-09-23',

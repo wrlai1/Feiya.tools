@@ -10,6 +10,9 @@
 //   PATCH ?action=edit&id=N    — update one row's quantity (admin)
 //   PATCH ?action=bulk-edit    — update multiple quantities atomically (admin)
 //   POST ?action=add-rows      — append new rows, skip existing (admin)
+//   GET  ?action=oversold      — negative inventory plus same-style/size substitutes
+//   POST ?action=resolve-oversold — transfer shortage to the color actually shipped
+//   POST ?action=undo-substitution — reverse a saved oversold substitution
 //   DELETE ?action=remove-rows — delete rows by id (admin)
 //   POST ?action=reset         — set all quantities to 0 (admin)
 //   POST ?action=apply         — deduct (sales) or add (return) quantities (admin)
@@ -327,6 +330,30 @@ async function ensureTables(sql) {
     WHERE rolled_back_at IS NULL
   `
   await sql`
+    CREATE TABLE IF NOT EXISTS inventory_substitutions (
+      id BIGSERIAL PRIMARY KEY,
+      transaction_id INTEGER NOT NULL,
+      original_row_id INTEGER NOT NULL,
+      substitute_row_id INTEGER NOT NULL,
+      style TEXT NOT NULL,
+      original_color TEXT NOT NULL,
+      substitute_color TEXT NOT NULL,
+      size TEXT NOT NULL,
+      quantity INTEGER NOT NULL CHECK (quantity > 0),
+      order_number TEXT,
+      reason TEXT,
+      created_by TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      undo_transaction_id INTEGER,
+      undone_by TEXT,
+      undone_at TIMESTAMPTZ
+    )
+  `
+  await sql`
+    CREATE INDEX IF NOT EXISTS inventory_substitutions_created_at_idx
+    ON inventory_substitutions (created_at DESC)
+  `
+  await sql`
     UPDATE inventory_order_claims claims
     SET rolled_back_at = transactions.rolled_back_at
     FROM inventory_transactions transactions
@@ -369,21 +396,22 @@ async function ensureTables(sql) {
   `
 }
 
-function formatRows(rows) {
+export function formatRows(rows) {
   return rows.map(r => ({
     id:       r.id,
     Style:    r.style,
     Color:    r.color,
     Size:     r.size,
-    Quantity: r.quantity,
+    Quantity: Math.max(0, Number(r.quantity) || 0),
+    RawQuantity: Number(r.quantity) || 0,
     style_n:  r.style,
     color_n:  r.color,
     size_n:   r.size,
   }))
 }
 
-function calcStats(rows) {
-  const totalUnits  = rows.reduce((s, r) => s + (Number(r.quantity) || 0), 0)
+export function calcStats(rows) {
+  const totalUnits  = rows.reduce((s, r) => s + Math.max(0, Number(r.quantity) || 0), 0)
   const skusInStock = rows.filter(r => r.quantity > 0).length
   const skusZero    = rows.filter(r => r.quantity <= 0).length
   return { total_units: totalUnits, skus_in_stock: skusInStock, skus_zero: skusZero }
@@ -417,6 +445,274 @@ export default async function handler(req, res) {
         rows: formatRows(rows),
         ...calcStats(rows),
       })
+    }
+
+    // ── GET oversold — unresolved negative inventory and substitutions ─────
+    if (req.method === 'GET' && action === 'oversold') {
+      const oversold = await sql`
+        SELECT
+          original.id,
+          original.style,
+          original.color,
+          original.size,
+          ABS(original.quantity)::int AS shortage,
+          COALESCE(
+            jsonb_agg(
+              jsonb_build_object(
+                'id', substitute.id,
+                'color', substitute.color,
+                'quantity', substitute.quantity
+              ) ORDER BY substitute.color
+            ) FILTER (WHERE substitute.id IS NOT NULL),
+            '[]'::jsonb
+          ) AS candidates
+        FROM inventory_balance original
+        LEFT JOIN inventory_balance substitute
+          ON substitute.id <> original.id
+         AND LOWER(BTRIM(substitute.style)) = LOWER(BTRIM(original.style))
+         AND LOWER(BTRIM(substitute.color)) <> LOWER(BTRIM(original.color))
+         AND CASE UPPER(BTRIM(substitute.size))
+               WHEN '1XL' THEN '1X' WHEN '2XL' THEN '2X' WHEN '3XL' THEN '3X'
+               ELSE UPPER(BTRIM(substitute.size))
+             END = CASE UPPER(BTRIM(original.size))
+               WHEN '1XL' THEN '1X' WHEN '2XL' THEN '2X' WHEN '3XL' THEN '3X'
+               ELSE UPPER(BTRIM(original.size))
+             END
+         AND substitute.quantity > 0
+        WHERE original.quantity < 0
+        GROUP BY original.id
+        ORDER BY original.style, original.color, original.size
+      `
+      const history = await sql`
+        SELECT id, style, original_color, substitute_color, size, quantity,
+               order_number, reason, created_by, created_at, undone_by, undone_at
+        FROM inventory_substitutions
+        ORDER BY created_at DESC, id DESC
+        LIMIT 100
+      `
+      return res.json({ oversold, history })
+    }
+
+    // ── POST resolve-oversold — move the shortage to actual substitute stock ─
+    if (req.method === 'POST' && action === 'resolve-oversold') {
+      const originalId = Number(req.body?.originalId)
+      const substituteId = Number(req.body?.substituteId)
+      const quantity = Number(req.body?.quantity)
+      if (!Number.isSafeInteger(originalId) || originalId <= 0
+        || !Number.isSafeInteger(substituteId) || substituteId <= 0
+        || originalId === substituteId
+        || !Number.isSafeInteger(quantity) || quantity <= 0) {
+        return res.status(400).json({ error: 'Choose a valid oversold SKU, substitute color, and quantity' })
+      }
+      const orderNumber = String(req.body?.orderNumber || '').trim().slice(0, 120)
+      const reason = String(req.body?.reason || '').trim().slice(0, 300)
+      const sourceName = `Oversold color substitution: ${quantity} unit${quantity === 1 ? '' : 's'}`
+      const results = await sql.transaction((txn) => [
+        txn`SELECT pg_advisory_xact_lock(hashtext('inventory-balance-write'))`,
+        txn`
+          WITH locked AS MATERIALIZED (
+            SELECT id, style, color, size, quantity
+            FROM inventory_balance
+            WHERE id IN (${originalId}, ${substituteId})
+            FOR UPDATE
+          ),
+          eligible AS MATERIALIZED (
+            SELECT
+              original.id AS original_id,
+              substitute.id AS substitute_id,
+              original.style,
+              original.color AS original_color,
+              substitute.color AS substitute_color,
+              original.size,
+              original.quantity AS original_quantity,
+              substitute.quantity AS substitute_quantity
+            FROM locked original
+            JOIN locked substitute ON substitute.id = ${substituteId}
+            WHERE original.id = ${originalId}
+              AND original.quantity < 0
+              AND ABS(original.quantity) >= ${quantity}
+              AND substitute.quantity >= ${quantity}
+              AND LOWER(BTRIM(substitute.style)) = LOWER(BTRIM(original.style))
+              AND LOWER(BTRIM(substitute.color)) <> LOWER(BTRIM(original.color))
+              AND CASE UPPER(BTRIM(substitute.size))
+                    WHEN '1XL' THEN '1X' WHEN '2XL' THEN '2X' WHEN '3XL' THEN '3X'
+                    ELSE UPPER(BTRIM(substitute.size))
+                  END = CASE UPPER(BTRIM(original.size))
+                    WHEN '1XL' THEN '1X' WHEN '2XL' THEN '2X' WHEN '3XL' THEN '3X'
+                    ELSE UPPER(BTRIM(original.size))
+                  END
+          ),
+          saved_snapshot AS (
+            INSERT INTO inventory_snapshots (label, source_name, data, total_rows, total_units)
+            SELECT
+              'adjustment', ${sourceName},
+              COALESCE(jsonb_agg(jsonb_build_object(
+                'style', inventory.style, 'color', inventory.color, 'size', inventory.size,
+                'quantity', inventory.quantity, 'sort_order', inventory.sort_order
+              ) ORDER BY inventory.sort_order NULLS LAST, inventory.id), '[]'::jsonb),
+              COUNT(*)::int, COALESCE(SUM(inventory.quantity), 0)::int
+            FROM inventory_balance inventory
+            WHERE EXISTS (SELECT 1 FROM eligible)
+            HAVING EXISTS (SELECT 1 FROM eligible)
+            RETURNING id
+          ),
+          logged_transaction AS (
+            INSERT INTO inventory_transactions (
+              transaction_type, source_file, applied_units, row_count,
+              applied_by, rollback_snapshot_id
+            )
+            SELECT 'substitution', ${sourceName}, ${quantity}, 2,
+                   ${payload.username}, saved_snapshot.id
+            FROM saved_snapshot, eligible
+            RETURNING id
+          ),
+          updated_original AS (
+            UPDATE inventory_balance inventory
+            SET quantity = inventory.quantity + ${quantity}, updated_at = NOW()
+            FROM eligible, logged_transaction
+            WHERE inventory.id = eligible.original_id
+            RETURNING inventory.quantity
+          ),
+          updated_substitute AS (
+            UPDATE inventory_balance inventory
+            SET quantity = inventory.quantity - ${quantity}, updated_at = NOW()
+            FROM eligible, logged_transaction
+            WHERE inventory.id = eligible.substitute_id
+            RETURNING inventory.quantity
+          ),
+          logged_movements AS (
+            INSERT INTO inventory_txn_rows (
+              transaction_id, txn_type, style, color, size, qty, source_file, applied_by
+            )
+            SELECT logged_transaction.id, 'substitution', eligible.style,
+                   eligible.original_color, eligible.size, ${quantity}, ${sourceName}, ${payload.username}
+            FROM eligible, logged_transaction
+            UNION ALL
+            SELECT logged_transaction.id, 'substitution', eligible.style,
+                   eligible.substitute_color, eligible.size, -${quantity}, ${sourceName}, ${payload.username}
+            FROM eligible, logged_transaction
+          ),
+          saved_substitution AS (
+            INSERT INTO inventory_substitutions (
+              transaction_id, original_row_id, substitute_row_id, style,
+              original_color, substitute_color, size, quantity,
+              order_number, reason, created_by
+            )
+            SELECT logged_transaction.id, eligible.original_id, eligible.substitute_id,
+                   eligible.style, eligible.original_color, eligible.substitute_color,
+                   eligible.size, ${quantity}, ${orderNumber || null}, ${reason || null},
+                   ${payload.username}
+            FROM eligible, logged_transaction
+            RETURNING id
+          )
+          SELECT saved_substitution.id,
+                 (SELECT quantity FROM updated_original) AS original_quantity,
+                 (SELECT quantity FROM updated_substitute) AS substitute_quantity
+          FROM saved_substitution
+        `,
+        trimInventorySnapshots(txn),
+      ], { isolationLevel: 'Serializable' })
+      const result = results[1]?.[0]
+      if (!result) {
+        return res.status(409).json({ error: 'The shortage or substitute inventory changed. Refresh and try again.' })
+      }
+      return res.json({ ok: true, substitution: result })
+    }
+
+    // ── POST undo-substitution — reverse a saved color substitution ─────────
+    if (req.method === 'POST' && action === 'undo-substitution') {
+      const substitutionId = Number(req.body?.id)
+      if (!Number.isSafeInteger(substitutionId) || substitutionId <= 0) {
+        return res.status(400).json({ error: 'Valid substitution id required' })
+      }
+      const sourceName = `Undo oversold color substitution ${substitutionId}`
+      const results = await sql.transaction((txn) => [
+        txn`SELECT pg_advisory_xact_lock(hashtext('inventory-balance-write'))`,
+        txn`
+          WITH substitution AS MATERIALIZED (
+            SELECT * FROM inventory_substitutions
+            WHERE id = ${substitutionId} AND undone_at IS NULL
+            FOR UPDATE
+          ),
+          locked AS MATERIALIZED (
+            SELECT inventory.id, inventory.style, inventory.color, inventory.size
+            FROM inventory_balance inventory
+            JOIN substitution ON inventory.id IN (
+              substitution.original_row_id, substitution.substitute_row_id
+            )
+            FOR UPDATE OF inventory
+          ),
+          eligible AS MATERIALIZED (
+            SELECT substitution.*
+            FROM substitution
+            WHERE (SELECT COUNT(*) FROM locked) = 2
+          ),
+          saved_snapshot AS (
+            INSERT INTO inventory_snapshots (label, source_name, data, total_rows, total_units)
+            SELECT
+              'adjustment', ${sourceName},
+              COALESCE(jsonb_agg(jsonb_build_object(
+                'style', inventory.style, 'color', inventory.color, 'size', inventory.size,
+                'quantity', inventory.quantity, 'sort_order', inventory.sort_order
+              ) ORDER BY inventory.sort_order NULLS LAST, inventory.id), '[]'::jsonb),
+              COUNT(*)::int, COALESCE(SUM(inventory.quantity), 0)::int
+            FROM inventory_balance inventory
+            WHERE EXISTS (SELECT 1 FROM eligible)
+            HAVING EXISTS (SELECT 1 FROM eligible)
+            RETURNING id
+          ),
+          logged_transaction AS (
+            INSERT INTO inventory_transactions (
+              transaction_type, source_file, applied_units, row_count,
+              applied_by, rollback_snapshot_id
+            )
+            SELECT 'substitution_undo', ${sourceName}, eligible.quantity, 2,
+                   ${payload.username}, saved_snapshot.id
+            FROM saved_snapshot, eligible
+            RETURNING id
+          ),
+          restored_original AS (
+            UPDATE inventory_balance inventory
+            SET quantity = inventory.quantity - eligible.quantity, updated_at = NOW()
+            FROM eligible, logged_transaction
+            WHERE inventory.id = eligible.original_row_id
+          ),
+          restored_substitute AS (
+            UPDATE inventory_balance inventory
+            SET quantity = inventory.quantity + eligible.quantity, updated_at = NOW()
+            FROM eligible, logged_transaction
+            WHERE inventory.id = eligible.substitute_row_id
+          ),
+          logged_movements AS (
+            INSERT INTO inventory_txn_rows (
+              transaction_id, txn_type, style, color, size, qty, source_file, applied_by
+            )
+            SELECT logged_transaction.id, 'substitution_undo', eligible.style,
+                   eligible.original_color, eligible.size, -eligible.quantity,
+                   ${sourceName}, ${payload.username}
+            FROM eligible, logged_transaction
+            UNION ALL
+            SELECT logged_transaction.id, 'substitution_undo', eligible.style,
+                   eligible.substitute_color, eligible.size, eligible.quantity,
+                   ${sourceName}, ${payload.username}
+            FROM eligible, logged_transaction
+          ),
+          marked AS (
+            UPDATE inventory_substitutions target
+            SET undo_transaction_id = logged_transaction.id,
+                undone_by = ${payload.username}, undone_at = NOW()
+            FROM eligible, logged_transaction
+            WHERE target.id = eligible.id
+            RETURNING target.id
+          )
+          SELECT id FROM marked
+        `,
+        trimInventorySnapshots(txn),
+      ], { isolationLevel: 'Serializable' })
+      if (!results[1]?.length) {
+        return res.status(409).json({ error: 'This substitution was already undone or its inventory rows no longer exist.' })
+      }
+      return res.json({ ok: true })
     }
 
     // ── POST init — replace entire balance ────────────────────────────────────

@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 
 import {
+  calcStats,
+  formatRows,
   normalizeInventoryBulkUpdates,
   normalizeInventoryRowIds,
   queryInventorySnapshotHistory,
@@ -22,6 +24,27 @@ test('inventory sizes follow the warehouse display order', () => {
     '1X', '2X', '3X',
     '1XL', '2XL', '3XL',
   ])
+})
+
+test('negative inventory stays available internally but is displayed and totaled as zero', () => {
+  assert.deepEqual(formatRows([{ id: 1, style: 'A', color: 'Black', size: 'M', quantity: -3 }])[0], {
+    id: 1,
+    Style: 'A',
+    Color: 'Black',
+    Size: 'M',
+    Quantity: 0,
+    RawQuantity: -3,
+    style_n: 'A',
+    color_n: 'Black',
+    size_n: 'M',
+  })
+  assert.deepEqual(calcStats([{ quantity: -3 }, { quantity: 7 }, { quantity: 0 }]), {
+    total_units: 7,
+    skus_in_stock: 1,
+    skus_zero: 2,
+  })
+  const emailSource = readFileSync(new URL('../lib/inventoryEmailApi.js', import.meta.url), 'utf8')
+  assert.match(emailSource, /GREATEST\(quantity, 0\)::int AS quantity/)
 })
 
 test('inventory row deletion IDs are validated and deduplicated before mutation', () => {
@@ -67,7 +90,7 @@ test('snapshot retention protects every active transaction rollback point', () =
 
   const apiSource = readFileSync(new URL('../api/inventory-balance.js', import.meta.url), 'utf8')
   assert.equal((apiSource.match(/DELETE FROM inventory_snapshots/g) || []).length, 1)
-  assert.equal((apiSource.match(/trimInventorySnapshots\(txn\)/g) || []).length, 7)
+  assert.equal((apiSource.match(/trimInventorySnapshots\(txn\)/g) || []).length, 9)
 })
 
 test('snapshot history caps only ordinary snapshots and always includes active rollback points', () => {
@@ -78,4 +101,14 @@ test('snapshot history caps only ordinary snapshots and always includes active r
   assert.match(query.text, /JOIN visible_snapshot_ids visible ON visible\.id = snapshots\.id/)
   assert.equal((query.text.match(/ LIMIT /g) || []).length, 1)
   assert.deepEqual(query.values, [20])
+})
+
+test('oversold substitutions require matching style and size, available stock, and support undo', () => {
+  const source = readFileSync(new URL('../api/inventory-balance.js', import.meta.url), 'utf8')
+  assert.match(source, /CREATE TABLE IF NOT EXISTS inventory_substitutions/)
+  assert.match(source, /original\.quantity < 0/)
+  assert.match(source, /ABS\(original\.quantity\) >= \$\{quantity\}/)
+  assert.match(source, /substitute\.quantity >= \$\{quantity\}/)
+  assert.match(source, /LOWER\(BTRIM\(substitute\.style\)\) = LOWER\(BTRIM\(original\.style\)\)/)
+  assert.match(source, /'substitution_undo'/)
 })
