@@ -68,7 +68,11 @@ export function normalizeInventoryBulkUpdates(rawUpdates) {
       quantity: normalizeInventoryQuantity(update?.quantity),
     }
     if (update?.expectedQuantity !== undefined && update?.expectedQuantity !== null) {
-      normalized.expected_quantity = normalizeInventoryQuantity(update.expectedQuantity)
+      const expectedQuantity = Number(update.expectedQuantity)
+      if (!Number.isSafeInteger(expectedQuantity)) {
+        throw new Error('Expected quantity must be a whole number')
+      }
+      normalized.expected_quantity = expectedQuantity
     }
     return normalized
   })

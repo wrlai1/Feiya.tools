@@ -30,16 +30,16 @@ test('bulk inventory updates require unique valid IDs and quantities', () => {
     { id: 7, quantity: 25 },
   ])
   assert.deepEqual(normalizeInventoryBulkUpdates([
-    { id: '12', quantity: '8', expectedQuantity: '6' },
+    { id: '12', quantity: '96', expectedQuantity: '-2' },
   ]), [
-    { id: 12, quantity: 8, expected_quantity: 6 },
+    { id: 12, quantity: 96, expected_quantity: -2 },
   ])
   assert.throws(() => normalizeInventoryBulkUpdates([]), /updates required/)
   assert.throws(() => normalizeInventoryBulkUpdates([{ id: 0, quantity: 1 }]), /positive whole-number/)
   assert.throws(() => normalizeInventoryBulkUpdates([{ id: 1, quantity: -1 }]), /whole number of 0 or more/)
   assert.throws(() => normalizeInventoryBulkUpdates([
-    { id: 1, quantity: 2, expectedQuantity: -1 },
-  ]), /whole number of 0 or more/)
+    { id: 1, quantity: 2, expectedQuantity: 1.5 },
+  ]), /Expected quantity must be a whole number/)
   assert.throws(() => normalizeInventoryBulkUpdates([
     { id: 1, quantity: 2 },
     { id: 1, quantity: 3 },
