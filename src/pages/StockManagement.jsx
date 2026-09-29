@@ -346,6 +346,7 @@ function BulkEditQtyModal({ rows, onClose, onDone, getToken }) {
 
 function InventorySpreadsheet({ rows, drafts, onChange }) {
   const [page, setPage] = useState(0)
+  const [adjustmentAmount, setAdjustmentAmount] = useState('1')
   const pageSize = 100
   const totalPages = Math.max(1, Math.ceil(rows.length / pageSize))
   const visibleRows = rows.slice(page * pageSize, (page + 1) * pageSize)
@@ -356,10 +357,15 @@ function InventorySpreadsheet({ rows, drafts, onChange }) {
 
   const quantityValue = (row) => drafts[row.id] ?? String(row.Quantity ?? 0)
 
-  const changeBy = (row, delta) => {
+  const adjustment = Number(adjustmentAmount)
+  const validAdjustment = Number.isSafeInteger(adjustment) && adjustment > 0
+
+  const changeBy = (row, direction) => {
     const current = Number(quantityValue(row))
-    if (!Number.isSafeInteger(current)) return
-    onChange(row, String(Math.max(0, current + delta)))
+    if (!Number.isSafeInteger(current) || !validAdjustment) return
+    const next = current + (direction * adjustment)
+    if (next < 0) return
+    onChange(row, String(next))
   }
 
   const handlePaste = (event, startIndex) => {
@@ -390,6 +396,21 @@ function InventorySpreadsheet({ rows, drafts, onChange }) {
 
   return (
     <div className="space-y-3">
+      <div className="flex flex-col gap-2 rounded-xl border border-blue-100 bg-blue-50 px-3 py-2.5 text-sm sm:flex-row sm:items-center">
+        <label htmlFor="inventory-adjustment-amount" className="font-semibold text-blue-900">Adjust by / 增减数量</label>
+        <input
+          id="inventory-adjustment-amount"
+          type="number"
+          min="1"
+          step="1"
+          value={adjustmentAmount}
+          onChange={(event) => setAdjustmentAmount(event.target.value)}
+          className={`h-8 w-28 rounded-md border bg-white px-2 font-semibold outline-none focus:ring-2 focus:ring-blue-200 ${validAdjustment ? 'border-blue-200 text-blue-900' : 'border-red-300 text-red-700'}`}
+        />
+        <span className="text-xs text-blue-700">
+          Set this to 200, then use − / + beside any size to subtract or add 200. Type in the Quantity cell to set an exact total.
+        </span>
+      </div>
       <div className="max-h-[68vh] overflow-auto rounded-xl border border-slate-200 bg-white">
         <table className="w-full min-w-[760px] border-collapse text-sm">
           <thead className="sticky top-0 z-20 bg-slate-100 text-xs uppercase tracking-wide text-slate-500 shadow-sm">
@@ -417,8 +438,9 @@ function InventorySpreadsheet({ rows, drafts, onChange }) {
                       <button
                         type="button"
                         onClick={() => changeBy(row, -1)}
-                        className="flex h-8 w-8 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-500 hover:bg-slate-100"
-                        aria-label={`Subtract one from ${row.Style} ${row.Color} ${row.Size}`}
+                        disabled={!validAdjustment || !Number.isSafeInteger(quantity) || quantity - adjustment < 0}
+                        className="flex h-8 w-8 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-500 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-35"
+                        aria-label={`Subtract ${validAdjustment ? adjustment : 'adjustment'} from ${row.Style} ${row.Color} ${row.Size}`}
                       >
                         <Minus className="h-3.5 w-3.5" />
                       </button>
@@ -438,8 +460,9 @@ function InventorySpreadsheet({ rows, drafts, onChange }) {
                       <button
                         type="button"
                         onClick={() => changeBy(row, 1)}
-                        className="flex h-8 w-8 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-500 hover:bg-slate-100"
-                        aria-label={`Add one to ${row.Style} ${row.Color} ${row.Size}`}
+                        disabled={!validAdjustment || !Number.isSafeInteger(quantity) || quantity + adjustment < 0}
+                        className="flex h-8 w-8 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-500 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-35"
+                        aria-label={`Add ${validAdjustment ? adjustment : 'adjustment'} to ${row.Style} ${row.Color} ${row.Size}`}
                       >
                         <Plus className="h-3.5 w-3.5" />
                       </button>
