@@ -11,6 +11,7 @@ import { useToast } from '../hooks/useToast.js'
 import { useAuth } from '../context/AuthContext.jsx'
 import { parseCSV } from '../utils/autoDeductEngine.js'
 import { inventoryRestoreMode } from '../utils/inventoryRestoreMode.js'
+import { compareInventorySizes } from '../utils/inventorySizeSort.js'
 
 const BASE = '/api'
 const MAX_SNAPSHOTS = 20
@@ -1591,6 +1592,15 @@ export default function StockManagement() {
       .sort((a, b) => String(a).localeCompare(String(b), undefined, { numeric: true }))
   ), [allRows])
 
+  const inventoryGroupOrder = useMemo(() => {
+    const order = new Map()
+    allRows.forEach((row) => {
+      const key = `${String(row.Style || '').trim().toLowerCase()}\u241f${String(row.Color || '').trim().toLowerCase()}`
+      if (!order.has(key)) order.set(key, order.size)
+    })
+    return order
+  }, [allRows])
+
   const displayRows = useMemo(() => {
     let rows = allRows
     if (searchQuery.trim()) {
@@ -1604,8 +1614,14 @@ export default function StockManagement() {
     if (filter === 'low')  rows = rows.filter(r => Number(r.Quantity) > 0 && Number(r.Quantity) < 5)
     if (filter === 'zero') rows = rows.filter(r => Number(r.Quantity) <= 0)
     if (styleFilter !== 'all') rows = rows.filter(r => r.Style === styleFilter)
-    return rows
-  }, [allRows, searchQuery, filter, styleFilter])
+    return [...rows].sort((left, right) => {
+      const leftGroup = `${String(left.Style || '').trim().toLowerCase()}\u241f${String(left.Color || '').trim().toLowerCase()}`
+      const rightGroup = `${String(right.Style || '').trim().toLowerCase()}\u241f${String(right.Color || '').trim().toLowerCase()}`
+      return (inventoryGroupOrder.get(leftGroup) ?? 0) - (inventoryGroupOrder.get(rightGroup) ?? 0)
+        || compareInventorySizes(left.Size, right.Size)
+        || Number(left.id) - Number(right.id)
+    })
+  }, [allRows, searchQuery, filter, inventoryGroupOrder, styleFilter])
 
   const selectedRows = useMemo(
     () => allRows.filter((row) => selectedIds.has(row.id)),

@@ -8,10 +8,21 @@ import {
   queryInventorySnapshotHistory,
   trimInventorySnapshots,
 } from '../api/inventory-balance.js'
+import { compareInventorySizes } from '../src/utils/inventorySizeSort.js'
 
 function captureSql(strings, ...values) {
   return { text: strings.join('?').replace(/\s+/g, ' ').trim(), values }
 }
+
+test('inventory sizes follow the warehouse display order', () => {
+  const sizes = ['3XL', '12', 'M', '1X', 'XL', '8', 'S', '2X', 'XS', '1XL', '16', '6', 'L', '3X', '2XL', '14', '10']
+  assert.deepEqual(sizes.sort(compareInventorySizes), [
+    'XS', 'S', 'M', 'L', 'XL',
+    '6', '8', '10', '12', '14', '16',
+    '1X', '2X', '3X',
+    '1XL', '2XL', '3XL',
+  ])
+})
 
 test('inventory row deletion IDs are validated and deduplicated before mutation', () => {
   assert.deepEqual(normalizeInventoryRowIds([12, '7', 12]), [12, 7])
