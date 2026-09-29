@@ -62,10 +62,16 @@ export function normalizeInventoryRowIds(rawIds) {
 export function normalizeInventoryBulkUpdates(rawUpdates) {
   if (!Array.isArray(rawUpdates) || rawUpdates.length === 0) throw new Error('updates required')
   if (rawUpdates.length > 2000) throw new Error('A maximum of 2,000 inventory rows can be updated at once')
-  const updates = rawUpdates.map((update) => ({
-    id: Number(update?.id),
-    quantity: normalizeInventoryQuantity(update?.quantity),
-  }))
+  const updates = rawUpdates.map((update) => {
+    const normalized = {
+      id: Number(update?.id),
+      quantity: normalizeInventoryQuantity(update?.quantity),
+    }
+    if (update?.expectedQuantity !== undefined && update?.expectedQuantity !== null) {
+      normalized.expected_quantity = normalizeInventoryQuantity(update.expectedQuantity)
+    }
+    return normalized
+  })
   if (updates.some(({ id }) => !Number.isSafeInteger(id) || id <= 0)) {
     throw new Error('Every update requires a positive whole-number inventory row ID')
   }
@@ -544,17 +550,25 @@ export default async function handler(req, res) {
         txn`
           WITH requested AS (
             SELECT * FROM jsonb_to_recordset(${updateJson}::jsonb)
-              AS incoming(id INTEGER, quantity INTEGER)
+              AS incoming(id INTEGER, quantity INTEGER, expected_quantity INTEGER)
           ),
           matched AS MATERIALIZED (
             SELECT inventory.id, inventory.style, inventory.color, inventory.size,
-                   inventory.quantity AS old_quantity, requested.quantity AS new_quantity
+                   inventory.quantity AS old_quantity, requested.quantity AS new_quantity,
+                   requested.expected_quantity
             FROM inventory_balance inventory
             JOIN requested ON requested.id = inventory.id
             FOR UPDATE OF inventory
           ),
+          conflicts AS MATERIALIZED (
+            SELECT * FROM matched
+            WHERE expected_quantity IS NOT NULL
+              AND old_quantity IS DISTINCT FROM expected_quantity
+          ),
           changes AS MATERIALIZED (
-            SELECT * FROM matched WHERE old_quantity IS DISTINCT FROM new_quantity
+            SELECT * FROM matched
+            WHERE old_quantity IS DISTINCT FROM new_quantity
+              AND NOT EXISTS (SELECT 1 FROM conflicts)
           ),
           validation AS (
             SELECT
@@ -573,6 +587,7 @@ export default async function handler(req, res) {
             FROM inventory_balance inventory
             CROSS JOIN validation
             WHERE validation.requested_count = validation.matched_count
+              AND NOT EXISTS (SELECT 1 FROM conflicts)
               AND EXISTS (SELECT 1 FROM changes)
             GROUP BY validation.requested_count, validation.matched_count
             RETURNING id
@@ -605,6 +620,7 @@ export default async function handler(req, res) {
             FROM changes CROSS JOIN logged_transaction
           )
           SELECT validation.requested_count, validation.matched_count,
+                 (SELECT COUNT(*)::int FROM conflicts) AS conflict_count,
                  (SELECT COUNT(*)::int FROM updated) AS updated,
                  COALESCE((SELECT jsonb_agg(jsonb_build_object('id', id, 'quantity', quantity)) FROM updated), '[]'::jsonb) AS rows
           FROM validation
@@ -615,6 +631,9 @@ export default async function handler(req, res) {
       const result = results[1]?.[0]
       if (!result || Number(result.matched_count) !== Number(result.requested_count)) {
         return res.status(409).json({ error: 'One or more inventory rows no longer exist. Refresh and try again.' })
+      }
+      if (Number(result.conflict_count) > 0) {
+        return res.status(409).json({ error: 'Inventory changed after you started editing. The latest quantities were reloaded; review your changes and try again.' })
       }
       return res.json({ ok: true, updated: Number(result.updated || 0), rows: result.rows || [] })
     }
@@ -631,6 +650,7 @@ export default async function handler(req, res) {
       } catch (error) {
         return res.status(400).json({ error: error.message })
       }
+      const sourceName = `Added inventory rows: ${importRows.length} requested`
       const results = await sql.transaction((txn) => [
         txn`SELECT pg_advisory_xact_lock(hashtext('inventory-balance-write'))`,
         txn`
@@ -653,17 +673,52 @@ export default async function handler(req, res) {
                     END = CASE UPPER(BTRIM(incoming.size))
                       WHEN '1XL' THEN '1X' WHEN '2XL' THEN '2X' WHEN '3XL' THEN '3X'
                       ELSE UPPER(BTRIM(incoming.size))
-                    END
+                END
             )
+          ),
+          saved_snapshot AS (
+            INSERT INTO inventory_snapshots (label, source_name, data, total_rows, total_units)
+            SELECT
+              'adjustment', ${sourceName},
+              COALESCE(jsonb_agg(jsonb_build_object(
+                'style', inventory.style, 'color', inventory.color, 'size', inventory.size,
+                'quantity', inventory.quantity, 'sort_order', inventory.sort_order
+              ) ORDER BY inventory.sort_order NULLS LAST, inventory.id), '[]'::jsonb),
+              COUNT(*)::int, COALESCE(SUM(inventory.quantity), 0)::int
+            FROM inventory_balance inventory
+            WHERE EXISTS (SELECT 1 FROM new_rows)
+            HAVING EXISTS (SELECT 1 FROM new_rows)
+            RETURNING id
           ),
           inserted AS (
             INSERT INTO inventory_balance (style, color, size, quantity, sort_order)
-            SELECT style, color, size, quantity, sort_order FROM new_rows
+            SELECT new_rows.style, new_rows.color, new_rows.size, new_rows.quantity, new_rows.sort_order
+            FROM new_rows CROSS JOIN saved_snapshot
             ON CONFLICT (style, color, size) DO NOTHING
+            RETURNING id, style, color, size, quantity
+          ),
+          logged_transaction AS (
+            INSERT INTO inventory_transactions (
+              transaction_type, source_file, applied_units, row_count,
+              applied_by, rollback_snapshot_id
+            )
+            SELECT 'adjustment', ${sourceName}, COALESCE(SUM(ABS(inserted.quantity)), 0)::int,
+                   COUNT(*)::int, ${payload.username}, saved_snapshot.id
+            FROM inserted CROSS JOIN saved_snapshot
+            GROUP BY saved_snapshot.id
             RETURNING id
+          ),
+          logged_movements AS (
+            INSERT INTO inventory_txn_rows (
+              transaction_id, txn_type, style, color, size, qty, source_file, applied_by
+            )
+            SELECT logged_transaction.id, 'adjustment', inserted.style, inserted.color,
+                   inserted.size, inserted.quantity, ${sourceName}, ${payload.username}
+            FROM inserted CROSS JOIN logged_transaction
           )
           SELECT COUNT(*)::int AS added FROM inserted
         `,
+        trimInventorySnapshots(txn),
       ], { isolationLevel: 'Serializable' })
       const added = Number(results[1]?.[0]?.added || 0)
       return res.json({ ok: true, added, skipped: importRows.length - added })

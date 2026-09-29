@@ -29,9 +29,17 @@ test('bulk inventory updates require unique valid IDs and quantities', () => {
     { id: 12, quantity: 0 },
     { id: 7, quantity: 25 },
   ])
+  assert.deepEqual(normalizeInventoryBulkUpdates([
+    { id: '12', quantity: '8', expectedQuantity: '6' },
+  ]), [
+    { id: 12, quantity: 8, expected_quantity: 6 },
+  ])
   assert.throws(() => normalizeInventoryBulkUpdates([]), /updates required/)
   assert.throws(() => normalizeInventoryBulkUpdates([{ id: 0, quantity: 1 }]), /positive whole-number/)
   assert.throws(() => normalizeInventoryBulkUpdates([{ id: 1, quantity: -1 }]), /whole number of 0 or more/)
+  assert.throws(() => normalizeInventoryBulkUpdates([
+    { id: 1, quantity: 2, expectedQuantity: -1 },
+  ]), /whole number of 0 or more/)
   assert.throws(() => normalizeInventoryBulkUpdates([
     { id: 1, quantity: 2 },
     { id: 1, quantity: 3 },
@@ -48,7 +56,7 @@ test('snapshot retention protects every active transaction rollback point', () =
 
   const apiSource = readFileSync(new URL('../api/inventory-balance.js', import.meta.url), 'utf8')
   assert.equal((apiSource.match(/DELETE FROM inventory_snapshots/g) || []).length, 1)
-  assert.equal((apiSource.match(/trimInventorySnapshots\(txn\)/g) || []).length, 6)
+  assert.equal((apiSource.match(/trimInventorySnapshots\(txn\)/g) || []).length, 7)
 })
 
 test('snapshot history caps only ordinary snapshots and always includes active rollback points', () => {

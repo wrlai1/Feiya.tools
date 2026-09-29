@@ -2,9 +2,8 @@ import React, { useState, useMemo, useCallback, useEffect, useTransition } from 
 import {
   Boxes, Search, Download, RefreshCw, CheckCircle, AlertTriangle, XCircle,
   TrendingUp, ChevronDown, ChevronUp, ServerCrash, Upload, X, FileUp,
-  Pencil, Plus, Minus,
+  Pencil, Plus, Minus, Save,
 } from 'lucide-react'
-import DataTable from '../components/DataTable.jsx'
 import DailyStyleReport from '../components/DailyStyleReport.jsx'
 import FileUploadZone from '../components/FileUploadZone.jsx'
 import ReplenishmentPlan from '../components/ReplenishmentPlan.jsx'
@@ -75,6 +74,10 @@ function rowColor(row) {
   if (n <= 0) return 'bg-red-50/60'
   if (n < 5)  return 'bg-yellow-50/60'
   return ''
+}
+
+function nextBlankInventoryRow() {
+  return { key: `${Date.now()}-${Math.random()}`, Style: '', Color: '', Size: '', Quantity: '0' }
 }
 
 // ── Edit Quantity Modal ────────────────────────────────────────────────────────
@@ -335,6 +338,345 @@ function BulkEditQtyModal({ rows, onClose, onDone, getToken }) {
             </button>
           </div>
         </div>
+      </div>
+    </div>
+  )
+}
+
+function InventorySpreadsheet({ rows, drafts, onChange }) {
+  const [page, setPage] = useState(0)
+  const pageSize = 100
+  const totalPages = Math.max(1, Math.ceil(rows.length / pageSize))
+  const visibleRows = rows.slice(page * pageSize, (page + 1) * pageSize)
+
+  useEffect(() => {
+    setPage((current) => Math.min(current, totalPages - 1))
+  }, [totalPages])
+
+  const quantityValue = (row) => drafts[row.id] ?? String(row.Quantity ?? 0)
+
+  const changeBy = (row, delta) => {
+    const current = Number(quantityValue(row))
+    if (!Number.isSafeInteger(current)) return
+    onChange(row, String(Math.max(0, current + delta)))
+  }
+
+  const handlePaste = (event, startIndex) => {
+    const values = event.clipboardData.getData('text')
+      .split(/[\t\r\n]+/)
+      .map((value) => value.trim())
+      .filter((value) => value !== '')
+    if (values.length <= 1) return
+    if (values.some((value) => !Number.isSafeInteger(Number(value)) || Number(value) < 0)) return
+    event.preventDefault()
+    values.forEach((value, offset) => {
+      const row = visibleRows[startIndex + offset]
+      if (row) onChange(row, value)
+    })
+  }
+
+  const focusNext = (event, index) => {
+    if (event.key !== 'Enter') return
+    event.preventDefault()
+    const inputs = event.currentTarget.closest('tbody')?.querySelectorAll('[data-inventory-quantity]')
+    inputs?.[index + 1]?.focus()
+    inputs?.[index + 1]?.select()
+  }
+
+  if (!rows.length) {
+    return <div className="py-16 text-center text-sm text-slate-400">No rows match the current filters</div>
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="max-h-[68vh] overflow-auto rounded-xl border border-slate-200 bg-white">
+        <table className="w-full min-w-[760px] border-collapse text-sm">
+          <thead className="sticky top-0 z-20 bg-slate-100 text-xs uppercase tracking-wide text-slate-500 shadow-sm">
+            <tr>
+              <th className="sticky left-0 z-30 w-48 border-b border-r border-slate-200 bg-slate-100 px-3 py-2.5 text-left">Style</th>
+              <th className="sticky left-48 z-30 w-56 border-b border-r border-slate-200 bg-slate-100 px-3 py-2.5 text-left">Color</th>
+              <th className="w-28 border-b border-r border-slate-200 px-3 py-2.5 text-left">Size</th>
+              <th className="w-64 border-b border-slate-200 px-3 py-2.5 text-left">Quantity</th>
+              <th className="border-b border-slate-200 px-3 py-2.5 text-right">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {visibleRows.map((row, index) => {
+              const value = quantityValue(row)
+              const changed = value !== String(row.Quantity ?? 0)
+              const quantity = Number(value)
+              const status = quantity <= 0 ? 'Out' : quantity < 5 ? 'Low' : 'In stock'
+              return (
+                <tr key={row.id} className={changed ? 'bg-amber-50' : rowColor(row)}>
+                  <td className={`sticky left-0 z-10 border-b border-r border-slate-200 px-3 py-2 font-semibold text-slate-800 ${changed ? 'bg-amber-50' : 'bg-white'}`}>{row.Style}</td>
+                  <td className={`sticky left-48 z-10 border-b border-r border-slate-200 px-3 py-2 text-slate-600 ${changed ? 'bg-amber-50' : 'bg-white'}`}>{row.Color}</td>
+                  <td className="border-b border-r border-slate-200 px-3 py-2 font-medium text-slate-700">{row.Size}</td>
+                  <td className="border-b border-slate-200 px-2 py-1.5">
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => changeBy(row, -1)}
+                        className="flex h-8 w-8 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-500 hover:bg-slate-100"
+                        aria-label={`Subtract one from ${row.Style} ${row.Color} ${row.Size}`}
+                      >
+                        <Minus className="h-3.5 w-3.5" />
+                      </button>
+                      <input
+                        data-inventory-quantity
+                        type="number"
+                        min="0"
+                        step="1"
+                        value={value}
+                        onChange={(event) => onChange(row, event.target.value)}
+                        onPaste={(event) => handlePaste(event, index)}
+                        onKeyDown={(event) => focusNext(event, index)}
+                        className={`h-8 w-24 rounded-md border px-2 text-center font-semibold outline-none focus:ring-2 focus:ring-blue-100 ${
+                          changed ? 'border-amber-400 bg-white text-amber-800' : 'border-slate-200 bg-white text-slate-800'
+                        }`}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => changeBy(row, 1)}
+                        className="flex h-8 w-8 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-500 hover:bg-slate-100"
+                        aria-label={`Add one to ${row.Style} ${row.Color} ${row.Size}`}
+                      >
+                        <Plus className="h-3.5 w-3.5" />
+                      </button>
+                      {changed && <span className="ml-1 text-xs font-medium text-amber-700">was {row.Quantity}</span>}
+                    </div>
+                  </td>
+                  <td className={`border-b border-slate-200 px-3 py-2 text-right text-xs font-semibold ${
+                    quantity <= 0 ? 'text-red-600' : quantity < 5 ? 'text-amber-600' : 'text-emerald-600'
+                  }`}>{status}</td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div className="flex items-center justify-between gap-3 text-xs text-slate-500">
+        <span>
+          Showing {page * pageSize + 1}–{Math.min((page + 1) * pageSize, rows.length)} of {rows.length.toLocaleString()} rows
+        </span>
+        {totalPages > 1 && (
+          <div className="flex items-center gap-2">
+            <button type="button" disabled={page === 0} onClick={() => setPage((value) => value - 1)} className="btn-secondary px-3 py-1.5 text-xs disabled:opacity-40">Previous</button>
+            <span>Page {page + 1} / {totalPages}</span>
+            <button type="button" disabled={page >= totalPages - 1} onClick={() => setPage((value) => value + 1)} className="btn-secondary px-3 py-1.5 text-xs disabled:opacity-40">Next</button>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function ReviewInventoryChangesModal({ changes, onClose, onSave, saving }) {
+  const [reason, setReason] = useState('')
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+      <div className="flex max-h-[90vh] w-full max-w-3xl flex-col gap-4 rounded-2xl bg-white p-6 shadow-xl">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h3 className="font-semibold text-slate-900">Review Inventory Changes</h3>
+            <p className="mt-1 text-sm text-slate-500">Confirm {changes.length} quantity change{changes.length === 1 ? '' : 's'} before saving.</p>
+          </div>
+          <button type="button" onClick={onClose} className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100"><X className="h-4 w-4" /></button>
+        </div>
+        <div className="min-h-0 overflow-auto rounded-xl border border-slate-200">
+          <table className="w-full text-sm">
+            <thead className="sticky top-0 bg-slate-50 text-xs uppercase text-slate-500">
+              <tr>{['Style', 'Color', 'Size', 'Before', 'After', 'Change'].map((label) => <th key={label} className="px-3 py-2 text-left">{label}</th>)}</tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {changes.map((row) => {
+                const delta = row.newQuantity - Number(row.Quantity)
+                return (
+                  <tr key={row.id}>
+                    <td className="px-3 py-2 font-medium">{row.Style}</td>
+                    <td className="px-3 py-2">{row.Color}</td>
+                    <td className="px-3 py-2">{row.Size}</td>
+                    <td className="px-3 py-2 text-slate-400">{row.Quantity}</td>
+                    <td className="px-3 py-2 font-semibold text-slate-800">{row.newQuantity}</td>
+                    <td className={`px-3 py-2 font-semibold ${delta >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>{delta > 0 ? '+' : ''}{delta}</td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+        <div>
+          <label className="mb-1.5 block text-xs font-medium text-slate-500">Reason / Remark (optional)</label>
+          <input value={reason} onChange={(event) => setReason(event.target.value)} maxLength={300} placeholder="Example: Physical count correction" className="input-base w-full" />
+        </div>
+        <div className="flex justify-end gap-2">
+          <button type="button" onClick={onClose} disabled={saving} className="btn-secondary">Back</button>
+          <button type="button" onClick={() => onSave(reason)} disabled={saving} className="btn-primary disabled:opacity-50">
+            {saving ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+            Save {changes.length} Change{changes.length === 1 ? '' : 's'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function AddRowsGridModal({ onClose, onDone, currentRows, getToken }) {
+  const [rows, setRows] = useState(() => Array.from({ length: 6 }, nextBlankInventoryRow))
+  const [preview, setPreview] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const toast = useToast()
+  const fields = ['Style', 'Color', 'Size', 'Quantity']
+
+  const updateCell = (rowKey, field, value) => {
+    setRows((current) => current.map((row) => row.key === rowKey ? { ...row, [field]: value } : row))
+    setPreview(null)
+  }
+
+  const handlePaste = (event, startRow, startField) => {
+    const text = event.clipboardData.getData('text')
+    if (!text.includes('\t') && !/[\r\n]/.test(text.trim())) return
+    event.preventDefault()
+    const matrix = text.replace(/\r/g, '').split('\n').filter((line) => line.length > 0).map((line) => line.split('\t'))
+    setRows((current) => {
+      const next = current.map((row) => ({ ...row }))
+      while (next.length < startRow + matrix.length) next.push(nextBlankInventoryRow())
+      matrix.forEach((values, rowOffset) => {
+        values.forEach((value, columnOffset) => {
+          const field = fields[startField + columnOffset]
+          if (field) next[startRow + rowOffset][field] = value.trim()
+        })
+      })
+      return next
+    })
+    setPreview(null)
+  }
+
+  const buildPreview = () => {
+    try {
+      const entered = rows.filter((row) => fields.some((field) => String(row[field] ?? '').trim()))
+      if (!entered.length) throw new Error('Enter at least one inventory row')
+      const normalized = entered.map((row, index) => normaliseRow(row, index))
+      const seen = new Set()
+      for (const row of normalized) {
+        const key = inventoryKey(row)
+        if (seen.has(key)) throw new Error(`${row.Style} / ${row.Color} / ${row.Size} appears more than once`)
+        seen.add(key)
+      }
+      const currentByKey = new Map(currentRows.map((row) => [inventoryKey(row), row]))
+      const toAdd = normalized.filter((row) => !currentByKey.has(inventoryKey(row)))
+      const existing = normalized.filter((row) => currentByKey.has(inventoryKey(row))).map((row) => ({
+        ...row,
+        currentQuantity: currentByKey.get(inventoryKey(row)).Quantity,
+      }))
+      setPreview({ toAdd, existing })
+    } catch (error) {
+      toast.error(error.message, 'Check New Styles')
+    }
+  }
+
+  const handleSave = async () => {
+    if (!preview?.toAdd.length) return
+    setLoading(true)
+    try {
+      const data = await apiFetch(`${BASE}/inventory-balance?action=add-rows`, {
+        method: 'POST',
+        headers: authHeaders(getToken(), true),
+        body: JSON.stringify({ rows: preview.toAdd }),
+      })
+      toast.success(`Added ${data.added} inventory row${data.added === 1 ? '' : 's'}`, 'Styles Added')
+      await onDone()
+      onClose()
+    } catch (error) {
+      toast.error(error.message, 'Add Failed')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+      <div className="flex max-h-[92vh] w-full max-w-5xl flex-col gap-4 rounded-2xl bg-white p-6 shadow-xl">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h3 className="font-semibold text-slate-900">Add Styles Online</h3>
+            <p className="mt-1 text-sm text-slate-500">Type directly or paste four columns from Excel: Style, Color, Size, Quantity.</p>
+          </div>
+          <button type="button" onClick={onClose} className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100"><X className="h-4 w-4" /></button>
+        </div>
+
+        {!preview ? (
+          <>
+            <div className="min-h-0 overflow-auto rounded-xl border border-slate-200">
+              <table className="w-full min-w-[680px] border-collapse text-sm">
+                <thead className="sticky top-0 bg-slate-100 text-xs uppercase text-slate-500">
+                  <tr>
+                    <th className="w-12 border-b border-r border-slate-200 px-2 py-2 text-center">#</th>
+                    {fields.map((field) => <th key={field} className="border-b border-r border-slate-200 px-3 py-2 text-left">{field}</th>)}
+                    <th className="w-12 border-b border-slate-200" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((row, rowIndex) => (
+                    <tr key={row.key}>
+                      <td className="border-b border-r border-slate-200 bg-slate-50 px-2 py-1.5 text-center text-xs text-slate-400">{rowIndex + 1}</td>
+                      {fields.map((field, fieldIndex) => (
+                        <td key={field} className="border-b border-r border-slate-200 p-0">
+                          <input
+                            type={field === 'Quantity' ? 'number' : 'text'}
+                            min={field === 'Quantity' ? '0' : undefined}
+                            step={field === 'Quantity' ? '1' : undefined}
+                            value={row[field]}
+                            onChange={(event) => updateCell(row.key, field, event.target.value)}
+                            onPaste={(event) => handlePaste(event, rowIndex, fieldIndex)}
+                            className="h-9 w-full border-0 bg-transparent px-3 outline-none focus:bg-blue-50 focus:ring-2 focus:ring-inset focus:ring-blue-300"
+                          />
+                        </td>
+                      ))}
+                      <td className="border-b border-slate-200 p-1 text-center">
+                        <button type="button" onClick={() => setRows((current) => current.length === 1 ? current : current.filter((item) => item.key !== row.key))} className="rounded p-1 text-slate-300 hover:bg-red-50 hover:text-red-500"><X className="h-3.5 w-3.5" /></button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
+              <button type="button" onClick={() => setRows((current) => [...current, nextBlankInventoryRow()])} className="btn-secondary w-fit text-sm"><Plus className="h-4 w-4" /> Add Row</button>
+              <div className="flex gap-2">
+                <button type="button" onClick={onClose} className="btn-secondary">Cancel</button>
+                <button type="button" onClick={buildPreview} className="btn-primary"><CheckCircle className="h-4 w-4" /> Review Rows</button>
+              </div>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-4">
+                <p className="text-sm font-semibold text-emerald-800">{preview.toAdd.length} new row{preview.toAdd.length === 1 ? '' : 's'} will be added</p>
+              </div>
+              <div className="rounded-xl border border-amber-200 bg-amber-50 p-4">
+                <p className="text-sm font-semibold text-amber-800">{preview.existing.length} existing row{preview.existing.length === 1 ? '' : 's'} will be skipped</p>
+              </div>
+            </div>
+            <div className="min-h-0 overflow-auto rounded-xl border border-slate-200">
+              <table className="w-full text-sm">
+                <thead className="sticky top-0 bg-slate-50 text-xs uppercase text-slate-500"><tr>{['Style', 'Color', 'Size', 'Starting Qty', 'Result'].map((label) => <th key={label} className="px-3 py-2 text-left">{label}</th>)}</tr></thead>
+                <tbody className="divide-y divide-slate-100">
+                  {[...preview.toAdd.map((row) => ({ ...row, result: 'Add' })), ...preview.existing.map((row) => ({ ...row, result: `Exists (${row.currentQuantity})` }))].map((row, index) => (
+                    <tr key={`${inventoryKey(row)}-${index}`}><td className="px-3 py-2 font-medium">{row.Style}</td><td className="px-3 py-2">{row.Color}</td><td className="px-3 py-2">{row.Size}</td><td className="px-3 py-2">{row.Quantity}</td><td className={`px-3 py-2 font-semibold ${row.result === 'Add' ? 'text-emerald-600' : 'text-amber-600'}`}>{row.result}</td></tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="flex justify-end gap-2">
+              <button type="button" onClick={() => setPreview(null)} disabled={loading} className="btn-secondary">Back to Edit</button>
+              <button type="button" onClick={handleSave} disabled={loading || !preview.toAdd.length} className="btn-primary disabled:opacity-50">
+                {loading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+                Add {preview.toAdd.length} Row{preview.toAdd.length === 1 ? '' : 's'}
+              </button>
+            </div>
+          </>
+        )}
       </div>
     </div>
   )
@@ -1080,6 +1422,9 @@ export default function StockManagement() {
   const [editTarget,     setEditTarget]     = useState(null)
   const [selectedIds,    setSelectedIds]    = useState(() => new Set())
   const [showBulkEdit,   setShowBulkEdit]   = useState(false)
+  const [quantityDrafts, setQuantityDrafts] = useState({})
+  const [showReview,     setShowReview]     = useState(false)
+  const [savingGrid,     setSavingGrid]     = useState(false)
   const [activeView,     setActiveView]     = useState('balance')
   const toast = useToast()
 
@@ -1167,6 +1512,79 @@ export default function StockManagement() {
   }, [getToken, toast, loadBalance])
 
   const allRows = balanceData?.rows || []
+
+  const pendingChanges = useMemo(() => allRows.flatMap((row) => {
+    if (!(row.id in quantityDrafts)) return []
+    const raw = quantityDrafts[row.id]
+    const quantity = Number(raw)
+    if (raw === '' || !Number.isSafeInteger(quantity) || quantity < 0 || quantity === Number(row.Quantity)) return []
+    return [{ ...row, newQuantity: quantity }]
+  }), [allRows, quantityDrafts])
+
+  const invalidDraftCount = useMemo(() => Object.entries(quantityDrafts).filter(([id, raw]) => {
+    const row = allRows.find((item) => item.id === Number(id))
+    if (!row) return false
+    const quantity = Number(raw)
+    return raw === '' || !Number.isSafeInteger(quantity) || quantity < 0
+  }).length, [allRows, quantityDrafts])
+
+  useEffect(() => {
+    if (!pendingChanges.length && !invalidDraftCount) return undefined
+    const warnBeforeLeave = (event) => {
+      event.preventDefault()
+      event.returnValue = ''
+    }
+    window.addEventListener('beforeunload', warnBeforeLeave)
+    return () => window.removeEventListener('beforeunload', warnBeforeLeave)
+  }, [invalidDraftCount, pendingChanges.length])
+
+  const handleGridChange = useCallback((row, value) => {
+    setQuantityDrafts((current) => {
+      const next = { ...current }
+      if (value === String(row.Quantity ?? 0)) delete next[row.id]
+      else next[row.id] = value
+      return next
+    })
+  }, [])
+
+  const saveGridChanges = useCallback(async (reason) => {
+    if (!pendingChanges.length || invalidDraftCount) return
+    setSavingGrid(true)
+    try {
+      const data = await apiFetch(`${BASE}/inventory-balance?action=bulk-edit`, {
+        method: 'PATCH',
+        headers: authHeaders(getToken(), true),
+        body: JSON.stringify({
+          reason,
+          updates: pendingChanges.map((row) => ({
+            id: row.id,
+            quantity: row.newQuantity,
+            expectedQuantity: Number(row.Quantity),
+          })),
+        }),
+      })
+      const savedById = new Map((data.rows || []).map((row) => [Number(row.id), Number(row.quantity)]))
+      setBalanceData((current) => {
+        if (!current?.rows) return current
+        const rows = current.rows.map((row) => savedById.has(row.id) ? { ...row, Quantity: savedById.get(row.id) } : row)
+        return {
+          ...current,
+          rows,
+          total_units: rows.reduce((sum, row) => sum + (Number(row.Quantity) || 0), 0),
+          skus_in_stock: rows.filter((row) => Number(row.Quantity) > 0).length,
+          skus_zero: rows.filter((row) => Number(row.Quantity) <= 0).length,
+        }
+      })
+      setQuantityDrafts({})
+      setShowReview(false)
+      toast.success(`Saved ${data.updated} inventory change${Number(data.updated) === 1 ? '' : 's'}`, 'Inventory Updated')
+    } catch (error) {
+      toast.error(error.message, 'Save Failed')
+      if (error.message.toLowerCase().includes('changed')) await loadBalance()
+    } finally {
+      setSavingGrid(false)
+    }
+  }, [getToken, invalidDraftCount, loadBalance, pendingChanges, toast])
 
   const styles = useMemo(() => (
     [...new Set(allRows.map((row) => row.Style).filter(Boolean))]
@@ -1307,7 +1725,7 @@ export default function StockManagement() {
         <ImportModal onClose={() => setShowImport(false)} onDone={loadBalance} getToken={getToken} />
       )}
       {showAddRows && (
-        <AddRowsModal onClose={() => setShowAddRows(false)} onDone={loadBalance} currentRows={allRows} getToken={getToken} />
+        <AddRowsGridModal onClose={() => setShowAddRows(false)} onDone={loadBalance} currentRows={allRows} getToken={getToken} />
       )}
       {showRemoveRows && (
         <RemoveRowsModal onClose={() => setShowRemoveRows(false)} onDone={loadBalance} currentRows={allRows} getToken={getToken} />
@@ -1326,6 +1744,14 @@ export default function StockManagement() {
           onClose={() => setShowBulkEdit(false)}
           onDone={handleBulkUpdated}
           getToken={getToken}
+        />
+      )}
+      {showReview && pendingChanges.length > 0 && (
+        <ReviewInventoryChangesModal
+          changes={pendingChanges}
+          onClose={() => setShowReview(false)}
+          onSave={saveGridChanges}
+          saving={savingGrid}
         />
       )}
 
@@ -1361,7 +1787,11 @@ export default function StockManagement() {
                 {resetting ? <RefreshCw className="w-4 h-4 animate-spin" /> : null}
                 Reset to Zero
               </button>
-              <button onClick={loadBalance} className="btn-secondary text-sm">
+              <button onClick={() => {
+                if (pendingChanges.length && !window.confirm('Discard unsaved inventory changes and refresh?')) return
+                setQuantityDrafts({})
+                loadBalance()
+              }} className="btn-secondary text-sm">
                 <RefreshCw className="w-4 h-4" />
                 Refresh
               </button>
@@ -1489,17 +1919,19 @@ export default function StockManagement() {
                   </div>
                 )}
 
-                {selectedRows.length > 0 && (
-                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3">
+                {(pendingChanges.length > 0 || invalidDraftCount > 0) && (
+                  <div className="flex flex-col gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
                     <div>
-                      <p className="text-sm font-semibold text-blue-800">{selectedRows.length} SKU{selectedRows.length === 1 ? '' : 's'} selected</p>
-                      <p className="text-xs text-blue-600 mt-0.5">Choose a style, then use the top checkbox to select all of its colors and sizes.</p>
+                      <p className="text-sm font-semibold text-amber-900">{pendingChanges.length} unsaved change{pendingChanges.length === 1 ? '' : 's'}</p>
+                      <p className="mt-0.5 text-xs text-amber-700">
+                        {invalidDraftCount ? `${invalidDraftCount} quantity cell${invalidDraftCount === 1 ? '' : 's'} must contain a whole number of 0 or more.` : 'Review the before and after quantities, then save them together.'}
+                      </p>
                     </div>
                     <div className="flex gap-2">
-                      <button onClick={() => setSelectedIds(new Set())} className="btn-secondary text-sm">Clear</button>
-                      <button onClick={() => setShowBulkEdit(true)} className="btn-primary text-sm">
-                        <Pencil className="w-4 h-4" />
-                        Bulk Edit
+                      <button onClick={() => setQuantityDrafts({})} className="btn-secondary text-sm">Discard</button>
+                      <button onClick={() => setShowReview(true)} disabled={!pendingChanges.length || invalidDraftCount > 0} className="btn-primary text-sm disabled:opacity-50">
+                        <Save className="w-4 h-4" />
+                        Review & Save
                       </button>
                     </div>
                   </div>
@@ -1512,18 +1944,11 @@ export default function StockManagement() {
                   <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-green-100" />In stock (≥ 5)</span>
                 </div>
 
-                <DataTable
-                  data={displayRows}
-                  columns={[selectionColumn, ...COLUMNS]}
-                  pageSize={50}
-                  resetPageKey={`${searchQuery}\u0000${filter}\u0000${styleFilter}`}
-                  rowClassName={rowColor}
-                  emptyMessage={
-                    searchQuery || filter !== 'all' || styleFilter !== 'all'
-                      ? 'No rows match the current filters'
-                      : 'No balance data'
-                  }
-                />
+                <div className="rounded-xl bg-blue-50 px-3 py-2 text-xs text-blue-700">
+                  Click a quantity to type, use + / −, or paste a vertical quantity column from Excel. Enter moves to the next row. Yellow cells are not saved yet.
+                </div>
+
+                <InventorySpreadsheet rows={displayRows} drafts={quantityDrafts} onChange={handleGridChange} />
               </div>
 
               {/* Version history + transaction log */}
