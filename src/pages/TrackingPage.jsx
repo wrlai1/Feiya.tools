@@ -251,6 +251,7 @@ export default function TrackingPage() {
   const [trackingData, setTrackingData] = useState([])
   const [lastUpdated, setLastUpdated] = useState(null)
   const [fileName, setFileName] = useState(null)
+  const [revision, setRevision] = useState(0)
   const [inputValue, setInputValue] = useState('')
   const deferredQuery = useDeferredValue(inputValue) // lags behind — drives filtering
   const isStale = deferredQuery !== inputValue       // true while results are catching up
@@ -271,6 +272,7 @@ export default function TrackingPage() {
           setTrackingData(result.rows || [])
           setLastUpdated(result.updatedAt || null)
           setFileName(result.fileName || null)
+          setRevision(Number(result.revision || 0))
         }
       } catch (err) {
         if (!cancelled) setApiError(err.message)
@@ -286,9 +288,10 @@ export default function TrackingPage() {
     setIsUploading(true)
     try {
       const data = await parseTrackingCSV(file)
-      await saveTracking(data, file.name)
+      const result = await saveTracking(data, file.name, revision)
       setTrackingData(data)
-      setLastUpdated(new Date().toISOString())
+      setRevision(Number(result.revision))
+      setLastUpdated(result.updatedAt || new Date().toISOString())
       setFileName(file.name)
       toast.success(`Uploaded ${data.length} rows — visible to everyone`, 'Tracking Updated')
     } catch (err) {
@@ -296,12 +299,13 @@ export default function TrackingPage() {
     } finally {
       setIsUploading(false)
     }
-  }, [toast])
+  }, [revision, toast])
 
   const handleClear = useCallback(async () => {
     try {
-      await clearTracking()
+      await clearTracking(revision)
       setTrackingData([])
+      setRevision(0)
       setLastUpdated(null)
       setFileName(null)
       setInputValue('')
@@ -309,7 +313,7 @@ export default function TrackingPage() {
     } catch (err) {
       toast.error(err.message, 'Clear Error')
     }
-  }, [toast])
+  }, [revision, toast])
 
   const MAX_GROUPS = 30
 
@@ -373,7 +377,9 @@ export default function TrackingPage() {
         <div className="flex-1">
           <h2 className="text-xl font-bold text-slate-800">Tracking → SKU</h2>
           <p className="text-sm text-slate-500 mt-0.5">
-            Upload a tracking CSV — data stays shared until cleared or re-uploaded
+            {isAdmin
+              ? 'Upload a tracking CSV — data stays shared until cleared or re-uploaded'
+              : 'Scan or enter a tracking number to find the expected SKUs'}
           </p>
         </div>
         {hasData && isAdmin && (
@@ -392,8 +398,8 @@ export default function TrackingPage() {
         </div>
       )}
 
-      {/* Upload zone */}
-      <div className="card p-5">
+      {/* Only admins can replace the shared source file. */}
+      {isAdmin ? <div className="card p-5">
         <h3 className="font-medium text-slate-700 mb-3 flex items-center gap-2">
           <Truck className="w-4 h-4 text-teal-500" />
           Upload Tracking File
@@ -423,7 +429,13 @@ export default function TrackingPage() {
             {fileName && <><span className="text-slate-300 mx-1">·</span><span className="truncate max-w-xs">{fileName}</span></>}
           </p>
         )}
-      </div>
+      </div> : lastUpdated ? (
+        <div className="card px-4 py-3 text-xs text-slate-500 flex items-center gap-2">
+          <Clock className="w-3.5 h-3.5" />
+          Shared tracking data updated {formatLastUpdated(lastUpdated)}
+          {fileName && <span className="truncate text-slate-400">· {fileName}</span>}
+        </div>
+      ) : null}
 
       {/* Search bar */}
       {hasData && (
@@ -544,7 +556,9 @@ export default function TrackingPage() {
           </div>
           <h3 className="font-semibold text-slate-700 mb-1">No tracking data loaded</h3>
           <p className="text-sm text-slate-400">
-            Upload a tracking CSV — it stays available for the whole team until cleared or replaced.
+            {isAdmin
+              ? 'Upload a tracking CSV — it stays available for the whole team until cleared or replaced.'
+              : 'No shared tracking file is available yet. Ask an administrator to upload it.'}
           </p>
         </div>
       )}

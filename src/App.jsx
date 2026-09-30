@@ -1,20 +1,26 @@
-import React from 'react'
+import React, { lazy, Suspense } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import { ToastProvider } from './components/Toast.jsx'
 import { AuthProvider, useAuth } from './context/AuthContext.jsx'
 import Layout from './components/Layout.jsx'
 import LoginPage from './pages/LoginPage.jsx'
-import Dashboard from './pages/Dashboard.jsx'
-import InventoryCheck from './pages/InventoryCheck.jsx'
-import TrackingPage from './pages/TrackingPage.jsx'
-import NotesPage from './pages/NotesPage.jsx'
-import StockManagement from './pages/StockManagement.jsx'
-import AutoDeduct from './pages/AutoDeduct.jsx'
-import MetricsAnalytics from './pages/MetricsAnalytics.jsx'
-import AutoGenerate from './pages/AutoGenerate.jsx'
-import AdminUsers from './pages/AdminUsers.jsx'
-import TimeClockPage from './pages/TimeClockPage.jsx'
-import AdminTimeReport from './pages/AdminTimeReport.jsx'
+const Dashboard = lazy(() => import('./pages/Dashboard.jsx'))
+const InventoryCheck = lazy(() => import('./pages/InventoryCheck.jsx'))
+const NotesPage = lazy(() => import('./pages/NotesPage.jsx'))
+const StockManagement = lazy(() => import('./pages/StockManagement.jsx'))
+const AutoDeduct = lazy(() => import('./pages/AutoDeduct.jsx'))
+const AutoDeductHistory = lazy(() => import('./pages/AutoDeductHistory.jsx'))
+const MetricsAnalytics = lazy(() => import('./pages/MetricsAnalytics.jsx'))
+const NewProductTracker = lazy(() => import('./pages/NewProductTracker.jsx'))
+const AutoGenerate = lazy(() => import('./pages/AutoGenerate.jsx'))
+const AdminUsers = lazy(() => import('./pages/AdminUsers.jsx'))
+const TimeClockPage = lazy(() => import('./pages/TimeClockPage.jsx'))
+const AdminTimeReport = lazy(() => import('./pages/AdminTimeReport.jsx'))
+const ReturnsReceiving = lazy(() => import('./pages/ReturnsReceiving.jsx'))
+const FactoryAttendance = lazy(() => import('./pages/FactoryAttendance.jsx'))
+import userPermissions from './utils/userPermissions.js'
+
+const { INVENTORY_CHECK_VIEW, userHasPermission } = userPermissions
 
 // Full-page spinner shown while verifying token on first load
 function SplashLoader() {
@@ -45,12 +51,38 @@ function RequireAuth({ children }) {
   return children
 }
 
-// Admin-only gate — regular users are redirected to /tracking
+// Admin-only gate — regular users are redirected to their operations workspace.
 function RequireAdmin({ children }) {
   const { user } = useAuth()
   const location = useLocation()
   if (import.meta.env.DEV && new URLSearchParams(location.search).get('mock') === '1') return children
-  if (user?.role !== 'admin') return <Navigate to="/tracking" replace />
+  if (user?.role !== 'admin') return <Navigate to="/returns" replace />
+  return children
+}
+
+function RequireAttendance({ children }) {
+  const { user } = useAuth()
+  const location = useLocation()
+  if (import.meta.env.DEV && new URLSearchParams(location.search).get('mock') === '1') return children
+  if (user?.role !== 'admin' && !user?.attendanceAccess) return <Navigate to="/returns" replace />
+  return children
+}
+
+function RequirePermission({ permission, children }) {
+  const { user } = useAuth()
+  const location = useLocation()
+  if (import.meta.env.DEV && new URLSearchParams(location.search).get('mock') === '1') return children
+  if (!userHasPermission(user, permission)) {
+    return <Navigate to={user?.attendanceAccess ? '/attendance' : '/returns'} replace />
+  }
+  return children
+}
+
+function RequireGeneralAccess({ children }) {
+  const { user } = useAuth()
+  const location = useLocation()
+  if (import.meta.env.DEV && new URLSearchParams(location.search).get('mock') === '1') return children
+  if (user?.role !== 'admin' && user?.attendanceAccess) return <Navigate to="/attendance" replace />
   return children
 }
 
@@ -58,7 +90,7 @@ function RequireAdmin({ children }) {
 function GuestOnly({ children }) {
   const { user, loading } = useAuth()
   if (loading) return <SplashLoader />
-  if (user) return <Navigate to={user.role === 'admin' ? '/' : '/tracking'} replace />
+  if (user) return <Navigate to={user.role === 'admin' ? '/' : user.attendanceAccess ? '/attendance' : '/returns'} replace />
   return children
 }
 
@@ -71,16 +103,20 @@ function AppRoutes() {
       {/* Protected */}
       <Route path="/" element={<RequireAuth><Layout /></RequireAuth>}>
         <Route index element={<RequireAdmin><Dashboard /></RequireAdmin>} />
-        <Route path="inventory" element={<RequireAdmin><InventoryCheck /></RequireAdmin>} />
-        <Route path="tracking" element={<TrackingPage />} />
-        <Route path="notes" element={<NotesPage />} />
+        <Route path="inventory" element={<RequirePermission permission={INVENTORY_CHECK_VIEW}><InventoryCheck /></RequirePermission>} />
+        <Route path="tracking" element={<Navigate to="/returns" replace />} />
+        <Route path="notes" element={<RequireGeneralAccess><NotesPage /></RequireGeneralAccess>} />
         <Route path="stock" element={<RequireAdmin><StockManagement /></RequireAdmin>} />
         <Route path="auto-deduct" element={<RequireAdmin><AutoDeduct /></RequireAdmin>} />
+        <Route path="auto-deduct/history" element={<RequireAdmin><AutoDeductHistory /></RequireAdmin>} />
+        <Route path="returns" element={<RequireGeneralAccess><ReturnsReceiving /></RequireGeneralAccess>} />
         <Route path="analytics" element={<RequireAdmin><MetricsAnalytics /></RequireAdmin>} />
+        <Route path="new-products" element={<RequireAdmin><NewProductTracker /></RequireAdmin>} />
         <Route path="auto-generate" element={<RequireAdmin><AutoGenerate /></RequireAdmin>} />
         <Route path="users" element={<RequireAdmin><AdminUsers /></RequireAdmin>} />
-        <Route path="timeclock" element={<TimeClockPage />} />
+        <Route path="timeclock" element={<RequireGeneralAccess><TimeClockPage /></RequireGeneralAccess>} />
         <Route path="time-report" element={<RequireAdmin><AdminTimeReport /></RequireAdmin>} />
+        <Route path="attendance" element={<RequireAttendance><FactoryAttendance /></RequireAttendance>} />
       </Route>
 
       {/* Fallback */}
@@ -94,7 +130,7 @@ export default function App() {
     <ToastProvider>
       <AuthProvider>
         <BrowserRouter>
-          <AppRoutes />
+          <Suspense fallback={<SplashLoader />}><AppRoutes /></Suspense>
         </BrowserRouter>
       </AuthProvider>
     </ToastProvider>

@@ -10,15 +10,18 @@ export default function FileUploadZone({
   currentFile = null,
   onClear,
   compact = false,
+  multiple = false,
 }) {
   const inputRef = useRef(null)
   const [isDragOver, setIsDragOver] = useState(false)
 
-  const handleFile = useCallback(
-    (file) => {
-      if (file && onFile) onFile(file)
+  const handleFiles = useCallback(
+    (files) => {
+      const selected = [...(files || [])]
+      if (!selected.length || !onFile) return
+      onFile(multiple ? selected : selected[0])
     },
-    [onFile]
+    [multiple, onFile]
   )
 
   const handleDragOver = useCallback((e) => {
@@ -35,19 +38,17 @@ export default function FileUploadZone({
     (e) => {
       e.preventDefault()
       setIsDragOver(false)
-      const file = e.dataTransfer.files[0]
-      if (file) handleFile(file)
+      handleFiles(e.dataTransfer.files)
     },
-    [handleFile]
+    [handleFiles]
   )
 
   const handleInputChange = useCallback(
     (e) => {
-      const file = e.target.files[0]
-      if (file) handleFile(file)
+      handleFiles(e.target.files)
       e.target.value = ''
     },
-    [handleFile]
+    [handleFiles]
   )
 
   const formatFileSize = (bytes) => {
@@ -97,6 +98,7 @@ export default function FileUploadZone({
         ref={inputRef}
         type="file"
         accept={accept}
+        multiple={multiple}
         className="hidden"
         onChange={handleInputChange}
       />

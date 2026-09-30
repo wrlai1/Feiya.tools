@@ -1,0 +1,1063 @@
+import { createHash } from 'node:crypto';
+import { neon } from '@neondatabase/serverless';
+import authentication from '../lib/authentication.cjs';
+import {
+  DEFAULT_ATTENDANCE_SETTINGS,
+  buildAttendanceSummary,
+  calculateAttendanceDays,
+  filterAttendanceRecordsByDates,
+  parseAttendanceFiles,
+  partitionAttendanceDuplicates,
+  standardMinutesForSchedule,
+} from '../src/utils/factoryAttendance.js';
+
+const { authenticateUser } = authentication;
+
+function validDate(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(value || ''));
+}
+
+function guatemalaToday() {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Guatemala', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function settingsFromRow(row = {}) {
+  return {
+    timezone: row.timezone || DEFAULT_ATTENDANCE_SETTINGS.timezone,
+    weekdayStart: String(row.weekday_start || DEFAULT_ATTENDANCE_SETTINGS.weekdayStart).slice(0, 5),
+    weekdayEnd: String(row.weekday_end || DEFAULT_ATTENDANCE_SETTINGS.weekdayEnd).slice(0, 5),
+    weekdayStandardMinutes: Number(row.weekday_standard_minutes ?? DEFAULT_ATTENDANCE_SETTINGS.weekdayStandardMinutes),
+    saturdayStart: String(row.saturday_start || DEFAULT_ATTENDANCE_SETTINGS.saturdayStart).slice(0, 5),
+    saturdayEnd: String(row.saturday_end || DEFAULT_ATTENDANCE_SETTINGS.saturdayEnd).slice(0, 5),
+    saturdayStandardMinutes: Number(row.saturday_standard_minutes ?? DEFAULT_ATTENDANCE_SETTINGS.saturdayStandardMinutes),
+    payrollStandardMinutes: Number(row.payroll_standard_minutes ?? DEFAULT_ATTENDANCE_SETTINGS.payrollStandardMinutes),
+    hourlyAdjustmentRate: Number(row.hourly_adjustment_rate ?? DEFAULT_ATTENDANCE_SETTINGS.hourlyAdjustmentRate),
+    fulltimeDailyRate: Number(row.fulltime_daily_rate ?? DEFAULT_ATTENDANCE_SETTINGS.fulltimeDailyRate),
+    fulltimeBonus: Number(row.fulltime_bonus ?? DEFAULT_ATTENDANCE_SETTINGS.fulltimeBonus),
+  };
+}
+
+function employeeFromRow(row) {
+  return {
+    employeeCode: Number(row.employee_code),
+    name: row.name,
+    department: row.department,
+    dailyPayment: row.daily_payment == null ? null : Number(row.daily_payment),
+    bonusEligible: Boolean(row.bonus_eligible),
+    rateEffectiveFrom: row.rate_effective_from || null,
+    activeFrom: row.active_from || null,
+    active: row.active == null ? true : Boolean(row.active),
+  };
+}
+
+async function ensureTables(sql) {
+  await sql`
+    CREATE TABLE IF NOT EXISTS attendance_settings (
+      id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+      timezone TEXT NOT NULL DEFAULT 'America/Guatemala',
+      weekday_start TIME NOT NULL DEFAULT '07:00',
+      weekday_end TIME NOT NULL DEFAULT '18:00',
+      weekday_standard_minutes INTEGER NOT NULL DEFAULT 600,
+      saturday_start TIME NOT NULL DEFAULT '07:00',
+      saturday_end TIME NOT NULL DEFAULT '12:00',
+      saturday_standard_minutes INTEGER NOT NULL DEFAULT 300,
+      payroll_standard_minutes INTEGER NOT NULL DEFAULT 5400,
+      hourly_adjustment_rate NUMERIC(10,2) NOT NULL DEFAULT 20,
+      fulltime_daily_rate NUMERIC(10,2) NOT NULL DEFAULT 107.37,
+      fulltime_bonus NUMERIC(10,2) NOT NULL DEFAULT 125,
+      updated_by TEXT,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `;
+  await sql`INSERT INTO attendance_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING`;
+  await sql`
+    CREATE TABLE IF NOT EXISTS attendance_employees (
+      employee_code INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      department TEXT,
+      daily_payment NUMERIC(10,2),
+      bonus_eligible BOOLEAN NOT NULL DEFAULT FALSE,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      active_from DATE,
+      archived_by TEXT,
+      archived_at TIMESTAMPTZ,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `;
+  await sql`ALTER TABLE attendance_employees ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE`;
+  await sql`ALTER TABLE attendance_employees ADD COLUMN IF NOT EXISTS active_from DATE`;
+  await sql`ALTER TABLE attendance_employees ADD COLUMN IF NOT EXISTS archived_by TEXT`;
+  await sql`ALTER TABLE attendance_employees ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ`;
+  await sql`
+    CREATE TABLE IF NOT EXISTS attendance_employee_history (
+      id BIGSERIAL PRIMARY KEY,
+      employee_code INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      department TEXT,
+      active_from DATE,
+      active_to DATE NOT NULL,
+      archived_by TEXT NOT NULL,
+      archived_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      reinstated_by TEXT,
+      reinstated_at TIMESTAMPTZ
+    )
+  `;
+  await sql`
+    CREATE TABLE IF NOT EXISTS attendance_edit_audit (
+      id BIGSERIAL PRIMARY KEY,
+      employee_code INTEGER NOT NULL,
+      work_date DATE,
+      edit_type TEXT NOT NULL,
+      before_value JSONB,
+      after_value JSONB,
+      reason TEXT,
+      edited_by TEXT NOT NULL,
+      edited_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `;
+  await sql`
+    CREATE TABLE IF NOT EXISTS attendance_employee_rates (
+      id BIGSERIAL PRIMARY KEY,
+      employee_code INTEGER NOT NULL REFERENCES attendance_employees(employee_code) ON DELETE CASCADE,
+      effective_from DATE NOT NULL,
+      daily_payment NUMERIC(10,2),
+      bonus_eligible BOOLEAN NOT NULL DEFAULT FALSE,
+      updated_by TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (employee_code, effective_from)
+    )
+  `;
+  await sql`
+    CREATE TABLE IF NOT EXISTS attendance_imports (
+      id BIGSERIAL PRIMARY KEY,
+      file_name TEXT NOT NULL,
+      file_hash TEXT UNIQUE NOT NULL,
+      record_count INTEGER NOT NULL,
+      inserted_count INTEGER NOT NULL DEFAULT 0,
+      uploaded_by TEXT NOT NULL,
+      uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      date_from DATE,
+      date_to DATE,
+      source_files JSONB NOT NULL DEFAULT '[]'::jsonb,
+      duplicate_details JSONB NOT NULL DEFAULT '[]'::jsonb,
+      date_schedules JSONB NOT NULL DEFAULT '[]'::jsonb,
+      reverted_by TEXT,
+      reverted_at TIMESTAMPTZ
+    )
+  `;
+  await sql`
+    CREATE TABLE IF NOT EXISTS attendance_clear_events (
+      id BIGSERIAL PRIMARY KEY,
+      scope TEXT NOT NULL CHECK (scope IN ('all', 'dates')),
+      dates JSONB NOT NULL DEFAULT '[]'::jsonb,
+      punch_count INTEGER NOT NULL DEFAULT 0,
+      employee_count INTEGER NOT NULL DEFAULT 0,
+      review_snapshots JSONB NOT NULL DEFAULT '[]'::jsonb,
+      cleared_by TEXT NOT NULL,
+      cleared_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      restored_by TEXT,
+      restored_at TIMESTAMPTZ
+    )
+  `;
+  await sql`
+    CREATE TABLE IF NOT EXISTS attendance_punches (
+      id BIGSERIAL PRIMARY KEY,
+      employee_code INTEGER NOT NULL REFERENCES attendance_employees(employee_code),
+      name TEXT NOT NULL,
+      department TEXT,
+      punched_at TIMESTAMP NOT NULL,
+      raw_timestamp TEXT,
+      device_id INTEGER NOT NULL DEFAULT 0,
+      import_id BIGINT NOT NULL REFERENCES attendance_imports(id),
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (employee_code, punched_at, device_id)
+    )
+  `;
+  await sql`
+    CREATE TABLE IF NOT EXISTS attendance_day_reviews (
+      employee_code INTEGER NOT NULL REFERENCES attendance_employees(employee_code),
+      work_date DATE NOT NULL,
+      confirmed BOOLEAN NOT NULL DEFAULT FALSE,
+      adjusted_minutes NUMERIC(10,2),
+      late BOOLEAN NOT NULL DEFAULT FALSE,
+      early BOOLEAN NOT NULL DEFAULT FALSE,
+      note TEXT,
+      updated_by TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (employee_code, work_date)
+    )
+  `;
+  await sql`ALTER TABLE attendance_day_reviews ADD COLUMN IF NOT EXISTS late BOOLEAN NOT NULL DEFAULT FALSE`;
+  await sql`ALTER TABLE attendance_day_reviews ADD COLUMN IF NOT EXISTS early BOOLEAN NOT NULL DEFAULT FALSE`;
+  await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS reverted_by TEXT`;
+  await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS reverted_at TIMESTAMPTZ`;
+  await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS date_from DATE`;
+  await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS date_to DATE`;
+  await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS source_files JSONB NOT NULL DEFAULT '[]'::jsonb`;
+  await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS duplicate_details JSONB NOT NULL DEFAULT '[]'::jsonb`;
+  await sql`ALTER TABLE attendance_imports ADD COLUMN IF NOT EXISTS date_schedules JSONB NOT NULL DEFAULT '[]'::jsonb`;
+  await sql`ALTER TABLE attendance_punches ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE`;
+  await sql`ALTER TABLE attendance_punches ADD COLUMN IF NOT EXISTS cleared_event_id BIGINT REFERENCES attendance_clear_events(id)`;
+  await sql`ALTER TABLE attendance_punches ALTER COLUMN import_id DROP NOT NULL`;
+  await sql`
+    UPDATE attendance_employees employee
+    SET active_from = first_punch.work_date
+    FROM (
+      SELECT employee_code, MIN(punched_at::date) AS work_date
+      FROM attendance_punches
+      GROUP BY employee_code
+    ) first_punch
+    WHERE employee.employee_code = first_punch.employee_code
+      AND employee.active_from IS NULL
+  `;
+  await sql`
+    UPDATE attendance_clear_events event
+    SET punch_count = cleared.punch_count,
+        employee_count = cleared.employee_count
+    FROM (
+      SELECT cleared_event_id,
+             COUNT(*)::int AS punch_count,
+             COUNT(DISTINCT employee_code)::int AS employee_count
+      FROM attendance_punches
+      WHERE cleared_event_id IS NOT NULL
+      GROUP BY cleared_event_id
+    ) cleared
+    WHERE event.id = cleared.cleared_event_id
+      AND event.punch_count = 0
+  `;
+  await sql`ALTER TABLE attendance_imports DROP CONSTRAINT IF EXISTS attendance_imports_file_hash_key`;
+  await sql`ALTER TABLE attendance_punches DROP CONSTRAINT IF EXISTS attendance_punches_employee_code_punched_at_device_id_key`;
+  await sql`DROP INDEX IF EXISTS attendance_imports_active_hash_idx`;
+  await sql`CREATE INDEX IF NOT EXISTS attendance_imports_hash_idx ON attendance_imports (file_hash, uploaded_at DESC)`;
+  await sql`CREATE UNIQUE INDEX IF NOT EXISTS attendance_punches_active_key_idx ON attendance_punches (employee_code, punched_at, device_id) WHERE active`;
+  await sql`
+    WITH ranked AS (
+      SELECT id, ROW_NUMBER() OVER (PARTITION BY employee_code, punched_at ORDER BY id) AS position
+      FROM attendance_punches WHERE active
+    )
+    UPDATE attendance_punches SET active = FALSE
+    WHERE id IN (SELECT id FROM ranked WHERE position > 1)
+  `;
+  await sql`CREATE UNIQUE INDEX IF NOT EXISTS attendance_punches_active_time_idx ON attendance_punches (employee_code, punched_at) WHERE active`;
+}
+
+async function loadDashboard(sql, from, to) {
+  const [settingsRows, punchRows, reviewRows, employeeRows, importRows, scheduleRows, clearRows, archivedRows] = await Promise.all([
+    sql`SELECT * FROM attendance_settings WHERE id = 1`,
+    sql`
+      SELECT employee_code, name, department,
+             TO_CHAR(punched_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS punched_at,
+             raw_timestamp, device_id, import_id
+      FROM attendance_punches
+      WHERE active
+        AND punched_at >= CAST(${from} AS date)
+        AND punched_at < CAST(${to} AS date) + INTERVAL '1 day'
+      ORDER BY punched_at ASC, employee_code ASC
+    `,
+    sql`
+      SELECT employee_code, work_date::text, confirmed, adjusted_minutes, late, early, note, updated_by, updated_at
+      FROM attendance_day_reviews
+      WHERE work_date >= CAST(${from} AS date) AND work_date <= CAST(${to} AS date)
+    `,
+    sql`
+      WITH selected_rates AS (
+        SELECT DISTINCT ON (employee_code)
+          employee_code, daily_payment, bonus_eligible, effective_from
+        FROM attendance_employee_rates
+        WHERE effective_from <= CAST(${to} AS date)
+        ORDER BY employee_code, effective_from DESC, id DESC
+      )
+      SELECT e.employee_code, e.name, e.department, e.active, e.active_from::text,
+             CASE
+               WHEN r.employee_code IS NOT NULL THEN r.daily_payment
+               WHEN EXISTS (SELECT 1 FROM attendance_employee_rates ar WHERE ar.employee_code = e.employee_code) THEN NULL
+               ELSE e.daily_payment
+             END AS daily_payment,
+             CASE
+               WHEN r.employee_code IS NOT NULL THEN r.bonus_eligible
+               WHEN EXISTS (SELECT 1 FROM attendance_employee_rates ar WHERE ar.employee_code = e.employee_code) THEN FALSE
+               ELSE e.bonus_eligible
+             END AS bonus_eligible,
+             r.effective_from::text AS rate_effective_from
+      FROM attendance_employees e
+      LEFT JOIN selected_rates r USING (employee_code)
+      WHERE (e.active AND (e.active_from IS NULL OR e.active_from <= CAST(${to} AS date)))
+         OR EXISTS (
+           SELECT 1 FROM attendance_employee_history history
+           WHERE history.employee_code = e.employee_code
+             AND history.active_from <= CAST(${to} AS date)
+             AND history.active_to >= CAST(${from} AS date)
+         )
+      ORDER BY e.employee_code
+    `,
+    sql`
+      SELECT id, file_name, record_count, inserted_count, uploaded_by, uploaded_at,
+             date_from::text, date_to::text, source_files, duplicate_details, date_schedules, reverted_by, reverted_at
+      FROM attendance_imports ORDER BY uploaded_at DESC LIMIT 50
+    `,
+    sql`
+      SELECT date_schedules
+      FROM attendance_imports
+      WHERE reverted_at IS NULL
+        AND date_to >= CAST(${from} AS date)
+        AND date_from <= CAST(${to} AS date)
+      ORDER BY uploaded_at ASC, id ASC
+    `,
+    sql`
+      SELECT id, scope, dates, punch_count, employee_count, cleared_by, cleared_at,
+             restored_by, restored_at
+      FROM attendance_clear_events
+      ORDER BY cleared_at DESC, id DESC
+      LIMIT 20
+    `,
+    sql`
+      SELECT id, employee_code, name, department, active_from::text, active_to::text,
+             archived_by, archived_at, reinstated_by, reinstated_at
+      FROM attendance_employee_history
+      ORDER BY archived_at DESC, id DESC
+    `,
+  ]);
+
+  const settings = settingsFromRow(settingsRows[0]);
+  const punches = punchRows.map((row) => ({
+    employeeCode: Number(row.employee_code),
+    name: row.name,
+    department: row.department,
+    punchedAt: row.punched_at,
+    rawTimestamp: row.raw_timestamp,
+    deviceId: Number(row.device_id),
+    importId: Number(row.import_id),
+  }));
+  const reviews = reviewRows.map((row) => ({
+    employeeCode: Number(row.employee_code),
+    workDate: row.work_date,
+    confirmed: Boolean(row.confirmed),
+    adjustedMinutes: row.adjusted_minutes == null ? null : Number(row.adjusted_minutes),
+    late: Boolean(row.late),
+    early: Boolean(row.early),
+    note: row.note,
+    updatedBy: row.updated_by,
+    updatedAt: row.updated_at,
+  }));
+  const employees = employeeRows.map((row) => {
+    const historical = archivedRows.find((history) => (
+      Number(history.employee_code) === Number(row.employee_code)
+      && (!history.active_from || history.active_from <= to)
+      && history.active_to >= from
+    ));
+    if (historical && (!row.active || (row.active_from && row.active_from > to))) {
+      return employeeFromRow({
+        ...row,
+        name: historical.name,
+        department: historical.department,
+        active_from: historical.active_from,
+        active: false,
+      });
+    }
+    return employeeFromRow(row);
+  });
+  const dateSchedules = new Map();
+  for (const row of scheduleRows) {
+    for (const schedule of row.date_schedules || []) dateSchedules.set(schedule.workDate, schedule);
+  }
+  const employeeMap = new Map(employees.map((employee) => [employee.employeeCode, employee]));
+  const days = calculateAttendanceDays(punches, settings, reviews, [...dateSchedules.values()]).map((day) => {
+    const employee = employeeMap.get(day.employeeCode);
+    return employee ? { ...day, name: employee.name, department: employee.department } : day;
+  });
+  return {
+    from,
+    to,
+    settings,
+    employees,
+    punches,
+    days,
+    summary: buildAttendanceSummary(days, employees),
+    imports: importRows,
+    clearEvents: clearRows,
+    archivedEmployees: archivedRows.map((row) => ({
+      id: Number(row.id),
+      employeeCode: Number(row.employee_code),
+      name: row.name,
+      department: row.department,
+      activeFrom: row.active_from || null,
+      activeTo: row.active_to,
+      archivedBy: row.archived_by,
+      archivedAt: row.archived_at,
+      reinstatedBy: row.reinstated_by,
+      reinstatedAt: row.reinstated_at,
+    })),
+  };
+}
+
+export default async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.status(204).end();
+
+  const dbUrl = process.env.DATABASE_URL;
+  const secret = process.env.JWT_SECRET;
+  if (!dbUrl || !secret) return res.status(500).json({ error: 'Server not configured' });
+  const sql = neon(dbUrl);
+
+  try {
+    const user = await authenticateUser(sql, req.headers.authorization, secret);
+    if (!user) return res.status(401).json({ error: 'Not authenticated' });
+    if (user.role !== 'admin' && !user.attendanceAccess) {
+      return res.status(403).json({ error: 'Attendance access required' });
+    }
+    await ensureTables(sql);
+    const action = String(req.query.action || 'dashboard');
+    if (user.role !== 'admin' && !['dashboard', 'import'].includes(action)) {
+      return res.status(403).json({ error: 'Admin access required for Attendance Management' });
+    }
+
+    if (req.method === 'GET' && action === 'dashboard') {
+      const from = String(req.query.from || '');
+      const to = String(req.query.to || '');
+      if (!validDate(from) || !validDate(to) || from > to) return res.status(400).json({ error: 'Valid date range required' });
+      const dashboard = await loadDashboard(sql, from, to);
+      if (user.role === 'admin') return res.status(200).json(dashboard);
+      const { employees, punches, days, summary } = dashboard;
+      return res.status(200).json({ from, to, employees, punches, days, summary });
+    }
+
+    if (req.method === 'GET' && action === 'clear-options') {
+      const rows = await sql`
+        SELECT punched_at::date::text AS work_date,
+               COUNT(*)::int AS punch_count,
+               COUNT(DISTINCT employee_code)::int AS employee_count
+        FROM attendance_punches
+        WHERE active
+        GROUP BY punched_at::date
+        ORDER BY punched_at::date DESC
+      `;
+      return res.status(200).json({
+        dates: rows.map((row) => ({
+          workDate: row.work_date,
+          punchCount: Number(row.punch_count),
+          employeeCount: Number(row.employee_count),
+        })),
+        punchCount: rows.reduce((sum, row) => sum + Number(row.punch_count), 0),
+      });
+    }
+
+    if (req.method === 'POST' && action === 'import') {
+      const submittedFiles = Array.isArray(req.body?.files)
+        ? req.body.files
+        : [{ fileName: req.body?.fileName, content: req.body?.content }];
+      const files = submittedFiles.map((file) => ({
+        fileName: String(file?.fileName || '').trim(),
+        content: String(file?.content || ''),
+      }));
+      if (!files.length || files.length > 3 || files.some((file) => !file.fileName || !file.content)) {
+        return res.status(400).json({ error: 'Select between one and three attendance TXT files' });
+      }
+      if (files.some((file) => file.content.length > 4_000_000) || files.reduce((sum, file) => sum + file.content.length, 0) > 12_000_000) {
+        return res.status(413).json({ error: 'One or more attendance files are too large' });
+      }
+      const sourceFiles = files.map((file) => file.fileName);
+      const fileName = sourceFiles.length === 1 ? sourceFiles[0] : `${sourceFiles.length} files: ${sourceFiles.join(', ')}`;
+      const contentHashes = files.map((file) => createHash('sha256').update(file.content).digest('hex')).sort();
+      const parsedRecords = parseAttendanceFiles(files);
+      const availableDates = [...new Set(parsedRecords.map((record) => record.punchedAt.slice(0, 10)))].sort();
+      const submittedSchedules = Array.isArray(req.body?.dateSchedules) ? req.body.dateSchedules : [];
+      const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
+      const scheduleByDate = new Map();
+      for (const schedule of submittedSchedules) {
+        const workDate = String(schedule?.workDate || '');
+        const endTime = String(schedule?.endTime || '').slice(0, 5);
+        if (!validDate(workDate) || !timePattern.test(endTime) || scheduleByDate.has(workDate)) {
+          return res.status(400).json({ error: 'Choose one valid end time for every attendance date' });
+        }
+        scheduleByDate.set(workDate, endTime);
+      }
+      if (!scheduleByDate.size || [...scheduleByDate.keys()].some((date) => !availableDates.includes(date))) {
+        return res.status(400).json({ error: 'Keep at least one valid date found in the TXT files' });
+      }
+      const dateSchedules = [...scheduleByDate.keys()].sort().map((workDate) => {
+        const endTime = scheduleByDate.get(workDate);
+        const standardMinutes = standardMinutesForSchedule(workDate, endTime);
+        return { workDate, startTime: '07:00', endTime, standardMinutes };
+      });
+      if (dateSchedules.some((schedule) => !Number.isFinite(schedule.standardMinutes) || schedule.standardMinutes <= 0)) {
+        return res.status(400).json({ error: 'Every selected end time must produce a positive workday after 07:00' });
+      }
+      const records = filterAttendanceRecordsByDates(parsedRecords, scheduleByDate.keys());
+      const recordDates = records.map((record) => record.punchedAt.slice(0, 10)).sort();
+      const dateFrom = recordDates[0];
+      const dateTo = recordDates.at(-1);
+      const hash = createHash('sha256').update(`${contentHashes.join('|')}|${JSON.stringify(dateSchedules)}`).digest('hex');
+      const preliminary = partitionAttendanceDuplicates(records);
+      const lookupJson = JSON.stringify(preliminary.accepted.map((record) => ({
+        employee_code: record.employeeCode,
+        punched_at: record.punchedAt,
+        device_id: record.deviceId,
+      })));
+      const existingPunches = await sql`
+        SELECT p.employee_code, TO_CHAR(p.punched_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS punched_at, p.device_id
+        FROM attendance_punches p
+        JOIN jsonb_to_recordset(${lookupJson}::jsonb)
+         AS x(employee_code INTEGER, punched_at TEXT, device_id INTEGER)
+          ON p.employee_code = x.employee_code
+         AND p.punched_at = CAST(x.punched_at AS timestamp)
+        WHERE p.active
+      `;
+      const existingKeys = new Set(existingPunches.map((record) => (
+        `${Number(record.employee_code)}|${record.punched_at}`
+      )));
+      const { accepted: newRecords, duplicates: duplicateDetails } = partitionAttendanceDuplicates(records, existingKeys);
+      const activeFile = await sql`
+        SELECT id, file_name, uploaded_at FROM attendance_imports
+        WHERE file_hash = ${hash} AND reverted_at IS NULL
+        ORDER BY uploaded_at DESC, id DESC
+        LIMIT 1
+      `;
+      if (activeFile[0] && newRecords.length === 0) {
+        return res.status(200).json({
+          importId: Number(activeFile[0].id), records: records.length, inserted: 0,
+          duplicates: records.length, duplicateDetails, exactFileDuplicate: true,
+          existing: activeFile[0], dateFrom, dateTo, sourceFiles, dateSchedules,
+        });
+      }
+      const employeeMap = new Map();
+      for (const record of records) {
+        const current = employeeMap.get(record.employeeCode);
+        const usefulDepartment = record.department && !/^Not Set/i.test(record.department);
+        if (!current || usefulDepartment) employeeMap.set(record.employeeCode, record);
+      }
+      const employeeJson = JSON.stringify([...employeeMap.values()].map((record) => ({
+        employee_code: record.employeeCode,
+        name: record.name,
+        department: record.department,
+      })));
+      await sql`
+        INSERT INTO attendance_employees (employee_code, name, department, active, active_from)
+        SELECT employee_code, name, department, TRUE, CAST(${dateFrom} AS date)
+        FROM jsonb_to_recordset(${employeeJson}::jsonb)
+          AS x(employee_code INTEGER, name TEXT, department TEXT)
+        ON CONFLICT (employee_code) DO UPDATE SET
+          name = CASE
+            WHEN attendance_employees.active OR NOT EXISTS (
+              SELECT 1 FROM attendance_employee_history history
+              WHERE history.employee_code = EXCLUDED.employee_code
+                AND history.active_to >= EXCLUDED.active_from
+            ) THEN EXCLUDED.name
+            ELSE attendance_employees.name
+          END,
+          department = CASE
+            WHEN NOT attendance_employees.active AND EXISTS (
+              SELECT 1 FROM attendance_employee_history history
+              WHERE history.employee_code = EXCLUDED.employee_code
+                AND history.active_to >= EXCLUDED.active_from
+            ) THEN attendance_employees.department
+            WHEN EXCLUDED.department = '' OR EXCLUDED.department ILIKE 'Not Set%' THEN attendance_employees.department
+            ELSE EXCLUDED.department
+          END,
+          active = attendance_employees.active OR NOT EXISTS (
+            SELECT 1 FROM attendance_employee_history history
+            WHERE history.employee_code = EXCLUDED.employee_code
+              AND history.active_to >= EXCLUDED.active_from
+          ),
+          active_from = CASE
+            WHEN attendance_employees.active THEN COALESCE(attendance_employees.active_from, EXCLUDED.active_from)
+            WHEN NOT EXISTS (
+              SELECT 1 FROM attendance_employee_history history
+              WHERE history.employee_code = EXCLUDED.employee_code
+                AND history.active_to >= EXCLUDED.active_from
+            ) THEN EXCLUDED.active_from
+            ELSE attendance_employees.active_from
+          END,
+          archived_by = CASE
+            WHEN NOT EXISTS (
+              SELECT 1 FROM attendance_employee_history history
+              WHERE history.employee_code = EXCLUDED.employee_code
+                AND history.active_to >= EXCLUDED.active_from
+            ) THEN NULL ELSE attendance_employees.archived_by
+          END,
+          archived_at = CASE
+            WHEN NOT EXISTS (
+              SELECT 1 FROM attendance_employee_history history
+              WHERE history.employee_code = EXCLUDED.employee_code
+                AND history.active_to >= EXCLUDED.active_from
+            ) THEN NULL ELSE attendance_employees.archived_at
+          END,
+          updated_at = NOW()
+      `;
+
+      const imports = await sql`
+        INSERT INTO attendance_imports (
+          file_name, file_hash, record_count, uploaded_by, date_from, date_to, source_files, duplicate_details, date_schedules
+        )
+        VALUES (
+          ${fileName}, ${hash}, ${records.length}, ${user.username}, ${dateFrom}, ${dateTo},
+          ${JSON.stringify(sourceFiles)}::jsonb,
+          ${JSON.stringify(duplicateDetails)}::jsonb,
+          ${JSON.stringify(dateSchedules)}::jsonb
+        )
+        RETURNING id
+      `;
+      const importId = Number(imports[0].id);
+      const punchJson = JSON.stringify(newRecords.map((record) => ({
+        employee_code: record.employeeCode,
+        name: record.name,
+        department: record.department,
+        punched_at: record.punchedAt,
+        raw_timestamp: record.rawTimestamp,
+        device_id: record.deviceId,
+      })));
+      const inserted = await sql`
+        INSERT INTO attendance_punches (
+          employee_code, name, department, punched_at, raw_timestamp, device_id, import_id
+        )
+        SELECT employee_code, name, department, CAST(punched_at AS timestamp), raw_timestamp, device_id, ${importId}
+        FROM jsonb_to_recordset(${punchJson}::jsonb)
+          AS x(employee_code INTEGER, name TEXT, department TEXT, punched_at TEXT, raw_timestamp TEXT, device_id INTEGER)
+        ON CONFLICT (employee_code, punched_at) WHERE active DO NOTHING
+        RETURNING id
+      `;
+      await sql`UPDATE attendance_imports SET inserted_count = ${inserted.length} WHERE id = ${importId}`;
+      return res.status(200).json({
+        importId, records: records.length, inserted: inserted.length,
+        duplicates: records.length - inserted.length, duplicateDetails, dateFrom, dateTo, sourceFiles, dateSchedules,
+      });
+    }
+
+    if (req.method === 'POST' && action === 'clear-data') {
+      const clearAll = req.body?.scope === 'all';
+      const dates = [...new Set((Array.isArray(req.body?.dates) ? req.body.dates : []).map(String))].sort();
+      if (!clearAll && (!dates.length || dates.some((date) => !validDate(date)))) {
+        return res.status(400).json({ error: 'Select at least one valid attendance date' });
+      }
+      const result = await sql`
+        WITH target_dates AS (
+          SELECT value::date AS work_date
+          FROM jsonb_array_elements_text(${JSON.stringify(dates)}::jsonb)
+        ), review_snapshot AS (
+          SELECT COALESCE(jsonb_agg(jsonb_build_object(
+            'employee_code', employee_code,
+            'work_date', work_date,
+            'confirmed', confirmed,
+            'adjusted_minutes', adjusted_minutes,
+            'late', late,
+            'early', early,
+            'note', note,
+            'updated_by', updated_by,
+            'updated_at', updated_at
+          )), '[]'::jsonb) AS snapshots
+          FROM attendance_day_reviews
+          WHERE ${clearAll} OR work_date IN (SELECT work_date FROM target_dates)
+        ), target_stats AS (
+          SELECT COUNT(*)::int AS punch_count,
+                 COUNT(DISTINCT employee_code)::int AS employee_count
+          FROM attendance_punches
+          WHERE active
+            AND (${clearAll} OR punched_at::date IN (SELECT work_date FROM target_dates))
+        ), created AS (
+          INSERT INTO attendance_clear_events (
+            scope, dates, punch_count, employee_count, review_snapshots, cleared_by
+          )
+          SELECT ${clearAll ? 'all' : 'dates'}, ${JSON.stringify(dates)}::jsonb,
+                 target_stats.punch_count, target_stats.employee_count,
+                 review_snapshot.snapshots, ${user.username}
+          FROM review_snapshot, target_stats
+          WHERE target_stats.punch_count > 0
+             OR jsonb_array_length(review_snapshot.snapshots) > 0
+          RETURNING id, punch_count, employee_count
+        ), deactivated AS (
+          UPDATE attendance_punches
+          SET active = FALSE, cleared_event_id = (SELECT id FROM created)
+          WHERE active
+            AND EXISTS (SELECT 1 FROM created)
+            AND (${clearAll} OR punched_at::date IN (SELECT work_date FROM target_dates))
+          RETURNING employee_code
+        ), removed_reviews AS (
+          DELETE FROM attendance_day_reviews
+          WHERE EXISTS (SELECT 1 FROM created)
+            AND (${clearAll} OR work_date IN (SELECT work_date FROM target_dates))
+          RETURNING employee_code
+        )
+        SELECT id, punch_count, employee_count
+        FROM created
+      `;
+      if (!result[0]) return res.status(404).json({ error: 'No active attendance data matched this selection' });
+      return res.status(200).json({
+        ok: true,
+        clearEventId: Number(result[0].id),
+        removedPunches: Number(result[0].punch_count),
+        affectedEmployees: Number(result[0].employee_count),
+      });
+    }
+
+    if (req.method === 'PATCH' && action === 'rollback-import') {
+      const importId = Number(req.body?.importId);
+      if (!Number.isSafeInteger(importId)) return res.status(400).json({ error: 'Import version required' });
+      const reverted = await sql`
+        WITH reverted AS (
+          UPDATE attendance_imports
+          SET reverted_by = ${user.username}, reverted_at = NOW()
+          WHERE id = ${importId} AND reverted_at IS NULL
+            AND id = (
+              SELECT id FROM attendance_imports
+              WHERE reverted_at IS NULL
+              ORDER BY uploaded_at DESC, id DESC
+              LIMIT 1
+            )
+          RETURNING id
+        ), deactivated AS (
+          UPDATE attendance_punches
+          SET active = FALSE
+          WHERE import_id IN (SELECT id FROM reverted) AND active
+          RETURNING id
+        )
+        SELECT (SELECT id FROM reverted) AS import_id,
+               (SELECT COUNT(*)::int FROM deactivated) AS removed_count
+      `;
+      if (!reverted[0]?.import_id) return res.status(409).json({ error: 'Only the latest active import can be rolled back' });
+      return res.status(200).json({ ok: true, removedPunches: Number(reverted[0].removed_count) });
+    }
+
+    if (req.method === 'PATCH' && action === 'restore-clear') {
+      const clearEventId = Number(req.body?.clearEventId);
+      if (!Number.isSafeInteger(clearEventId)) return res.status(400).json({ error: 'Clear version required' });
+      const restored = await sql`
+        WITH chosen AS (
+          SELECT event.*
+          FROM attendance_clear_events event
+          WHERE event.id = ${clearEventId}
+            AND event.restored_at IS NULL
+            AND event.id = (
+              SELECT id FROM attendance_clear_events
+              WHERE restored_at IS NULL
+              ORDER BY cleared_at DESC, id DESC
+              LIMIT 1
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM attendance_imports WHERE uploaded_at > event.cleared_at
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM attendance_punches cleared
+              JOIN attendance_punches active
+                ON active.employee_code = cleared.employee_code
+               AND active.punched_at = cleared.punched_at
+               AND active.active
+              WHERE cleared.cleared_event_id = event.id
+            )
+        ), restored_punches AS (
+          UPDATE attendance_punches
+          SET active = TRUE, cleared_event_id = NULL
+          WHERE cleared_event_id = (SELECT id FROM chosen)
+          RETURNING id
+        ), restored_reviews AS (
+          INSERT INTO attendance_day_reviews (
+            employee_code, work_date, confirmed, adjusted_minutes, late, early,
+            note, updated_by, updated_at
+          )
+          SELECT employee_code, work_date, confirmed, adjusted_minutes, late, early,
+                 note, updated_by, updated_at
+          FROM chosen,
+          jsonb_to_recordset(chosen.review_snapshots) AS review(
+            employee_code INTEGER, work_date DATE, confirmed BOOLEAN,
+            adjusted_minutes NUMERIC, late BOOLEAN, early BOOLEAN, note TEXT,
+            updated_by TEXT, updated_at TIMESTAMPTZ
+          )
+          ON CONFLICT (employee_code, work_date) DO NOTHING
+          RETURNING employee_code
+        )
+        UPDATE attendance_clear_events
+        SET restored_by = ${user.username}, restored_at = NOW()
+        WHERE id = (SELECT id FROM chosen)
+        RETURNING id, (SELECT COUNT(*)::int FROM restored_punches) AS restored_count
+      `;
+      if (!restored[0]) {
+        return res.status(409).json({ error: 'Only the latest cleanup can be restored, and only before new attendance is uploaded' });
+      }
+      return res.status(200).json({ ok: true, restoredPunches: Number(restored[0].restored_count) });
+    }
+
+    if (req.method === 'PATCH' && action === 'review') {
+      const employeeCode = Number(req.body?.employeeCode);
+      const workDate = String(req.body?.workDate || '');
+      const adjustedMinutes = Number(req.body?.adjustedMinutes);
+      const late = Boolean(req.body?.late);
+      const early = Boolean(req.body?.early);
+      const note = String(req.body?.note || '').trim();
+      if (!Number.isSafeInteger(employeeCode) || !validDate(workDate)) return res.status(400).json({ error: 'Employee and date required' });
+      if (!Number.isFinite(adjustedMinutes) || adjustedMinutes < 0 || adjustedMinutes > 1440) {
+        return res.status(400).json({ error: 'Adjusted work time must be between 0 and 24 hours' });
+      }
+      await sql`
+        WITH previous AS (
+          SELECT to_jsonb(review.*) AS value
+          FROM attendance_day_reviews review
+          WHERE employee_code = ${employeeCode} AND work_date = CAST(${workDate} AS date)
+        ), audited AS (
+          INSERT INTO attendance_edit_audit (
+            employee_code, work_date, edit_type, before_value, after_value, reason, edited_by
+          ) VALUES (
+            ${employeeCode}, ${workDate}, 'hours_override',
+            (SELECT value FROM previous),
+            ${JSON.stringify({ adjustedMinutes, late, early, note })}::jsonb,
+            ${note || null}, ${user.username}
+          )
+          RETURNING id
+        )
+        INSERT INTO attendance_day_reviews (
+          employee_code, work_date, confirmed, adjusted_minutes, late, early, note, updated_by
+        )
+        SELECT ${employeeCode}, ${workDate}, TRUE, ${adjustedMinutes}, ${late}, ${early}, ${note || null}, ${user.username}
+        FROM audited
+        ON CONFLICT (employee_code, work_date) DO UPDATE SET
+          confirmed = TRUE,
+          adjusted_minutes = EXCLUDED.adjusted_minutes,
+          late = EXCLUDED.late,
+          early = EXCLUDED.early,
+          note = EXCLUDED.note,
+          updated_by = EXCLUDED.updated_by,
+          updated_at = NOW()
+      `;
+      return res.status(200).json({ ok: true });
+    }
+
+    if (req.method === 'PATCH' && action === 'punches') {
+      const employeeCode = Number(req.body?.employeeCode);
+      const workDate = String(req.body?.workDate || '');
+      const reason = String(req.body?.reason || '').trim();
+      const submittedPunches = Array.isArray(req.body?.punches) ? req.body.punches.map(String) : [];
+      const timePattern = /^([01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/;
+      if (!Number.isSafeInteger(employeeCode) || !validDate(workDate)) {
+        return res.status(400).json({ error: 'Employee and date required' });
+      }
+      if (!reason) return res.status(400).json({ error: 'Reason is required for the audit trail' });
+      if (submittedPunches.length > 12 || submittedPunches.some((time) => !timePattern.test(time))) {
+        return res.status(400).json({ error: 'Punches must use HH:MM or HH:MM:SS' });
+      }
+      const normalizedPunches = [...new Set(submittedPunches.map((time) => (
+        `${workDate}T${time.length === 5 ? `${time}:00` : time}`
+      )))].sort();
+      if (normalizedPunches.length !== submittedPunches.length) {
+        return res.status(400).json({ error: 'Duplicate punch times are not allowed' });
+      }
+      const punchJson = JSON.stringify(normalizedPunches.map((punchedAt) => ({ punched_at: punchedAt })));
+      const result = await sql`
+        WITH originals AS MATERIALIZED (
+          SELECT id, employee_code, name, department,
+                 TO_CHAR(punched_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS punched_at,
+                 raw_timestamp, device_id, import_id
+          FROM attendance_punches
+          WHERE employee_code = ${employeeCode}
+            AND punched_at::date = CAST(${workDate} AS date)
+            AND active
+          ORDER BY punched_at
+        ), audited AS (
+          INSERT INTO attendance_edit_audit (
+            employee_code, work_date, edit_type, before_value, after_value, reason, edited_by
+          ) VALUES (
+            ${employeeCode}, ${workDate}, 'punches',
+            COALESCE((SELECT jsonb_agg(to_jsonb(originals)) FROM originals), '[]'::jsonb),
+            ${JSON.stringify(normalizedPunches)}::jsonb, ${reason}, ${user.username}
+          )
+          RETURNING id
+        ), deactivated AS (
+          UPDATE attendance_punches
+          SET active = FALSE
+          WHERE id IN (SELECT id FROM originals)
+            AND EXISTS (SELECT 1 FROM audited)
+          RETURNING id
+        ), identity AS (
+          SELECT employee.employee_code,
+                 COALESCE((SELECT name FROM originals LIMIT 1), employee.name) AS name,
+                 COALESCE((SELECT department FROM originals LIMIT 1), employee.department) AS department
+          FROM attendance_employees employee
+          WHERE employee.employee_code = ${employeeCode}
+        ), inserted AS (
+          INSERT INTO attendance_punches (
+            employee_code, name, department, punched_at, raw_timestamp, device_id, import_id
+          )
+          SELECT identity.employee_code, identity.name, identity.department,
+                 CAST(next_punch.punched_at AS timestamp), next_punch.punched_at, 0, NULL
+          FROM identity
+          CROSS JOIN jsonb_to_recordset(${punchJson}::jsonb) AS next_punch(punched_at TEXT)
+          CROSS JOIN (SELECT COUNT(*) FROM deactivated) dependency
+          RETURNING id
+        )
+        SELECT (SELECT COUNT(*)::int FROM originals) AS previous_count,
+               (SELECT COUNT(*)::int FROM inserted) AS inserted_count,
+               EXISTS (SELECT 1 FROM identity) AS employee_exists
+      `;
+      if (!result[0]?.employee_exists) return res.status(404).json({ error: 'Employee not found' });
+      return res.status(200).json({
+        ok: true,
+        previousPunches: Number(result[0].previous_count),
+        punches: Number(result[0].inserted_count),
+      });
+    }
+
+    if (req.method === 'PATCH' && action === 'employee-details') {
+      const employeeCode = Number(req.body?.employeeCode);
+      const name = String(req.body?.name || '').trim();
+      const department = String(req.body?.department || '').trim();
+      const reason = String(req.body?.reason || '').trim();
+      if (!Number.isSafeInteger(employeeCode) || !name) return res.status(400).json({ error: 'Employee and name required' });
+      if (!reason) return res.status(400).json({ error: 'Reason is required for the audit trail' });
+      const updated = await sql`
+        WITH previous AS (
+          SELECT employee_code, name, department
+          FROM attendance_employees
+          WHERE employee_code = ${employeeCode} AND active
+        ), audited AS (
+          INSERT INTO attendance_edit_audit (
+            employee_code, edit_type, before_value, after_value, reason, edited_by
+          )
+          SELECT ${employeeCode}, 'employee_details', to_jsonb(previous.*),
+                 ${JSON.stringify({ name, department })}::jsonb, ${reason}, ${user.username}
+          FROM previous
+          RETURNING id
+        )
+        UPDATE attendance_employees
+        SET name = ${name}, department = ${department || null}, updated_at = NOW()
+        WHERE employee_code = ${employeeCode} AND active
+          AND EXISTS (SELECT 1 FROM audited)
+        RETURNING employee_code
+      `;
+      if (!updated[0]) return res.status(404).json({ error: 'Active employee not found' });
+      return res.status(200).json({ ok: true });
+    }
+
+    if (req.method === 'POST' && action === 'archive-employee') {
+      const employeeCode = Number(req.body?.employeeCode);
+      const confirmation = String(req.body?.confirmation || '');
+      const activeTo = String(req.body?.activeTo || guatemalaToday());
+      if (!Number.isSafeInteger(employeeCode) || !validDate(activeTo)) return res.status(400).json({ error: 'Employee and final work date required' });
+      if (confirmation.toLowerCase() !== 'delete') return res.status(400).json({ error: 'Type delete to archive this employee' });
+      const archived = await sql`
+        WITH current_employee AS (
+          SELECT * FROM attendance_employees
+          WHERE employee_code = ${employeeCode} AND active
+        ), history AS (
+          INSERT INTO attendance_employee_history (
+            employee_code, name, department, active_from, active_to, archived_by
+          )
+          SELECT employee_code, name, department,
+                 COALESCE(active_from, CAST(${activeTo} AS date)), CAST(${activeTo} AS date), ${user.username}
+          FROM current_employee
+          WHERE COALESCE(active_from, CAST(${activeTo} AS date)) <= CAST(${activeTo} AS date)
+          RETURNING id
+        )
+        UPDATE attendance_employees
+        SET active = FALSE, archived_by = ${user.username}, archived_at = NOW(), updated_at = NOW()
+        WHERE employee_code = ${employeeCode}
+          AND EXISTS (SELECT 1 FROM history)
+        RETURNING employee_code
+      `;
+      if (!archived[0]) return res.status(409).json({ error: 'Employee is already archived or the final work date is before their start date' });
+      return res.status(200).json({ ok: true });
+    }
+
+    if (req.method === 'POST' && action === 'reinstate-employee') {
+      const historyId = Number(req.body?.historyId);
+      const activeFrom = String(req.body?.activeFrom || guatemalaToday());
+      if (!Number.isSafeInteger(historyId) || !validDate(activeFrom)) return res.status(400).json({ error: 'Archived employee and return date required' });
+      const reinstated = await sql`
+        WITH archived AS (
+          SELECT history.*
+          FROM attendance_employee_history history
+          LEFT JOIN attendance_employees employee USING (employee_code)
+          WHERE history.id = ${historyId}
+            AND history.reinstated_at IS NULL
+            AND (employee.employee_code IS NULL OR NOT employee.active)
+        ), restored_employee AS (
+          INSERT INTO attendance_employees (employee_code, name, department, active, active_from)
+          SELECT employee_code, name, department, TRUE, CAST(${activeFrom} AS date)
+          FROM archived
+          ON CONFLICT (employee_code) DO UPDATE SET
+            name = EXCLUDED.name,
+            department = EXCLUDED.department,
+            active = TRUE,
+            active_from = EXCLUDED.active_from,
+            archived_by = NULL,
+            archived_at = NULL,
+            updated_at = NOW()
+          RETURNING employee_code
+        )
+        UPDATE attendance_employee_history
+        SET reinstated_by = ${user.username}, reinstated_at = NOW()
+        WHERE id = ${historyId}
+          AND EXISTS (SELECT 1 FROM restored_employee)
+        RETURNING id
+      `;
+      if (!reinstated[0]) return res.status(409).json({ error: 'This employee cannot be reinstated because the ID is active or this archive was already restored' });
+      return res.status(200).json({ ok: true });
+    }
+
+    if (req.method === 'PATCH' && action === 'employee') {
+      if (user.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+      const employeeCode = Number(req.body?.employeeCode);
+      const dailyPayment = Number(req.body?.dailyPayment);
+      const effectiveFrom = String(req.body?.effectiveFrom || '');
+      if (!Number.isSafeInteger(employeeCode) || !Number.isFinite(dailyPayment) || dailyPayment < 0 || !validDate(effectiveFrom)) {
+        return res.status(400).json({ error: 'Employee, rate, and effective date required' });
+      }
+      const attendanceSettings = await sql`SELECT fulltime_daily_rate FROM attendance_settings WHERE id = 1`;
+      const bonusEligible = Number(dailyPayment) === Number(attendanceSettings[0]?.fulltime_daily_rate);
+      const updated = await sql`
+        UPDATE attendance_employees SET
+          daily_payment = ${dailyPayment}, bonus_eligible = ${bonusEligible}, updated_at = NOW()
+        WHERE employee_code = ${employeeCode}
+        RETURNING employee_code
+      `;
+      if (!updated[0]) return res.status(404).json({ error: 'Employee not found' });
+      await sql`
+        INSERT INTO attendance_employee_rates (
+          employee_code, effective_from, daily_payment, bonus_eligible, updated_by
+        ) VALUES (${employeeCode}, ${effectiveFrom}, ${dailyPayment}, ${bonusEligible}, ${user.username})
+        ON CONFLICT (employee_code, effective_from) DO UPDATE SET
+          daily_payment = EXCLUDED.daily_payment,
+          bonus_eligible = EXCLUDED.bonus_eligible,
+          updated_by = EXCLUDED.updated_by,
+          updated_at = NOW()
+      `;
+      return res.status(200).json({ ok: true });
+    }
+
+    if (req.method === 'PATCH' && action === 'settings') {
+      if (user.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+      const next = { ...DEFAULT_ATTENDANCE_SETTINGS, ...(req.body || {}) };
+      const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
+      if (![next.weekdayStart, next.weekdayEnd, next.saturdayStart, next.saturdayEnd].every((value) => timePattern.test(String(value)))) {
+        return res.status(400).json({ error: 'Schedule times must use HH:MM' });
+      }
+      const numericKeys = ['weekdayStandardMinutes', 'saturdayStandardMinutes', 'payrollStandardMinutes', 'hourlyAdjustmentRate', 'fulltimeDailyRate', 'fulltimeBonus'];
+      if (numericKeys.some((key) => !Number.isFinite(Number(next[key])) || Number(next[key]) < 0)) {
+        return res.status(400).json({ error: 'Settings must be positive numbers' });
+      }
+      await sql`
+        UPDATE attendance_settings SET
+          timezone = 'America/Guatemala',
+          weekday_start = ${next.weekdayStart}, weekday_end = ${next.weekdayEnd},
+          weekday_standard_minutes = ${Number(next.weekdayStandardMinutes)},
+          saturday_start = ${next.saturdayStart}, saturday_end = ${next.saturdayEnd},
+          saturday_standard_minutes = ${Number(next.saturdayStandardMinutes)},
+          payroll_standard_minutes = ${Number(next.payrollStandardMinutes)},
+          hourly_adjustment_rate = ${Number(next.hourlyAdjustmentRate)},
+          fulltime_daily_rate = ${Number(next.fulltimeDailyRate)},
+          fulltime_bonus = ${Number(next.fulltimeBonus)},
+          updated_by = ${user.username}, updated_at = NOW()
+        WHERE id = 1
+      `;
+      return res.status(200).json({ ok: true });
+    }
+
+    return res.status(405).json({ error: 'Method not allowed' });
+  } catch (error) {
+    if (error.code === '23505') return res.status(409).json({ error: 'This attendance file or record already exists' });
+    return res.status(500).json({ error: error.message });
+  }
+}
