@@ -25,6 +25,7 @@ const ADMIN_GROUPS = [
     items: [
       { label: 'Inventory Check', to: '/inventory', icon: Package },
       { label: 'Low Inventory Notes', to: '/notes', icon: MessageSquare },
+      { label: 'Warehouse Alerts', to: '/warehouse-alerts', icon: ClipboardList },
       { label: 'Stock Management', to: '/stock', icon: Boxes },
       { label: 'Auto Deduct', to: '/auto-deduct', icon: Minus, end: true },
       { label: 'Returns Receiving', to: '/returns', icon: ScanLine },

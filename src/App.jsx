@@ -4,6 +4,7 @@ import { ToastProvider } from './components/Toast.jsx'
 import { AuthProvider, useAuth } from './context/AuthContext.jsx'
 import Layout from './components/Layout.jsx'
 import LoginPage from './pages/LoginPage.jsx'
+const WarehouseAlerts = lazy(() => import('./pages/WarehouseAlerts.jsx'))
 const Dashboard = lazy(() => import('./pages/Dashboard.jsx'))
 const InventoryCheck = lazy(() => import('./pages/InventoryCheck.jsx'))
 const NotesPage = lazy(() => import('./pages/NotesPage.jsx'))
@@ -106,6 +107,7 @@ function AppRoutes() {
         <Route path="inventory" element={<RequirePermission permission={INVENTORY_CHECK_VIEW}><InventoryCheck /></RequirePermission>} />
         <Route path="tracking" element={<Navigate to="/returns" replace />} />
         <Route path="notes" element={<RequireGeneralAccess><NotesPage /></RequireGeneralAccess>} />
+        <Route path="warehouse-alerts" element={<RequireAdmin><WarehouseAlerts /></RequireAdmin>} />
         <Route path="stock" element={<RequireAdmin><StockManagement /></RequireAdmin>} />
         <Route path="auto-deduct" element={<RequireAdmin><AutoDeduct /></RequireAdmin>} />
         <Route path="auto-deduct/history" element={<RequireAdmin><AutoDeductHistory /></RequireAdmin>} />

@@ -236,3 +236,17 @@ export function fetchMovements(days = 30) {
 export function fetchInventoryBalance() {
   return request(`${BASE}/inventory-balance?action=list`)
 }
+
+export function fetchWarehouseAlerts() {
+  return request(`${BASE}/warehouse-alerts`)
+}
+export function saveWarehouseAlertChange(change, expectedRevision) {
+  return request(`${BASE}/warehouse-alerts`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...change, expectedRevision }),
+  })
+}
+
+export function fetchWarehouseSnapshot(key) {
+  return request(`${BASE}/warehouse-alerts?snapshot=${encodeURIComponent(key)}`)
+}
