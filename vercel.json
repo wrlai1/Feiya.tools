@@ -2,7 +2,7 @@
   "buildCommand": "npm run migrate:returns && npm run build",
   "outputDirectory": "dist",
   "crons": [
-    { "path": "/api/warehouse-alerts?action=cron", "schedule": "5 23 * * *" },
+    { "path": "/api/inventory-balance?warehouse-alerts=1&action=cron", "schedule": "5 23 * * *" },
     { "path": "/api/inventory-balance?action=email-cron&slot=00", "schedule": "5 0 * * *" },
     { "path": "/api/inventory-balance?action=email-cron&slot=01", "schedule": "5 1 * * *" },
     { "path": "/api/inventory-balance?action=email-cron&slot=02", "schedule": "5 2 * * *" },

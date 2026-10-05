@@ -238,15 +238,15 @@ export function fetchInventoryBalance() {
 }
 
 export function fetchWarehouseAlerts() {
-  return request(`${BASE}/warehouse-alerts`)
+  return request(`${BASE}/inventory-balance?warehouse-alerts=1`)
 }
 export function saveWarehouseAlertChange(change, expectedRevision) {
-  return request(`${BASE}/warehouse-alerts`, {
+  return request(`${BASE}/inventory-balance?warehouse-alerts=1`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ...change, expectedRevision }),
   })
 }
 
 export function fetchWarehouseSnapshot(key) {
-  return request(`${BASE}/warehouse-alerts?snapshot=${encodeURIComponent(key)}`)
+  return request(`${BASE}/inventory-balance?warehouse-alerts=1&snapshot=${encodeURIComponent(key)}`)
 }

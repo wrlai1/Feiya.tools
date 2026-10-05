@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { calculateWarehouseAlerts, DEFAULT_SETTINGS, normalizeOrders, normalizeSales, normalizeSettings, skuKey, orderKey } from '../src/utils/warehouseAlerts.js'
-import { applyWarehouseChange } from '../api/warehouse-alerts.js'
+import { applyWarehouseChange } from '../lib/warehouseAlertsApi.js'
 const now = '2026-10-02T16:00:00Z'
 const order = (extra = {}) => ({ order_id: '1', store_id: 'A', platform: 'TEMU', order_date: '2026-10-01T16:00:00Z', paid_time: '', ship_deadline: '2026-10-02T22:00:00Z', carrier: 'UPS', style: '50199', color: 'Black', size: 'L', qty: 10, order_status: 'paid', shipment_status: 'unshipped', ...extra })
 const stock = { style: '50199', color: 'Black', size: 'L', quantity: 400 }

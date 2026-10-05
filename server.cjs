@@ -54,7 +54,7 @@ function mountProductionHandler(route, modulePath) {
   ['/api/timeclock', './api/timeclock.js'],
   ['/api/attendance', './api/attendance.js'],
   ['/api/returns', './api/returns.js'],
-  ['/api/warehouse-alerts', './api/warehouse-alerts.js'],
+  ['/api/warehouse-alerts', './lib/warehouseAlertsApi.js'],
 ].forEach(([route, modulePath]) => mountProductionHandler(route, modulePath));
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

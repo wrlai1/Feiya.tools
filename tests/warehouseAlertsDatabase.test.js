@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { PGlite } from '@electric-sql/pglite'
-import handler, { loadWarehouseSources, saveWarehouseState, saveWarehouseSnapshots } from '../api/warehouse-alerts.js'
+import handler, { loadWarehouseSources, saveWarehouseState, saveWarehouseSnapshots } from '../lib/warehouseAlertsApi.js'
 function tagged(db) { return async (strings, ...values) => (await db.query(strings.reduce((q, s, i) => q + s + (i < values.length ? `$${i + 1}` : ''), ''), values)).rows }
 test('revision guard prevents concurrent saves and does not persist a rejected audit', async () => {
   const db = new PGlite(), sql = tagged(db)

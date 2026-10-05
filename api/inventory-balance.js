@@ -25,6 +25,7 @@ import authentication from '../lib/authentication.cjs'
 import inventoryTargetResolution from '../lib/inventoryTargetResolution.cjs'
 import inventoryTransactionSafety from '../lib/inventoryTransactionSafety.cjs'
 import inventoryEmailHandler from '../lib/inventoryEmailApi.js'
+import warehouseAlertsHandler from '../lib/warehouseAlertsApi.js'
 import { inventoryRestoreMode, inventoryRestoreUsesQuantities } from '../src/utils/inventoryRestoreMode.js'
 
 const MAX_SNAPSHOTS = 20
@@ -424,6 +425,7 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end()
 
   try {
+    if (req.query['warehouse-alerts'] === '1') return warehouseAlertsHandler(req, res)
     if (String(req.query.action || '').startsWith('email-')) return inventoryEmailHandler(req, res)
     const sql     = getDB()
     const secret  = getSecret()
