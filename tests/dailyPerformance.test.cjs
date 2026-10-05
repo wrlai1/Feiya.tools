@@ -39,7 +39,7 @@ test('only includes selected styles, skips period totals, does not guess missing
   assert.equal(report.details.some((row) => row.store === 'E' && row.styleNumber), false)
 })
 
-test('workbook keeps shipment date and China purchase date separate with daily received returns', async () => {
+test('workbook keeps shipment date and uploaded purchase date separate with daily received returns', async () => {
   const performance = buildDailyPerformance({ days, products, styles: ['5010015'] })
   const report = buildInventoryEmail({ reportDate: '2026-10-04', movementDay: '2026-10-01',
     inventory: [{ style: '5010015', color: 'Black', size: 'S', quantity: 76 }],
@@ -50,19 +50,19 @@ test('workbook keeps shipment date and China purchase date separate with daily r
   assert.match(workbook.getWorksheet('Shipments Summary').getCell('A2').value, /2026-10-01/)
   assert.equal(workbook.getWorksheet('Shipments Summary').getCell('K5').value, 1)
   const roas = workbook.getWorksheet('Purchase ROAS')
-  assert.match(roas.getCell('A2').value, /2026-10-03.*Asia\/Shanghai/)
+  assert.match(roas.getCell('A2').value, /2026-10-03.*Dates parsed from uploaded reports/)
   assert.equal(roas.getCell('C5').value, 22)
   assert.equal(roas.getCell('F5').value, 300 / 110)
   assert.match(workbook.getWorksheet('Data Coverage').getCell('C7').value, /Older date/)
 })
 
 test('missing analytics tables reports unavailable rather than zero ROAS', async () => {
-  const report = await loadDailyPerformance(async () => [{ days: null }], ['5010015'], '2026-10-04')
+  const report = await loadDailyPerformance(async () => [{ days: null }], ['5010015'])
   assert.match(report.unavailable, /not available/)
   assert.equal(report.rows.length, 0)
 })
 
-test('database reader uses shared admin data, latest uploads through China date, and lists stores without uploads', async () => {
+test('database reader uses shared admin data, latest uploaded dates without a clock-based cutoff, and lists stores without uploads', async () => {
   const { PGlite } = await import('@electric-sql/pglite')
   const db = new PGlite()
   try {
@@ -79,9 +79,9 @@ test('database reader uses shared admin data, latest uploads through China date,
       const query = strings.reduce((out, part, index) => out + part + (index < values.length ? `$${index + 1}` : ''), '')
       return (await db.query(query, values)).rows
     }
-    const result = await loadDailyPerformance(sql, ['5010015'], '2026-10-04')
-    assert.equal(result.purchaseDay, '2026-10-03')
-    assert.equal(result.rows[0].units, 10)
+    const result = await loadDailyPerformance(sql, ['5010015'])
+    assert.equal(result.purchaseDay, '2026-10-05')
+    assert.equal(result.rows[0].units, 1998)
     assert.equal(result.coverage.length, 2)
     assert.equal(result.coverage.find((row) => row.store === 'B').current, false)
     assert.equal(result.details.some((row) => row.store === 'Private'), false)

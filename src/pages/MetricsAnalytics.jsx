@@ -3368,7 +3368,7 @@ function StyleDailyPerformanceTable({ trends }) {
       <div className="flex items-center justify-between gap-3 mb-3">
         <div>
           <h3 className="font-semibold text-slate-800">Style Daily Performance</h3>
-          <p className="text-xs text-slate-400 mt-0.5">按上传的中国时间日期展示购买件数；每日午夜截止，与出货量分开。</p>
+          <p className="text-xs text-slate-400 mt-0.5">按上传表格自动解析的日期展示购买件数，与出货量分开。</p>
         </div>
         <span className="text-xs text-slate-400">{rows.length} days</span>
       </div>
@@ -3427,7 +3427,7 @@ function CrossStoreComparison({ rows, loading }) {
       <div className="flex items-center justify-between mb-3">
         <div>
           <h3 className="font-semibold text-slate-800">Same Product Across Stores</h3>
-          <p className="text-xs text-slate-400 mt-0.5">通过档案款号关联不同店铺的同款；未填写款号时只显示当前店铺。购买数据按中国时间午夜截止，与出货记录分开。</p>
+          <p className="text-xs text-slate-400 mt-0.5">通过档案款号关联不同店铺的同款；未填写款号时只显示当前店铺。购买日期由上传表格自动解析，与出货记录分开。</p>
         </div>
         {loading && <span className="text-xs text-slate-400">Loading...</span>}
       </div>
