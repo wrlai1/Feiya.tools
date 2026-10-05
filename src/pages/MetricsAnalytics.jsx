@@ -61,7 +61,7 @@ const TARGET_FIELDS = [
   ['minImpressions', '最低曝光判断量', 'integer'],
   ['minClicks', '最低点击判断量', 'integer'],
   ['stopLossSpend', '花费止损线 $', 'money'],
-  ['targetUnits', '销量目标', 'integer'],
+  ['targetUnits', '购买件数目标', 'integer'],
   ['newProductDays', '新品观察天数', 'integer'],
 ]
 const TREND_METRICS = [
@@ -96,7 +96,7 @@ const MATRIX_SORTS = [
   ['spend_asc', 'Spend 最低'],
 ]
 const DAILY_LOG_TAGS = ['上新', '广告', '价格', '库存', '素材']
-const PRODUCT_TEXT_FIELDS = ['sku', 'productName', 'notes', 'category', 'sizeLine', 'lifecycle', 'skuType']
+const PRODUCT_TEXT_FIELDS = ['sku', 'styleNumber', 'productName', 'notes', 'category', 'sizeLine', 'lifecycle', 'skuType']
 const PRODUCT_NUMBER_FIELDS = ['unitMultiplier', 'cost', 'declaredPrice', 'frontPrice', 'couponPrice', 'grossProfit']
 const PRODUCT_PERCENT_FIELDS = ['grossMargin', 'discountRate']
 const EXCHANGE_RATE_SOURCES = [
@@ -114,6 +114,7 @@ const EXCHANGE_RATE_SOURCES = [
 let exchangeRateCache = null
 const PRODUCT_EDIT_FIELDS = [
   ['sku', 'SKU', 'text'],
+  ['styleNumber', '款号', 'text'],
   ['productName', '商品名', 'text'],
   ['notes', '备注', 'textarea'],
   ['unitMultiplier', 'Unit 数量', 'number'],
@@ -283,6 +284,9 @@ async function parseProductPlan(file) {
         spu,
         store: String(r['店铺'] ?? '').trim(),
         sku: normalizeId(r['SKU']),
+        ...(r['款号'] != null || r['内部款号'] != null || r['Style Number'] != null
+          ? { styleNumber: String(r['款号'] ?? r['内部款号'] ?? r['Style Number']).trim() }
+          : {}),
         productName: String(r['商品名'] ?? r['商品名称'] ?? '').trim(),
         notes: String(r['备注'] ?? r['Notes'] ?? '').trim(),
         unitMultiplier: toNumber(r['Unit'] ?? r['unit'] ?? r['Unit数量'] ?? r['组合数量'] ?? r['件数倍率']) || 1,
@@ -422,6 +426,7 @@ function aggregateBySpu(rows, products, settings = DEFAULT_TARGETS) {
     const out = {
       spu,
       sku: product.sku || '',
+      styleNumber: product.styleNumber || '',
       productName: product.productName || group.find((r) => r.productName)?.productName || spu,
       category: product.category || '',
       lifecycle: product.lifecycle || '',
@@ -476,7 +481,7 @@ function diagnoseProduct(p, settings = DEFAULT_TARGETS) {
   const score = scoreProduct(p, settings)
   const band = scoreBand(score)
   if ((p.roas ?? 0) >= settings.roasTarget && (p.units || 0) >= settings.targetUnits) {
-    return { score, grade: band.label, status: 'good', decision: '表现好，可加流量', reason: 'ROAS 和销量都达到你的目标，优先观察库存和预算。' }
+    return { score, grade: band.label, status: 'good', decision: '表现好，可加流量', reason: 'ROAS 和购买件数都达到你的目标，优先观察库存和预算。' }
   }
   if ((p.conversionRate ?? 0) >= settings.conversionTarget && (p.impressions || 0) < settings.minImpressions) {
     return { score, grade: band.label, status: 'good', decision: '转化好，缺流量', reason: '转化率达标但曝光不足，可以测试加流量。' }
@@ -576,7 +581,13 @@ function mergeProductPlans(existing, incoming, overwriteDuplicates) {
     return overwriteDuplicates ? !duplicated : true
   })
   const additions = overwriteDuplicates
-    ? incoming
+    ? incoming.map((product) => {
+      if (Object.prototype.hasOwnProperty.call(product, 'styleNumber')) return product
+      const { spu, sku } = productIdentity(product)
+      const previous = existing.find((item) => productIdentity(item).spu === spu)
+        || (sku ? existing.find((item) => productIdentity(item).sku === sku) : null)
+      return { ...product, styleNumber: previous?.styleNumber || '' }
+    })
     : incoming.filter((product) => {
       const { spu, sku } = productIdentity(product)
       return !existing.some((item) => {
@@ -652,6 +663,7 @@ function blankProduct(store) {
     store,
     spu: '',
     sku: '',
+    styleNumber: '',
     productName: '',
     notes: '',
     unitMultiplier: 1,
@@ -1146,6 +1158,8 @@ export default function MetricsAnalytics() {
       if (!query || !stores.length) { setStoreComparison([]); return }
       const { from, to } = currentRange
       if (!from || !to) return
+      const selectedCatalog = products.find((product) => matchesProductKey(product, query))
+      const styleNumber = String(selectedCatalog?.styleNumber || '').trim().toUpperCase()
       setComparisonLoading(true)
       try {
         const rows = []
@@ -1156,14 +1170,14 @@ export default function MetricsAnalytics() {
             fetchStoreRange(storeName, from, to).catch(() => ({ rows: [] })),
           ])
           const storeProducts = productRes.products || []
-          const matchingProducts = storeProducts.filter((p) => matchesProductKey(p, query))
+          const matchingProducts = storeProducts.filter((p) => styleNumber
+            ? String(p.styleNumber || '').trim().toUpperCase() === styleNumber
+            : storeName === activeStore && matchesProductKey(p, query))
           const matchingSpus = new Set(matchingProducts.map((p) => p.spu))
-          const matchingRows = (rangeRes.rows || []).filter((r) => matchingSpus.has(r.spu) || normalizeId(r.spu) === query)
+          const matchingRows = (rangeRes.rows || []).filter((r) => matchingSpus.has(r.spu))
           if (!matchingRows.length && !matchingProducts.length) continue
-          const summary = aggregateBySpu(matchingRows, matchingProducts, targets)[0] || {
-            ...(matchingProducts[0] || { spu: query, sku: query }),
-            ...aggregateTotals(matchingRows, matchingProducts),
-          }
+          const totals = aggregateTotals(matchingRows, matchingProducts)
+          const summary = { ...(matchingProducts[0] || {}), ...totals, ...diagnoseProduct(totals, targets) }
           rows.push({ store: storeName, ...summary, rows: matchingRows.length })
         }
         if (!cancelled) setStoreComparison(rows.sort((a, b) => (b.units || 0) - (a.units || 0)))
@@ -1173,7 +1187,7 @@ export default function MetricsAnalytics() {
     }
     loadStoreComparison()
     return () => { cancelled = true }
-  }, [selectedProduct, stores, currentRange, targets])
+  }, [selectedProduct, products, activeStore, stores, currentRange, targets])
 
   useEffect(() => {
     let cancelled = false
@@ -2148,7 +2162,7 @@ export default function MetricsAnalytics() {
           <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <div className="card p-5">
               <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
-                <h2 className="font-semibold text-slate-800">销量和指标关系</h2>
+                <h2 className="font-semibold text-slate-800">购买件数和指标关系</h2>
                 <select className="metric-input !py-1" value={metricX} onChange={(e) => setMetricX(e.target.value)}>
                   <option value="ctr">点击率 CTR</option>
                   <option value="conversionRate">转化率</option>
@@ -2536,7 +2550,7 @@ function ProductCatalogEditor({ activeStore, products, onSave, onDelete }) {
     return products
       .filter((p) => {
         if (!q) return true
-        return [p.spu, p.sku, p.productName, p.newProductName, p.notes, p.category, p.lifecycle, p.skuType]
+        return [p.spu, p.sku, p.styleNumber, p.productName, p.newProductName, p.notes, p.category, p.lifecycle, p.skuType]
           .some((v) => String(v || '').toLowerCase().includes(q))
       })
       .sort((a, b) => String(a.sku || a.spu).localeCompare(String(b.sku || b.spu)))
@@ -2604,7 +2618,7 @@ function ProductCatalogEditor({ activeStore, products, onSave, onDelete }) {
       <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
         <div>
           <h2 className="font-semibold text-slate-800">SPU Product Catalog</h2>
-          <p className="text-xs text-slate-400 mt-0.5">修改上新计划里的 SPU 档案。这里的 SKU、商品名、备注、价格和毛利会用于后续分析。</p>
+          <p className="text-xs text-slate-400 mt-0.5">款号用于关联不同店铺的同款商品。SPU 保持原值，SKU、商品名、价格和毛利用于商品分析。</p>
         </div>
         <div className="flex gap-2">
           <button onClick={startNew} disabled={!activeStore} className="btn-primary text-xs px-3 py-1.5 disabled:opacity-40">
@@ -2620,7 +2634,7 @@ function ProductCatalogEditor({ activeStore, products, onSave, onDelete }) {
         <div className="grid grid-cols-1 xl:grid-cols-5 gap-4">
           <div className="xl:col-span-2 rounded-lg border border-slate-200 p-3">
             <div className="flex items-center justify-between gap-2 mb-3">
-              <input className="metric-input !py-1.5 flex-1" placeholder="Search SPU / SKU / name" value={query} onChange={(e) => setQuery(e.target.value)} />
+              <input className="metric-input !py-1.5 flex-1" placeholder="Search SPU / SKU / 款号 / name" value={query} onChange={(e) => setQuery(e.target.value)} />
               <span className="text-xs text-slate-400 whitespace-nowrap">{filtered.length} / {products.length}</span>
             </div>
             <div className="max-h-96 overflow-y-auto divide-y divide-slate-100">
@@ -2635,6 +2649,7 @@ function ProductCatalogEditor({ activeStore, products, onSave, onDelete }) {
                     <span className="text-[11px] text-slate-400">SPU {product.spu}</span>
                   </div>
                   <div className="text-xs text-slate-400 truncate">{product.productName || product.notes || 'No name yet'}</div>
+                  {product.styleNumber && <div className="mt-1 text-xs text-slate-500">款号 {product.styleNumber}</div>}
                   {product.newProductName && (
                     <div className="mt-1 text-[11px] text-emerald-700 truncate">New: {product.newProductName}</div>
                   )}
@@ -2785,7 +2800,7 @@ function DateRangeControl({
       logMap.get(day)?.followUp || '',
       logMap.get(day)?.followUpDone ? '已完成' : logMap.get(day)?.followUp ? '未完成' : '',
     ])
-    const csv = `\ufeff日期,销量,销售额,标签,Daily Log,后续动作,状态\n${rows.map((row) => row.map(csvCell).join(',')).join('\n')}`
+    const csv = `\ufeff日期,购买件数,销售额,标签,Daily Log,后续动作,状态\n${rows.map((row) => row.map(csvCell).join(',')).join('\n')}`
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }))
     const link = document.createElement('a')
     link.href = url
@@ -2864,7 +2879,7 @@ function DateRangeControl({
                       {log?.note && <NotebookPen className="h-3 w-3 text-amber-500" />}
                     </span>
                     <span className="mt-1 block truncate text-[10px]">
-                      {saved ? `销量 ${count(stats?.units || 0)}` : period ? 'Period total only' : 'No data'}
+                      {saved ? `购买件数 ${count(stats?.units || 0)}` : period ? 'Period total only' : 'No data'}
                     </span>
                   </button>
                   <div className={`pointer-events-none absolute top-full z-30 w-64 pt-1 opacity-0 transition group-hover:pointer-events-auto group-hover:opacity-100 ${index % 7 >= 5 ? 'right-0' : 'left-0'}`}>
@@ -2874,11 +2889,11 @@ function DateRangeControl({
                         <span className="text-[10px] text-slate-400">{saved ? '已上传逐日数据' : period ? '只有周期汇总' : '未上传数据'}</span>
                       </div>
                       {period && <p className="mt-2 rounded-md bg-amber-50 px-2 py-1.5 text-[10px] leading-4 text-amber-700">
-                        {period.periodStart}—{period.periodEnd} 的合计已保存，但原文件没有逐日明细，因此这一天不显示销量趋势。
+                        {period.periodStart}—{period.periodEnd} 的合计已保存，但原文件没有逐日明细，因此这一天不显示购买件数趋势。
                       </p>}
                       {!period && <div className="mt-2 grid grid-cols-2 gap-2">
                         <div className="rounded-md bg-blue-50 px-2 py-1.5">
-                          <div className="text-[10px] text-blue-500">销量</div>
+                          <div className="text-[10px] text-blue-500">购买件数</div>
                           <div className="text-sm font-semibold text-blue-700">{count(stats?.units || 0)}</div>
                         </div>
                         <div className="rounded-md bg-emerald-50 px-2 py-1.5">
@@ -2912,7 +2927,7 @@ function DateRangeControl({
               <div>
                 <div className="text-xs font-semibold text-slate-700">区间总结</div>
                 <p className="mt-1 text-xs text-slate-500">
-                  {days.length} 天 · 销量 {count(summaryUnits)} · 销售额 {money(summaryRevenue)} · {loggedDays.length} 天有日志
+                  {days.length} 天 · 购买件数 {count(summaryUnits)} · 销售额 {money(summaryRevenue)} · {loggedDays.length} 天有日志
                 </p>
                 {recentLogs.length > 0 && (
                   <div className="mt-2 space-y-1">
@@ -2928,7 +2943,7 @@ function DateRangeControl({
                     <div className="text-[10px] font-semibold text-violet-600">日志关联提醒（仅表示时间关联）</div>
                     {logImpacts.map((impact) => (
                       <p key={impact.day} className="mt-1 text-xs text-violet-700">
-                        {impact.day.slice(5).replace('-', '/')} 记录操作后，次日销量{impact.change >= 0 ? '上升' : '下降'} {Math.abs(impact.change * 100).toFixed(0)}%
+                        {impact.day.slice(5).replace('-', '/')} 记录操作后，次日购买件数{impact.change >= 0 ? '上升' : '下降'} {Math.abs(impact.change * 100).toFixed(0)}%
                       </p>
                     ))}
                   </div>
@@ -3353,7 +3368,7 @@ function StyleDailyPerformanceTable({ trends }) {
       <div className="flex items-center justify-between gap-3 mb-3">
         <div>
           <h3 className="font-semibold text-slate-800">Style Daily Performance</h3>
-          <p className="text-xs text-slate-400 mt-0.5">最近每天这个款卖了多少，用 daily units 做日对比。</p>
+          <p className="text-xs text-slate-400 mt-0.5">按上传的中国时间日期展示购买件数；每日午夜截止，与出货量分开。</p>
         </div>
         <span className="text-xs text-slate-400">{rows.length} days</span>
       </div>
@@ -3412,7 +3427,7 @@ function CrossStoreComparison({ rows, loading }) {
       <div className="flex items-center justify-between mb-3">
         <div>
           <h3 className="font-semibold text-slate-800">Same Product Across Stores</h3>
-          <p className="text-xs text-slate-400 mt-0.5">比较同一个 SPU/SKU 在不同店铺的销量、ROAS、转化率和判断。</p>
+          <p className="text-xs text-slate-400 mt-0.5">通过档案款号关联不同店铺的同款；未填写款号时只显示当前店铺。购买数据按中国时间午夜截止，与出货记录分开。</p>
         </div>
         {loading && <span className="text-xs text-slate-400">Loading...</span>}
       </div>
@@ -3967,7 +3982,7 @@ function ProductMatrix({
       <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
         <div>
           <h2 className="font-semibold text-slate-800">Product Performance Matrix</h2>
-          <p className="text-xs text-slate-400 mt-0.5">筛出销量最多、花费最高、转化最好或需要修改的款。</p>
+          <p className="text-xs text-slate-400 mt-0.5">筛出购买件数最多、花费最高、转化最好或需要修改的款。</p>
         </div>
         <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
           <input

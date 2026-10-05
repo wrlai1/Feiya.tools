@@ -68,7 +68,7 @@ test('separates 95445 letter and number size tables', async () => {
   assert.ok(workbook.getWorksheet('95445(Number)'))
   assert.equal(workbook.getWorksheet('95445(Letter)').getCell('B5').value, 'M')
   assert.equal(workbook.getWorksheet('95445(Number)').getCell('B5').value, '8')
-  assert.deepEqual(workbook.getWorksheet('Sales Summary').getColumn(1).values.slice(5), [
+  assert.deepEqual(workbook.getWorksheet('Shipments Summary').getColumn(1).values.slice(5), [
     '95445(Letter)', '95445(Number)', 'TOTAL',
   ])
 })
@@ -107,11 +107,11 @@ test('builds one formatted worksheet per style with stock alerts', async () => {
   const workbook = new ExcelJS.Workbook()
   await workbook.xlsx.load(bytes)
 
-  assert.deepEqual(workbook.worksheets.map((sheet) => sheet.name), ['Sales Summary', '50199', '50200'])
-  const summary = workbook.getWorksheet('Sales Summary')
+  assert.deepEqual(workbook.worksheets.map((sheet) => sheet.name), ['Shipments Summary', '50199', '50200', 'Purchase ROAS', 'Purchase Details', 'Data Coverage'])
+  const summary = workbook.getWorksheet('Shipments Summary')
   assert.deepEqual(summary.getRow(4).values.slice(1), [
-    'Style', 'Color', 'Size', 'Sales (2026-09-06)', '7-Day Sales', '14-Day Sales',
-    '30-Day Sales', '30-Day Returns', '30-Day Return Rate', 'Current Inventory',
+    'Style', 'Color', 'Size', 'Shipments (2026-09-06)', '7-Day Shipments', '14-Day Shipments',
+    '30-Day Shipments', '30-Day Returns', '30-Day Returns / Shipments', 'Current Inventory', 'Latest Day Received Returns',
   ])
   assert.deepEqual(summary.getRow(5).values.slice(1, 11), [
     '50199', 'White', 'S', 2, 12, 28, 60, 3, 0.05, 120,
@@ -120,7 +120,7 @@ test('builds one formatted worksheet per style with stock alerts', async () => {
   assert.equal(summary.getCell('I7').numFmt, '0.0%')
   assert.equal(summary.getCell('J6').fill.fgColor.argb, 'FFF4CCCC')
   const sheet = workbook.getWorksheet('50199')
-  assert.deepEqual(['A4', 'B4', 'D4', 'F4', 'H4', 'J4', 'L4', 'N4'].map((cell) => sheet.getCell(cell).value), ['Color', 'Current Inventory', 'Latest Day Sales', 'Latest Day Returns', '30-Day Avg / Day', '21-Day Target', 'Replenishment', 'Total Replenishment'])
+  assert.deepEqual(['A4', 'B4', 'D4', 'F4', 'H4', 'J4', 'L4', 'N4'].map((cell) => sheet.getCell(cell).value), ['Color', 'Current Inventory', 'Latest Day Shipments', 'Latest Day Returns', '30-Day Avg / Day', '21-Day Target', 'Replenishment', 'Total Replenishment'])
   assert.deepEqual(sheet.getRow(5).values.slice(2, 6), ['S', 'M', 'S', 'M'])
   assert.equal(sheet.getCell('B5').fill.fgColor.argb, 'FF16A34A')
   assert.equal(sheet.getCell('C5').fill.fgColor.argb, 'FF16A34A')

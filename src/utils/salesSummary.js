@@ -111,6 +111,7 @@ export async function loadSalesSummary(stores, windowDays = 30) {
       if (!inCurrentSeven && !inPreviousSeven) continue
 
       const spu = String(row.spu || row.productId || '').trim()
+      const productKey = String(product.styleNumber || '').trim().toUpperCase() || JSON.stringify([payload.store, spu])
       const productDetails = {
         spu,
         sku: String(product.sku || '').trim(),
@@ -119,10 +120,10 @@ export async function loadSalesSummary(stores, windowDays = 30) {
       }
       const color = rowColor(row)
       if (inCurrentSeven) {
-        addRankValue(currentProducts, spu, units, productDetails)
+        addRankValue(currentProducts, productKey, units, productDetails)
         addRankValue(currentColors, color.toLowerCase(), units, { label: color, store: payload.store })
       } else {
-        addRankValue(previousProducts, spu, units, productDetails)
+        addRankValue(previousProducts, productKey, units, productDetails)
         addRankValue(previousColors, color.toLowerCase(), units, { label: color, store: payload.store })
       }
     }
