@@ -1,3 +1,4 @@
+import ShipmentRangeReport from '../components/ShipmentRangeReport.jsx'
 import React, { useState, useMemo, useCallback, useEffect, useTransition } from 'react'
 import {
   Boxes, Search, Download, RefreshCw, CheckCircle, AlertTriangle, XCircle,
@@ -1861,6 +1862,7 @@ export default function StockManagement() {
               ['balance', 'Inventory Balance'],
               ['oversold', 'Oversold'],
               ['daily-report', 'Daily Style Report'],
+              ['shipment-report', '出货记录报表'],
               ['replenishment', 'Replenishment Plan'],
             ].map(([value, label]) => (
               <button
@@ -1877,7 +1879,9 @@ export default function StockManagement() {
             ))}
           </div>
 
-          {activeView === 'replenishment' ? (
+          {activeView === 'shipment-report' ? (
+            <ShipmentRangeReport inventoryRows={allRows} />
+          ) : activeView === 'replenishment' ? (
             <ReplenishmentPlan
               inventoryRows={allRows}
               storageOwner={user?.username || user?.name || 'admin'}

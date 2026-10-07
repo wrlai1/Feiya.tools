@@ -1,3 +1,4 @@
+import shipmentRange from '../lib/shipmentDateRange.cjs'
 // api/inventory-balance.js
 // Single source of truth for inventory stock levels.
 // Used by both Stock Management (view/edit) and Auto Deduct (fill template + apply).
@@ -1405,12 +1406,22 @@ export default async function handler(req, res) {
     // ── GET movements — per-SKU dated flow for the 动销 view ─────────────────
     if (req.method === 'GET' && action === 'movements') {
       const days = Math.min(Math.max(parseInt(req.query.days, 10) || 30, 1), 365)
-      const fromDay = new Date(Date.now() - (days - 1) * 86400000).toISOString().slice(0, 10)
+      let fromDay = new Date(Date.now() - (days - 1) * 86400000).toISOString().slice(0, 10)
+      let toDay = null
+      if (req.query.from != null || req.query.to != null) {
+        try { const range = shipmentRange.shipmentDateRange(req.query.from, req.query.to); fromDay = range.from; toDay = range.to }
+        catch (error) { return res.status(400).json({ error: error.message }) }
+      }
+      const style = String(req.query.style || '').trim().toUpperCase()
+      const salesOnly = req.query.txnType === 'sales'
       const rows = await sql`
         SELECT rows.txn_type, rows.style, rows.color, rows.size, rows.qty,
-               COALESCE(rows.business_day, rows.applied_at::date) AS day
+               COALESCE(rows.business_day, (rows.applied_at AT TIME ZONE 'America/New_York')::date) AS day
         FROM inventory_txn_rows rows
-        WHERE COALESCE(rows.business_day, rows.applied_at::date) >= ${fromDay}::date
+        WHERE COALESCE(rows.business_day, (rows.applied_at AT TIME ZONE 'America/New_York')::date) >= ${fromDay}::date
+          AND (${toDay}::date IS NULL OR COALESCE(rows.business_day, (rows.applied_at AT TIME ZONE 'America/New_York')::date) <= ${toDay}::date)
+          AND (${style}::text = '' OR UPPER(BTRIM(rows.style)) = ${style})
+          AND (NOT ${salesOnly}::boolean OR rows.txn_type = 'sales')
           AND NOT EXISTS (
             SELECT 1
             FROM inventory_transactions transactions
@@ -1426,7 +1437,7 @@ export default async function handler(req, res) {
                 )
               )
           )
-        ORDER BY COALESCE(rows.business_day, rows.applied_at::date), rows.applied_at
+        ORDER BY COALESCE(rows.business_day, (rows.applied_at AT TIME ZONE 'America/New_York')::date), rows.applied_at
       `
       return res.json({ days, rows })
     }
