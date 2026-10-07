@@ -1,4 +1,5 @@
 import { fetchStoreProducts, fetchStoreRange } from './api.js'
+import { dailyAnalyticsRows } from './analyticsUpload.js'
 
 function isoDay(value) {
   return String(value || '').slice(0, 10)
@@ -62,7 +63,7 @@ function rankedRows(currentMap, previousMap) {
 
 export async function loadSalesSummary(stores, windowDays = 30) {
   const availableStores = (stores || [])
-    .map((store) => ({ ...store, lastDay: isoDay(store.last_day || store.lastDay) }))
+    .map((store) => ({ ...store, lastDay: isoDay(store.last_daily_day || store.lastDailyDay || store.lastDay) }))
     .filter((store) => store.name && store.lastDay)
 
   const latestDay = availableStores.map((store) => store.lastDay).sort().at(-1) || ''
@@ -95,7 +96,7 @@ export async function loadSalesSummary(stores, windowDays = 30) {
 
   for (const payload of payloads) {
     const products = new Map(payload.products.map((product) => [String(product.spu || ''), product]))
-    for (const row of payload.rows) {
+    for (const row of dailyAnalyticsRows(payload.rows)) {
       const day = isoDay(row.date || row.periodEnd)
       if (!day) continue
       const product = products.get(String(row.spu || '')) || {}
@@ -110,6 +111,7 @@ export async function loadSalesSummary(stores, windowDays = 30) {
       if (!inCurrentSeven && !inPreviousSeven) continue
 
       const spu = String(row.spu || row.productId || '').trim()
+      const productKey = String(product.styleNumber || '').trim().toUpperCase() || JSON.stringify([payload.store, spu])
       const productDetails = {
         spu,
         sku: String(product.sku || '').trim(),
@@ -118,10 +120,10 @@ export async function loadSalesSummary(stores, windowDays = 30) {
       }
       const color = rowColor(row)
       if (inCurrentSeven) {
-        addRankValue(currentProducts, spu, units, productDetails)
+        addRankValue(currentProducts, productKey, units, productDetails)
         addRankValue(currentColors, color.toLowerCase(), units, { label: color, store: payload.store })
       } else {
-        addRankValue(previousProducts, spu, units, productDetails)
+        addRankValue(previousProducts, productKey, units, productDetails)
         addRankValue(previousColors, color.toLowerCase(), units, { label: color, store: payload.store })
       }
     }

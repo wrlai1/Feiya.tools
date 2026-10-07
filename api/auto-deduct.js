@@ -8,10 +8,13 @@
 //   GET  ?action=aliases         — return learned unmatched-row aliases
 //   POST ?action=upload-template — save template rows (JSON body from client)
 //   POST ?action=save-aliases    — save learned unmatched-row aliases
+//   POST ?action=patch-aliases   — atomically merge/remove learned aliases
 //   POST ?action=apply           — log a deduction/return transaction
 
 import { neon } from '@neondatabase/serverless'
-import jwt from 'jsonwebtoken'
+import authentication from '../lib/authentication.cjs'
+
+const { authenticateUser } = authentication
 
 function getDB() {
   const url = process.env.DATABASE_URL
@@ -23,11 +26,6 @@ function getSecret() {
   const s = process.env.JWT_SECRET
   if (!s) throw new Error('JWT_SECRET not set')
   return s
-}
-
-function verifyToken(authHeader, secret) {
-  if (!authHeader?.startsWith('Bearer ')) return null
-  try { return jwt.verify(authHeader.slice(7), secret) } catch { return null }
 }
 
 async function ensureAppDataTable(sql) {
@@ -54,6 +52,42 @@ async function ensureDeductLogTable(sql) {
   `
 }
 
+export function patchAliasesQuery(sql, upsertsJson, deleteKeysJson, username) {
+  return sql`
+    WITH saved_aliases AS (
+      INSERT INTO app_data (key, value, updated_at)
+      VALUES (
+        'autodeduct_aliases',
+        jsonb_build_object(
+          'aliases', ${upsertsJson}::jsonb,
+          'updatedAt', NOW(),
+          'updatedBy', ${username}::text
+        ),
+        NOW()
+      )
+      ON CONFLICT (key) DO UPDATE SET
+        value = jsonb_build_object(
+          'aliases',
+          (
+            COALESCE(app_data.value->'aliases', '{}'::jsonb)
+            - ARRAY(
+                SELECT jsonb_array_elements_text(${deleteKeysJson}::jsonb)
+              )
+          ) || ${upsertsJson}::jsonb,
+          'updatedAt', NOW(),
+          'updatedBy', ${username}::text
+        ),
+        updated_at = NOW()
+      RETURNING value
+    )
+    SELECT COUNT(alias_key)::int AS count
+    FROM saved_aliases
+    CROSS JOIN LATERAL jsonb_object_keys(
+      COALESCE(saved_aliases.value->'aliases', '{}'::jsonb)
+    ) AS alias_keys(alias_key)
+  `
+}
+
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*')
   res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type')
@@ -63,11 +97,13 @@ export default async function handler(req, res) {
   try {
     const sql    = getDB()
     const secret = getSecret()
-    const payload = verifyToken(req.headers.authorization, secret)
+    const payload = await authenticateUser(sql, req.headers.authorization, secret)
     if (!payload) return res.status(401).json({ error: 'Not authenticated' })
 
     const isAdmin = payload.role === 'admin'
     const action  = req.query.action
+
+    if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
 
     await ensureAppDataTable(sql)
 
@@ -119,6 +155,7 @@ export default async function handler(req, res) {
     }
 
     if (req.method === 'POST' && action === 'save-aliases') {
+      if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
       const { aliases } = req.body || {}
       if (!aliases || typeof aliases !== 'object' || Array.isArray(aliases)) {
         return res.status(400).json({ error: 'aliases object required' })
@@ -136,12 +173,47 @@ export default async function handler(req, res) {
       return res.json({ ok: true, count: Object.keys(aliases).length })
     }
 
+    if (req.method === 'POST' && action === 'patch-aliases') {
+      if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
+      const rawUpserts = req.body?.upserts
+      const rawDeleteKeys = req.body?.deleteKeys
+      const upserts = rawUpserts == null ? {} : rawUpserts
+      const deleteKeys = rawDeleteKeys == null ? [] : rawDeleteKeys
+      if (!upserts || typeof upserts !== 'object' || Array.isArray(upserts)) {
+        return res.status(400).json({ error: 'upserts object required' })
+      }
+      if (!Array.isArray(deleteKeys) || deleteKeys.some((key) => typeof key !== 'string')) {
+        return res.status(400).json({ error: 'deleteKeys array required' })
+      }
+      const cleanDeleteKeys = [...new Set(deleteKeys.map((key) => key.trim()).filter(Boolean))]
+      if (Object.keys(upserts).length + cleanDeleteKeys.length > 10000) {
+        return res.status(400).json({ error: 'Too many alias changes in one request' })
+      }
+      const upsertsJson = JSON.stringify(upserts)
+      const deleteKeysJson = JSON.stringify(cleanDeleteKeys)
+      const [saved] = await patchAliasesQuery(
+        sql,
+        upsertsJson,
+        deleteKeysJson,
+        payload.username,
+      )
+      return res.json({ ok: true, count: Number(saved?.count || 0) })
+    }
+
     // ── POST apply ──────────────────────────────────────────────────────────
     if (req.method === 'POST' && action === 'apply') {
+      if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
       await ensureDeductLogTable(sql)
       const { filledRows = [], txnType = 'sales', sourceName = '' } = req.body || {}
+      if (!Array.isArray(filledRows) || !['sales', 'return'].includes(txnType)) {
+        return res.status(400).json({ error: 'Valid filledRows and transaction type are required' })
+      }
+      const quantities = filledRows.map((row) => Number(row.QTY || 0))
+      if (quantities.some((quantity) => !Number.isSafeInteger(quantity) || quantity < 0)) {
+        return res.status(400).json({ error: 'Every quantity must be a whole number of 0 or more' })
+      }
       const rowCount  = filledRows.length
-      const totalQty  = filledRows.reduce((s, r) => s + (parseInt(r.QTY, 10) || 0), 0)
+      const totalQty = quantities.reduce((sum, quantity) => sum + quantity, 0)
 
       await sql`
         INSERT INTO deduct_log (txn_type, source_name, applied_by, row_count, total_qty)

@@ -1,7 +1,9 @@
 /**
  * Pure helpers for calculating work hours from punch arrays.
- * Punches must be sorted by punched_at ASC.
+ * Hour calculations sort a copy by punched_at before pairing shifts.
  */
+
+const filteredRangeByPunches = new WeakMap()
 
 export function getStatus(punches) {
   if (!punches?.length) return 'not_started'
@@ -18,53 +20,126 @@ export function getLastClockIn(punches) {
   return null
 }
 
-/** Total worked hours from an array of punches (includes ongoing shift). */
-export function calcHours(punches) {
-  let totalMs      = 0
-  let clockInTime  = null
-  let breakStartMs = null
-  let breakMs      = 0
+/**
+ * Total worked hours clipped to a time range. Shifts are paired before the
+ * range is applied so a clock-in before midnight still contributes work after
+ * midnight. An open shift is counted through rangeEndMs.
+ */
+function calculateHoursInRange(punches, rangeStartMs, rangeEndMs, includeOpenShift) {
+  const startMs = Number.isFinite(rangeStartMs) ? rangeStartMs : -Infinity
+  const endMs = Number.isFinite(rangeEndMs) ? rangeEndMs : Date.now()
+  if (endMs <= startMs) return 0
 
-  for (const p of punches) {
-    const t = new Date(p.punched_at).getTime()
-    switch (p.type) {
+  const sortedPunches = [...(punches || [])]
+    .map((punch) => ({ punch, time: new Date(punch?.punched_at).getTime() }))
+    .filter(({ time }) => Number.isFinite(time))
+    .sort((a, b) => a.time - b.time)
+
+  let totalMs = 0
+  let shiftMs = 0
+  let onShift = false
+  let workingFromMs = null
+  let firstPunchIndex = 0
+
+  // A range export only needs the immediately preceding punch to restore the
+  // employee's state at the boundary. This also avoids counting older shifts.
+  if (Number.isFinite(startMs)) {
+    while (
+      firstPunchIndex < sortedPunches.length
+      && sortedPunches[firstPunchIndex].time < startMs
+    ) {
+      firstPunchIndex += 1
+    }
+    const previousPunch = sortedPunches[firstPunchIndex - 1]?.punch
+    if (previousPunch?.type === 'clock_in' || previousPunch?.type === 'break_end') {
+      onShift = true
+      workingFromMs = startMs
+    } else if (previousPunch?.type === 'break_start') {
+      onShift = true
+    }
+  }
+
+  const addWorkedInterval = (fromMs, toMs) => {
+    const clippedStart = Math.max(fromMs, startMs)
+    const clippedEnd = Math.min(toMs, endMs)
+    if (clippedEnd > clippedStart) shiftMs += clippedEnd - clippedStart
+  }
+
+  for (let index = firstPunchIndex; index < sortedPunches.length; index += 1) {
+    const { punch, time } = sortedPunches[index]
+    switch (punch.type) {
       case 'clock_in':
-        clockInTime  = t
-        breakMs      = 0
-        breakStartMs = null
+        // A new clock-in starts a new shift. If the previous shift never had a
+        // clock-out, discard it instead of bridging multiple days of work.
+        onShift = true
+        shiftMs = 0
+        workingFromMs = time
         break
       case 'break_start':
-        breakStartMs = t
+        if (onShift && workingFromMs != null) {
+          addWorkedInterval(workingFromMs, time)
+          workingFromMs = null
+        }
         break
       case 'break_end':
-        if (breakStartMs != null) { breakMs += t - breakStartMs; breakStartMs = null }
+        if (onShift && workingFromMs == null) workingFromMs = time
         break
       case 'clock_out':
-        if (clockInTime != null) {
-          totalMs    += Math.max(0, t - clockInTime - breakMs)
-          clockInTime = null
-          breakMs     = 0
+        if (onShift) {
+          if (workingFromMs != null) addWorkedInterval(workingFromMs, time)
+          totalMs += shiftMs
+          shiftMs = 0
+          onShift = false
+          workingFromMs = null
         }
         break
     }
   }
 
-  // Ongoing shift
-  if (clockInTime != null) {
-    const now         = Date.now()
-    const liveBreak   = breakStartMs != null ? now - breakStartMs : 0
-    totalMs          += Math.max(0, now - clockInTime - breakMs - liveBreak)
+  if (onShift && includeOpenShift) {
+    if (workingFromMs != null) addWorkedInterval(workingFromMs, endMs)
+    totalMs += shiftMs
   }
 
-  return totalMs / 3_600_000 // → hours (float)
+  return totalMs / 3_600_000
+}
+
+export function calcHoursInRange(punches, rangeStartMs, rangeEndMs) {
+  return calculateHoursInRange(punches, rangeStartMs, rangeEndMs, true)
+}
+
+/** Payroll/report hours count only shifts that have a matching clock-out. */
+export function calcCompletedHoursInRange(punches, rangeStartMs, rangeEndMs) {
+  return calculateHoursInRange(punches, rangeStartMs, rangeEndMs, false)
+}
+
+/** Total worked hours from an array of punches (includes ongoing shift). */
+export function calcHours(punches, nowMs = Date.now()) {
+  const filteredRange = filteredRangeByPunches.get(punches)
+  if (filteredRange) {
+    return calcHoursInRange(filteredRange.source, filteredRange.startMs, nowMs)
+  }
+  return calcHoursInRange(punches, -Infinity, nowMs)
 }
 
 export function formatHours(h) {
   if (!h || h < 0) return '0h 0m'
-  const hours = Math.floor(h)
-  const mins  = Math.round((h - hours) * 60)
+  const totalMinutes = Math.round(h * 60)
+  const hours = Math.floor(totalMinutes / 60)
+  const mins = totalMinutes % 60
   if (hours === 0) return `${mins}m`
   return `${hours}h ${mins}m`
+}
+
+/** Format an instant for a datetime-local input without changing its timezone. */
+export function toLocalDateTimeInput(value) {
+  const date = new Date(value)
+  if (!Number.isFinite(date.getTime())) return ''
+  const pad = (part) => String(part).padStart(2, '0')
+  return [
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`,
+    `${pad(date.getHours())}:${pad(date.getMinutes())}`,
+  ].join('T')
 }
 
 export function isMissedPunch(punches) {
@@ -74,17 +149,23 @@ export function isMissedPunch(punches) {
   return (Date.now() - t.getTime()) > 12 * 3_600_000
 }
 
-export function filterToday(punches) {
-  const start = new Date(); start.setHours(0, 0, 0, 0)
-  return punches.filter(p => new Date(p.punched_at) >= start)
+export function filterToday(punches, nowMs = Date.now()) {
+  const start = new Date(nowMs); start.setHours(0, 0, 0, 0)
+  const source = punches || []
+  const filtered = source.filter(p => new Date(p.punched_at) >= start)
+  filteredRangeByPunches.set(filtered, { source, startMs: start.getTime() })
+  return filtered
 }
 
-export function filterThisWeek(punches) {
-  const now   = new Date()
+export function filterThisWeek(punches, nowMs = Date.now()) {
+  const now   = new Date(nowMs)
   const start = new Date(now)
   start.setDate(now.getDate() - now.getDay())
   start.setHours(0, 0, 0, 0)
-  return punches.filter(p => new Date(p.punched_at) >= start)
+  const source = punches || []
+  const filtered = source.filter(p => new Date(p.punched_at) >= start)
+  filteredRangeByPunches.set(filtered, { source, startMs: start.getTime() })
+  return filtered
 }
 
 /** Group a flat punch array by username → { username: [punches] } */
