@@ -1,5 +1,6 @@
 import { neon } from '@neondatabase/serverless'
 import authentication from '../lib/authentication.cjs'
+import { ensureNewProductTrackerTables, syncNewProductTrackersQueries, deleteNewProductTrackerQueries } from '../lib/newProductTrackerSync.js'
 
 const { authenticateUser } = authentication
 
@@ -30,37 +31,6 @@ function validDay(value) {
     && checked.getUTCDate() === date
     ? day
     : ''
-}
-
-async function ensureTables(sql) {
-  await sql`
-    CREATE TABLE IF NOT EXISTS new_product_trackers (
-      id           BIGSERIAL PRIMARY KEY,
-      username     TEXT NOT NULL,
-      store        TEXT NOT NULL,
-      spu          TEXT NOT NULL,
-      product_name TEXT,
-      launch_date  DATE NOT NULL,
-      created_at   TIMESTAMPTZ DEFAULT NOW(),
-      updated_at   TIMESTAMPTZ DEFAULT NOW()
-    )
-  `
-  await sql`
-    CREATE TABLE IF NOT EXISTS new_product_roas_events (
-      id             BIGSERIAL PRIMARY KEY,
-      tracker_id     BIGINT NOT NULL REFERENCES new_product_trackers(id) ON DELETE CASCADE,
-      username       TEXT NOT NULL,
-      effective_date DATE NOT NULL,
-      roas           NUMERIC NOT NULL,
-      note           TEXT,
-      created_at     TIMESTAMPTZ DEFAULT NOW(),
-      UNIQUE (tracker_id, effective_date)
-    )
-  `
-  await sql`
-    CREATE INDEX IF NOT EXISTS new_product_trackers_user_idx
-    ON new_product_trackers (username, created_at DESC)
-  `
 }
 
 function trackerJson(row, events = []) {
@@ -95,7 +65,18 @@ export default async function handler(req, res) {
     if (payload.role !== 'admin') return res.status(403).json({ error: 'Admin access required' })
     const username = payload.role === 'admin' ? 'admin' : payload.username
     const action = String(req.query.action || '')
-    await ensureTables(sql)
+    await ensureNewProductTrackerTables(sql)
+
+    if (req.method === 'POST' && action === 'sync') {
+      const [tables] = await sql`SELECT to_regclass('analytics_store_days') AS days`
+      if (!tables.days) return res.json({ ok: true, added: 0 })
+      const results = await sql.transaction((txn) => [
+        txn`SELECT pg_advisory_xact_lock(hashtext('analytics-store-write'))`,
+        txn`SELECT pg_advisory_xact_lock(hashtext('new-product-tracker-write'))`,
+        ...syncNewProductTrackersQueries(txn, username),
+      ], { isolationLevel: 'Serializable' })
+      return res.json({ ok: true, added: results.at(-1).length })
+    }
 
     if (req.method === 'GET' && action === 'list') {
       const trackers = await sql`
@@ -225,11 +206,8 @@ export default async function handler(req, res) {
     if (req.method === 'DELETE') {
       const id = Number(req.query.id)
       if (!Number.isSafeInteger(id) || id <= 0) return res.status(400).json({ error: 'id is required' })
-      const rows = await sql`
-        DELETE FROM new_product_trackers
-        WHERE id = ${id} AND username = ${username}
-        RETURNING id
-      `
+      const results = await sql.transaction((txn) => deleteNewProductTrackerQueries(txn, username, id))
+      const rows = results.at(-1)
       if (!rows.length) return res.status(404).json({ error: '未找到这个新品追踪' })
       return res.json({ ok: true })
     }

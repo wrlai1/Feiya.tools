@@ -19,6 +19,7 @@
 
 import { neon } from '@neondatabase/serverless'
 import authentication from '../lib/authentication.cjs'
+import { ensureNewProductTrackerTables, syncNewProductTrackersQueries } from '../lib/newProductTrackerSync.js'
 
 const { authenticateUser } = authentication
 
@@ -648,8 +649,11 @@ export default async function handler(req, res) {
         return res.status(400).json({ error: 'store, day and rows are required' })
       }
       const json = JSON.stringify(rows)
+      await ensureNewProductTrackerTables(sql)
       await sql.transaction((txn) => [
         txn`SELECT pg_advisory_xact_lock(hashtext('analytics-store-write'))`,
+        txn`SELECT pg_advisory_xact_lock(hashtext('new-product-tracker-write'))`,
+        ...syncNewProductTrackersQueries(txn, username, name).slice(0, 1),
         txn`
           INSERT INTO analytics_store_events (username, actor, store, action, summary, details, snapshot)
           VALUES (
@@ -678,6 +682,7 @@ export default async function handler(req, res) {
           ON CONFLICT (username, store, day)
           DO UPDATE SET rows = EXCLUDED.rows, file_name = EXCLUDED.file_name, updated_at = NOW()
         `,
+        ...syncNewProductTrackersQueries(txn, username, name),
       ], { isolationLevel: 'Serializable' })
       return res.json({ ok: true })
     }
@@ -710,6 +715,7 @@ export default async function handler(req, res) {
       }
       const json = JSON.stringify(normalizedDays)
       const totalRows = normalizedDays.reduce((sum, item) => sum + item.rows.length, 0)
+      await ensureNewProductTrackerTables(sql)
       if (!replaceOverlaps) {
         const conflicts = await sql`
           SELECT
@@ -738,6 +744,8 @@ export default async function handler(req, res) {
       }
       await sql.transaction((txn) => [
         txn`SELECT pg_advisory_xact_lock(hashtext('analytics-store-write'))`,
+        txn`SELECT pg_advisory_xact_lock(hashtext('new-product-tracker-write'))`,
+        ...syncNewProductTrackersQueries(txn, username, name).slice(0, 1),
         txn`
           INSERT INTO analytics_store_events (username, actor, store, action, summary, details, snapshot)
           VALUES (
@@ -833,6 +841,7 @@ export default async function handler(req, res) {
           ON CONFLICT (username, store, period_start, period_end)
           DO UPDATE SET rows = EXCLUDED.rows, file_name = EXCLUDED.file_name, updated_at = NOW()
         `,
+        ...syncNewProductTrackersQueries(txn, username, name),
       ], { isolationLevel: 'Serializable' })
       return res.json({
         ok: true,

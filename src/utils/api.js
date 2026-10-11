@@ -203,7 +203,8 @@ export function saveAnalyticsSettings(store, settings) {
 
 // ─── 新品 14 天追踪 ────────────────────────────────────────────────────────────
 
-export function fetchNewProductTrackers() {
+export async function fetchNewProductTrackers() {
+  await request(`${BASE}/new-product-tracker?action=sync`, { method: 'POST' })
   return request(`${BASE}/new-product-tracker?action=list`)
 }
 

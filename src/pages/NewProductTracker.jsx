@@ -329,7 +329,7 @@ function buildDailyRows(tracker, storeData) {
       if (row.date !== day) return false
       return [row.spu, row.productId, row.sku].some((value) => ids.has(normalizeId(value)))
     })
-    const uploaded = uploadedDays.has(day)
+    const uploaded = uploadedDays.has(day) && matches.length > 0
     if (!uploaded) {
       result.push({
         day, label: `${parseDay(day).getMonth() + 1}/${parseDay(day).getDate()}`,
