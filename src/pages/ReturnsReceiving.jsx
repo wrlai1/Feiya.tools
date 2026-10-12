@@ -1,3 +1,5 @@
+import InventoryStyleSearch from '../components/InventoryStyleSearch.jsx'
+import { updateReturnMappingTarget, newReturnMappingTarget } from '../utils/returnMappingDefaults.js'
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle,
@@ -224,21 +226,10 @@ function InventoryMappingFields({ targets, inventoryRows, onChange, disabled }) 
         const sizeOptions = [...new Set(inventoryRows
           .filter((row) => row.STYLE === target.style && row.COLOR === target.color)
           .map((row) => row.SIZE))].sort()
-        const updateTarget = (changes) => onChange(targets.map((row, rowIndex) => (
-          rowIndex === index ? { ...row, ...changes } : row
-        )))
+        const updateTarget = (changes) => onChange(updateReturnMappingTarget(targets, index, changes))
         return (
           <div key={`inventory-mapping-${index}`} className="grid gap-2 sm:grid-cols-4">
-            <select
-              aria-label="Inventory style"
-              value={target.style}
-              disabled={disabled}
-              onChange={(event) => updateTarget({ style: event.target.value, color: '', size: '' })}
-              className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm disabled:bg-slate-100"
-            >
-              <option value="">Style / 款号</option>
-              {styleOptions.map((style) => <option key={style} value={style}>{style}</option>)}
-            </select>
+            <InventoryStyleSearch value={target.style} options={styleOptions} disabled={disabled} onChange={(style) => updateTarget({ style, color: '', size: '' })} />
             <select
               aria-label="Inventory color"
               value={target.color}
@@ -2026,19 +2017,13 @@ export default function ReturnsReceiving() {
                                       <div className="mt-2 grid gap-2 sm:grid-cols-2">
                                         <label className="text-xs font-medium text-slate-600">
                                           Inventory style / Estilo
-                                          <select
-                                            value={selection.style || ''}
-                                            onChange={(event) => setReviewSkuSelections((current) => ({
+                                          <InventoryStyleSearch
+                                            value={selection.style || ''} options={styleOptions}
+                                            onChange={(style) => setReviewSkuSelections((current) => ({
                                               ...current,
-                                              [selectionKey]: { style: event.target.value, color: '' },
+                                              [selectionKey]: { style, color: '' },
                                             }))}
-                                            className="mt-1 h-11 w-full rounded-lg border border-slate-300 bg-white px-2 text-sm"
-                                          >
-                                            <option value="">Choose / Elegir</option>
-                                            {styleOptions.map((style) => (
-                                              <option key={style} value={style}>{style}</option>
-                                            ))}
-                                          </select>
+                                          />
                                         </label>
                                         <label className="text-xs font-medium text-slate-600">
                                           Inventory color / Color
@@ -2111,9 +2096,7 @@ export default function ReturnsReceiving() {
                                       .map((item) => item.SIZE),
                                   )].sort()
                                   const updateTarget = (changes) => {
-                                    const next = manualTargets.map((item, itemIndex) =>
-                                      itemIndex === index ? { ...item, ...changes } : item
-                                    )
+                                    const next = updateReturnMappingTarget(manualTargets, index, changes)
                                     setReviewManualTargets((current) => ({
                                       ...current,
                                       [row.skuId]: next,
@@ -2124,21 +2107,7 @@ export default function ReturnsReceiving() {
                                       key={`${row.skuId}-manual-${index}`}
                                       className="grid gap-2 rounded-xl border border-slate-200 bg-slate-50 p-3 sm:grid-cols-4"
                                     >
-                                      <select
-                                        aria-label="Inventory style"
-                                        value={target.style}
-                                        onChange={(event) => updateTarget({
-                                          style: event.target.value,
-                                          color: '',
-                                          size: '',
-                                        })}
-                                        className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm"
-                                      >
-                                        <option value="">Style / Estilo</option>
-                                        {styleOptions.map((style) => (
-                                          <option key={style} value={style}>{style}</option>
-                                        ))}
-                                      </select>
+                                      <InventoryStyleSearch value={target.style} options={styleOptions} onChange={(style) => updateTarget({ style, color: '', size: '' })} />
                                       <select
                                         aria-label="Inventory color"
                                         value={target.color}
@@ -2201,7 +2170,7 @@ export default function ReturnsReceiving() {
                                     ...current,
                                     [row.skuId]: [
                                       ...manualTargets,
-                                      { style: '', color: '', size: '', qty: 1 },
+                                      newReturnMappingTarget(manualTargets),
                                     ],
                                   }))}
                                   className="btn-secondary min-h-11 w-full justify-center sm:w-auto"
@@ -2288,25 +2257,13 @@ export default function ReturnsReceiving() {
                                 .filter((row) => row.STYLE === target.style && row.COLOR === target.color)
                                 .map((row) => row.SIZE))].sort()
                               const updateTarget = (changes) => {
-                                const next = mapping.map((row, rowIndex) =>
-                                  rowIndex === index ? { ...row, ...changes } : row
-                                )
+                                const next = updateReturnMappingTarget(mapping, index, changes)
                                 setAdminItemMappings((current) => ({ ...current, [item.id]: next }))
                                 setAdminSelections((current) => ({ ...current, [item.id]: 0 }))
                               }
                               return (
                                 <div key={`${item.id}-mapping-${index}`} className="grid gap-2 sm:grid-cols-4">
-                                  <select
-                                    aria-label="Inventory style"
-                                    value={target.style}
-                                    onChange={(event) => updateTarget({
-                                      style: event.target.value, color: '', size: '',
-                                    })}
-                                    className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm"
-                                  >
-                                    <option value="">Style / Estilo</option>
-                                    {styleOptions.map((style) => <option key={style} value={style}>{style}</option>)}
-                                  </select>
+                                  <InventoryStyleSearch value={target.style} options={styleOptions} onChange={(style) => updateTarget({ style, color: '', size: '' })} />
                                   <select
                                     aria-label="Inventory color"
                                     value={target.color}
@@ -2369,7 +2326,7 @@ export default function ReturnsReceiving() {
                                 onClick={() => {
                                   setAdminItemMappings((current) => ({
                                     ...current,
-                                    [item.id]: [...mapping, { style: '', color: '', size: '', qty: 1 }],
+                                    [item.id]: [...mapping, newReturnMappingTarget(mapping)],
                                   }))
                                   setAdminSelections((current) => ({ ...current, [item.id]: 0 }))
                                 }}
@@ -2496,21 +2453,11 @@ export default function ReturnsReceiving() {
                                 .filter((row) => row.STYLE === target.style && row.COLOR === target.color)
                                 .map((row) => row.SIZE))].sort()
                               const updateTarget = (changes) => setEditingSetTargets((current) => (
-                                current.map((row, rowIndex) => (
-                                  rowIndex === index ? { ...row, ...changes } : row
-                                ))
+                                updateReturnMappingTarget(current, index, changes)
                               ))
                               return (
                                 <div key={`${product.skuId}-edit-${index}`} className="grid gap-2 sm:grid-cols-4">
-                                  <select
-                                    aria-label="Set inventory style"
-                                    value={target.style}
-                                    onChange={(event) => updateTarget({ style: event.target.value, color: '', size: '' })}
-                                    className="h-11 min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-sm"
-                                  >
-                                    <option value="">Style / 款号</option>
-                                    {styleOptions.map((style) => <option key={style} value={style}>{style}</option>)}
-                                  </select>
+                                  <InventoryStyleSearch label="Set inventory style" value={target.style} options={styleOptions} onChange={(style) => updateTarget({ style, color: '', size: '' })} />
                                   <select
                                     aria-label="Set inventory color"
                                     value={target.color}
@@ -2564,7 +2511,7 @@ export default function ReturnsReceiving() {
                                 type="button"
                                 onClick={() => setEditingSetTargets((current) => [
                                   ...current,
-                                  { style: '', color: '', size: '', qty: 1 },
+                                  newReturnMappingTarget(current),
                                 ])}
                                 disabled={editSetLoading || !reviewInventoryRows.length}
                                 className="btn-secondary min-h-10 justify-center disabled:opacity-50"
@@ -3233,7 +3180,7 @@ export default function ReturnsReceiving() {
                             type="button"
                             onClick={() => setSavedSetTargets((current) => [
                               ...current,
-                              { style: '', color: '', size: '', qty: 1 },
+                              newReturnMappingTarget(current),
                             ])}
                             disabled={savedSetSaving || !savedSetInventoryRows.length}
                             className="btn-secondary min-h-10 justify-center disabled:opacity-50"

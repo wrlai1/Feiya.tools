@@ -123,7 +123,7 @@ function QuantityCell({ row, field, disabled, onAdjust, large = false, readOnly 
   )
 }
 
-function MobileInventoryCards({ rows, pending, disabled, editable, resetKey, onAdjust, onEdit, onDelete, onSelect }) {
+function MobileInventoryCards({ rows, pending, disabled, editable, resetKey, onAdjust, onEdit, onDelete, onSelect, checkedIds, onToggleChecked }) {
   const [visibleCount, setVisibleCount] = useState(25)
 
   useEffect(() => setVisibleCount(25), [resetKey])
@@ -138,6 +138,9 @@ function MobileInventoryCards({ rows, pending, disabled, editable, resetKey, onA
       {visibleRows.map((row) => (
         <article key={row.id} onClick={() => onSelect(row)} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm active:bg-slate-50">
           <div className="flex items-start justify-between gap-3">
+            <label className="flex h-11 w-8 shrink-0 items-center justify-center" onClick={(event) => event.stopPropagation()}>
+              <input type="checkbox" checked={checkedIds.has(row.id)} onChange={() => onToggleChecked(row.id)} aria-label={`Select ${row.style || row.po || 'record'} ${row.color || ''}`} className="h-5 w-5 accent-indigo-600" />
+            </label>
             <div className="min-w-0">
               <p className="truncate text-base font-black text-slate-900">{row.style || row.po || 'Inventory Record'}</p>
               <p className="mt-1 truncate text-sm text-slate-500">
@@ -393,6 +396,7 @@ export default function InventoryCheck() {
   const [inputValue, setInputValue] = useState('')
   const [searchQuery, setSearchQuery] = useState('')
   const [selected, setSelected] = useState(null)
+  const [checkedIds, setCheckedIds] = useState(() => new Set())
   const [editingRow, setEditingRow] = useState(null)
   const [isAdding, setIsAdding] = useState(false)
   const [showUpload, setShowUpload] = useState(false)
@@ -402,6 +406,19 @@ export default function InventoryCheck() {
   const [apiError, setApiError] = useState(null)
   const [isPending, startTransition] = useTransition()
   const toast = useToast()
+
+  useEffect(() => setCheckedIds(new Set()), [activeSheet])
+  useEffect(() => {
+    const existingIds = new Set(rows.map((row) => row.id))
+    setCheckedIds((current) => new Set([...current].filter((id) => existingIds.has(id))))
+  }, [rows])
+
+  const toggleChecked = (id) => setCheckedIds((current) => {
+    const next = new Set(current)
+    if (next.has(id)) next.delete(id)
+    else next.add(id)
+    return next
+  })
 
   useEffect(() => {
     let cancelled = false
@@ -564,6 +581,26 @@ export default function InventoryCheck() {
     toast.success(`Exported ${filteredRows.length.toLocaleString()} rows.`, 'CSV Exported')
   }, [filteredRows, activeSheet, toast])
 
+  const checkedRows = rows.filter((row) => row.sheet === activeSheet && checkedIds.has(row.id))
+  const allFilteredChecked = filteredRows.length > 0 && filteredRows.every((row) => checkedIds.has(row.id))
+  const toggleFiltered = () => setCheckedIds((current) => {
+    const next = new Set(current)
+    for (const row of filteredRows) {
+      if (allFilteredChecked) next.delete(row.id)
+      else next.add(row.id)
+    }
+    return next
+  })
+  const handleDownloadSelected = () => {
+    if (!checkedRows.length) return
+    downloadCSV(inventoryToCSV(checkedRows), `${SHEET_LABELS[activeSheet] || activeSheet}_selected_${Date.now()}.csv`)
+    toast.success(`Exported ${checkedRows.length.toLocaleString()} selected rows.`, 'CSV Exported')
+  }
+  const selectionColumn = {
+    key: 'selection', label: '', sortable: false,
+    render: (_, row) => <label className="flex h-9 w-9 items-center justify-center" onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={checkedIds.has(row.id)} onChange={() => toggleChecked(row.id)} aria-label={`Select ${row.style || row.po || 'record'} ${row.color || ''}`} className="h-4 w-4 accent-indigo-600" /></label>,
+  }
+
   const pendingSheet = activeSheet === 'Pending Shipment'
   const categorySheet = !pendingSheet && activeSheet !== 'Location final'
   const getLinks = (row) => row.kind === 'inventory' ? (masterIndex.get(linkKey(row)) || []) : []
@@ -618,6 +655,7 @@ export default function InventoryCheck() {
             </div>
           </div>
           <div className="flex flex-wrap gap-2">
+            {!!rows.length && <button type="button" onClick={handleDownloadSelected} disabled={!checkedRows.length} className="inline-flex items-center gap-2 rounded-lg border border-white/20 bg-white/10 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-white/20 disabled:cursor-not-allowed disabled:opacity-40"><Download className="h-4 w-4" />Download Selected ({checkedRows.length})</button>}
             {!!rows.length && <button onClick={handleDownload} className="inline-flex items-center gap-2 rounded-xl border border-white/20 bg-white/10 px-4 py-2.5 text-sm font-semibold text-white backdrop-blur transition hover:bg-white/20"><Download className="h-4 w-4" />Export View</button>}
             {canEdit && <button onClick={() => setShowUpload((value) => !value)} className="inline-flex items-center gap-2 rounded-xl bg-white px-4 py-2.5 text-sm font-bold text-indigo-950 shadow-lg shadow-black/10 transition hover:-translate-y-0.5 hover:bg-indigo-50"><Upload className="h-4 w-4" />Weekly Upload</button>}
           </div>
@@ -672,7 +710,9 @@ export default function InventoryCheck() {
                   {canEdit && <button type="button" onClick={openAdd} disabled={isSaving} className="ml-auto inline-flex min-h-11 items-center gap-1.5 rounded-xl bg-indigo-600 px-4 py-2 text-sm font-bold text-white shadow-sm hover:bg-indigo-700 disabled:opacity-50 lg:ml-2 lg:min-h-0 lg:px-3 lg:text-xs"><Plus className="h-4 w-4 lg:h-3.5 lg:w-3.5" />Add New</button>}
                 </div>
               </div>
-              <div className="mt-3 flex items-center gap-2 text-xs text-slate-500">
+              <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-slate-500">
+                <label className="inline-flex min-h-9 cursor-pointer items-center gap-2"><input type="checkbox" checked={allFilteredChecked} disabled={!filteredRows.length} ref={(input) => { if (input) input.indeterminate = !allFilteredChecked && filteredRows.some((row) => checkedIds.has(row.id)) }} onChange={toggleFiltered} className="h-4 w-4 accent-indigo-600" />Select Results</label>
+                {!!checkedRows.length && <><span>{num(checkedRows.length)} selected</span><button type="button" onClick={() => setCheckedIds(new Set())} title="Clear selection" aria-label="Clear selection" className="flex h-9 w-9 items-center justify-center rounded-lg hover:bg-slate-100"><X className="h-4 w-4" /></button></>}
                 {activeSheet === 'Location final' ? <><CheckCircle2 className="h-4 w-4 text-emerald-500" />These totals are the official on-hand inventory.</> : pendingSheet ? <><CalendarClock className="h-4 w-4 text-amber-500" />Pending quantities are not included in on-hand inventory.</> : <><Link2 className="h-4 w-4 text-indigo-500" />This is a linked view; quantities are already included in Location Final.</>}
               </div>
             </div>
@@ -687,9 +727,11 @@ export default function InventoryCheck() {
                 onEdit={(row) => { setIsAdding(false); setEditingRow(row) }}
                 onDelete={handleDelete}
                 onSelect={setSelected}
+                checkedIds={checkedIds}
+                onToggleChecked={toggleChecked}
               />
               <div className="hidden sm:block">
-                <DataTable data={filteredRows} columns={pendingSheet ? pendingColumns : inventoryColumns} pageSize={50} onRowClick={setSelected} getRowKey={(row) => row.id} emptyMessage={searchQuery ? `No results for “${searchQuery}”` : 'No inventory rows in this sheet'} />
+                <DataTable data={filteredRows} columns={[selectionColumn, ...(pendingSheet ? pendingColumns : inventoryColumns)]} pageSize={50} onRowClick={setSelected} getRowKey={(row) => row.id} emptyMessage={searchQuery ? `No results for “${searchQuery}”` : 'No inventory rows in this sheet'} />
               </div>
             </div>
           </section>
