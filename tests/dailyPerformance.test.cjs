@@ -39,7 +39,7 @@ test('only includes selected styles, skips period totals, does not guess missing
   assert.equal(report.details.some((row) => row.store === 'E' && row.styleNumber), false)
 })
 
-test('workbook keeps shipment date and uploaded purchase date separate with daily received returns', async () => {
+test('inventory workbook retains daily received returns and omits purchase and coverage sheets', async () => {
   const performance = buildDailyPerformance({ days, products, styles: ['5010015'] })
   const report = buildInventoryEmail({ reportDate: '2026-10-04', movementDay: '2026-10-01',
     inventory: [{ style: '5010015', color: 'Black', size: 'S', quantity: 76 }],
@@ -49,11 +49,7 @@ test('workbook keeps shipment date and uploaded purchase date separate with dail
   await workbook.xlsx.load(await buildInventoryWorkbook({ ...report, reportDate: '2026-10-04', movementDay: '2026-10-01', performance }))
   assert.match(workbook.getWorksheet('Shipments Summary').getCell('A2').value, /2026-10-01/)
   assert.equal(workbook.getWorksheet('Shipments Summary').getCell('K5').value, 1)
-  const roas = workbook.getWorksheet('Purchase ROAS')
-  assert.match(roas.getCell('A2').value, /2026-10-03.*Dates parsed from uploaded reports/)
-  assert.equal(roas.getCell('C5').value, 22)
-  assert.equal(roas.getCell('F5').value, 300 / 110)
-  assert.match(workbook.getWorksheet('Data Coverage').getCell('C7').value, /Older date/)
+  for (const name of ['Purchase ROAS', 'Purchase Details', 'Data Coverage', 'Ledger Coverage']) assert.equal(workbook.getWorksheet(name), undefined)
 })
 
 test('missing analytics tables reports unavailable rather than zero ROAS', async () => {

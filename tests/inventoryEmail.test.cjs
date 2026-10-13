@@ -107,7 +107,7 @@ test('builds one formatted worksheet per style with stock alerts', async () => {
   const workbook = new ExcelJS.Workbook()
   await workbook.xlsx.load(bytes)
 
-  assert.deepEqual(workbook.worksheets.map((sheet) => sheet.name), ['Shipments Summary', '50199', '50200', 'Purchase ROAS', 'Purchase Details', 'Data Coverage'])
+  assert.deepEqual(workbook.worksheets.map((sheet) => sheet.name), ['Shipments Summary', '50199', '50200'])
   const summary = workbook.getWorksheet('Shipments Summary')
   assert.deepEqual(summary.getRow(4).values.slice(1), [
     'Style', 'Color', 'Size', 'Shipments (2026-09-06)', '7-Day Shipments', '14-Day Shipments',
