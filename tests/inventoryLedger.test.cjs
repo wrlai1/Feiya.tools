@@ -69,7 +69,13 @@ test('workbook retains dated IN/OUT and actual return dates with live replenishm
   const outColumns = headers.slice(outStart, headers.indexOf('Total', outStart))
   assert.ok(outColumns.includes('2026-10-14'))
   assert.ok(!outColumns.includes('2026-10-16'))
-  assert.ok(headers.some((day, index) => day === '2026-10-15' && groupHeaders[index] === 'Returns'))
+  assert.ok(headers.some((day, index) => day === '2026-10-15' && index < outStart))
+  assert.ok(!groupHeaders.includes('Returns'))
+  assert.ok(!groupHeaders.includes('Adjustments'))
+  const rateColumn = headers.indexOf('Return Rate')
+  assert.equal(rateColumn, headers.indexOf('Total', outStart) + 1)
+  assert.equal(sheet.getCell(6, rateColumn).value.result, 3 / 100)
+  assert.equal(sheet.getCell(6, rateColumn).numFmt, '0.0%')
   assert.equal(sheet.getCell(6, headers.indexOf('Balance')).value, 80)
   assert.equal(sheet.getCell(6, headers.indexOf('Minimum')).value.result, 100)
   assert.equal(sheet.getCell(6, headers.indexOf('Replenishment')).value.result, 20)
@@ -123,4 +129,23 @@ test('invalid quantities and dates fail explicitly rather than generating plausi
   assert.throws(() => buildLedger({ reportDate: '2026-10-13', history: [movement('sales', '2026-02-30', 2)] }), /Invalid inventory movement/)
   assert.throws(() => normalizeMinimumRows([{ ...sku, minimum: ' ' }]))
   assert.throws(() => normalizeMinimumRows([{ ...sku, minimum: true }]))
+})
+
+test('all-history return rate excludes receipts, allows over 100 percent and zero shipments is N/A', async () => {
+  const other = { style: 'RATE', color: 'NO SALES', size: 'M' }
+  const ledger = buildLedger({ reportDate: '2026-10-13', inventory: [{ ...sku, quantity: 80 }, { ...other, quantity: 10 }], history: [
+    movement('sales', '2026-09-01', 5), movement('sales', '2026-10-12', 5),
+    movement('return', '2026-10-13', 15), movement('in', '2026-10-13', 100),
+    { ...other, txn_type: 'return', day: '2026-10-13', qty: 2 },
+  ] })
+  const workbook = new ExcelJS.Workbook()
+  await workbook.xlsx.load(await buildInventoryWorkbook({ rows: [], ledger, reportDate: ledger.reportDate, movementDay: ledger.salesDay, returnDay: ledger.returnDay }))
+  const sheet = workbook.getWorksheet('M015')
+  const headers = sheet.getRow(5).values
+  const rate = sheet.getCell(6, headers.indexOf('Return Rate'))
+  assert.equal(rate.value.result, 1.5)
+  assert.ok(rate.value.formula.includes("15/"))
+  assert.equal(sheet.getCell(6, headers.indexOf('Total')).value.result, 115)
+  const empty = workbook.getWorksheet('RATE')
+  assert.equal(empty.getCell(6, empty.getRow(5).values.indexOf('Return Rate')).value.result, 'N/A')
 })
