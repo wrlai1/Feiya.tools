@@ -202,6 +202,7 @@ export default function AutoDeduct() {
   const isMock = import.meta.env.DEV && new URLSearchParams(window.location.search).get('mock') === '1'
   const [srcFile,         setSrcFile]         = useState(null)
   const [txnType,         setTxnType]         = useState('sales')
+  const [returnDay, setReturnDay] = useState('')
   const [processing,      setProcessing]      = useState(false)
   const [result,          setResult]          = useState(null)   // { filledRows, unmatchedRows, stats }
   const [templateRows,    setTemplateRows]    = useState([])     // raw template for the resolver
@@ -396,6 +397,7 @@ export default function AutoDeduct() {
   useEffect(() => { loadAliases() }, [loadAliases])
 
   const handleFile = useCallback((file) => {
+    setReturnDay('')
     setSrcFile(file); setResult(null); setApplied(false); setResolvedExtras(null); setSkippedRows([]); setSourceHash(''); setEditingResolutions(false); setResolutionAliasKeys([]); setPreviewConfirmed(false); setOrderArchive(null)
   }, [])
 
@@ -673,6 +675,7 @@ export default function AutoDeduct() {
           filledRows:  mergedFilledRows,
           movementRows: businessMovementRows,
           txnType,
+          businessDay: txnType === 'return' ? returnDay : undefined,
           sourceName:  srcFile?.name || '',
           sourceHash,
           orderClaims,
@@ -811,6 +814,13 @@ export default function AutoDeduct() {
           ))}
         </div>
 
+        {txnType === 'return' && srcFile && <label className="block text-sm font-medium text-slate-700">
+          Return to inventory date / 回库日期
+          <input type="date" value={returnDay} onChange={(event) => setReturnDay(event.target.value)} disabled={applying || applied}
+            max={new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date())}
+            className="ml-3 rounded-lg border border-slate-300 px-3 py-2" />
+          <span className="mt-1 block text-xs text-slate-500">Blank = today (Eastern Time). Apply only quantities already received back into inventory.</span>
+        </label>}
         {/* File upload */}
         <FileUploadZone
           onFile={handleFile}

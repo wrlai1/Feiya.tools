@@ -1,4 +1,5 @@
 import shipmentRange from '../lib/shipmentDateRange.cjs'
+import returnDate from '../lib/returnBusinessDate.cjs'
 // api/inventory-balance.js
 // Single source of truth for inventory stock levels.
 // Used by both Stock Management (view/edit) and Auto Deduct (fill template + apply).
@@ -1107,6 +1108,10 @@ export default async function handler(req, res) {
         storeName: rawStoreName = '',
       } = req.body || {}
       if (!['sales', 'return'].includes(txnType)) return res.status(400).json({ error: 'Invalid transaction type' })
+      let returnDay
+      if (txnType === 'return') {
+        try { returnDay = returnDate.returnBusinessDate(req.body?.businessDay) } catch (error) { return res.status(400).json({ error: error.message }) }
+      }
       const sourceHash = String(rawSourceHash || '').trim()
       const store = normalizeStore(rawStoreName)
       if (!sourceHash) return res.status(400).json({ error: 'A source file fingerprint is required before inventory can be changed.' })
@@ -1241,7 +1246,7 @@ export default async function handler(req, res) {
         const color = String(raw.COLOR || raw.color || '').trim()
         const size = String(raw.SIZE || raw.size || '').trim()
         const qty = Number(raw.QTY ?? raw.qty)
-        const businessDay = String(raw.businessDay || raw.business_day || '').trim()
+        const businessDay = txnType === 'return' ? returnDay : String(raw.businessDay || raw.business_day || '').trim()
         if (
           !style || !color || !size
           || !Number.isSafeInteger(qty) || qty <= 0

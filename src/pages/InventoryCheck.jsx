@@ -287,6 +287,9 @@ function DailyInventoryEmailPanel() {
   const [enabled, setEnabled] = useState(false)
   const [availableStyles, setAvailableStyles] = useState([])
   const [runs, setRuns] = useState([])
+  const [minimumOverrides, setMinimumOverrides] = useState([])
+  const [minimumDraft, setMinimumDraft] = useState([])
+  const [minimumBusy, setMinimumBusy] = useState(false)
   const [system, setSystem] = useState({ emailConfigured: false, cronConfigured: false })
 
   const load = useCallback(async () => {
@@ -301,6 +304,7 @@ function DailyInventoryEmailPanel() {
       setEnabled(Boolean(data.settings?.enabled))
       setAvailableStyles(data.availableStyles || [])
       setRuns(data.runs || [])
+      setMinimumOverrides(data.minimumOverrides || [])
       setSystem({ emailConfigured: data.emailConfigured, cronConfigured: data.cronConfigured })
     } catch (error) {
       toast.error(error.message, 'Email Settings')
@@ -334,6 +338,53 @@ function DailyInventoryEmailPanel() {
   }
 
   const selectedStyles = new Set(styles.split(/[\n,;]+/).map((value) => value.trim().toUpperCase()).filter(Boolean))
+  const downloadMinimum = async () => {
+    const XLSX = await import('xlsx')
+    const book = XLSX.utils.book_new()
+    const sheet = XLSX.utils.aoa_to_sheet([
+      ['style', 'color', 'size', 'minimum quantity'],
+      ...minimumOverrides.map((row) => [row.style, row.color, row.size, row.minimum]),
+    ])
+    sheet['!cols'] = [{ wch: 22 }, { wch: 30 }, { wch: 14 }, { wch: 22 }]
+    for (let row = 1; row <= Math.max(100, minimumOverrides.length); row++) {
+      for (let col = 0; col < 3; col++) {
+        const address = XLSX.utils.encode_cell({ r: row, c: col })
+        sheet[address] = { ...(sheet[address] || { t: 's', v: '' }), z: '@' }
+      }
+    }
+    sheet['!ref'] = `A1:D${Math.max(101, minimumOverrides.length + 1)}`
+    XLSX.utils.book_append_sheet(book, sheet, 'Minimum')
+    XLSX.writeFile(book, 'inventory_minimum.xlsx')
+  }
+  const readMinimum = async (file) => {
+    if (!file) return
+    setMinimumDraft([])
+    try {
+      const XLSX = await import('xlsx')
+      const book = XLSX.read(await file.arrayBuffer(), { type: 'array' })
+      const rows = XLSX.utils.sheet_to_json(book.Sheets[book.SheetNames[0]], { defval: '' }).map((raw) => {
+        const row = Object.fromEntries(Object.entries(raw).map(([key, value]) => [key.trim().toLowerCase().replace(/_/g, ' '), value]))
+        if (!['style', 'color', 'size', 'minimum quantity'].every((key) => key in row)) throw new Error('Required columns: style, color, size, minimum quantity')
+        if (!String(row.style).trim() || !String(row.color).trim() || !String(row.size).trim() || String(row['minimum quantity']).trim() === '' || !Number.isFinite(Number(row['minimum quantity'])) || Number(row['minimum quantity']) < 0 || Number(row['minimum quantity']) > 2147483647) throw new Error('Every row needs a SKU and a Minimum from 0 to 2147483647')
+        return { style: String(row.style).trim(), color: String(row.color).trim(), size: String(row.size).trim(), minimum: Math.ceil(Number(row['minimum quantity'])) }
+      })
+      if (!rows.length) throw new Error('No Minimum rows found')
+      setMinimumDraft(rows)
+    } catch (error) { toast.error(error.message, 'Minimum Upload') }
+  }
+  const updateMinimum = async (rows, reset = false) => {
+    setMinimumBusy(true)
+    try {
+      const response = await fetch(`/api/inventory-balance?action=${reset ? 'email-minimum-reset' : 'email-minimum-upload'}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${getToken()}` }, body: JSON.stringify({ rows }),
+      })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.error || 'Could not save Minimum')
+      setMinimumDraft([])
+      toast.success(reset ? 'Automatic 21-day Minimum restored.' : `${data.updated} manual Minimum values saved.`, 'Minimum')
+      await load()
+    } catch (error) { toast.error(error.message, 'Minimum') } finally { setMinimumBusy(false) }
+  }
   const toggleStyle = (style) => {
     const next = new Set(selectedStyles)
     const key = style.toUpperCase()
@@ -346,7 +397,7 @@ function DailyInventoryEmailPanel() {
       <button type="button" onClick={() => setOpen((value) => !value)} className="flex w-full items-center justify-between gap-4 p-5 text-left hover:bg-indigo-50/40">
         <div className="flex min-w-0 items-center gap-3">
           <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-indigo-100 text-indigo-700"><Mail className="h-5 w-5" /></span>
-          <div><h2 className="font-bold text-slate-900">Daily Sales & Inventory Email</h2><p className="mt-0.5 text-sm text-slate-500">Email an Excel summary with latest-day, 7/14/30-day sales, return rate and current inventory.</p></div>
+          <div><h2 className="font-bold text-slate-900">Daily Sales & Inventory Email</h2><p className="mt-0.5 text-sm text-slate-500">Daily IN / OUT history, current Balance, Minimum and Replenishment in one Excel sheet per style.</p></div>
         </div>
         <ChevronRight className={`h-5 w-5 shrink-0 text-slate-400 transition ${open ? 'rotate-90' : ''}`} />
       </button>
@@ -374,6 +425,21 @@ function DailyInventoryEmailPanel() {
             <textarea value={styles} onChange={(event) => setStyles(event.target.value)} rows={2} placeholder="50199, 50210" className="mt-2 w-full rounded-2xl border border-slate-200 px-4 py-3 text-sm font-normal uppercase outline-none focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100" />
           </label>
           {!!availableStyles.length && <div><p className="mb-2 text-xs font-bold uppercase tracking-wider text-slate-400">Available styles</p><div className="flex max-h-32 flex-wrap gap-2 overflow-y-auto">{availableStyles.map((style) => <button key={style} type="button" onClick={() => toggleStyle(style)} className={`rounded-full border px-3 py-1.5 text-xs font-semibold ${selectedStyles.has(style.toUpperCase()) ? 'border-indigo-600 bg-indigo-600 text-white' : 'border-slate-200 text-slate-600 hover:border-indigo-300'}`}>{style}</button>)}</div></div>}
+          <div className="space-y-3 rounded-2xl border border-slate-200 p-4">
+            <h3 className="font-bold text-slate-800">Minimum / 最低库存</h3>
+            <p className="text-sm text-slate-500">Default: last 21 calendar days’ shipments (missing days = 0). Excel overrides stay fixed until restored to Auto. Replenishment = MAX(0, Minimum − Balance).</p>
+            <div className="flex flex-wrap items-center gap-3">
+              <button type="button" onClick={downloadMinimum} className="rounded-lg border px-3 py-2 text-sm">Download Minimum Excel</button>
+              <label className="cursor-pointer rounded-lg border px-3 py-2 text-sm">Upload Minimum Excel<input type="file" accept=".xlsx,.xls" disabled={minimumBusy} className="hidden" onChange={(event) => { readMinimum(event.target.files?.[0]); event.target.value = '' }} /></label>
+            </div>
+            {!!minimumDraft.length && <div className="space-y-2 text-sm">
+              <p>{minimumDraft.length} rows ready. Quantities rounded up. Only listed SKUs will change.</p>
+              <div className="max-h-48 overflow-auto">{minimumDraft.slice(0, 20).map((row, index) => <p key={index}>{row.style} / {row.color} / {row.size}: {row.minimum}</p>)}</div>
+              <button type="button" disabled={minimumBusy} onClick={() => updateMinimum(minimumDraft)} className="rounded-lg bg-indigo-600 px-3 py-2 text-white disabled:opacity-50">Save Manual Minimum</button>
+              <button type="button" onClick={() => setMinimumDraft([])} className="ml-3 text-slate-500">Cancel</button>
+            </div>}
+            {!!minimumOverrides.length && <div className="max-h-56 space-y-2 overflow-auto">{minimumOverrides.map((row) => <div key={`${row.style}|${row.color}|${row.size}`} className="flex items-center justify-between gap-3 text-sm"><span>{row.style} / {row.color} / {row.size} · Manual: {row.minimum}</span><button type="button" disabled={minimumBusy} onClick={() => updateMinimum([row], true)} className="shrink-0 text-indigo-600 disabled:opacity-50">Restore Auto / 恢复自动</button></div>)}</div>}
+          </div>
           <div className="flex flex-wrap justify-end gap-2 border-t border-slate-100 pt-5">
             <button type="button" disabled={sending || saving || !system.emailConfigured} onClick={() => save('send-test')} className="inline-flex items-center gap-2 rounded-xl border border-indigo-200 px-4 py-2.5 text-sm font-bold text-indigo-700 hover:bg-indigo-50 disabled:opacity-40"><Send className="h-4 w-4" />{sending ? 'Sending…' : 'Send Test Now'}</button>
             <button type="button" disabled={saving || sending} onClick={() => save()} className="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-bold text-white hover:bg-indigo-700 disabled:opacity-50">{saving && <RefreshCw className="h-4 w-4 animate-spin" />}{saving ? 'Saving…' : 'Save Settings'}</button>

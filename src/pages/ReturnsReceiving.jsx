@@ -456,6 +456,8 @@ export default function ReturnsReceiving() {
   const [pkg, setPkg] = useState(null)
   const [counts, setCounts] = useState({})
   const [remark, setRemark] = useState('')
+  const [returnDay, setReturnDay] = useState('')
+  useEffect(() => { setReturnDay('') }, [pkg?.id, pkg?.tracking_number])
   const [counted, setCounted] = useState(false)
   const [cameraOpen, setCameraOpen] = useState(false)
   const [recent, setRecent] = useState([])
@@ -864,6 +866,7 @@ export default function ReturnsReceiving() {
         headers: headers(getToken, true),
         body: JSON.stringify({
           tracking: pkg.tracking_number,
+          businessDay: returnDay,
           items: pkg.items.map((item) => ({
             id: item.id,
             actualQty: Number(effectiveCounts[item.id]?.good || 0)
@@ -2660,6 +2663,15 @@ export default function ReturnsReceiving() {
               </>
               )}
 
+              {['pending', 'needs_review'].includes(pkg.status) && !pkg.requires_item_resolution && (
+                <label className="block border-t border-slate-200 p-4 text-sm font-semibold text-slate-700">
+                  Return to inventory date / 回库日期
+                  <input type="date" value={returnDay} onChange={(event) => setReturnDay(event.target.value)} disabled={loading}
+                    max={new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date())}
+                    className="ml-3 rounded-lg border border-slate-300 px-3 py-2" />
+                  <span className="mt-1 block text-xs font-normal text-slate-500">Blank = today (Eastern Time). Only confirmed restockable quantities enter IN. / 不选择则默认纽约时间当天。</span>
+                </label>
+              )}
               {isAdmin && ['pending', 'needs_review'].includes(pkg.status)
                 && !pkg.requires_item_resolution && (
                 <div ref={confirmationRef} className="scroll-mt-4 border-t border-slate-200 bg-slate-50/70 p-4 sm:p-5">

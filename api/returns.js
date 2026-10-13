@@ -2,6 +2,7 @@ import { neon } from '@neondatabase/serverless'
 import authentication from '../lib/authentication.cjs'
 import inventoryTargetResolution from '../lib/inventoryTargetResolution.cjs'
 import returnPackageSafety from '../lib/returnPackageSafety.cjs'
+import returnDate from '../lib/returnBusinessDate.cjs'
 import { summarizeReturnInspection } from '../src/utils/returnInspection.js'
 import {
   limitReturnPackageQuantities,
@@ -2324,6 +2325,8 @@ export default async function handler(req, res) {
     }
 
     if (req.method === 'POST' && action === 'confirm') {
+      let businessDay
+      try { businessDay = returnDate.returnBusinessDate(req.body?.businessDay) } catch (error) { return res.status(400).json({ error: error.message }) }
       const trackingKey = normalizeTracking(req.body?.tracking)
       if (!trackingKey) return res.status(400).json({ error: 'tracking required' })
       const pkg = await loadPackage(sql, trackingKey)
@@ -2553,12 +2556,12 @@ export default async function handler(req, res) {
           txn`
             INSERT INTO inventory_txn_rows (
               transaction_id, txn_type, style, color, size, qty, source_file, applied_by,
-              store_name, store_key
+              store_name, store_key, business_day
             )
             SELECT
               transactions.id, 'return', ${row.style}, ${row.color}, ${row.size},
               ${row.qty}, ${sourceName}, ${payload.username},
-              ${pkg.store_name || ''}, ${pkg.store_key || ''}
+              ${pkg.store_name || ''}, ${pkg.store_key || ''}, ${businessDay}::date
             FROM inventory_transactions transactions
             WHERE transactions.transaction_type = 'return'
               AND transactions.source_hash = ${sourceHash}
