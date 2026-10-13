@@ -37,7 +37,7 @@ test('actual APIs persist Minimum overrides and selected return business dates',
   }
   const token = jwt.sign({ userId: 1 }, process.env.JWT_SECRET)
   const call = async (handler, action, body, options = {}) => {
-    const response = { code: 200, setHeader() {}, status(code) { this.code = code; return this }, json(body) { this.body = body; return this } }
+    const response = { code: 200, headers: {}, setHeader(name, value) { this.headers[name] = value }, send(body) { this.body = body; return this }, status(code) { this.code = code; return this }, json(body) { this.body = body; return this } }
     await handler({ method: 'POST', query: { action }, body, headers: { authorization: `Bearer ${token}` }, ...options }, response)
     return response
   }
@@ -114,6 +114,29 @@ test('actual APIs persist Minimum overrides and selected return business dates',
       assert.equal(sheet.getCell(6, headers.indexOf('Replenishment')).value.result, 20)
       assert.match(sheet.getCell('A2').value, new RegExp(`OUT through ${yesterday}`))
       assert.match(sheet.getCell('A2').value, new RegExp(`Returns through ${day}`))
+      const settingsBeforeDownload = (await db.query('SELECT * FROM inventory_email_settings')).rows
+      const stockBeforeDownload = (await db.query('SELECT * FROM inventory_balance ORDER BY id')).rows
+      const runsBeforeDownload = (await db.query('SELECT * FROM inventory_email_runs')).rows
+      delete process.env.RESEND_API_KEY
+      delete process.env.INVENTORY_EMAIL_FROM
+      const downloaded = await call(emailHandler, 'email-download', { styles: ['0055'], recipients: [] })
+      assert.equal(downloaded.code, 200, JSON.stringify(downloaded.body))
+      assert.match(downloaded.headers['Content-Type'], /spreadsheetml/)
+      assert.match(downloaded.headers['Content-Disposition'], /daily_inventory_performance_/)
+      const downloadedWorkbook = new ExcelJS.Workbook()
+      await downloadedWorkbook.xlsx.load(downloaded.body)
+      assert.equal(downloadedWorkbook.getWorksheet('UNSELECTED'), undefined)
+      const downloadedSheet = downloadedWorkbook.getWorksheet('0055')
+      const downloadedHeaders = downloadedSheet.getRow(5).values
+      assert.equal(downloadedSheet.getCell(6, downloadedHeaders.indexOf('Replenishment')).value.result, 20)
+      assert.deepEqual((await db.query('SELECT * FROM inventory_email_settings')).rows, settingsBeforeDownload)
+      assert.deepEqual((await db.query('SELECT * FROM inventory_balance ORDER BY id')).rows, stockBeforeDownload)
+      assert.deepEqual((await db.query('SELECT * FROM inventory_email_runs')).rows, runsBeforeDownload)
+      assert.equal(calls, 1)
+      assert.equal((await call(emailHandler, 'email-download', { styles: [] })).code, 400)
+      assert.equal((await call(emailHandler, 'email-download', { styles: ['0055'] }, { headers: {} })).code, 401)
+      process.env.RESEND_API_KEY = 'test-resend'
+      process.env.INVENTORY_EMAIL_FROM = 'test@example.com'
       assert.equal((await call(emailHandler, 'email-cron', {}, cronOptions)).body.skipped, true)
       assert.equal(calls, 1)
       assert.equal((await db.query('SELECT status FROM inventory_email_runs')).rows[0].status, 'sent')

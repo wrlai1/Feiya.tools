@@ -281,6 +281,7 @@ function DailyInventoryEmailPanel() {
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [sending, setSending] = useState(false)
+  const [downloading, setDownloading] = useState(false)
   const [recipients, setRecipients] = useState('')
   const [styles, setStyles] = useState('')
   const [sendHour, setSendHour] = useState(9)
@@ -335,6 +336,29 @@ function DailyInventoryEmailPanel() {
       setSaving(false)
       setSending(false)
     }
+  }
+
+  const downloadReport = async () => {
+    setDownloading(true)
+    try {
+      const response = await fetch('/api/inventory-balance?action=email-download', {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${getToken()}` },
+        body: JSON.stringify(payload()),
+      })
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}))
+        throw new Error(data.error || 'Could not download report')
+      }
+      const url = URL.createObjectURL(await response.blob())
+      const link = document.createElement('a')
+      link.href = url
+      link.download = response.headers.get('Content-Disposition')?.match(/filename="([^"]+)"/)?.[1] || 'daily_inventory_performance.xlsx'
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch (error) { toast.error(error.message, 'Could Not Download') }
+    finally { setDownloading(false) }
   }
 
   const selectedStyles = new Set(styles.split(/[\n,;]+/).map((value) => value.trim().toUpperCase()).filter(Boolean))
@@ -441,8 +465,10 @@ function DailyInventoryEmailPanel() {
             {!!minimumOverrides.length && <div className="max-h-56 space-y-2 overflow-auto">{minimumOverrides.map((row) => <div key={`${row.style}|${row.color}|${row.size}`} className="flex items-center justify-between gap-3 text-sm"><span>{row.style} / {row.color} / {row.size} · Manual: {row.minimum}</span><button type="button" disabled={minimumBusy} onClick={() => updateMinimum([row], true)} className="shrink-0 text-indigo-600 disabled:opacity-50">Restore Auto / 恢复自动</button></div>)}</div>}
           </div>
           <div className="flex flex-wrap justify-end gap-2 border-t border-slate-100 pt-5">
-            <button type="button" disabled={sending || saving || !system.emailConfigured} onClick={() => save('send-test')} className="inline-flex items-center gap-2 rounded-xl border border-indigo-200 px-4 py-2.5 text-sm font-bold text-indigo-700 hover:bg-indigo-50 disabled:opacity-40"><Send className="h-4 w-4" />{sending ? 'Sending…' : 'Send Test Now'}</button>
-            <button type="button" disabled={saving || sending} onClick={() => save()} className="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-bold text-white hover:bg-indigo-700 disabled:opacity-50">{saving && <RefreshCw className="h-4 w-4 animate-spin" />}{saving ? 'Saving…' : 'Save Settings'}</button>
+            {!loading && !system.emailConfigured && <p className="mr-auto text-sm text-amber-800">Email is not configured for this environment. Use <a href="https://feiya.tools/inventory" className="font-semibold underline">feiya.tools</a> to send email. You can still download the report here.</p>}
+            <button type="button" disabled={sending || saving || loading || downloading || !system.emailConfigured} onClick={() => save('send-test')} className="inline-flex items-center gap-2 rounded-xl border border-indigo-200 px-4 py-2.5 text-sm font-bold text-indigo-700 hover:bg-indigo-50 disabled:opacity-40"><Send className="h-4 w-4" />{sending ? 'Sending…' : 'Send Test Now'}</button>
+            <button type="button" disabled={downloading || sending || saving || loading} onClick={downloadReport} className="inline-flex items-center gap-2 rounded-xl border border-indigo-200 px-4 py-2.5 text-sm font-bold text-indigo-700 hover:bg-indigo-50 disabled:opacity-40"><Download className="h-4 w-4" />{downloading ? 'Downloading…' : 'Download'}</button>
+            <button type="button" disabled={saving || sending || downloading} onClick={() => save()} className="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-bold text-white hover:bg-indigo-700 disabled:opacity-50">{saving && <RefreshCw className="h-4 w-4 animate-spin" />}{saving ? 'Saving…' : 'Save Settings'}</button>
           </div>
           {!!runs.length && <div><h3 className="mb-2 text-xs font-bold uppercase tracking-wider text-slate-400">Recent deliveries</h3><div className="divide-y divide-slate-100 rounded-2xl border border-slate-200">{runs.slice(0, 5).map((run) => <div key={`${run.report_date}-${run.created_at}`} className="flex items-center justify-between gap-3 px-4 py-3 text-sm"><span className="text-slate-600">{String(run.report_date).slice(0, 10)} · {(run.recipients || []).join(', ')}</span><span className={`shrink-0 rounded-full px-2 py-1 text-xs font-bold ${run.status === 'sent' ? 'bg-emerald-100 text-emerald-700' : run.status === 'failed' ? 'bg-red-100 text-red-700' : 'bg-amber-100 text-amber-700'}`}>{run.status}</span></div>)}</div></div>}
         </div>}
