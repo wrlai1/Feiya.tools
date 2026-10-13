@@ -149,3 +149,32 @@ test('all-history return rate excludes receipts, allows over 100 percent and zer
   const empty = workbook.getWorksheet('RATE')
   assert.equal(empty.getCell(6, empty.getRow(5).values.indexOf('Return Rate')).value.result, 'N/A')
 })
+
+test('each IN and OUT section shows latest seven calendar days and collapses earlier history', async () => {
+  const ledger = buildLedger({ reportDate: '2026-10-13', inventory: [{ ...sku, quantity: 80 }], history: [
+    movement('sales', '2026-09-01', 5), movement('sales', '2026-10-10', 7),
+    movement('in', '2026-09-02', 100), movement('return', '2026-10-13', 2),
+  ] })
+  const workbook = new ExcelJS.Workbook()
+  await workbook.xlsx.load(await buildInventoryWorkbook({ rows: [], ledger, reportDate: ledger.reportDate, movementDay: ledger.salesDay, returnDay: ledger.returnDay }))
+  const sheet = workbook.getWorksheet('M015')
+  const headers = sheet.getRow(5).values
+  const outStart = sheet.getRow(4).values.indexOf('OUT')
+  const outTotal = headers.indexOf('Total', outStart)
+  let visibleIn = 0, visibleOut = 0, hidden = 0
+  for (let index = 3; index < headers.length; index++) {
+    if (!(headers[index] instanceof Date)) { assert.equal(Boolean(sheet.getColumn(index).hidden), false); continue }
+    const day = headers[index].toISOString().slice(0, 10)
+    const isOut = index >= outStart && index < outTotal
+    const expectedHidden = day < (isOut ? '2026-10-04' : '2026-10-07')
+    assert.equal(Boolean(sheet.getColumn(index).hidden), expectedHidden)
+    if (expectedHidden) { assert.equal(sheet.getColumn(index).outlineLevel, 1); hidden++ }
+    else if (isOut) visibleOut++; else visibleIn++
+  }
+  assert.equal(visibleIn, 7)
+  assert.equal(visibleOut, 7)
+  assert.ok(hidden > 0)
+  assert.equal(sheet.getCell(6, outTotal).value.result, 12)
+  assert.equal(sheet.getCell(6, headers.indexOf('Return Rate')).value.result, 2 / 12)
+  assert.equal(sheet.getCell(6, headers.indexOf('Minimum')).value.result, 7)
+})
