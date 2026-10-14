@@ -1,3 +1,4 @@
+import SkuCorrectionReview from '../components/SkuCorrectionReview.jsx'
 import React, { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { AlertTriangle, ArrowLeft, CheckCircle, History, Minus, RefreshCw, RotateCcw, TrendingUp } from 'lucide-react'
@@ -120,6 +121,8 @@ export default function AutoDeductHistory() {
           </button>
         </div>
       </div>
+
+      <SkuCorrectionReview onApplied={loadHistory} />
 
       <div className="flex gap-2" role="group" aria-label="History type">
         {[['sales', 'Daily Auto Deduct / 每日扣库存'], ['return', 'Returns / 退货']].map(([value, label]) => (

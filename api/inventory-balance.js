@@ -1,3 +1,4 @@
+import inventorySkuCorrection from '../lib/inventorySkuCorrection.cjs'
 import inventoryReceipt from '../lib/inventoryReceipt.cjs'
 import shipmentRange from '../lib/shipmentDateRange.cjs'
 import inventoryLedger from '../lib/inventoryLedger.cjs'
@@ -442,6 +443,21 @@ export default async function handler(req, res) {
     if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
 
     await ensureTables(sql)
+    await inventorySkuCorrection.ensureCorrectionTable(sql)
+
+    if (req.method === 'GET' && action === 'sku-audit') {
+      const items = await sql`SELECT orders.order_number, orders.source_hash, orders.source_file, orders.inventory_status, items.sku_code, items.attributes, items.quantity, items.sku_id
+        FROM return_orders orders JOIN return_order_items items ON items.order_id=orders.id ORDER BY orders.id, items.id`
+      return res.json({ items })
+    }
+    if (action === 'sku-correction' && ['GET','POST'].includes(req.method)) {
+      try {
+        const preview = await inventorySkuCorrection.correctionPreview(sql)
+        if (req.method === 'GET') return res.json(preview)
+        return res.json(await inventorySkuCorrection.applyCorrection(sql, preview, req.body?.version, payload.username))
+      } catch (error) { return res.status(409).json({ error: error.message }) }
+    }
+
 
     if (req.method === 'POST' && action === 'receive') {
       let receipt
@@ -1756,6 +1772,7 @@ export default async function handler(req, res) {
                 )
             `]
           : []),
+        inventorySkuCorrection.undoCorrections(txn),
         trimInventorySnapshots(txn),
         txn`
           SELECT COUNT(*)::int AS total_rows, COALESCE(SUM(quantity), 0)::int AS total_units
