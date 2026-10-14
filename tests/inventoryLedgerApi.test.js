@@ -98,6 +98,8 @@ test('actual APIs persist Minimum overrides and selected return business dates',
           ('0055','BLACK','S','sales',900,$1,999),
           ('0055','BLACK','S','sales',5000,$2,NULL),
           ('UNSELECTED','BLACK','S','sales',7000,$3,NULL)`, [yesterday, oldDay, day])
+      await db.exec("UPDATE inventory_txn_rows SET source_file='TEMU-' || business_day::text || '.xlsx' WHERE txn_type='sales'")
+      await db.query("UPDATE inventory_txn_rows SET business_day=$1 WHERE txn_type='sales' AND qty=100", [oldDay])
       assert.equal((await call(emailHandler, 'email-settings', { enabled: true, recipients: ['recipient@example.com'], styles: ['0055'], sendHour: 0 })).code, 200)
       const cronOptions = { method: 'GET', headers: { authorization: 'Bearer test-cron' } }
       const sent = await call(emailHandler, 'email-cron', {}, cronOptions)

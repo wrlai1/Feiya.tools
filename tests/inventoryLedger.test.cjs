@@ -1,7 +1,7 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const ExcelJS = require('exceljs')
-const { buildLedger, normalizeMinimumRows, skuKey } = require('../lib/inventoryLedger.cjs')
+const { shipmentFileDay, buildLedger, normalizeMinimumRows, skuKey } = require('../lib/inventoryLedger.cjs')
 const { buildInventoryWorkbook } = require('../lib/inventoryEmail.cjs')
 const { returnBusinessDate } = require('../lib/returnBusinessDate.cjs')
 const sku = { style: 'M015', color: 'BLACK', size: 'S' }
@@ -177,4 +177,14 @@ test('each IN and OUT section shows latest seven calendar days and collapses ear
   assert.equal(sheet.getCell(6, outTotal).value.result, 12)
   assert.equal(sheet.getCell(6, headers.indexOf('Return Rate')).value.result, 2 / 12)
   assert.equal(sheet.getCell(6, headers.indexOf('Minimum')).value.result, 7)
+})
+
+test('Auto Deduct filename date overrides order dates and undated files use upload date', () => {
+  assert.equal(shipmentFileDay('TEMU ORDER-1010-packing list.xlsx', '2026-10-13'), '2026-10-10')
+  assert.equal(shipmentFileDay('TEMU-2026-10-10.xlsx', '2026-10-13'), '2026-10-10')
+  assert.equal(shipmentFileDay('TEMU-20261010.xlsx', '2026-10-13'), '2026-10-10')
+  assert.equal(shipmentFileDay('TEMU-123456789012.xlsx', '2026-10-13'), '2026-10-13')
+  assert.equal(shipmentFileDay('TEMU-1231.xlsx', '2027-01-02'), '2026-12-31')
+  assert.equal(shipmentFileDay(null, '2026-10-13'), '2026-10-13')
+  assert.throws(() => shipmentFileDay('TEMU-1010-1011.xlsx', '2026-10-13'), /Multiple/)
 })
