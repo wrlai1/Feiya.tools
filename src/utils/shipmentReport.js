@@ -24,7 +24,7 @@ export function buildShipmentReport(style, from, to, movements) {
 export function shipmentReportSheet(report) {
   return [
     [`${report.style} 实际出货记录`, report.from, report.to],
-    ['按出货业务日期；已撤回记录不计入。0 表示没有匹配记录，不代表当天数据已上传。'],
+    ['按 Auto Deduct 出货文件名日期；无文件日期时使用确认扣库当天（纽约时间）。已撤回记录不计入。0 表示没有匹配记录，不代表当天数据已上传。'],
     ['Color','Size',...report.dates,'Total'],
     ...report.rows.map(row=>[row.color,row.size,...report.dates.map(day=>row.byDay[day]||0),row.total]),
     ['TOTAL','',...report.dailyTotals,report.total],

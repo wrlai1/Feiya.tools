@@ -1,5 +1,6 @@
 import inventoryReceipt from '../lib/inventoryReceipt.cjs'
 import shipmentRange from '../lib/shipmentDateRange.cjs'
+import inventoryLedger from '../lib/inventoryLedger.cjs'
 import returnDate from '../lib/returnBusinessDate.cjs'
 // api/inventory-balance.js
 // Single source of truth for inventory stock levels.
@@ -1420,7 +1421,7 @@ export default async function handler(req, res) {
     // ── GET movements — per-SKU dated flow for the 动销 view ─────────────────
     if (req.method === 'GET' && action === 'movements') {
       const days = Math.min(Math.max(parseInt(req.query.days, 10) || 30, 1), 365)
-      let fromDay = new Date(Date.now() - (days - 1) * 86400000).toISOString().slice(0, 10)
+      let fromDay = new Date(Date.parse(`${returnDate.newYorkDate()}T12:00:00Z`) - (days - 1) * 86400000).toISOString().slice(0, 10)
       let toDay = null
       if (req.query.from != null || req.query.to != null) {
         try { const range = shipmentRange.shipmentDateRange(req.query.from, req.query.to); fromDay = range.from; toDay = range.to }
@@ -1429,11 +1430,13 @@ export default async function handler(req, res) {
       const style = String(req.query.style || '').trim().toUpperCase()
       const salesOnly = req.query.txnType === 'sales'
       const rows = await sql`
-        SELECT rows.txn_type, rows.style, rows.color, rows.size, rows.qty,
-               COALESCE(rows.business_day, (rows.applied_at AT TIME ZONE 'America/New_York')::date) AS day
+        SELECT rows.txn_type, rows.style, rows.color, rows.size, rows.qty, rows.source_file,
+               (rows.applied_at AT TIME ZONE 'America/New_York')::date::text AS applied_day,
+               COALESCE(rows.business_day, (rows.applied_at AT TIME ZONE 'America/New_York')::date)::text AS day
         FROM inventory_txn_rows rows
-        WHERE COALESCE(rows.business_day, (rows.applied_at AT TIME ZONE 'America/New_York')::date) >= ${fromDay}::date
-          AND (${toDay}::date IS NULL OR COALESCE(rows.business_day, (rows.applied_at AT TIME ZONE 'America/New_York')::date) <= ${toDay}::date)
+        WHERE (rows.txn_type = 'sales' OR (
+          COALESCE(rows.business_day, (rows.applied_at AT TIME ZONE 'America/New_York')::date) >= ${fromDay}::date
+          AND (${toDay}::date IS NULL OR COALESCE(rows.business_day, (rows.applied_at AT TIME ZONE 'America/New_York')::date) <= ${toDay}::date)))
           AND (${style}::text = '' OR UPPER(BTRIM(rows.style)) = ${style})
           AND (NOT ${salesOnly}::boolean OR rows.txn_type = 'sales')
           AND NOT EXISTS (
@@ -1453,7 +1456,13 @@ export default async function handler(req, res) {
           )
         ORDER BY COALESCE(rows.business_day, (rows.applied_at AT TIME ZONE 'America/New_York')::date), rows.applied_at
       `
-      return res.json({ days, rows })
+      let reportRows = inventoryLedger.movementsForReport(rows, fromDay, toDay || returnDate.newYorkDate())
+      if (salesOnly) {
+        const inventory = await sql`SELECT style, color, size FROM inventory_balance
+          WHERE (${style}::text = '' OR UPPER(BTRIM(style)) = ${style}) ORDER BY style, color, size`
+        reportRows = inventoryLedger.currentInventoryMovements(reportRows, inventory)
+      }
+      return res.json({ days, rows: reportRows })
     }
 
     // ── GET transactions ──────────────────────────────────────────────────────

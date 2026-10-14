@@ -52,7 +52,7 @@ export default function ShipmentRangeReport({ inventoryRows = [] }) {
     </form>
     {error && <p role="alert" className="text-red-700">{error}</p>}
     {report && <><p className="text-sm">{report.style} · {report.from} — {report.to} · 合计 {report.total.toLocaleString()} 条</p>
-      <p className="text-xs text-slate-500">按出货业务日期统计，排除已撤回记录。0 表示没有匹配出货记录，不代表当天数据已上传。</p>
+      <p className="text-xs text-slate-500">按 Auto Deduct 出货文件名日期统计；无文件日期时使用确认扣库当天（纽约时间）。排除已撤回记录。0 表示没有匹配出货记录，不代表当天数据已上传。</p>
       {!report.rows.length ? <p>所选款号在此期间没有有效出货记录。</p> : <div className="overflow-x-auto"><table className="min-w-full text-sm"><thead><tr>{['颜色','尺码',...report.dates,'合计'].map(label=><th className="p-2 whitespace-nowrap" key={label}>{label}</th>)}</tr></thead><tbody>
         {report.rows.map(row=><tr className="border-t" key={JSON.stringify([row.color,row.size])}><td className="p-2">{row.color}</td><td className="p-2">{row.size}</td>{report.dates.map(day=><td className="p-2 text-right" key={day}>{row.byDay[day]||0}</td>)}<td className="p-2 font-semibold text-right">{row.total}</td></tr>)}
         <tr className="border-t font-semibold"><td className="p-2" colSpan={2}>TOTAL</td>{report.dailyTotals.map((qty,index)=><td className="p-2 text-right" key={report.dates[index]}>{qty}</td>)}<td className="p-2 text-right">{report.total}</td></tr>
