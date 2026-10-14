@@ -1,16 +1,29 @@
-import React, { useState, useMemo } from 'react'
+import React, { useEffect, useState, useMemo } from 'react'
 import { ChevronUp, ChevronDown, ChevronLeft, ChevronRight } from 'lucide-react'
 
 export default function DataTable({
   data = [],
   columns = [],
   pageSize = 50,
+  resetPageKey,
   rowClassName,
+  onRowClick,
+  getRowKey,
   emptyMessage = 'No data to display',
 }) {
   const [sortKey, setSortKey] = useState(null)
   const [sortDir, setSortDir] = useState('asc')
   const [page, setPage] = useState(0)
+
+  const hasResetPageKey = resetPageKey !== undefined
+
+  useEffect(() => {
+    if (hasResetPageKey) setPage(0)
+  }, [hasResetPageKey, resetPageKey])
+
+  useEffect(() => {
+    if (!hasResetPageKey) setPage(0)
+  }, [data, hasResetPageKey])
 
   const handleSort = (key) => {
     if (sortKey === key) {
@@ -35,6 +48,10 @@ export default function DataTable({
 
   const totalPages = Math.ceil(sorted.length / pageSize)
   const paginated = sorted.slice(page * pageSize, (page + 1) * pageSize)
+
+  useEffect(() => {
+    setPage((current) => Math.min(current, Math.max(totalPages - 1, 0)))
+  }, [totalPages])
 
   const SortIcon = ({ colKey }) => {
     if (sortKey !== colKey)
@@ -81,10 +98,11 @@ export default function DataTable({
           <tbody className="divide-y divide-slate-100">
             {paginated.map((row, idx) => (
               <tr
-                key={idx}
+                key={getRowKey ? getRowKey(row) : idx}
+                onClick={() => onRowClick?.(row)}
                 className={`group hover:bg-slate-50 transition-colors ${
                   rowClassName ? rowClassName(row) : ''
-                }`}
+                } ${onRowClick ? 'cursor-pointer' : ''}`}
               >
                 {columns.map((col) => (
                   <td
