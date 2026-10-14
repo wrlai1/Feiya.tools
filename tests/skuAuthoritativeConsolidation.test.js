@@ -22,3 +22,11 @@ test('attribute lists cannot expand a single SKU or fill missing SKU sizes; expl
   const duplicate=consolidateRows([{SKU:'0015Black&BlackM',Quantity:1}])
   assert.equal(duplicate.consolidated[0].QTY,2)
 })
+
+test('numeric color codes touching plus-size suffixes require review without using attributes', () => {
+  const input={ 'SKU货号':'5010149RoyalWine&BrownBlackBlue&21XL', '应履约件数':1, '商品属性':'RoyalWine&BrownBlackBlue&21 / XL' }
+  const result=consolidateRows([input])
+  assert.equal(result.needsReview.length,3)
+  assert.ok(result.needsReview.every(row=>row.parse_issue.includes('ambiguous_size_suffix')))
+  assert.deepEqual(result,consolidateRows([{...input,'商品属性':''}]))
+})

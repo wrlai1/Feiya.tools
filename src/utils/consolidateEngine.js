@@ -117,6 +117,9 @@ export function parseStyleColorSize(raw) {
   if (rest === '') issues.push('missing_color_size')
   if (size === '') issues.push('no_size_suffix_match')
   if (color === '' && size !== '') issues.push('empty_color')
+  // A numeric color touching a plus-size suffix can also be a longer color
+  // code followed by XL/X. The SKU alone cannot resolve that boundary.
+  if (/^[1-3]X(?:L)?$/i.test(size) && /\d$/.test(color)) issues.push('ambiguous_size_suffix')
 
   return { style, color, size, issue: issues.join(';') }
 }

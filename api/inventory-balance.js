@@ -442,15 +442,16 @@ export default async function handler(req, res) {
 
     if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
 
-    await ensureTables(sql)
-    await inventorySkuCorrection.ensureCorrectionTable(sql)
-
     if (req.method === 'GET' && action === 'sku-audit') {
       const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1)
       const items = await sql`SELECT orders.order_number, orders.source_hash, orders.source_file, orders.inventory_status, items.sku_code, items.attributes, items.quantity, items.sku_id
         FROM return_orders orders JOIN return_order_items items ON items.order_id=orders.id ORDER BY orders.id, items.id LIMIT 1001 OFFSET ${(page - 1) * 1000}`
       return res.json({ items: items.slice(0, 1000), more: items.length > 1000, page })
     }
+
+    await ensureTables(sql)
+    await inventorySkuCorrection.ensureCorrectionTable(sql)
+
     if (action === 'sku-correction' && ['GET','POST'].includes(req.method)) {
       try {
         const preview = await inventorySkuCorrection.correctionPreview(sql)
