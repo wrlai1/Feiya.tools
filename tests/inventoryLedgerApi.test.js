@@ -73,6 +73,14 @@ test('actual APIs persist Minimum overrides and selected return business dates',
     // Exercise actual cron/report/provider handoff entirely locally: no real
     // recipients, provider requests or production records are touched.
     const oldFetch = globalThis.fetch
+    const [receiptSku] = (await db.query("SELECT id,style,color,size,quantity FROM inventory_balance WHERE style='0055' AND size='S'")).rows
+    const receiptBody = { reference: 'LOCAL-DELIVERY', rows: [{ ...receiptSku, quantity: 20 }] }
+    assert.equal((await call(balanceHandler, 'receive', receiptBody, { headers: {} })).code, 401)
+    assert.equal((await call(balanceHandler, 'receive', { ...receiptBody, reference: '' })).code, 400)
+    assert.equal((await call(balanceHandler, 'receive', receiptBody)).code, 200)
+    assert.equal((await db.query('SELECT quantity FROM inventory_balance WHERE id=$1', [receiptSku.id])).rows[0].quantity, receiptSku.quantity + 20)
+    assert.equal((await call(balanceHandler, 'receive', receiptBody)).code, 409)
+    assert.equal((await db.query('SELECT quantity FROM inventory_balance WHERE id=$1', [receiptSku.id])).rows[0].quantity, receiptSku.quantity + 20)
     const emailKeys = ['CRON_SECRET', 'RESEND_API_KEY', 'INVENTORY_EMAIL_FROM']
     const oldEmailEnv = Object.fromEntries(emailKeys.map((key) => [key, process.env[key]]))
     process.env.CRON_SECRET = 'test-cron'

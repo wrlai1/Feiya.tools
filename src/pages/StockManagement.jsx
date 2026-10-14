@@ -1,3 +1,4 @@
+import InventoryReceipt from '../components/InventoryReceipt.jsx'
 import ShipmentRangeReport from '../components/ShipmentRangeReport.jsx'
 import React, { useState, useMemo, useCallback, useEffect, useTransition } from 'react'
 import {
@@ -1442,6 +1443,7 @@ export default function StockManagement() {
   const [isPending,      startTransition]   = useTransition()
   const [serverError,    setServerError]    = useState(null)
   const [resetting,      setResetting]      = useState(false)
+  const [showReceipt, setShowReceipt] = useState(false)
   const [showImport,     setShowImport]     = useState(false)
   const [showAddRows,    setShowAddRows]    = useState(false)
   const [showRemoveRows, setShowRemoveRows] = useState(false)
@@ -1766,6 +1768,7 @@ export default function StockManagement() {
 
   return (
     <div className="space-y-6 max-w-7xl">
+      {showReceipt && <InventoryReceipt inventory={allRows} getToken={getToken} onClose={() => setShowReceipt(false)} onDone={loadBalance} />}
       {showImport && (
         <ImportModal onClose={() => setShowImport(false)} onDone={loadBalance} getToken={getToken} />
       )}
@@ -1822,6 +1825,7 @@ export default function StockManagement() {
             </button>
             {initialized && (
             <>
+              <button onClick={() => setShowReceipt(true)} className="btn-secondary text-sm"><Plus className="w-4 h-4" />批量进货入库</button>
               <button onClick={() => setShowAddRows(true)} className="btn-secondary text-sm">
                 <Plus className="w-4 h-4" />
                 Add Styles

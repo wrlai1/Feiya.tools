@@ -1,3 +1,4 @@
+import inventoryReceipt from '../lib/inventoryReceipt.cjs'
 import shipmentRange from '../lib/shipmentDateRange.cjs'
 import returnDate from '../lib/returnBusinessDate.cjs'
 // api/inventory-balance.js
@@ -440,6 +441,14 @@ export default async function handler(req, res) {
     if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
 
     await ensureTables(sql)
+
+    if (req.method === 'POST' && action === 'receive') {
+      let receipt
+      try { receipt = inventoryReceipt.normalizeReceipt(req.body) } catch (error) { return res.status(400).json({ error: error.message }) }
+      const result = await inventoryReceipt.receiveInventory(sql, receipt, payload.username)
+      if (!Number(result.updated)) return res.status(409).json({ error: result.duplicate ? '此入库单号已使用，没有重复增加库存。请核对入库单号。' : '库存行已变化或数量超出限制，没有修改库存。请重新下载模板。' })
+      return res.json({ ok: true, updated: result.updated, rows: result.rows, received: receipt.total })
+    }
 
     // ── GET list ──────────────────────────────────────────────────────────────
     if (req.method === 'GET' && action === 'list') {
