@@ -845,6 +845,7 @@ export default function AutoDeduct() {
           currentFile={srcFile}
           onClear={() => { setSrcFile(null); setResult(null); setApplied(false); setPreviewConfirmed(false); setOrderArchive(null) }}
         />
+        <p className="text-xs text-slate-500">款式、颜色、尺码和套装组成以 SKU 货号为准，商品属性不参与解析。SKU 信息不完整或组合不明确时，需要人工核对后才能扣库。</p>
 
         {!aliasesError && (
           <div className={`flex items-center gap-2 text-xs ${aliasesLoading || aliasesSaving ? 'text-amber-700' : 'text-green-700'}`}>

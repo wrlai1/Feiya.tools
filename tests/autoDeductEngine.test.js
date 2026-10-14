@@ -319,17 +319,15 @@ test('known style routing keeps previously confirmed source color links valid', 
   )
 })
 
-test('SKU and product-attribute size or ampersand color conflicts require review', () => {
+test('SKU dimensions remain authoritative when product attributes disagree', () => {
   const result = consolidateRows([
     { SKU: '73086mid1XL', 'Product Attribute': '孔雀蓝 / XL', Quantity: 2 },
     { SKU: 'M022Black&WhiteM', 'Product Attribute': 'Black&Khaki / M', Quantity: 1 },
   ])
 
-  assert.equal(result.needsReview.length, 3)
-  assert.ok(result.needsReview.some((row) => row.parse_issue === 'sku_attribute_size_conflict'))
-  assert.ok(result.needsReview.every((row) =>
-    /sku_attribute_size_conflict|sku_attribute_color_conflict/.test(row.parse_issue)
-  ))
+  assert.equal(result.needsReview.length, 0)
+  assert.equal(result.consolidated.find(row=>row.style==='73086').size,'1XL')
+  assert.deepEqual(result.consolidated.filter(row=>row.style==='M022').map(row=>row.color),['black','white'])
 })
 
 test('skipped review rows count every physical component', () => {
@@ -807,12 +805,12 @@ test('learned mapping cannot bypass a source parsing warning', () => {
   assert.equal(result.unmatchedRows[0].parseIssue, 'ambiguous_style')
 })
 
-test('a reviewed dimension is reused across source signatures without bypassing a missing target', () => {
-  const firstSource = consolidateRows([{
+test('legacy reviewed dimensions remain protected while new SKU-only rows ignore attributes', () => {
+  const firstSource = { ...consolidateRows([{
     SKU: 'A100BlackS',
     'Product Attribute': 'Black / M',
     Quantity: 2,
-  }]).consolidated[0]
+  }]).consolidated[0], parse_issue: 'sku_attribute_size_conflict', source_signature: 'legacy attribute review' }
   assert.equal(firstSource.parse_issue, 'sku_attribute_size_conflict')
   assert.ok(firstSource.source_signature)
 

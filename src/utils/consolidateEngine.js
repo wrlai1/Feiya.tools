@@ -170,43 +170,6 @@ function businessDayValue(value) {
     : ''
 }
 
-function attributeParts(raw) {
-  const parts = String(raw || '').split('/').map(x => x.trim())
-  const colorText = parts[0] || ''
-  const sizeText = parts.at(-1) || ''
-  const sizeMatch = sizeText.toUpperCase().match(/(?:^|\s)(PXL|PL|PM|PS|3XL|2XL|1XL|XXL|XL|XXS|XS|3X|2X|1X|24W|22W|20W|18W|16W|14W|16P|14P|12P|10P|8P|6P|16R|14R|12R|10R|8R|6R|24|22|20|18|16|14|12|10|8|6|4|2|L|M|S)$/)
-  return {
-    colors: colorText.includes('&') ? colorText.split('&').map(x => x.trim().toLowerCase()).filter(Boolean) : [],
-    size: sizeMatch?.[1] || '',
-    packCount: Number(colorText.match(/\b([2-9])\s*[- ]?(?:piece|pack)\b/i)?.[1] || 0),
-    mentionsSet: /\bset\b/i.test(colorText),
-  }
-}
-
-function normalizedColorList(colors) {
-  return colors
-    .map((color) => String(color || '').toLowerCase().replace(/[^a-z0-9]/g, ''))
-    .filter(Boolean)
-    .sort()
-}
-
-function hasSizeConflict(skuSize, attributeSize) {
-  const sku = String(skuSize || '').trim().toUpperCase()
-  const attr = String(attributeSize || '').trim().toUpperCase()
-  if (!sku || !attr) return false
-
-  const plus = (value) => /^(1X|1XL|2X|2XL|3X|3XL|\d+W)$/.test(value)
-  if (plus(sku) !== plus(attr)) return true
-  if (plus(sku)) {
-    return sku.replace(/^([123])XL$/, '$1X') !== attr.replace(/^([123])XL$/, '$1X')
-  }
-
-  // Numeric and petite labels use style-specific grids in TEMU. Only compare
-  // plain Missy labels when both sides use that same unambiguous grid.
-  const missy = /^(XXS|XS|S|M|L|XL|XXL)$/
-  return missy.test(sku) && missy.test(attr) && sku !== attr
-}
-
 function sourceReviewSignature(rawStyle, rawAttribute) {
   const clean = (value) => String(value || '').trim().toLowerCase().replace(/\s+/g, ' ')
   return JSON.stringify([clean(rawStyle), clean(rawAttribute)])
@@ -219,7 +182,6 @@ export function consolidateRows(rows) {
   if (!rows.length) throw new Error('文件是空的')
   const styleKey = findKey(rows[0], 'Style', ['SKU', 'SKU货号'])
   const qtyKey = findKey(rows[0], 'Quantity', ['Qty', 'QTY', '数量', '件数', '应履约件数'])
-  const attrKey = findKey(rows[0], 'Product Attribute', ['商品属性', 'Attributes'])
   const dateKey = findKey(rows[0], 'Order Created At', ['订单创建时间'])
   if (!styleKey) throw new Error('找不到 Style/SKU 列')
   if (!qtyKey) throw new Error('找不到 Quantity/Qty/数量 列')
@@ -248,31 +210,14 @@ export function consolidateRows(rows) {
   // 解析每一行
   let parsed = productRows.map((r) => {
     const rawStyle = String(r[styleKey] ?? '').trim()
-    const rawAttr = attrKey ? String(r[attrKey] ?? '').trim() : ''
     const qty = Number(r[qtyKey]) || 0
     const p = parseStyleColorSize(rawStyle)
-    const attr = attributeParts(rawAttr)
-    if (p.size && attr.size && hasSizeConflict(p.size, attr.size)) {
-      p.issue = appendIssue(p.issue, 'sku_attribute_size_conflict')
-    }
-    const skuColors = p.color.includes('&')
-      ? normalizedColorList(p.color.split('&'))
-      : []
-    const attrColors = normalizedColorList(attr.colors)
-    if (skuColors.length > 1 && attrColors.length > 1 && skuColors.join('|') !== attrColors.join('|')) {
-      p.issue = appendIssue(p.issue, 'sku_attribute_color_conflict')
-    }
-    if (!p.size && attr.size) {
-      p.size = attr.size
-      p.color = p.color.replace(/\s+sx$/i, '').trim()
-      p.issue = p.issue.split(';').filter(x => x !== 'no_size_suffix_match').join(';')
-    }
+    // Inventory identity and component counts come only from the SKU.
+    // Missing/ambiguous SKU dimensions require review, never attribute guesses.
     return {
       rawStyle,
-      rawAttr,
-      sourceSignature: sourceReviewSignature(rawStyle, rawAttr),
+      sourceSignature: sourceReviewSignature(rawStyle, ''),
       qty,
-      attr,
       packCount: 1,
       businessDay: businessDayValue(dateKey ? r[dateKey] : ''),
       ...p,
@@ -315,11 +260,6 @@ export function consolidateRows(rows) {
   // rows still require an exact database match later. Other combo formats review.
   const expanded = []
   for (const p of parsed) {
-    if (p.attr.colors.length > 1) {
-      for (const color of p.attr.colors) expanded.push({ ...p, color, issue: p.issue, packCount: 1 })
-      continue
-    }
-
     const ampersandColors = p.color.split('&').map(x => x.trim()).filter(Boolean)
     if (ampersandColors.length > 1) {
       for (const color of ampersandColors) expanded.push({ ...p, color, issue: p.issue, packCount: 1 })
@@ -351,10 +291,10 @@ export function consolidateRows(rows) {
       }
     }
 
-    const unknownSet = p.attr.packCount > 1 || p.attr.mentionsSet || /set/i.test(p.color)
+    const unknownSet = /set/i.test(p.color)
     expanded.push({
       ...p,
-      packCount: p.attr.packCount || 1,
+      packCount: 1,
       issue: unknownSet ? appendIssue(p.issue, 'set_components_unknown') : p.issue,
     })
   }
