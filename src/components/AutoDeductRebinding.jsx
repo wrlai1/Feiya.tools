@@ -68,21 +68,21 @@ export default function AutoDeductRebinding({ getToken, onClose, onSaved, onSave
       </div>
       <p className="text-sm text-slate-600">选择出货款式和颜色，将同一原目标的已保存匹配一起改到新库存目标。尺码沿用原规则；保存后需重新运行 Auto-Fill 核对。已确认扣库存的记录保留，保存匹配不会增减库存。</p>
       {loading ? <p className="text-sm text-slate-500">正在加载匹配和当前库存…</p> : <>
-        <input aria-label="搜索已保存匹配" value={search} disabled={saving} onChange={(event) => setSearch(event.target.value)} placeholder="搜索款式或颜色，例如 5020090" className="input w-full" />
+        <input aria-label="搜索已保存匹配" value={search} disabled={saving} onChange={(event) => { setSearch(event.target.value); setGroupId(''); setReviewed(false) }} placeholder="搜索款式或颜色，例如 5020090" className="input-base" />
         <label className="block text-sm font-medium">原匹配
-          <select aria-label="原匹配" value={groupId} disabled={saving} onChange={(event) => { setGroupId(event.target.value); setReviewed(false) }} className="input mt-1 w-full">
+          <select aria-label="原匹配" value={groupId} disabled={saving} onChange={(event) => { setGroupId(event.target.value); setReviewed(false) }} className="input-base mt-1">
             <option value="">请选择（{filtered.length} 组）</option>
             {filtered.map((group) => <option key={group.id} value={group.id}>{group.sourceStyle} / {group.sourceColor} → {group.targetStyle} / {group.targetColor}（{group.keys.length} 条）</option>)}
           </select>
         </label>
         <div className="grid grid-cols-2 gap-3">
           <label className="text-sm font-medium">新库存款式
-            <select aria-label="新库存款式" disabled={saving} value={style} onChange={(event) => { setStyle(event.target.value); setColor(''); setReviewed(false) }} className="input mt-1 w-full">
+            <select aria-label="新库存款式" disabled={saving} value={style} onChange={(event) => { setStyle(event.target.value); setColor(''); setReviewed(false) }} className="input-base mt-1">
               <option value="">请选择</option>{styles.map((item) => <option key={item}>{item}</option>)}
             </select>
           </label>
           <label className="text-sm font-medium">新库存颜色
-            <select aria-label="新库存颜色" disabled={saving || !style} value={color} onChange={(event) => { setColor(event.target.value); setReviewed(false) }} className="input mt-1 w-full">
+            <select aria-label="新库存颜色" disabled={saving || !style} value={color} onChange={(event) => { setColor(event.target.value); setReviewed(false) }} className="input-base mt-1">
               <option value="">请选择</option>{colors.map((item) => <option key={item}>{item}</option>)}
             </select>
           </label>

@@ -730,7 +730,9 @@ export default function AutoDeduct() {
         />
       )}
       {showRebinding && <AutoDeductRebinding getToken={getToken} onClose={() => setShowRebinding(false)}
-        onSaveError={setAliasesError} onSaved={(verified, count) => {
+        onSaveError={(message) => {
+          setAliasesError(message); setResult(null); setResolvedExtras(null); setPreviewConfirmed(false)
+        }} onSaved={(verified, count) => {
           setAliases(verified); setAliasesError(null); setShowRebinding(false)
           setResult(null); setResolvedExtras(null); setSkippedRows([]); setEditingResolutions(false)
           setResolutionAliasKeys([]); setPreviewConfirmed(false)
