@@ -30,3 +30,18 @@ test('numeric color codes touching plus-size suffixes require review without usi
   assert.ok(result.needsReview.every(row=>row.parse_issue.includes('ambiguous_size_suffix')))
   assert.deepEqual(result,consolidateRows([{...input,'商品属性':''}]))
 })
+
+test('confirmed compact SKU set codes expand across sizes, without attribute inference or other-style changes',()=>{
+  for(const size of ['S','M','L','XL'])for(const [sku,colors] of [['50340BlackWhite',['black','white']],['0071BachelorNavyWht',['bachelorbutton','navy','white']]]){
+    const row={SKU:sku+size,Quantity:2,'商品属性':'Incorrect Color / 3XL'}
+    const result=consolidateRows([row])
+    assert.deepEqual(result.consolidated.map(r=>r.color).sort(),colors.slice().sort())
+    assert.ok(result.consolidated.every(r=>r.size===size&&r.QTY===2))
+    assert.equal(result.stats.newTotal,colors.length*2)
+    assert.equal(result.needsReview.length,0)
+    assert.deepEqual(result,consolidateRows([{SKU:row.SKU,Quantity:2}]))
+  }
+  const other=consolidateRows([{SKU:'95536BlackWhiteL',Quantity:1,'商品属性':'Black&White / L'}])
+  assert.equal(other.consolidated.length,1)
+  assert.equal(other.consolidated[0].color,'blackwhite')
+})

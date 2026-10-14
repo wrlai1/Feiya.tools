@@ -39,6 +39,12 @@ const STYLE_NORMALIZE = {
 }
 
 // TEMU petite labels run one size larger than the physical inventory labels.
+// User-confirmed SKU component codes. Attributes never define these pieces.
+const SKU_COMPONENTS = {
+  '50340|blackwhite': ['black', 'white'],
+  '0071|bachelornavywht': ['bachelorbutton', 'navy', 'white'],
+}
+
 const IMPORT_SIZE_NORMALIZE = { PS: 'PS', PM: 'PS', PL: 'PM', PXL: 'PL' }
 
 function normalizeImportedSize(size) {
@@ -263,6 +269,11 @@ export function consolidateRows(rows) {
   // rows still require an exact database match later. Other combo formats review.
   const expanded = []
   for (const p of parsed) {
+    const components = SKU_COMPONENTS[`${p.style.toUpperCase()}|${p.color.replace(/\s+/g, '')}`]
+    if (components) {
+      for (const color of components) expanded.push({ ...p, color, packCount: 1 })
+      continue
+    }
     const ampersandColors = p.color.split('&').map(x => x.trim()).filter(Boolean)
     if (ampersandColors.length > 1) {
       for (const color of ampersandColors) expanded.push({ ...p, color, issue: p.issue, packCount: 1 })
