@@ -13,6 +13,7 @@
 
 import { neon } from '@neondatabase/serverless'
 import authentication from '../lib/authentication.cjs'
+import { rebindSavedAliases } from '../lib/autoDeductRebinding.js'
 
 const { authenticateUser } = authentication
 
@@ -198,6 +199,12 @@ export default async function handler(req, res) {
         payload.username,
       )
       return res.json({ ok: true, count: Number(saved?.count || 0) })
+    }
+
+    if (req.method === 'POST' && action === 'rebind-aliases') {
+      const result = await rebindSavedAliases(sql, req.body, payload.username)
+      const { status, ...data } = result
+      return res.status(status).json(data)
     }
 
     // ── POST apply ──────────────────────────────────────────────────────────

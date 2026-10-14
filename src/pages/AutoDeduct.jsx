@@ -6,6 +6,7 @@ import {
 } from 'lucide-react'
 import FileUploadZone from '../components/FileUploadZone.jsx'
 import UnmatchedResolver from '../components/UnmatchedResolver.jsx'
+import AutoDeductRebinding from '../components/AutoDeductRebinding.jsx'
 import { useToast } from '../hooks/useToast.js'
 import { useAuth } from '../context/AuthContext.jsx'
 import {
@@ -213,6 +214,7 @@ export default function AutoDeduct() {
   const [configError,     setConfigError]     = useState(null)
   const [templateMissing, setTemplateMissing] = useState(false)
   const [showSettings,    setShowSettings]    = useState(false)
+  const [showRebinding, setShowRebinding] = useState(false)
   const [aliases,         setAliases]         = useState({})
   const [aliasesLoading,  setAliasesLoading]  = useState(true)
   const [aliasesSaving,   setAliasesSaving]   = useState(false)
@@ -727,6 +729,13 @@ export default function AutoDeduct() {
           onUploaded={() => setTemplateMissing(false)}
         />
       )}
+      {showRebinding && <AutoDeductRebinding getToken={getToken} onClose={() => setShowRebinding(false)}
+        onSaveError={setAliasesError} onSaved={(verified, count) => {
+          setAliases(verified); setAliasesError(null); setShowRebinding(false)
+          setResult(null); setResolvedExtras(null); setSkippedRows([]); setEditingResolutions(false)
+          setResolutionAliasKeys([]); setPreviewConfirmed(false)
+          toast.success(`已更新 ${count} 条匹配，请重新运行 Auto-Fill 核对`, '重新绑定已保存')
+        }} />}
 
       {/* Header */}
       <div className="flex items-start justify-between">
@@ -737,6 +746,9 @@ export default function AutoDeduct() {
           </p>
         </div>
         <div className="flex items-center gap-2">
+          <button disabled={processing || applying || aliasesLoading || aliasesSaving} onClick={() => setShowRebinding(true)} className="btn-secondary text-sm disabled:opacity-50">
+            <RefreshCw className="w-4 h-4" />重新绑定
+          </button>
           <Link to="/auto-deduct/history" className="btn-secondary text-sm">
             <History className="w-4 h-4" />
             History

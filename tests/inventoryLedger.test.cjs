@@ -50,11 +50,9 @@ test('Minimum uploads reject missing, negative and duplicate SKUs and preserve l
   assert.throws(() => normalizeMinimumRows([{ ...sku, minimum: 1 }, { ...sku, color: 'black', minimum: 2 }]), /Duplicate/)
 })
 
-test('retains every starting SKU and makes missing current balances unavailable', () => {
+test('starting SKUs absent from current inventory are excluded', () => {
   const ledger = buildLedger({ source, reportDate: source.cutoff })
-  assert.equal(ledger.rows.length, source.rows.length)
-  assert.equal(ledger.rows[0].quantity, null)
-  assert.equal(ledger.rows[0].replenishment, null)
+  assert.deepEqual(ledger.rows, [])
 })
 
 test('workbook retains dated IN/OUT and actual return dates with live replenishment formula', async () => {
