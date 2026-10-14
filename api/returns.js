@@ -1,3 +1,4 @@
+import { returnMappingMigration } from '../lib/returnMappingMigration.js'
 import { neon } from '@neondatabase/serverless'
 import authentication from '../lib/authentication.cjs'
 import inventoryTargetResolution from '../lib/inventoryTargetResolution.cjs'
@@ -661,6 +662,8 @@ export default async function handler(req, res) {
     )
     if (!payload) return res.status(401).json({ error: 'Not authenticated' })
     const action = String(req.query.action || '')
+
+    if (req.method === 'POST' && ['catalog-migrate-preview', 'catalog-migrate-apply'].includes(action)) return returnMappingMigration(req, res, sql, payload)
 
     if (req.method === 'POST' && action === 'catalog-import') {
       if (payload.role !== 'admin') return res.status(403).json({ error: 'Admin access required' })

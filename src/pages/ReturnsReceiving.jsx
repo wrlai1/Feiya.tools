@@ -1,3 +1,4 @@
+import ReturnMappingMigration from '../components/ReturnMappingMigration.jsx'
 import InventoryStyleSearch from '../components/InventoryStyleSearch.jsx'
 import { updateReturnMappingTarget, newReturnMappingTarget } from '../utils/returnMappingDefaults.js'
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -468,6 +469,7 @@ export default function ReturnsReceiving() {
   const [stores, setStores] = useState([])
   const [storeLoadError, setStoreLoadError] = useState('')
   const [storeName, setStoreName] = useState('')
+  const [showMappingMigration, setShowMappingMigration] = useState(false)
   const [catalogFile, setCatalogFile] = useState(null)
   const [catalogParsed, setCatalogParsed] = useState(null)
   const [catalogUploading, setCatalogUploading] = useState(false)
@@ -1323,6 +1325,18 @@ export default function ReturnsReceiving() {
     } finally {
       setCatalogUploading(false)
     }
+  }
+
+  const onMappingsMigrated = async (mappings) => {
+    const changedItems = new Map(mappings.flatMap(row => row.pending).map(item => [String(item.id), item]))
+    setPkg(current => current ? { ...current, items: (current.items || []).map(item => {
+      const change = changedItems.get(String(item.id))
+      if (!change) return item
+      const mapping = mappings.find(row => row.pending.some(pending => String(pending.id) === String(item.id)))
+      return { ...item, style: change.new_style, color: change.new_color, size: change.new_size, catalog_components: mapping.components }
+    }) } : current)
+    await Promise.all([loadSavedSets(storeName, savedSetSearch), loadRecent(), loadReviewPackages()])
+    toast.success('已保存匹配和未确认包裹已迁移，库存数量未改变。', '匹配已更新')
   }
 
   const startEditingSavedSet = async (row) => {
@@ -3094,6 +3108,8 @@ export default function ReturnsReceiving() {
                 </div>
                 <div>
                   <h3 className="font-semibold text-slate-900">Saved mappings / 已保存匹配</h3>
+                  <button type="button" disabled={!storeName} onClick={() => setShowMappingMigration(true)} className="btn-secondary mt-2">批量更换库存款式</button>
+                  {showMappingMigration && <ReturnMappingMigration storeName={storeName} getToken={getToken} onClose={() => setShowMappingMigration(false)} onDone={onMappingsMigrated} />}
                   <p className="mt-1 text-sm text-slate-500">
                     Search and edit saved products or sets. Manual PO matches appear here too.
                   </p>
