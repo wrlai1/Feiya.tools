@@ -1,0 +1,47 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import {consolidateRows} from '../src/utils/consolidateEngine.js'
+
+test('four disputed orders allocate one Black and one Navy per SKU, preserving sixteen total pieces',()=>{
+  const rows=['M','M','S','XL'].map(size=>({SKU:`0015Navy&Sahara&Black&Yellow ${size}`,'Product Attribute':`Black&Sahara&Black&Yellow / ${size}`,Quantity:1}))
+  const original=JSON.stringify(rows),result=consolidateRows(rows)
+  const sum=color=>result.consolidated.filter(r=>r.color===color).reduce((s,r)=>s+r.QTY,0)
+  assert.equal(sum('black'),4);assert.equal(sum('navy'),4)
+  assert.equal(sum('sahara'),4);assert.equal(sum('yellow'),4)
+  assert.equal(result.stats.newTotal,16);assert.equal(result.needsReview.length,0)
+  assert.equal(JSON.stringify(rows),original)
+  assert.deepEqual(consolidateRows(rows.map(({SKU,Quantity})=>({SKU,Quantity}))).consolidated,result.consolidated)
+})
+
+test('attribute lists cannot expand a single SKU or fill missing SKU sizes; explicit duplicate SKU components remain valid',()=>{
+  const single=consolidateRows([{SKU:'0015BlackS','Product Attribute':'Black&Navy&White / XL',Quantity:2}])
+  assert.equal(single.stats.newTotal,2);assert.equal(single.consolidated.length,1)
+  assert.equal(single.consolidated[0].size,'S')
+  const missing=consolidateRows([{SKU:'0015Black','Product Attribute':'Black / M',Quantity:1}])
+  assert.equal(missing.consolidated[0].size,'');assert.ok(missing.needsReview.length)
+  const duplicate=consolidateRows([{SKU:'0015Black&BlackM',Quantity:1}])
+  assert.equal(duplicate.consolidated[0].QTY,2)
+})
+
+test('numeric color codes touching plus-size suffixes require review without using attributes', () => {
+  const input={ 'SKU货号':'5010149RoyalWine&BrownBlackBlue&21XL', '应履约件数':1, '商品属性':'RoyalWine&BrownBlackBlue&21 / XL' }
+  const result=consolidateRows([input])
+  assert.equal(result.needsReview.length,3)
+  assert.ok(result.needsReview.every(row=>row.parse_issue.includes('ambiguous_size_suffix')))
+  assert.deepEqual(result,consolidateRows([{...input,'商品属性':''}]))
+})
+
+test('confirmed compact SKU set codes expand across sizes, without attribute inference or other-style changes',()=>{
+  for(const size of ['S','M','L','XL'])for(const [sku,colors] of [['50340BlackWhite',['black','white']],['0071BachelorNavyWht',['bachelorbutton','navy','white']]]){
+    const row={SKU:sku+size,Quantity:2,'商品属性':'Incorrect Color / 3XL'}
+    const result=consolidateRows([row])
+    assert.deepEqual(result.consolidated.map(r=>r.color).sort(),colors.slice().sort())
+    assert.ok(result.consolidated.every(r=>r.size===size&&r.QTY===2))
+    assert.equal(result.stats.newTotal,colors.length*2)
+    assert.equal(result.needsReview.length,0)
+    assert.deepEqual(result,consolidateRows([{SKU:row.SKU,Quantity:2}]))
+  }
+  const other=consolidateRows([{SKU:'95536BlackWhiteL',Quantity:1,'商品属性':'Black&White / L'}])
+  assert.equal(other.consolidated.length,1)
+  assert.equal(other.consolidated[0].color,'blackwhite')
+})

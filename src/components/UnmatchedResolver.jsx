@@ -1,12 +1,51 @@
-import React, { useState, useMemo } from 'react'
-import { Search, Plus, SkipForward, CheckCircle, X, Link2 } from 'lucide-react'
+import React, { useEffect, useState, useMemo } from 'react'
+import { Search, Plus, SkipForward, CheckCircle, X, Link2, ChevronDown, RotateCcw } from 'lucide-react'
+import { findAdditionalComboSizeMappings, findAdditionalSizeMappings } from '../utils/autoDeductRules.js'
+
+const REVIEW_REASONS = {
+  style_identity_mismatch: 'The style punctuation differs from inventory, so it was not matched automatically.',
+  ambiguous_inventory_style: 'More than one inventory style could match this source style.',
+  ambiguous_inventory_color: 'More than one inventory color has the same cleaned identity.',
+  confirmed_mapping_requires_review: 'This saved mapping changes style or uses a combo and must be confirmed again.',
+  confirmed_mapping_size_missing: 'The previously confirmed target does not contain this exact size.',
+  confirmed_new_target_missing: 'This previously created inventory target no longer exists. Choose an existing target or confirm Create new entry again.',
+  m022_size_unknown: 'M022 must use S–XL for Missy or 1X–3X for Plus.',
+  sku_attribute_size_conflict: 'The SKU size and Product Attribute size disagree. Confirm whether this is Missy, Plus, or Petite.',
+  sku_attribute_color_conflict: 'The SKU color combination and Product Attribute color combination disagree.',
+  ambiguous_color_separator: 'This SKU uses "/" instead of the confirmed "&" color format. The system cannot know whether this is one color name or multiple physical pieces. Confirm the units per sold SKU and choose the exact inventory item(s).',
+}
+
+function DeferredSearchInput({ value, onCommit, onFocus }) {
+  const [draft, setDraft] = useState(value)
+
+  useEffect(() => setDraft(value), [value])
+  useEffect(() => {
+    if (draft === value) return undefined
+    const timer = window.setTimeout(() => onCommit(draft), 180)
+    return () => window.clearTimeout(timer)
+  }, [draft, value, onCommit])
+
+  return (
+    <div className="relative">
+      <Search className="absolute left-3 top-2.5 w-3.5 h-3.5 text-slate-400 pointer-events-none" />
+      <input
+        type="text"
+        placeholder="Search template (style, color, size)…"
+        value={draft}
+        onFocus={onFocus}
+        onChange={(event) => setDraft(event.target.value)}
+        className="w-full pl-9 pr-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+      />
+    </div>
+  )
+}
 
 /**
  * Interactive panel for resolving unmatched sales rows.
  *
  * For each row the auto-matcher couldn't place, the user can:
  *   Link   — pick an existing template entry to assign the QTY to
- *   Combo  — pick multiple existing template entries; each gets the source QTY
+ *   Combo  — pick multiple existing template entries with a quantity multiplier
  *   Create — manually specify STYLE / COLOR / SIZE (new row appended to output)
  *   Skip   — discard the row
  *
@@ -20,6 +59,10 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
   const [searches,        setSearches]        = useState(() => Array(unmatchedRows.length).fill(''))
   const [createForms,     setCreateForms]     = useState(() => Array(unmatchedRows.length).fill(null))
   const [comboSelections, setComboSelections] = useState(() => Array(unmatchedRows.length).fill(null).map(() => []))
+  const [packCounts,      setPackCounts]      = useState(() => unmatchedRows.map(row => row.packCount > 1 ? row.packCount : ''))
+  const [itemModes,       setItemModes]       = useState(() => Array(unmatchedRows.length).fill(null))
+  const [activeSearch,    setActiveSearch]    = useState(null)
+  const [ruleBatches,     setRuleBatches]     = useState([])
 
   const pending   = resolved.filter(r => !r).length
   const linked    = resolved.filter(r => r?.type === 'link').length
@@ -39,12 +82,79 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
     setCreateForms(prev => { const n = [...prev]; n[i] = null; return n })
   }
 
+  function confirmLink(i, entry) {
+    const additional = findAdditionalSizeMappings({
+      unmatchedRows,
+      templateRows: normTemplate,
+      resolved,
+      sourceIndex: i,
+      targetEntry: entry,
+    })
+    const batchId = `${Date.now()}-${i}`
+    const next = [...resolved]
+    next[i] = { type: 'link', entry, batchId, isBatchSource: additional.length > 0 }
+    for (const match of additional) {
+      next[match.index] = { type: 'link', entry: match.entry, batchId, autoApplied: true }
+    }
+    setResolved(next)
+    setCreateForms(prev => { const forms = [...prev]; forms[i] = null; return forms })
+    if (additional.length) {
+      setRuleBatches(prev => [...prev, {
+        id: batchId,
+        sourceIndex: i,
+        memberIndexes: additional.map(match => match.index),
+        expanded: false,
+      }])
+    }
+  }
+
+  function undoBatch(batchId, includeSource = false) {
+    const batch = ruleBatches.find(item => item.id === batchId)
+    if (!batch) return
+    setResolved(prev => {
+      const next = [...prev]
+      for (const index of batch.memberIndexes) next[index] = null
+      if (includeSource) next[batch.sourceIndex] = null
+      else if (next[batch.sourceIndex]) next[batch.sourceIndex] = { ...next[batch.sourceIndex], batchId: undefined, isBatchSource: false }
+      return next
+    })
+    setRuleBatches(prev => prev.filter(item => item.id !== batchId))
+  }
+
+  function editBatchMember(batchId, index) {
+    setResolved(prev => { const next = [...prev]; next[index] = null; return next })
+    setRuleBatches(prev => prev.flatMap(batch => {
+      if (batch.id !== batchId) return [batch]
+      const memberIndexes = batch.memberIndexes.filter(member => member !== index)
+      return memberIndexes.length ? [{ ...batch, memberIndexes }] : []
+    }))
+    setActiveSearch(index)
+  }
+
+  function toggleBatch(batchId) {
+    setRuleBatches(prev => prev.map(batch => batch.id === batchId ? { ...batch, expanded: !batch.expanded } : batch))
+  }
+
   function unresolve(i) {
+    const batch = ruleBatches.find(item => item.sourceIndex === i || item.memberIndexes.includes(i))
+    if (batch) {
+      if (batch.sourceIndex === i) undoBatch(batch.id, true)
+      else editBatchMember(batch.id, i)
+      return
+    }
     setResolved(prev => { const n = [...prev]; n[i] = null; return n })
   }
 
   function setSearch(i, v) {
     setSearches(prev => { const n = [...prev]; n[i] = v; return n })
+  }
+
+  function chooseItemMode(i, mode) {
+    setItemModes(prev => { const next = [...prev]; next[i] = mode; return next })
+    setResolved(prev => { const next = [...prev]; next[i] = null; return next })
+    setCreateForms(prev => { const next = [...prev]; next[i] = null; return next })
+    setComboSelections(prev => { const next = [...prev]; next[i] = []; return next })
+    setActiveSearch(i)
   }
 
   function openCreate(i, row) {
@@ -82,7 +192,17 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
       const next = [...prev]
       const current = next[i] || []
       if (current.some(item => componentKey(item) === componentKey(entry))) return next
-      next[i] = [...current, entry]
+      next[i] = [...current, { ...entry, multiplier: 1 }]
+      return next
+    })
+  }
+
+  function updateComboMultiplier(i, entry, value) {
+    setComboSelections(prev => {
+      const next = [...prev]
+      next[i] = (next[i] || []).map(item => componentKey(item) === componentKey(entry)
+        ? { ...item, multiplier: Math.max(1, parseInt(value, 10) || 1) }
+        : item)
       return next
     })
   }
@@ -95,10 +215,35 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
     })
   }
 
-  function confirmCombo(i) {
+  function expectedPackCount(i) {
+    if (itemModes[i] !== 'set') return null
+    const value = parseInt(packCounts[i], 10)
+    return value > 0 ? value : null
+  }
+
+  function comboMultiplierTotal(i) {
+    return (comboSelections[i] || []).reduce((sum, component) => sum + Math.max(1, parseInt(component.multiplier, 10) || 1), 0)
+  }
+
+  function confirmCombo(i, row) {
     const components = comboSelections[i] || []
     if (!components.length) return
-    resolve(i, 'combo', { components })
+    const expected = expectedPackCount(i)
+    if (itemModes[i] !== 'set' || !expected || comboMultiplierTotal(i) !== expected) return
+    const additional = findAdditionalComboSizeMappings({
+      unmatchedRows,
+      templateRows: normTemplate,
+      resolved,
+      sourceIndex: i,
+      components,
+    })
+    const next = [...resolved]
+    next[i] = { type: 'combo', entry: { components } }
+    for (const match of additional) {
+      next[match.index] = { type: 'combo', entry: { components: match.components }, autoApplied: true }
+    }
+    setResolved(next)
+    setCreateForms(prev => { const forms = [...prev]; forms[i] = null; return forms })
   }
 
   function handleApply() {
@@ -108,15 +253,27 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
     for (const [i, row] of unmatchedRows.entries()) {
       const r = resolved[i]
       if (!r || r.type === 'skip') {
-        skipped.push({ style: row.style, color: row.color, size: row.size, qty: row.qty })
+        skipped.push({ style: row.style, color: row.color, size: row.size, qty: row.qty, packCount: row.packCount, businessDay: row.businessDay, parseIssue: row.parseIssue })
         continue
       }
       if (r.type === 'combo') {
+        const confirmedPackCount = r.entry.components.reduce((sum, component) =>
+          sum + Math.max(1, parseInt(component.multiplier, 10) || 1), 0)
         items.push({
           components: r.entry.components,
           QTY: row.qty,
           _isCombo: true,
-          _source: { style: row.style, color: row.color, size: row.size },
+          _source: {
+            style: row.style,
+            color: row.color,
+            size: row.size,
+            packCount: confirmedPackCount,
+            originalPackCount: row.packCount,
+            businessDay: row.businessDay,
+            sourceSignature: row.sourceSignature,
+            sourceIssue: row.sourceIssue,
+            parseIssue: row.parseIssue,
+          },
           _learnAlias: true,
         })
         continue
@@ -127,7 +284,15 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
         SIZE:   r.entry.SIZE,
         QTY:    row.qty,
         _isNew: r.type === 'create',
-        _source: { style: row.style, color: row.color, size: row.size },
+        _source: {
+          style: row.style,
+          color: row.color,
+          size: row.size,
+          businessDay: row.businessDay,
+          sourceSignature: row.sourceSignature,
+          sourceIssue: row.sourceIssue,
+          parseIssue: row.parseIssue,
+        },
         _learnAlias: r.type === 'link' || r.type === 'create',
       })
     }
@@ -303,8 +468,13 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
           const r        = resolved[i]
           const isCreate = !!createForms[i]
           const form     = createForms[i]
-          const matches  = getMatches(i, row)
+          const matches  = activeSearch === i && !r && !isCreate ? getMatches(i, row) : []
           const comboComponents = comboSelections[i] || []
+          const itemMode = itemModes[i]
+          const setReview = itemMode === 'set'
+          const expected = expectedPackCount(i)
+          const comboTotal = comboMultiplierTotal(i)
+          const sourceBatch = ruleBatches.find(batch => batch.sourceIndex === i)
 
           return (
             <div
@@ -320,15 +490,69 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
               {/* Sales row info */}
               <div className="flex items-center gap-2 flex-wrap">
                 <span className="font-mono text-sm font-semibold text-slate-800 bg-slate-100 px-2 py-0.5 rounded">
-                  {row.style}
+                  {row.style || row.rawStyle || 'Unknown style'}
                 </span>
                 <span className="text-sm text-slate-600">{row.color}</span>
                 <span className="text-slate-300">·</span>
                 <span className="text-sm text-slate-600">{row.size}</span>
                 <span className="ml-auto bg-orange-100 text-orange-700 text-xs font-bold px-2 py-0.5 rounded-full shrink-0">
-                  QTY {row.qty}
+                  {row.packCount > 1 ? `${row.qty} order(s) × ${row.packCount} units` : `QTY ${row.qty}`}
                 </span>
               </div>
+
+              {row.parseIssue && !r && (
+                <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                  {REVIEW_REASONS[row.parseIssue] || `Source needs review: ${row.parseIssue.replaceAll('_', ' ')}`}
+                </div>
+              )}
+
+              {!r && (
+                <div className="rounded-lg border border-blue-100 bg-blue-50/60 px-3 py-3">
+                  <p className="mb-2 text-xs font-semibold text-slate-700">
+                    Is this sold SKU one item or a set?
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => chooseItemMode(i, 'single')}
+                      className={`rounded-lg border px-3 py-1.5 text-xs font-semibold ${
+                        itemMode === 'single'
+                          ? 'border-blue-500 bg-blue-600 text-white'
+                          : 'border-blue-200 bg-white text-blue-700 hover:bg-blue-50'
+                      }`}
+                    >
+                      Single item / Not a set
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => chooseItemMode(i, 'set')}
+                      className={`rounded-lg border px-3 py-1.5 text-xs font-semibold ${
+                        itemMode === 'set'
+                          ? 'border-indigo-500 bg-indigo-600 text-white'
+                          : 'border-indigo-200 bg-white text-indigo-700 hover:bg-indigo-50'
+                      }`}
+                    >
+                      Set / Combination
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {setReview && !r && (
+                <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span>Physical pieces are not confirmed. Enter units per sold SKU, then build the exact inventory target(s):</span>
+                    <input
+                      type="number"
+                      min="1"
+                      value={packCounts[i]}
+                      onChange={(e) => setPackCounts(prev => { const next = [...prev]; next[i] = e.target.value; return next })}
+                      className="w-16 rounded border border-amber-200 bg-white px-2 py-1 text-center"
+                      placeholder="?"
+                    />
+                  </div>
+                </div>
+              )}
 
               {/* Resolved state */}
               {r ? (
@@ -341,7 +565,7 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
                       <span className="font-medium text-indigo-700">Combo set</span>
                       <span className="text-slate-400">→</span>
                       <span className="text-slate-600 truncate">
-                        {r.entry.components.map(c => `${c.STYLE}/${c.COLOR}/${c.SIZE}`).join(' + ')}
+                        {r.entry.components.map(c => `${c.STYLE}/${c.COLOR}/${c.SIZE} ×${c.multiplier || 1}`).join(' + ')}
                       </span>
                     </>
                   ) : (
@@ -367,6 +591,14 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
                     <X className="w-3.5 h-3.5" />
                   </button>
                 </div>
+              ) : !itemMode ? (
+                <button
+                  onClick={() => resolve(i, 'skip', null)}
+                  className="flex items-center gap-1.5 text-xs px-3 py-1.5 text-slate-400 hover:text-slate-600"
+                >
+                  <SkipForward className="w-3 h-3" />
+                  Skip
+                </button>
               ) : isCreate ? (
                 /* Create form */
                 <div className="space-y-2">
@@ -408,10 +640,11 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
                       <div className="flex items-center justify-between gap-2 mb-2">
                         <p className="text-xs font-medium text-indigo-700">Combo components</p>
                         <button
-                          onClick={() => confirmCombo(i)}
-                          className="btn-primary text-xs px-3 py-1.5"
+                          onClick={() => confirmCombo(i, row)}
+                          disabled={setReview && (!expected || comboTotal !== expected)}
+                          className="btn-primary text-xs px-3 py-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
                         >
-                          Confirm combo
+                          Confirm combo{setReview && expected ? ` (${comboTotal}/${expected})` : ''}
                         </button>
                       </div>
                       <div className="space-y-1.5">
@@ -422,9 +655,19 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
                             <span className="text-slate-600 truncate">{component.COLOR}</span>
                             <span className="text-slate-400">/</span>
                             <span className="text-slate-600">{component.SIZE}</span>
+                            <label className="ml-auto flex items-center gap-1 text-slate-500">
+                              ×
+                              <input
+                                type="number"
+                                min="1"
+                                value={component.multiplier || 1}
+                                onChange={(e) => updateComboMultiplier(i, component, e.target.value)}
+                                className="w-14 rounded border border-indigo-100 px-1.5 py-1 text-center"
+                              />
+                            </label>
                             <button
                               onClick={() => removeComboComponent(i, component)}
-                              className="ml-auto text-slate-300 hover:text-red-500"
+                              className="text-slate-300 hover:text-red-500"
                               title="Remove component"
                             >
                               <X className="w-3.5 h-3.5" />
@@ -435,16 +678,11 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
                     </div>
                   )}
 
-                  <div className="relative">
-                    <Search className="absolute left-3 top-2.5 w-3.5 h-3.5 text-slate-400 pointer-events-none" />
-                    <input
-                      type="text"
-                      placeholder="Search template (style, color, size)…"
-                      value={searches[i]}
-                      onChange={e => setSearch(i, e.target.value)}
-                      className="w-full pl-9 pr-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    />
-                  </div>
+                  <DeferredSearchInput
+                    value={searches[i]}
+                    onCommit={(value) => setSearch(i, value)}
+                    onFocus={() => setActiveSearch(i)}
+                  />
 
                   {/* Template matches */}
                   {matches.length > 0 && (
@@ -452,37 +690,46 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
                       {matches.map((t, j) => (
                         <div key={j} className="flex items-center">
                           <button
-                            onClick={() => resolve(i, 'link', t)}
-                            className="flex-1 text-left px-3 py-2 text-sm hover:bg-blue-50 flex items-center gap-3 min-w-0"
+                            onClick={() => { if (!setReview) confirmLink(i, t) }}
+                            disabled={setReview}
+                            className="flex-1 text-left px-3 py-2 text-sm hover:bg-blue-50 flex items-center gap-3 min-w-0 disabled:opacity-50 disabled:cursor-not-allowed"
                           >
                             <span className="font-mono font-medium text-slate-700 shrink-0 w-20 truncate">{t.STYLE}</span>
                             <span className="text-slate-500 flex-1 truncate">{t.COLOR}</span>
                             <span className="text-slate-400 shrink-0">{t.SIZE}</span>
                           </button>
-                          <button
-                            onClick={() => addComboComponent(i, t)}
-                            className="mr-2 shrink-0 rounded-md border border-indigo-100 px-2 py-1 text-xs text-indigo-600 hover:bg-indigo-50"
-                            title="Add this row to a combo set"
-                          >
-                            Set +
-                          </button>
+                          {setReview && (
+                            <button
+                              onClick={() => addComboComponent(i, t)}
+                              className="mr-2 shrink-0 rounded-md border border-indigo-100 px-2 py-1 text-xs text-indigo-600 hover:bg-indigo-50"
+                              title="Add this row to a combo set"
+                            >
+                              Set +
+                            </button>
+                          )}
                         </div>
                       ))}
                     </div>
                   )}
 
-                  {matches.length === 0 && searches[i] && (
-                    <p className="text-xs text-slate-400 px-1">No matches — try a different search or create a new entry.</p>
+                  {activeSearch === i && matches.length === 0 && searches[i] && (
+                    <p className="text-xs text-slate-400 px-1">
+                      {itemMode === 'single'
+                        ? 'No matches — try a different search or create a new entry.'
+                        : 'No matches — try a different search for each inventory item in this set.'}
+                    </p>
                   )}
 
                   <div className="flex gap-2 pt-1">
-                    <button
-                      onClick={() => openCreate(i, row)}
-                      className="flex items-center gap-1.5 text-xs px-3 py-1.5 border border-slate-200 rounded-lg hover:bg-slate-50 text-slate-600"
-                    >
-                      <Plus className="w-3 h-3" />
-                      Create new entry
-                    </button>
+                    {itemMode === 'single' && (
+                      <button
+                        onClick={() => openCreate(i, row)}
+                        className="flex items-center gap-1.5 text-xs px-3 py-1.5 border border-slate-200 rounded-lg hover:bg-slate-50 text-slate-600"
+                      >
+                        <Plus className="w-3 h-3" />
+                        Create new entry
+                      </button>
+                    )}
                     <button
                       onClick={() => resolve(i, 'skip', null)}
                       className="flex items-center gap-1.5 text-xs px-3 py-1.5 text-slate-400 hover:text-slate-600"
@@ -491,6 +738,42 @@ export default function UnmatchedResolver({ unmatchedRows, templateRows, onDone 
                       Skip
                     </button>
                   </div>
+                </div>
+              )}
+              {sourceBatch && (
+                <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900">
+                  <div className="flex items-center gap-3 flex-wrap">
+                    <CheckCircle className="w-4 h-4 text-emerald-600 shrink-0" />
+                    <span className="font-medium">
+                      Applied this rule to {sourceBatch.memberIndexes.length} additional size{sourceBatch.memberIndexes.length === 1 ? '' : 's'}
+                    </span>
+                    <div className="ml-auto flex items-center gap-2">
+                      <button onClick={() => toggleBatch(sourceBatch.id)} className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-100">
+                        Review <ChevronDown className={`w-3.5 h-3.5 transition-transform ${sourceBatch.expanded ? 'rotate-180' : ''}`} />
+                      </button>
+                      <button onClick={() => undoBatch(sourceBatch.id)} className="inline-flex items-center gap-1 rounded-lg border border-emerald-200 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50">
+                        <RotateCcw className="w-3.5 h-3.5" /> Undo
+                      </button>
+                    </div>
+                  </div>
+                  {sourceBatch.expanded && (
+                    <div className="mt-3 divide-y divide-emerald-100 rounded-lg border border-emerald-100 bg-white/80 px-3">
+                      {sourceBatch.memberIndexes.map(index => {
+                        const sibling = unmatchedRows[index]
+                        const target = resolved[index]?.entry
+                        if (!sibling || !target) return null
+                        return (
+                          <div key={index} className="flex items-center gap-2 py-2 text-xs">
+                            <span className="font-mono font-semibold text-slate-700">{sibling.style}</span>
+                            <span className="text-slate-500">{sibling.color} / {sibling.size}</span>
+                            <span className="text-slate-300">→</span>
+                            <span className="min-w-0 flex-1 truncate text-emerald-700">{target.STYLE} / {target.COLOR} / {target.SIZE}</span>
+                            <button onClick={() => editBatchMember(sourceBatch.id, index)} className="font-semibold text-blue-600 hover:text-blue-700">Edit</button>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
