@@ -226,6 +226,8 @@ test('color rename is scoped, atomic and compatible with style rename and rollba
       const notes = 'unchanged-history-'.repeat(200000)
       await db.exec(`INSERT INTO inventory_balance(style,color,size,quantity)
         SELECT 'PAGING-' || n,'BLACK','S',1 FROM generate_series(1,1200) n`)
+      await db.exec(`INSERT INTO inventory_txn_rows(txn_type,style,color,size,qty,source_file)
+        SELECT 'sales','5010149','#21 Black Grey Blue Plaid','S',-1,'bulk-history-' || n FROM generate_series(1,3000) n`)
       await db.query("INSERT INTO app_data(key,value) VALUES('oversized-related',$1::jsonb)", [JSON.stringify({ rows: [{ style: '5010149', color: '#21 Black Grey Blue Plaid', quantity: 99 }], notes, revision: 1 })])
       renameReads.length = 0
       enforceBoundedRenameReads = true
@@ -237,6 +239,9 @@ test('color rename is scoped, atomic and compatible with style rename and rollba
       assert.equal(reads.length, 0, 'large documents must never leave PostgreSQL')
       const inventoryReads = renameReads.filter(read => read.query.includes('FROM "inventory_balance"'))
       assert.equal(inventoryReads.length, 2, 'over 1,200 scalar inventory rows need two requests, not hundreds')
+      assert.equal(readDocuments('inventory_txn_rows').length, 0, 'transaction history must be updated inside PostgreSQL')
+      const history = (await db.query("SELECT COUNT(*)::int n,SUM(qty)::int qty FROM inventory_txn_rows WHERE source_file LIKE 'bulk-history-%' AND color='#22 Black Grey Blue Plaid'")).rows[0]
+      assert.deepEqual(history, { n: 3000, qty: -3000 })
       const saved = (await db.query("SELECT value FROM app_data WHERE key='oversized-related'")).rows[0].value
       assert.equal(saved.rows[0].color, '#22 Black Grey Blue Plaid')
       assert.equal(saved.rows[0].quantity, 99)
