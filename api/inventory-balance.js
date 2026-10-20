@@ -1647,7 +1647,9 @@ export default async function handler(req, res) {
         .map((sourceHash) => sourceHash.slice('return-package:'.length))
         .filter(Boolean))]
 
-      const restoreRows = (Array.isArray(snap.data) ? snap.data : []).map((row, index) => ({
+      const snapshotRequest = { body: snap.data }
+      await canonicalizeStyleRequest(sql, snapshotRequest)
+      const restoreRows = (Array.isArray(snapshotRequest.body) ? snapshotRequest.body : []).map((row, index) => ({
         style: String(row.style || '').trim(),
         color: String(row.color || '').trim(),
         size: String(row.size || '').trim(),

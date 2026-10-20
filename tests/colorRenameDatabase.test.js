@@ -118,10 +118,11 @@ test('color rename is scoped, atomic and compatible with style rename and rollba
         VALUES(999,1,3,'A','BLACK','WHITE','S',1,'admin');`)
     await t.test('one color rename changes all sizes of its style and every linked color identity', async () => {
       const before = (await db.query('SELECT id,quantity FROM inventory_balance ORDER BY id')).rows
+      const backups = (await db.query('SELECT id,md5(data::text) AS hash FROM inventory_snapshots ORDER BY id')).rows
       const result = await ok('rename-colors', { renames: [{ style: 'A', oldColor: 'BLACK', newColor: 'MIDNIGHT' }] }, 'PATCH')
       assert.equal(result.updated, 2)
       assert.equal(result.renamedColors, 1)
-      assert.notEqual((await db.query("SELECT current_setting('feiya.inventory_name_rename',true) flag")).rows[0].flag, 'on', 'rename-only guard bypass must never leak into subsequent writes')
+      assert.deepEqual((await db.query('SELECT id,md5(data::text) AS hash FROM inventory_snapshots ORDER BY id')).rows, backups, 'immutable rollback backups must not be rewritten for a display-name change')
       assert.deepEqual((await db.query('SELECT id,quantity FROM inventory_balance ORDER BY id')).rows, before)
       assert.equal((await db.query("SELECT COUNT(*)::int n FROM inventory_balance WHERE style='A' AND color='MIDNIGHT'")).rows[0].n, 2)
       assert.equal((await db.query("SELECT quantity FROM inventory_balance WHERE style='B' AND color='BLACK'")).rows[0].quantity, 30)
@@ -241,6 +242,7 @@ test('color rename is scoped, atomic and compatible with style rename and rollba
       const inventoryReads = renameReads.filter(read => read.query.includes('FROM "inventory_balance"'))
       assert.equal(inventoryReads.length, 2, 'over 1,200 scalar inventory rows need two requests, not hundreds')
       assert.equal(readDocuments('inventory_txn_rows').length, 0, 'transaction history must be updated inside PostgreSQL')
+      assert.equal(readDocuments('inventory_snapshots').length, 0, 'rename must not read full-inventory backups')
       const history = (await db.query("SELECT COUNT(*)::int n,SUM(qty)::int qty FROM inventory_txn_rows WHERE source_file LIKE 'bulk-history-%' AND color='#22 Black Grey Blue Plaid'")).rows[0]
       assert.deepEqual(history, { n: 3000, qty: -3000 })
       const saved = (await db.query("SELECT value FROM app_data WHERE key='oversized-related'")).rows[0].value
