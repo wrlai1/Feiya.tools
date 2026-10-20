@@ -1,4 +1,4 @@
-import { renameStyle } from '../lib/renameStyle.js'
+import { renameStyle, renameStyles } from '../lib/renameStyle.js'
 import { canonicalizeStyleRequest } from '../lib/styleNames.js'
 import inventorySkuCorrection from '../lib/inventorySkuCorrection.cjs'
 import inventoryReceipt from '../lib/inventoryReceipt.cjs'
@@ -444,7 +444,7 @@ export default async function handler(req, res) {
 
     if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
 
-    const styleAliases = action === 'rename-style' ? {} : await canonicalizeStyleRequest(sql, req)
+    const styleAliases = ['rename-style', 'rename-styles'].includes(action) ? {} : await canonicalizeStyleRequest(sql, req)
 
     if (req.method === 'GET' && action === 'sku-audit') {
       const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1)
@@ -790,6 +790,10 @@ export default async function handler(req, res) {
       ], { isolationLevel: 'Serializable' })
       const [stat] = results[results.length - 1]
       return res.json({ ok: true, total_rows: stat.c, total_units: stat.u })
+    }
+
+    if (req.method === 'PATCH' && action === 'rename-styles') {
+      return res.json(await renameStyles(sql, req.body?.renames, payload.username || 'admin'))
     }
 
     if (req.method === 'PATCH' && action === 'rename-style') {

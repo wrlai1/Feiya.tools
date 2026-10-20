@@ -1,3 +1,5 @@
+import BulkRenameStylesModal from '../components/BulkRenameStylesModal.jsx'
+import { canonicalizeStyleNames, resolveStyleName, styleNameKey } from '../utils/styleNames.js'
 import InventoryReceipt from '../components/InventoryReceipt.jsx'
 import ShipmentRangeReport from '../components/ShipmentRangeReport.jsx'
 import React, { useState, useMemo, useCallback, useEffect, useTransition } from 'react'
@@ -383,7 +385,7 @@ function BulkEditQtyModal({ rows, onClose, onDone, getToken }) {
   )
 }
 
-function InventorySpreadsheet({ rows, drafts, onChange }) {
+function InventorySpreadsheet({ rows, drafts, onChange, onRenameStyle }) {
   const [page, setPage] = useState(0)
   const [adjustmentAmount, setAdjustmentAmount] = useState('1')
   const pageSize = 100
@@ -469,7 +471,9 @@ function InventorySpreadsheet({ rows, drafts, onChange }) {
               const status = quantity <= 0 ? 'Out' : quantity < 5 ? 'Low' : 'In stock'
               return (
                 <tr key={row.id} className={changed ? 'bg-amber-50' : rowColor(row)}>
-                  <td className={`sticky left-0 z-10 border-b border-r border-slate-200 px-3 py-2 font-semibold text-slate-800 ${changed ? 'bg-amber-50' : 'bg-white'}`}>{row.Style}</td>
+                  <td className={`sticky left-0 z-10 border-b border-r border-slate-200 px-3 py-2 font-semibold text-slate-800 ${changed ? 'bg-amber-50' : 'bg-white'}`}><span className="inline-flex items-center gap-2">{row.Style}
+                    <button type="button" onClick={() => onRenameStyle(row.Style)} title="修改 Style 名称" aria-label={`修改款式名称 ${row.Style}`} className="rounded-md border border-blue-100 bg-blue-50 p-1.5 text-blue-600 hover:bg-blue-100"><Pencil className="h-3.5 w-3.5" /></button>
+                  </span></td>
                   <td className={`sticky left-48 z-10 border-b border-r border-slate-200 px-3 py-2 text-slate-600 ${changed ? 'bg-amber-50' : 'bg-white'}`}>{row.Color}</td>
                   <td className="border-b border-r border-slate-200 px-3 py-2 font-medium text-slate-700">{row.Size}</td>
                   <td className="border-b border-slate-200 px-2 py-1.5">
@@ -1483,6 +1487,7 @@ export default function StockManagement() {
   const [showImport,     setShowImport]     = useState(false)
   const [showAddRows,    setShowAddRows]    = useState(false)
   const [showRemoveRows, setShowRemoveRows] = useState(false)
+  const [showBulkRename, setShowBulkRename] = useState(false)
   const [renameTarget, setRenameTarget] = useState(null)
   const [editTarget,     setEditTarget]     = useState(null)
   const [selectedIds,    setSelectedIds]    = useState(() => new Set())
@@ -1778,6 +1783,18 @@ export default function StockManagement() {
     toast.success(`Exported ${displayRows.length.toLocaleString()} rows`)
   }, [displayRows, toast])
 
+  const handleStylesRenamed = (renames) => {
+    const aliases = Object.fromEntries(renames.map(({ oldStyle, newStyle }) => [styleNameKey(oldStyle), newStyle]))
+    setBalanceData(current => ({ ...current,
+      rows: canonicalizeStyleNames(current.rows, aliases),
+      styleAliases: { ...Object.fromEntries(Object.entries(current.styleAliases || {}).map(([key, value]) => [key, resolveStyleName(value, aliases)])),
+        ...aliases, ...Object.fromEntries(renames.map(({ newStyle }) => [styleNameKey(newStyle), newStyle])) },
+    }))
+    setStyleFilter(current => current === 'all' ? current : resolveStyleName(current, aliases))
+    setInputValue(current => resolveStyleName(current, aliases))
+    setSearchQuery(current => resolveStyleName(current, aliases))
+  }
+
   // ── Render states ──────────────────────────────────────────────────────────
   if (serverError) {
     return (
@@ -1821,19 +1838,16 @@ export default function StockManagement() {
       {showRemoveRows && (
         <RemoveRowsModal onClose={() => setShowRemoveRows(false)} onDone={loadBalance} currentRows={allRows} getToken={getToken} />
       )}
+      {showBulkRename && (
+        <BulkRenameStylesModal inventoryRows={allRows} initialStyles={[...new Set(displayRows.map(row => row.Style))]}
+          onClose={() => setShowBulkRename(false)} onDone={result => handleStylesRenamed(result.renames)}
+          onSave={renames => apiFetch(`${BASE}/inventory-balance?action=rename-styles`, {
+            method: 'PATCH', headers: authHeaders(getToken(), true), body: JSON.stringify({ renames }),
+          })} />
+      )}
       {renameTarget !== null && (
         <RenameStyleModal style={renameTarget} getToken={getToken} onClose={() => setRenameTarget(null)}
-          onDone={({ oldStyle, newStyle }) => {
-            setBalanceData(current => ({ ...current,
-              rows: current.rows.map(row => row.Style.trim().toUpperCase() === oldStyle.trim().toUpperCase() ? { ...row, Style: newStyle, style_n: newStyle } : row),
-              styleAliases: { ...Object.fromEntries(Object.entries(current.styleAliases || {}).map(([key, value]) => [key, value.trim().toUpperCase() === oldStyle.trim().toUpperCase() ? newStyle : value])), [oldStyle.trim().toUpperCase()]: newStyle, [newStyle.toUpperCase()]: newStyle },
-            }))
-            setStyleFilter(current => current === oldStyle ? newStyle : current)
-            if (searchQuery.trim().toUpperCase() === oldStyle.trim().toUpperCase()) {
-              setInputValue(newStyle)
-              setSearchQuery(newStyle)
-            }
-          }} />
+          onDone={({ oldStyle, newStyle }) => handleStylesRenamed([{ oldStyle, newStyle }])} />
       )}
       {editTarget && (
         <EditQtyModal
@@ -1882,6 +1896,7 @@ export default function StockManagement() {
             </button>
             {initialized && (
             <>
+              <button type="button" onClick={() => setShowBulkRename(true)} className="btn-secondary border-blue-200 bg-blue-50 text-sm text-blue-700"><Pencil className="h-4 w-4" />批量修改 Style 名称</button>
               <button onClick={() => setShowReceipt(true)} className="btn-secondary text-sm"><Plus className="w-4 h-4" />批量进货入库</button>
               <button onClick={() => setShowAddRows(true)} className="btn-secondary text-sm">
                 <Plus className="w-4 h-4" />
@@ -2062,7 +2077,7 @@ export default function StockManagement() {
                   Click a quantity to type, use + / −, or paste a vertical quantity column from Excel. Enter moves to the next row. Yellow cells are not saved yet.
                 </div>
 
-                <InventorySpreadsheet rows={displayRows} drafts={quantityDrafts} onChange={handleGridChange} />
+                <InventorySpreadsheet rows={displayRows} drafts={quantityDrafts} onChange={handleGridChange} onRenameStyle={setRenameTarget} />
               </div>
 
               {/* Version history + transaction log */}

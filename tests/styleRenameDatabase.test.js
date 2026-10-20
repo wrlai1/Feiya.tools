@@ -196,6 +196,49 @@ test('global style rename is atomic across reports, mappings and imports', async
       await ok('apply', { ...apply('final-alias-import'), filledRows: [{ STYLE: 'FINAL', COLOR: 'Black', SIZE: '1X', QTY: 2 }] })
       assert.equal((await balance()).some(item => item.style === 'final'), false)
     })
+    await t.test('bulk rename validates the whole batch and rolls back every dependent update on a late conflict', async () => {
+      const before = await balance()
+      const auditCount = (await db.query('SELECT COUNT(*)::int n FROM inventory_style_renames')).rows[0].n
+      const pairs = [{ oldStyle: 'B', newStyle: 'BULK-B' }, { oldStyle: 'A', newStyle: 'TAKEN' }]
+      assert.equal((await call('rename-styles', { renames: pairs }, 'PATCH')).code, 409)
+      assert.deepEqual(await balance(), before)
+      assert.equal((await db.query('SELECT COUNT(*)::int n FROM inventory_style_renames')).rows[0].n, auditCount)
+      assert.equal((await db.query('SELECT styles FROM inventory_email_settings')).rows[0].styles[0], 'A')
+      assert.equal((await call('rename-styles', { renames: [{ oldStyle: 'A', newStyle: 'X' }, { oldStyle: 'B', newStyle: 'x' }] }, 'PATCH')).code, 400)
+      assert.equal((await call('rename-styles', { renames: [{ oldStyle: 'A', newStyle: 'B' }, { oldStyle: 'B', newStyle: 'C' }] }, 'PATCH')).code, 409)
+      assert.equal((await call('rename-styles', { renames: [] }, 'PATCH')).code, 400)
+      assert.equal((await call('rename-styles', { renames: [{ oldStyle: 'A', newStyle: 'X' }, { oldStyle: 'MISSING', newStyle: 'Y' }] }, 'PATCH')).code, 409)
+      assert.deepEqual(await balance(), before)
+    })
+    await t.test('one bulk save updates both styles, shared JSON documents, settings, history and aliases together', async () => {
+      await callOther(emailHandler, 'email-settings', { enabled: true, recipients: ['recipient@example.com'], styles: ['A', 'B'], sendHour: 9 })
+      await db.query("INSERT INTO app_data(key,value) VALUES('bulk-shared',$1::jsonb)", [JSON.stringify({ rows: [{ style: 'A', qty: 11 }, { style: 'B', qty: 22 }], revision: 1 })])
+      const before = await balance()
+      const result = await ok('rename-styles', { renames: [{ oldStyle: 'A', newStyle: 'BULK-A' }, { oldStyle: 'B', newStyle: 'BULK-B' }] }, 'PATCH')
+      assert.equal(result.renamedStyles, 2)
+      assert.equal(result.updated, before.length)
+      assert.deepEqual((await balance()).map(item => item.quantity).sort(), before.map(item => item.quantity).sort())
+      assert.deepEqual((await db.query('SELECT styles FROM inventory_email_settings')).rows[0].styles, ['BULK-A', 'BULK-B'])
+      const shared = (await db.query("SELECT value FROM app_data WHERE key='bulk-shared'")).rows[0].value
+      assert.deepEqual(shared.rows, [{ style: 'BULK-A', qty: 11 }, { style: 'BULK-B', qty: 22 }])
+      assert.equal(shared.revision, 2)
+      const aliases = (await ok('list', {}, 'GET')).styleAliases
+      assert.equal(aliases.A, 'BULK-A')
+      assert.equal(aliases.FINAL, 'BULK-A')
+      assert.equal(aliases.B, 'BULK-B')
+      assert.equal((await db.query("SELECT COUNT(*)::int n FROM inventory_txn_rows WHERE style IN ('A','B')")).rows[0].n, 0)
+      assert.equal((await db.query('SELECT style FROM inventory_email_minimum')).rows[0].style, 'BULK-A')
+    })
+    await t.test('concurrent changes abort the whole batch and admin access is required', async () => {
+      const before = await balance()
+      const changes = { renames: [{ oldStyle: 'BULK-A', newStyle: 'NEXT-A' }, { oldStyle: 'BULK-B', newStyle: 'NEXT-B' }] }
+      beforeBatch = async () => db.query("UPDATE app_data SET value=$1::jsonb WHERE key='bulk-shared'", [JSON.stringify({ rows: [{ style: 'BULK-A', qty: 99 }], revision: 3 })])
+      assert.equal((await call('rename-styles', changes, 'PATCH')).code, 409)
+      assert.deepEqual(await balance(), before)
+      await db.exec("UPDATE users SET role='user'")
+      assert.equal((await call('rename-styles', changes, 'PATCH')).code, 403)
+      await db.exec("UPDATE users SET role='admin'")
+    })
   } finally {
     neonConfig.fetchFunction = previousFetch
     if (previousUrl === undefined) delete process.env.DATABASE_URL; else process.env.DATABASE_URL = previousUrl
