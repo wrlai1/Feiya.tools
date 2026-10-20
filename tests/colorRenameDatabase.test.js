@@ -22,11 +22,23 @@ test('color rename is scoped, atomic and compatible with style rename and rollba
   let beforeBatch
   let enforceBoundedRenameReads = false
   const renameReads = []
+  const readDocuments = table => {
+    const chunks = renameReads.filter(read => read.query.includes(`FROM "${table}"`)).flatMap(read => read.rows)
+    const documents = [], parts = []
+    for (const row of chunks) {
+      parts.push(row.chunk)
+      if (Number(row.part) === Number(row.parts)) { documents.push(JSON.parse(parts.join(''))); parts.length = 0 }
+    }
+    return documents
+  }
   const execute = async (connection, { query, params }) => {
     if (enforceBoundedRenameReads && /jsonb_agg\(to_jsonb\(saved\)\)/.test(query)) {
       throw Object.assign(new Error('total size of jsonb array elements exceeds the maximum of 268435455 bytes'), { code: '54000' })
     }
     const result = await connection.query(query, params)
+    if (enforceBoundedRenameReads && Buffer.byteLength(JSON.stringify(result.rows)) > 3 * 1024 * 1024) {
+      throw new Error('response is too large (simulated HTTP limit)')
+    }
     if (enforceBoundedRenameReads && query.includes('__rename_hash')) renameReads.push({ query, rows: result.rows })
     return {
       fields: result.fields.map(field => ({ name: field.name, dataTypeID: field.dataTypeID })),
@@ -41,6 +53,7 @@ test('color rename is scoped, atomic and compatible with style rename and rollba
   }
   neonConfig.fetchFunction = async (_url, options) => {
     const request = JSON.parse(options.body)
+    if (enforceBoundedRenameReads && Buffer.byteLength(options.body) > 3 * 1024 * 1024) throw new Error('request is too large (simulated HTTP limit)')
     try {
       if (request.queries && beforeBatch) {
         const callback = beforeBatch; beforeBatch = null
@@ -208,12 +221,29 @@ test('color rename is scoped, atomic and compatible with style rename and rollba
       const stock = (await db.query("SELECT color,quantity FROM inventory_balance WHERE style='5010149' ORDER BY id")).rows
       assert.deepEqual(stock.map(row => row.quantity).sort((a,b) => a-b), [1,2,3,4])
       assert.equal(stock.every(row => row.color === newColor), true)
-      const documents = renameReads.find(read => read.query.includes('FROM "app_data"')).rows
+      const documents = readDocuments('app_data')
       assert.deepEqual(documents.map(row => row.key), ['size-fix-related'])
-      const reports = renameReads.find(read => read.query.includes('FROM "inventory_email_runs"')).rows
+      const reports = readDocuments('inventory_email_runs')
       assert.equal(reports[0].payload, true)
       assert.equal((await db.query("SELECT value FROM app_data WHERE key='size-fix-related'")).rows[0].value.rows[0].color, newColor)
       assert.equal((await db.query("SELECT COUNT(*)::int n FROM app_data WHERE key LIKE 'unrelated-large-%'")).rows[0].n, 10)
+    })
+    await t.test('a related document larger than the HTTP limit is read in bounded chunks and saved with small name patches', async () => {
+      const notes = 'unchanged-history-'.repeat(200000)
+      await db.query("INSERT INTO app_data(key,value) VALUES('oversized-related',$1::jsonb)", [JSON.stringify({ rows: [{ style: '5010149', color: '#21 Black Grey Blue Plaid', quantity: 99 }], notes, revision: 1 })])
+      renameReads.length = 0
+      enforceBoundedRenameReads = true
+      try {
+        const result = await ok('rename-colors', { renames: [{ style: '5010149', oldColor: '#21 Black Grey Blue Plaid', newColor: '#22 Black Grey Blue Plaid' }] }, 'PATCH')
+        assert.equal(result.updated, 4)
+      } finally { enforceBoundedRenameReads = false }
+      const reads = renameReads.filter(read => read.query.includes('FROM "app_data"'))
+      assert.ok(reads.length > 1, 'large documents must cross response pages')
+      const saved = (await db.query("SELECT value FROM app_data WHERE key='oversized-related'")).rows[0].value
+      assert.equal(saved.rows[0].color, '#22 Black Grey Blue Plaid')
+      assert.equal(saved.rows[0].quantity, 99)
+      assert.equal(saved.notes, notes)
+      assert.equal(saved.revision, 2)
     })
     await t.test('related-document filtering treats wildcard and JSON escape characters literally', async () => {
       const special = String.raw`STYLE%_"TEST`
@@ -223,7 +253,7 @@ test('color rename is scoped, atomic and compatible with style rename and rollba
       enforceBoundedRenameReads = true
       await ok('rename-colors', { renames: [{ style: special, oldColor: 'BLACK', newColor: 'CHARCOAL' }] }, 'PATCH')
       enforceBoundedRenameReads = false
-      const documents = renameReads.find(read => read.query.includes('FROM "app_data"')).rows
+      const documents = readDocuments('app_data')
       assert.deepEqual(documents.map(row => row.key), ['special-related'])
       assert.equal((await db.query("SELECT value FROM app_data WHERE key='special-related'")).rows[0].value.color, 'CHARCOAL')
       assert.equal((await db.query("SELECT value FROM app_data WHERE key='special-unrelated'")).rows[0].value.color, 'BLACK')
