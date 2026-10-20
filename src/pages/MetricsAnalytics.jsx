@@ -1266,6 +1266,14 @@ export default function MetricsAnalytics() {
     })
   }
 
+  const openStoreManager = () => {
+    setActiveWorkspace('manage')
+    setStoreSettingsOpen(true)
+    window.requestAnimationFrame(() => {
+      document.getElementById('analytics-stores')?.scrollIntoView({ block: 'start' })
+    })
+  }
+
   const handleCreateStore = async () => {
     const name = newStore.trim()
     if (!name) return
@@ -1725,6 +1733,9 @@ export default function MetricsAnalytics() {
                 {label}
               </button>
             ))}
+            <button type="button" onClick={openStoreManager} className="btn-primary whitespace-nowrap px-3 py-1.5 text-xs">
+              <Plus className="h-4 w-4" /> 添加店铺
+            </button>
           </div>
         </div>
       </nav>
@@ -1732,6 +1743,7 @@ export default function MetricsAnalytics() {
       <div className={activeWorkspace === 'overview' ? 'space-y-3' : 'hidden'} style={{ order: 1 }}>
         <DataStatusBanner
           activeStore={activeStore}
+          onManageStores={openStoreManager}
           latestSavedDay={latestSavedDay}
           latestSource={latestRangeUpload?.fileName || ''}
           dataAgeDays={dataAgeDays}
@@ -2213,6 +2225,7 @@ export default function MetricsAnalytics() {
 
 function DataStatusBanner({
   activeStore,
+  onManageStores,
   latestSavedDay,
   latestSource,
   dataAgeDays,
@@ -2293,7 +2306,7 @@ function DataStatusBanner({
       </div>
       {(!activeStore || (!isPreview && (!hasSavedData || coveredDays === 0))) && (
         <div className="mt-3 flex flex-wrap gap-2 border-t border-black/5 pt-3">
-          {!activeStore && <a href="#analytics-stores" className="btn-primary text-xs">Create or select store</a>}
+          {!activeStore && <button type="button" onClick={onManageStores} className="btn-primary text-xs">Create or select store</button>}
           {activeStore && <a href="#analytics-uploads" className="btn-primary text-xs">Upload performance data</a>}
           {activeStore && hasSavedData && coveredDays === 0 && <a href="#analytics-performance" className="btn-secondary text-xs">Review selected range</a>}
         </div>
