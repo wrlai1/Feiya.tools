@@ -20,8 +20,14 @@ test('color rename is scoped, atomic and compatible with style rename and rollba
   process.env.DATABASE_URL = 'postgresql://test:test@localhost/test'
   process.env.JWT_SECRET = 'inventory-local-test'
   let beforeBatch
+  let enforceBoundedRenameReads = false
+  const renameReads = []
   const execute = async (connection, { query, params }) => {
+    if (enforceBoundedRenameReads && /jsonb_agg\(to_jsonb\(saved\)\)/.test(query)) {
+      throw Object.assign(new Error('total size of jsonb array elements exceeds the maximum of 268435455 bytes'), { code: '54000' })
+    }
     const result = await connection.query(query, params)
+    if (enforceBoundedRenameReads && query.includes('__rename_hash')) renameReads.push({ query, rows: result.rows })
     return {
       fields: result.fields.map(field => ({ name: field.name, dataTypeID: field.dataTypeID })),
       rows: result.rows.map(row => result.fields.map(field => {
@@ -187,6 +193,40 @@ test('color rename is scoped, atomic and compatible with style rename and rollba
       assert.deepEqual(await balance(), before)
       assert.deepEqual((await ok('list', {}, 'GET')).colorAliases, aliasesBefore)
       assert.equal((await db.query('SELECT COUNT(*)::int n FROM inventory_color_renames')).rows[0].n, auditBefore)
+    })
+    await t.test('large history and cached attachments are never aggregated or loaded unnecessarily during a four-size rename', async () => {
+      const oldColor = 'Black Grey Blue Plaid', newColor = '#21 Black Grey Blue Plaid'
+      await ok('add-rows', { rows: ['S','M','L','XL'].map((size,index) => ({ Style: '5010149', Color: oldColor, Size: size, Quantity: index + 1 })) })
+      await db.query("INSERT INTO app_data(key,value) VALUES('size-fix-related',$1::jsonb)", [JSON.stringify({ rows: [{ style: '5010149', color: oldColor, qty: 99 }], revision: 1 })])
+      await db.exec(`INSERT INTO app_data(key,value) SELECT 'unrelated-large-' || n, jsonb_build_object('rows',jsonb_build_array(jsonb_build_object('style','UNRELATED','color','BLACK','notes',repeat('z',200000)))) FROM generate_series(1,10) n;
+        INSERT INTO inventory_email_runs(report_date,status,styles,payload) VALUES('2000-01-01','sent','["5010149"]',repeat('x',1000000));`)
+      renameReads.length = 0
+      enforceBoundedRenameReads = true
+      const result = await ok('rename-colors', { renames: [{ style: '5010149', oldColor, newColor }] }, 'PATCH')
+      enforceBoundedRenameReads = false
+      assert.equal(result.updated, 4)
+      const stock = (await db.query("SELECT color,quantity FROM inventory_balance WHERE style='5010149' ORDER BY id")).rows
+      assert.deepEqual(stock.map(row => row.quantity).sort((a,b) => a-b), [1,2,3,4])
+      assert.equal(stock.every(row => row.color === newColor), true)
+      const documents = renameReads.find(read => read.query.includes('FROM "app_data"')).rows
+      assert.deepEqual(documents.map(row => row.key), ['size-fix-related'])
+      const reports = renameReads.find(read => read.query.includes('FROM "inventory_email_runs"')).rows
+      assert.equal(reports[0].payload, true)
+      assert.equal((await db.query("SELECT value FROM app_data WHERE key='size-fix-related'")).rows[0].value.rows[0].color, newColor)
+      assert.equal((await db.query("SELECT COUNT(*)::int n FROM app_data WHERE key LIKE 'unrelated-large-%'")).rows[0].n, 10)
+    })
+    await t.test('related-document filtering treats wildcard and JSON escape characters literally', async () => {
+      const special = String.raw`STYLE%_"TEST`
+      await ok('add-rows', { rows: [{ Style: special, Color: 'BLACK', Size: 'S', Quantity: 7 }] })
+      await db.query("INSERT INTO app_data(key,value) VALUES('special-related',$1::jsonb),('special-unrelated',$2::jsonb)", [JSON.stringify({ style: special, color: 'BLACK' }), JSON.stringify({ style: 'STYLExxxTEST', color: 'BLACK' })])
+      renameReads.length = 0
+      enforceBoundedRenameReads = true
+      await ok('rename-colors', { renames: [{ style: special, oldColor: 'BLACK', newColor: 'CHARCOAL' }] }, 'PATCH')
+      enforceBoundedRenameReads = false
+      const documents = renameReads.find(read => read.query.includes('FROM "app_data"')).rows
+      assert.deepEqual(documents.map(row => row.key), ['special-related'])
+      assert.equal((await db.query("SELECT value FROM app_data WHERE key='special-related'")).rows[0].value.color, 'CHARCOAL')
+      assert.equal((await db.query("SELECT value FROM app_data WHERE key='special-unrelated'")).rows[0].value.color, 'BLACK')
     })
   } finally {
     neonConfig.fetchFunction = previousFetch
