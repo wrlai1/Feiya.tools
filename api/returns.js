@@ -1,3 +1,4 @@
+import { canonicalizeStyleRequest } from '../lib/styleNames.js'
 import { returnMappingMigration } from '../lib/returnMappingMigration.js'
 import { neon } from '@neondatabase/serverless'
 import authentication from '../lib/authentication.cjs'
@@ -661,6 +662,7 @@ export default async function handler(req, res) {
       process.env.JWT_SECRET,
     )
     if (!payload) return res.status(401).json({ error: 'Not authenticated' })
+    await canonicalizeStyleRequest(sql, req)
     const action = String(req.query.action || '')
 
     if (req.method === 'POST' && ['catalog-migrate-preview', 'catalog-migrate-apply'].includes(action)) return returnMappingMigration(req, res, sql, payload)
@@ -3090,6 +3092,7 @@ export default async function handler(req, res) {
 
     return res.status(400).json({ error: `Unknown action: ${action}` })
   } catch (error) {
+    if (error.code === 'PST01') return res.status(409).json({ error: error.message })
     console.error('[/api/returns]', error.message)
     if (/return_inventory_target_changed/.test(error.message)) {
       return res.status(409).json({

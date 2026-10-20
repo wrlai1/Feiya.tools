@@ -1,3 +1,4 @@
+import { canonicalizeStyleRequest } from '../lib/styleNames.js'
 // api/analytics-store.js
 // Per-account stores + daily and aggregate-period analytics data (Analytics page).
 //
@@ -386,6 +387,7 @@ export default async function handler(req, res) {
     const payload = await authenticateUser(sql, req.headers.authorization, getSecret())
     if (!payload) return res.status(401).json({ error: 'Not authenticated' })
     if (payload.role !== 'admin') return res.status(403).json({ error: 'Admin access required' })
+    await canonicalizeStyleRequest(sql, req)
     const actor = payload.username
     const username = payload.role === 'admin' ? 'admin' : payload.username
     const action   = req.query.action
@@ -1084,6 +1086,7 @@ export default async function handler(req, res) {
 
     return res.status(400).json({ error: 'Unknown action' })
   } catch (err) {
+    if (err.code === 'PST01') return res.status(409).json({ error: err.message })
     return res.status(500).json({ error: err.message })
   }
 }

@@ -1,3 +1,4 @@
+import { resolveStyleName, canonicalizeStyleNames } from './styleNames.js'
 /**
  * Auto Deduct matching engine — runs entirely in the browser.
  *
@@ -353,7 +354,9 @@ function inferConfirmedDimensionReviewAlias(aliases, sizeKey) {
  *                                 exact target size exists in inventory.
  * @returns {{ filledRows, unmatchedRows, stats }}
  */
-export function fillTemplate(templateRows, salesRows, aliases = {}) {
+export function fillTemplate(templateRows, salesRows, aliases = {}, styleAliases = {}) {
+  aliases = canonicalizeStyleNames(aliases, styleAliases)
+  const currentStyle = value => resolveStyleName(value, styleAliases)
   // Build output entries in EXACT template row order. Buckets (keyed by normalized
   // style||size) hold REFERENCES to the same entry objects, so quantities accumulate
   // in place without disturbing order. Keys are normalized so LT366===Lt366, 1XL===1X,
@@ -459,7 +462,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
       parseIssue = [...new Set([...parseIssue.split(';'), 'm022_size_unknown'].filter(Boolean))].join(';')
     }
     const sourceIssue = parseIssue
-    const matchStyle = routedStyle || style
+    const matchStyle = currentStyle(routedStyle || style)
     const normStyle = normalizeStyle(matchStyle)
     const key       = `${normStyle}||${normSize}`
     let candidates = buckets.get(key) || []
@@ -500,7 +503,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
     const aliasNeedsReview = (Array.isArray(aliasTarget?.components) && !confirmedComboRule)
       || (
         aliasTarget?.STYLE
-        && normalizeStyleIdentity(aliasTarget.STYLE) !== normalizeStyleIdentity(style)
+        && normalizeStyleIdentity(currentStyle(aliasTarget.STYLE)) !== normalizeStyleIdentity(currentStyle(style))
         && !confirmedStyleColorRule
     )
     if (aliasNeedsReview) {
@@ -518,7 +521,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}) {
     const target = typeof aliasTarget === 'string' ? { COLOR: aliasTarget } : aliasTarget
     const applyAliasTarget = (pool = []) => {
       const matchTarget = (wanted, items) => {
-        const wantStyle = String(wanted.STYLE || '').trim()
+        const wantStyle = String(currentStyle(wanted.STYLE || '')).trim()
         const wantColor = String(wanted.COLOR || '').trim()
         const wantSize = normalizeSize(wanted.SIZE || normSize)
         const matches = items.filter(c => {

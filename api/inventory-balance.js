@@ -1,3 +1,5 @@
+import { renameStyle } from '../lib/renameStyle.js'
+import { canonicalizeStyleRequest } from '../lib/styleNames.js'
 import inventorySkuCorrection from '../lib/inventorySkuCorrection.cjs'
 import inventoryReceipt from '../lib/inventoryReceipt.cjs'
 import shipmentRange from '../lib/shipmentDateRange.cjs'
@@ -442,6 +444,8 @@ export default async function handler(req, res) {
 
     if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
 
+    const styleAliases = action === 'rename-style' ? {} : await canonicalizeStyleRequest(sql, req)
+
     if (req.method === 'GET' && action === 'sku-audit') {
       const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1)
       const items = await sql`SELECT orders.order_number, orders.source_hash, orders.source_file, orders.inventory_status, items.sku_code, items.attributes, items.quantity, items.sku_id
@@ -473,6 +477,7 @@ export default async function handler(req, res) {
     if (req.method === 'GET' && action === 'list') {
       const rows = await sql`SELECT id, style, color, size, quantity FROM inventory_balance ORDER BY sort_order NULLS LAST, id`
       return res.json({
+        styleAliases,
         initialized: rows.length > 0,
         rows: formatRows(rows),
         ...calcStats(rows),
@@ -785,6 +790,10 @@ export default async function handler(req, res) {
       ], { isolationLevel: 'Serializable' })
       const [stat] = results[results.length - 1]
       return res.json({ ok: true, total_rows: stat.c, total_units: stat.u })
+    }
+
+    if (req.method === 'PATCH' && action === 'rename-style') {
+      return res.json(await renameStyle(sql, req.body, payload.username || 'admin'))
     }
 
     // ── PATCH edit — update one row's quantity ────────────────────────────────
@@ -1793,7 +1802,9 @@ export default async function handler(req, res) {
 
     return res.status(400).json({ error: `Unknown action: ${action}` })
   } catch (err) {
+    if (err.code === 'PST01') return res.status(409).json({ error: err.message })
     console.error('[/api/inventory-balance]', err.message)
+    if (err.status) return res.status(err.status).json({ error: err.message })
     if (/inventory_order_claims_active_item_uq/.test(err.message)) {
       return res.status(409).json({ error: 'One or more order items were already deducted. Inventory was not changed.' })
     }

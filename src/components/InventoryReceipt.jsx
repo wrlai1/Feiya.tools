@@ -2,7 +2,7 @@ import { parseInventoryReceiptRows, receiptSkuKey as key, sortReceiptRows as sor
 import React, { useMemo, useState } from 'react'
 import { X, Download, Upload, RefreshCw } from 'lucide-react'
 
-export default function InventoryReceipt({ inventory, getToken, onClose, onDone }) {
+export default function InventoryReceipt({ inventory, styleAliases = {}, getToken, onClose, onDone }) {
   const styles = useMemo(() => [...new Set(inventory.map((r) => r.Style))].sort(), [inventory])
   const [selected, setSelected] = useState([])
   const [search, setSearch] = useState('')
@@ -28,7 +28,7 @@ export default function InventoryReceipt({ inventory, getToken, onClose, onDone 
       const XLSX = await import('xlsx')
       const workbook = XLSX.read(await file.arrayBuffer(), { type: 'array' })
       const source = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], { defval: '' })
-      const additions = parseInventoryReceiptRows(source, inventory)
+      const additions = parseInventoryReceiptRows(source, inventory, styleAliases)
       setRows(additions)
       setSelected([...new Set(additions.map(row => row.style))])
     } catch (e) { setError(e.message) }

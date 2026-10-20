@@ -1,3 +1,4 @@
+import { canonicalizeStyleRequest } from '../lib/styleNames.js';
 import { neon } from '@neondatabase/serverless';
 import authentication from '../lib/authentication.cjs';
 import userPermissions from '../lib/userPermissions.cjs';
@@ -52,6 +53,7 @@ export default async function handler(req, res) {
     }
 
     await ensureTable(sql);
+    await canonicalizeStyleRequest(sql, req);
 
     if (req.method === 'GET') {
       const rows = await sql`SELECT value, updated_at FROM app_data WHERE key = ${type}`;
@@ -118,6 +120,7 @@ export default async function handler(req, res) {
 
     return res.status(405).json({ error: 'Method not allowed' });
   } catch (err) {
+    if (err.code === 'PST01') return res.status(409).json({ error: err.message });
     return res.status(500).json({ error: err.message });
   }
 }

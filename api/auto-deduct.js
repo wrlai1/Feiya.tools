@@ -1,3 +1,4 @@
+import { canonicalizeStyleRequest } from '../lib/styleNames.js'
 // api/auto-deduct.js — Vercel serverless function
 // Handles template storage and transaction logging for Auto Deduct.
 // The actual CSV matching is done client-side (see autoDeductEngine.js).
@@ -107,6 +108,7 @@ export default async function handler(req, res) {
     if (!isAdmin) return res.status(403).json({ error: 'Admin access required' })
 
     await ensureAppDataTable(sql)
+    await canonicalizeStyleRequest(sql, req)
 
     // ── GET config ──────────────────────────────────────────────────────────
     if (req.method === 'GET' && action === 'config') {
@@ -231,6 +233,7 @@ export default async function handler(req, res) {
 
     return res.status(400).json({ error: `Unknown action: ${action}` })
   } catch (err) {
+    if (err.code === 'PST01') return res.status(409).json({ error: err.message })
     console.error('[/api/auto-deduct]', err.message)
     return res.status(500).json({ error: err.message })
   }

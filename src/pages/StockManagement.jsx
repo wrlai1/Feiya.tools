@@ -84,6 +84,42 @@ function nextBlankInventoryRow() {
   return { key: `${Date.now()}-${Math.random()}`, Style: '', Color: '', Size: '', Quantity: '0' }
 }
 
+function RenameStyleModal({ style, onClose, onDone, getToken }) {
+  const [name, setName] = useState(style)
+  const [saving, setSaving] = useState(false)
+  const toast = useToast()
+  const save = async (event) => {
+    event.preventDefault()
+    if (saving || !name.trim() || name.trim() === style) return
+    setSaving(true)
+    try {
+      const result = await apiFetch(`${BASE}/inventory-balance?action=rename-style`, {
+        method: 'PATCH', headers: authHeaders(getToken(), true),
+        body: JSON.stringify({ oldStyle: style, newStyle: name.trim() }),
+      })
+      onDone(result)
+      toast.success(`${style} → ${result.newStyle}`, 'Style Renamed')
+      onClose()
+    } catch (error) { toast.error(error.message, 'Rename Failed') }
+    finally { setSaving(false) }
+  }
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+      <form onSubmit={save} role="dialog" aria-modal="true" aria-labelledby="rename-style-title" className="bg-white rounded-2xl shadow-xl w-full max-w-sm p-6 space-y-5">
+        <h3 id="rename-style-title" className="font-semibold text-slate-800">Rename Style</h3>
+        <p className="text-sm text-slate-500">Rename {style} across all colors and sizes. Related records, reports, and daily email settings update together. Quantities stay the same.</p>
+        <label className="block text-sm">New Style Name
+          <input className="input-base w-full mt-2" value={name} onChange={event => setName(event.target.value)} maxLength={100} autoFocus required disabled={saving} />
+        </label>
+        <div className="flex gap-2">
+          <button type="button" onClick={onClose} disabled={saving} className="btn-secondary flex-1 justify-center">Cancel</button>
+          <button type="submit" disabled={saving || !name.trim() || name.trim() === style} className="btn-primary flex-1 justify-center disabled:opacity-50">{saving ? 'Saving…' : 'Save'}</button>
+        </div>
+      </form>
+    </div>
+  )
+}
+
 // ── Edit Quantity Modal ────────────────────────────────────────────────────────
 function EditQtyModal({ row, onClose, onDone, getToken }) {
   const [qty,     setQty]     = useState(String(row.Quantity ?? 0))
@@ -1447,6 +1483,7 @@ export default function StockManagement() {
   const [showImport,     setShowImport]     = useState(false)
   const [showAddRows,    setShowAddRows]    = useState(false)
   const [showRemoveRows, setShowRemoveRows] = useState(false)
+  const [renameTarget, setRenameTarget] = useState(null)
   const [editTarget,     setEditTarget]     = useState(null)
   const [selectedIds,    setSelectedIds]    = useState(() => new Set())
   const [showBulkEdit,   setShowBulkEdit]   = useState(false)
@@ -1457,7 +1494,13 @@ export default function StockManagement() {
   const toast = useToast()
 
   const COLUMNS = useMemo(() => [
-    { key: 'Style',    label: 'Style',    sortable: true },
+    { key: 'Style', label: 'Style', sortable: true, render: (value) => (
+      <span className="inline-flex items-center gap-2">{value}
+        <button onClick={event => { event.stopPropagation(); setRenameTarget(value) }}
+          className="p-1 rounded hover:bg-slate-200 text-slate-400 hover:text-blue-600"
+          title="Rename style" aria-label={`Rename style ${value}`}><Pencil className="w-3.5 h-3.5" /></button>
+      </span>
+    ) },
     { key: 'Color',    label: 'Color',    sortable: true },
     { key: 'Size',     label: 'Size',     sortable: true },
     {
@@ -1768,7 +1811,7 @@ export default function StockManagement() {
 
   return (
     <div className="space-y-6 max-w-7xl">
-      {showReceipt && <InventoryReceipt inventory={allRows} getToken={getToken} onClose={() => setShowReceipt(false)} onDone={loadBalance} />}
+      {showReceipt && <InventoryReceipt inventory={allRows} styleAliases={balanceData?.styleAliases} getToken={getToken} onClose={() => setShowReceipt(false)} onDone={loadBalance} />}
       {showImport && (
         <ImportModal onClose={() => setShowImport(false)} onDone={loadBalance} getToken={getToken} />
       )}
@@ -1777,6 +1820,20 @@ export default function StockManagement() {
       )}
       {showRemoveRows && (
         <RemoveRowsModal onClose={() => setShowRemoveRows(false)} onDone={loadBalance} currentRows={allRows} getToken={getToken} />
+      )}
+      {renameTarget !== null && (
+        <RenameStyleModal style={renameTarget} getToken={getToken} onClose={() => setRenameTarget(null)}
+          onDone={({ oldStyle, newStyle }) => {
+            setBalanceData(current => ({ ...current,
+              rows: current.rows.map(row => row.Style.trim().toUpperCase() === oldStyle.trim().toUpperCase() ? { ...row, Style: newStyle, style_n: newStyle } : row),
+              styleAliases: { ...Object.fromEntries(Object.entries(current.styleAliases || {}).map(([key, value]) => [key, value.trim().toUpperCase() === oldStyle.trim().toUpperCase() ? newStyle : value])), [oldStyle.trim().toUpperCase()]: newStyle, [newStyle.toUpperCase()]: newStyle },
+            }))
+            setStyleFilter(current => current === oldStyle ? newStyle : current)
+            if (searchQuery.trim().toUpperCase() === oldStyle.trim().toUpperCase()) {
+              setInputValue(newStyle)
+              setSearchQuery(newStyle)
+            }
+          }} />
       )}
       {editTarget && (
         <EditQtyModal

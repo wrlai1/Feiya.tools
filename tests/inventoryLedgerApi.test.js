@@ -173,6 +173,51 @@ test('actual APIs persist Minimum overrides and selected return business dates',
       assert.equal((await call(emailHandler, 'email-minimum-upload', { rows: [sku] }, { headers: {} })).code, 401)
       assert.equal((await call(emailHandler, 'email-nonsense', {})).code, 400)
       assert.equal((await db.query('SELECT styles FROM inventory_email_settings')).rows[0].styles[0], '0055')
+      // Renaming must not replace a provider retry's immutable attachment.
+      const rename = () => call(balanceHandler, 'rename-style', { oldStyle: '0055', newStyle: 'DAILY-NEW' }, { method: 'PATCH' })
+      await db.query("UPDATE inventory_email_runs SET status='failed',payload=$1", [JSON.stringify(firstPayload)])
+      assert.equal((await rename()).code, 409)
+      assert.equal((await db.query('SELECT payload FROM inventory_email_runs')).rows[0].payload, JSON.stringify(firstPayload))
+      await db.exec("UPDATE inventory_email_runs SET status='sending',created_at=NOW()")
+      assert.equal((await rename()).code, 409)
+      await db.exec("UPDATE inventory_email_runs SET status='sent',payload=NULL")
+      assert.equal((await call(emailHandler, 'email-minimum-upload', { rows: [sku] })).code, 200)
+      const stockBeforeRename = (await db.query('SELECT quantity FROM inventory_balance ORDER BY id')).rows
+      const renamed = await rename()
+      assert.equal(renamed.code, 200, JSON.stringify(renamed.body))
+      assert.equal((await db.query('SELECT styles FROM inventory_email_settings')).rows[0].styles[0], 'DAILY-NEW')
+      assert.equal((await db.query('SELECT minimum FROM inventory_email_minimum')).rows[0].minimum, 101)
+      assert.equal((await db.query('SELECT style FROM return_package_items')).rows[0].style, 'DAILY-NEW')
+      assert.deepEqual((await db.query('SELECT quantity FROM inventory_balance ORDER BY id')).rows, stockBeforeRename)
+      assert.equal((await db.query('SELECT styles FROM inventory_email_runs')).rows[0].styles[0], '0055')
+      const renamedDownload = await call(emailHandler, 'email-download', { styles: ['0055'], recipients: [] })
+      assert.equal(renamedDownload.code, 200, JSON.stringify(renamedDownload.body))
+      const renamedWorkbook = new ExcelJS.Workbook()
+      await renamedWorkbook.xlsx.load(renamedDownload.body)
+      assert.ok(renamedWorkbook.getWorksheet('DAILY-NEW'))
+      assert.equal(renamedWorkbook.getWorksheet('0055'), undefined)
+      // Advance only this local test's clock: tomorrow's scheduled mail must
+      // pick up the renamed selection, movement history, and Minimum override.
+      const RealDate = globalThis.Date
+      const tomorrow = RealDate.now() + 86400000
+      globalThis.Date = class extends RealDate {
+        constructor(...args) { super(...(args.length ? args : [tomorrow])) }
+        static now() { return tomorrow }
+      }
+      try {
+        const nextReport = await call(emailHandler, 'email-cron', {}, cronOptions)
+        assert.equal(nextReport.code, 200, JSON.stringify(nextReport.body))
+        assert.equal(nextReport.body.sent, true)
+        const nextWorkbook = new ExcelJS.Workbook()
+        await nextWorkbook.xlsx.load(Buffer.from(sentPayload.attachments[0].content, 'base64'))
+        assert.equal(nextWorkbook.getWorksheet('0055'), undefined)
+        const nextSheet = nextWorkbook.getWorksheet('DAILY-NEW')
+        assert.ok(nextSheet)
+        const nextHeaders = nextSheet.getRow(5).values
+        assert.equal(nextSheet.getCell(6, nextHeaders.indexOf('Minimum')).value, 101)
+        assert.deepEqual((await db.query('SELECT quantity FROM inventory_balance ORDER BY id')).rows, stockBeforeRename)
+      } finally { globalThis.Date = RealDate }
+
     } finally {
       globalThis.fetch = oldFetch
       for (const key of emailKeys) if (oldEmailEnv[key] === undefined) delete process.env[key]; else process.env[key] = oldEmailEnv[key]
