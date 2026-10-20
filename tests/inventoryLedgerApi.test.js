@@ -217,6 +217,20 @@ test('actual APIs persist Minimum overrides and selected return business dates',
         assert.equal(nextSheet.getCell(6, nextHeaders.indexOf('Minimum')).value, 101)
         assert.deepEqual((await db.query('SELECT quantity FROM inventory_balance ORDER BY id')).rows, stockBeforeRename)
       } finally { globalThis.Date = RealDate }
+      const colorRename = await call(balanceHandler, 'rename-colors', { renames: [{ style: 'DAILY-NEW', oldColor: 'BLACK', newColor: 'MIDNIGHT' }] }, { method: 'PATCH' })
+      assert.equal(colorRename.code, 200, JSON.stringify(colorRename.body))
+      assert.equal((await db.query('SELECT color FROM inventory_email_minimum')).rows[0].color, 'MIDNIGHT')
+      assert.equal((await db.query('SELECT color FROM return_package_items')).rows[0].color, 'MIDNIGHT')
+      const colorDownload = await call(emailHandler, 'email-download', { styles: ['0055'], recipients: [] })
+      assert.equal(colorDownload.code, 200, JSON.stringify(colorDownload.body))
+      const colorWorkbook = new ExcelJS.Workbook()
+      await colorWorkbook.xlsx.load(colorDownload.body)
+      const colorSheet = colorWorkbook.getWorksheet('DAILY-NEW')
+      const colorHeaders = colorSheet.getRow(5).values
+      assert.equal(colorSheet.getCell(6, colorHeaders.indexOf('Color')).value, 'MIDNIGHT')
+      assert.equal(colorSheet.getCell(6, colorHeaders.indexOf('Minimum')).value, 101)
+      assert.deepEqual((await db.query('SELECT quantity FROM inventory_balance ORDER BY id')).rows, stockBeforeRename)
+
 
     } finally {
       globalThis.fetch = oldFetch

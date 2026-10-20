@@ -1,3 +1,4 @@
+import { resolveColorName } from './colorNames.js'
 import { resolveStyleName } from './styleNames.js'
 import exportSizes from '../../lib/inventoryExportSizes.cjs'
 
@@ -7,7 +8,7 @@ const sizeKey = value => norm(value).replace(/^([1-5])XL$/, '$1X')
 export const receiptSkuKey = (style, color, size) => [norm(style), norm(color), sizeKey(size)].join('|')
 export const sortReceiptRows = (a, b) => a.style.localeCompare(b.style, undefined, { numeric: true }) || a.color.localeCompare(b.color, undefined, { numeric: true }) || exportSizes.compareExportSizes(a.size, b.size)
 
-export function parseInventoryReceiptRows(source, inventory, styleAliases = {}) {
+export function parseInventoryReceiptRows(source, inventory, styleAliases = {}, colorAliases = {}) {
   if (!Array.isArray(source) || source.length > 10000) throw new Error('请上传不超过 10000 行的入库模板')
   const read = (row, names) => {
     const keys = Object.keys(row).filter(key => names.includes(text(key).toLowerCase()))
@@ -31,7 +32,7 @@ export function parseInventoryReceiptRows(source, inventory, styleAliases = {}) 
     if (!['string', 'number'].includes(typeof value) || !Number.isSafeInteger(quantity) || quantity < 0 || quantity > 2147483647) throw new Error(`Row ${rowNumber}: 入库数量必须是非负整数`)
     if (!quantity) continue
     const style = resolveStyleName(text(read(row, ['style', '款式', '款号'])), styleAliases)
-    const color = text(read(row, ['color', '颜色']))
+    const color = resolveColorName(style, text(read(row, ['color', '颜色'])), colorAliases)
     const size = norm(read(row, ['size', '尺码']))
     const missing = [['款式', style], ['颜色', color], ['尺码', size]].filter(([, value]) => !value).map(([label]) => label)
     if (missing.length) throw new Error(`Row ${rowNumber}: 缺少${missing.join('、')}，请补充该行`)

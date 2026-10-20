@@ -445,7 +445,7 @@ export default function AutoDeduct() {
       }
 
       // 3. Match & fill — pure JS, no server needed
-      const engineResult = fillTemplate(tRows, salesRows, aliases, tData.styleAliases || {})
+      const engineResult = fillTemplate(tRows, salesRows, aliases, tData.styleAliases || {}, tData.colorAliases || {})
       setResult(engineResult)
       setConfigError(null)
 

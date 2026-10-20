@@ -1,3 +1,4 @@
+import { canonicalizeColorNames, resolveColorName, colorAliasKey } from './colorNames.js'
 import { resolveStyleName, canonicalizeStyleNames } from './styleNames.js'
 /**
  * Auto Deduct matching engine — runs entirely in the browser.
@@ -354,9 +355,17 @@ function inferConfirmedDimensionReviewAlias(aliases, sizeKey) {
  *                                 exact target size exists in inventory.
  * @returns {{ filledRows, unmatchedRows, stats }}
  */
-export function fillTemplate(templateRows, salesRows, aliases = {}, styleAliases = {}) {
-  aliases = canonicalizeStyleNames(aliases, styleAliases)
+export function fillTemplate(templateRows, salesRows, aliases = {}, styleAliases = {}, colorAliases = {}) {
+  aliases = canonicalizeColorNames(canonicalizeStyleNames(aliases, styleAliases), colorAliases)
   const currentStyle = value => resolveStyleName(value, styleAliases)
+  const priorColors = new Map()
+  for (const [key, currentColor] of Object.entries(colorAliases)) {
+    const [scope, oldColor] = JSON.parse(key)
+    const target = colorAliasKey(scope,currentColor)
+    if (!priorColors.has(target)) priorColors.set(target, [])
+    priorColors.get(target).push(oldColor)
+  }
+  const colorNames = (scope, color) => [color, ...(priorColors.get(colorAliasKey(scope,color)) || [])]
   // Build output entries in EXACT template row order. Buckets (keyed by normalized
   // style||size) hold REFERENCES to the same entry objects, so quantities accumulate
   // in place without disturbing order. Keys are normalized so LT366===Lt366, 1XL===1X,
@@ -522,11 +531,11 @@ export function fillTemplate(templateRows, salesRows, aliases = {}, styleAliases
     const applyAliasTarget = (pool = []) => {
       const matchTarget = (wanted, items) => {
         const wantStyle = String(currentStyle(wanted.STYLE || '')).trim()
-        const wantColor = String(wanted.COLOR || '').trim()
+        const wantColor = String(resolveColorName(wantStyle || matchStyle, wanted.COLOR || '', colorAliases)).trim()
         const wantSize = normalizeSize(wanted.SIZE || normSize)
         const matches = items.filter(c => {
           const styleOk = !wantStyle || normalizeStyleIdentity(c.style) === normalizeStyleIdentity(wantStyle)
-          const colorOk = !wantColor || normalizeColor(c.color) === normalizeColor(wantColor)
+          const colorOk = !wantColor || colorNames(c.style,c.color).some(name => normalizeColor(name) === normalizeColor(wantColor))
           const sizeOk = !wantSize || normalizeSize(c.size) === wantSize
           return styleOk && colorOk && sizeOk
         })
@@ -671,10 +680,11 @@ export function fillTemplate(templateRows, salesRows, aliases = {}, styleAliases
 
     // Fail closed if destructive cleanup would make two differently named
     // inventory colors share one exact identity.
-    const exactIdentity = normalizeColor(color)
+    const matchColor = resolveColorName(matchStyle, color, colorAliases)
+    const exactIdentity = normalizeColor(matchColor)
     const exactTargets = new Map(
       candidates
-        .filter((candidate) => normalizeColor(candidate.color) === exactIdentity)
+        .filter((candidate) => colorNames(candidate.style,candidate.color).some(name => normalizeColor(name) === exactIdentity))
         .map((candidate) => [
           `${candidate.style}\u0000${candidate.color}\u0000${candidate.size}`,
           candidate,
@@ -694,7 +704,7 @@ export function fillTemplate(templateRows, salesRows, aliases = {}, styleAliases
     // suede" count as the same color, but "grey white" and "winter white" do not).
     const bySig = new Map()  // signature → { score, idx }
     candidates.forEach((c, i) => {
-      const s   = colorScore(c.color, color)
+      const s   = Math.max(...colorNames(c.style,c.color).map(name => colorScore(name, matchColor)))
       const sig = colorTokens(c.color).slice().sort().join('|')
       const cur = bySig.get(sig)
       if (!cur || s > cur.score) bySig.set(sig, { score: s, idx: i })
