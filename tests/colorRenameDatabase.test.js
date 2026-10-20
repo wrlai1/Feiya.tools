@@ -121,6 +121,7 @@ test('color rename is scoped, atomic and compatible with style rename and rollba
       const result = await ok('rename-colors', { renames: [{ style: 'A', oldColor: 'BLACK', newColor: 'MIDNIGHT' }] }, 'PATCH')
       assert.equal(result.updated, 2)
       assert.equal(result.renamedColors, 1)
+      assert.notEqual((await db.query("SELECT current_setting('feiya.inventory_name_rename',true) flag")).rows[0].flag, 'on', 'rename-only guard bypass must never leak into subsequent writes')
       assert.deepEqual((await db.query('SELECT id,quantity FROM inventory_balance ORDER BY id')).rows, before)
       assert.equal((await db.query("SELECT COUNT(*)::int n FROM inventory_balance WHERE style='A' AND color='MIDNIGHT'")).rows[0].n, 2)
       assert.equal((await db.query("SELECT quantity FROM inventory_balance WHERE style='B' AND color='BLACK'")).rows[0].quantity, 30)
