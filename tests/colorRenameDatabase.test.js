@@ -23,13 +23,7 @@ test('color rename is scoped, atomic and compatible with style rename and rollba
   let enforceBoundedRenameReads = false
   const renameReads = []
   const readDocuments = table => {
-    const chunks = renameReads.filter(read => read.query.includes(`FROM "${table}"`)).flatMap(read => read.rows)
-    const documents = [], parts = []
-    for (const row of chunks) {
-      parts.push(row.chunk)
-      if (Number(row.part) === Number(row.parts)) { documents.push(JSON.parse(parts.join(''))); parts.length = 0 }
-    }
-    return documents
+    return renameReads.filter(read => read.query.includes(`FROM "${table}"`)).flatMap(read => read.rows)
   }
   const execute = async (connection, { query, params }) => {
     if (enforceBoundedRenameReads && /jsonb_agg\(to_jsonb\(saved\)\)/.test(query)) {
@@ -222,14 +216,16 @@ test('color rename is scoped, atomic and compatible with style rename and rollba
       assert.deepEqual(stock.map(row => row.quantity).sort((a,b) => a-b), [1,2,3,4])
       assert.equal(stock.every(row => row.color === newColor), true)
       const documents = readDocuments('app_data')
-      assert.deepEqual(documents.map(row => row.key), ['size-fix-related'])
+      assert.deepEqual(documents, [], 'historical documents must stay in the database')
       const reports = readDocuments('inventory_email_runs')
       assert.equal(reports[0].payload, true)
       assert.equal((await db.query("SELECT value FROM app_data WHERE key='size-fix-related'")).rows[0].value.rows[0].color, newColor)
       assert.equal((await db.query("SELECT COUNT(*)::int n FROM app_data WHERE key LIKE 'unrelated-large-%'")).rows[0].n, 10)
     })
-    await t.test('a related document larger than the HTTP limit is read in bounded chunks and saved with small name patches', async () => {
+    await t.test('a related document larger than the HTTP limit is renamed without transporting it', async () => {
       const notes = 'unchanged-history-'.repeat(200000)
+      await db.exec(`INSERT INTO inventory_balance(style,color,size,quantity)
+        SELECT 'PAGING-' || n,'BLACK','S',1 FROM generate_series(1,1200) n`)
       await db.query("INSERT INTO app_data(key,value) VALUES('oversized-related',$1::jsonb)", [JSON.stringify({ rows: [{ style: '5010149', color: '#21 Black Grey Blue Plaid', quantity: 99 }], notes, revision: 1 })])
       renameReads.length = 0
       enforceBoundedRenameReads = true
@@ -238,7 +234,9 @@ test('color rename is scoped, atomic and compatible with style rename and rollba
         assert.equal(result.updated, 4)
       } finally { enforceBoundedRenameReads = false }
       const reads = renameReads.filter(read => read.query.includes('FROM "app_data"'))
-      assert.ok(reads.length > 1, 'large documents must cross response pages')
+      assert.equal(reads.length, 0, 'large documents must never leave PostgreSQL')
+      const inventoryReads = renameReads.filter(read => read.query.includes('FROM "inventory_balance"'))
+      assert.equal(inventoryReads.length, 2, 'over 1,200 scalar inventory rows need two requests, not hundreds')
       const saved = (await db.query("SELECT value FROM app_data WHERE key='oversized-related'")).rows[0].value
       assert.equal(saved.rows[0].color, '#22 Black Grey Blue Plaid')
       assert.equal(saved.rows[0].quantity, 99)
@@ -254,7 +252,7 @@ test('color rename is scoped, atomic and compatible with style rename and rollba
       await ok('rename-colors', { renames: [{ style: special, oldColor: 'BLACK', newColor: 'CHARCOAL' }] }, 'PATCH')
       enforceBoundedRenameReads = false
       const documents = readDocuments('app_data')
-      assert.deepEqual(documents.map(row => row.key), ['special-related'])
+      assert.deepEqual(documents, [])
       assert.equal((await db.query("SELECT value FROM app_data WHERE key='special-related'")).rows[0].value.color, 'CHARCOAL')
       assert.equal((await db.query("SELECT value FROM app_data WHERE key='special-unrelated'")).rows[0].value.color, 'BLACK')
     })
